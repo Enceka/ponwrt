@@ -263,9 +263,13 @@ define KernelPackage/mt7916-ct-wed-prepare
   SUBMENU:=Wireless Drivers
   TITLE:=HG5585F-CT MT7916 slot 1 cold ring preparation
   DEPENDS:=@TARGET_airoha_an7581_DEVICE_fiberhome_hg5585f-ct @MT7915_NPU kmod-mt7915e
-  FILES:=$(PKG_BUILD_DIR)/mt7915/ct_wed_platform.ko
+  FILES:=$(PKG_BUILD_DIR)/mt7915/ct_wed_platform.ko $(PKG_BUILD_DIR)/mt7915/ct_wed_guard_v2.ko
   AUTOLOAD:=$(call AutoLoad,19,ct_wed_platform,1)
   MODPARAMS.ct_wed_platform:=prepare=1
+endef
+
+define KernelPackage/mt7916-ct-wed-prepare/install
+	echo ct_wed_guard_v2 >> $(1)/etc/modules.d/19-mt7916-ct-wed-prepare
 endef
 
 define KernelPackage/mt7981-firmware
@@ -549,7 +553,7 @@ ifneq ($(filter y m,$(CONFIG_PACKAGE_kmod-mt7916-ct-wed-prepare)),)
 	$(call Build/Prepare/Default)
 	$(call PatchDir,$(PKG_BUILD_DIR),$(CURDIR)/ct-wed/patches,ct-wed/)
 	$(INSTALL_DIR) $(PKG_BUILD_DIR)/mt7915/ct-wed
-	$(CP) $(CURDIR)/ct-wed/ct_wed_platform.c $(CURDIR)/ct-wed/ct_wdma_rx.h $(PKG_BUILD_DIR)/mt7915/ct-wed/
+	$(CP) $(CURDIR)/ct-wed/*.c $(CURDIR)/ct-wed/*.h $(PKG_BUILD_DIR)/mt7915/ct-wed/
   endef
 endif
 

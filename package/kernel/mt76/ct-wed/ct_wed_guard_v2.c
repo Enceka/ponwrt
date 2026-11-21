@@ -1,0 +1,128 @@
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+
+#include "../ct-wed-provider-v2.h"
+
+enum ct_exposure {
+	CT_NEVER_EXPOSED,
+	CT_EXPOSED,
+	CT_RETAINED,
+};
+
+struct airoha_ct_wed_lease_v2 {
+	struct airoha_ct_wed *provider;
+	enum ct_exposure exposure;
+};
+
+static DEFINE_MUTEX(ct_v2_lock);
+static struct airoha_ct_wed_lease_v2 *ct_v2_owner;
+
+static struct airoha_ct_wed *ct_v2_get(struct device *radio)
+{
+	return airoha_ct_wed_ops_v1.get(radio);
+}
+
+static void ct_v2_put(struct airoha_ct_wed *provider)
+{
+	mutex_lock(&ct_v2_lock);
+	if (!ct_v2_owner || ct_v2_owner->provider != provider)
+		airoha_ct_wed_ops_v1.put(provider);
+	mutex_unlock(&ct_v2_lock);
+}
+
+static int ct_v2_acquire(struct airoha_ct_wed *provider, const struct airoha_ct_wed_plan *plan,
+			 struct airoha_ct_wed_view *view, struct airoha_ct_wed_lease_v2 **out)
+{
+	struct airoha_ct_wed_lease_v2 *lease;
+	int err;
+
+	if (!out || !provider || !view || !plan)
+		return -EINVAL;
+	*out = NULL;
+	mutex_lock(&ct_v2_lock);
+	err = -EBUSY;
+	if (ct_v2_owner)
+		goto unlock;
+	err = -ENOMEM;
+	lease = kzalloc(sizeof(*lease), GFP_KERNEL);
+	if (!lease)
+		goto unlock;
+	err = airoha_ct_wed_ops_v1.acquire(provider, plan, view);
+	if (err) {
+		kfree(lease);
+		goto unlock;
+	}
+	lease->provider = provider;
+	lease->exposure = CT_NEVER_EXPOSED;
+	ct_v2_owner = lease;
+	*out = lease;
+unlock:
+	mutex_unlock(&ct_v2_lock);
+	return err;
+}
+
+static int ct_v2_start_masked(struct airoha_ct_wed_lease_v2 *lease)
+{
+	int err;
+
+	mutex_lock(&ct_v2_lock);
+	if (!lease || lease != ct_v2_owner)
+		err = -ESTALE;
+	else if (lease->exposure != CT_NEVER_EXPOSED)
+		err = -EUCLEAN;
+	else
+		err = -EOPNOTSUPP;
+	mutex_unlock(&ct_v2_lock);
+	return err;
+}
+
+static int ct_v2_quiesce(struct airoha_ct_wed_lease_v2 *lease, struct airoha_ct_wed_drain_v2 *result)
+{
+	int err = -ESTALE;
+
+	if (!result)
+		return -EINVAL;
+	result->fences = 0;
+	mutex_lock(&ct_v2_lock);
+	if (lease && lease == ct_v2_owner) {
+		if (lease->exposure == CT_NEVER_EXPOSED)
+			err = -EALREADY;
+		else {
+			lease->exposure = CT_RETAINED;
+			err = -EUCLEAN;
+		}
+	}
+	mutex_unlock(&ct_v2_lock);
+	return err;
+}
+
+static int ct_v2_release(struct airoha_ct_wed_lease_v2 *lease)
+{
+	int err = -ESTALE;
+
+	mutex_lock(&ct_v2_lock);
+	if (lease && lease == ct_v2_owner) {
+		err = -EBUSY;
+		if (lease->exposure == CT_NEVER_EXPOSED) {
+			airoha_ct_wed_ops_v1.release(lease->provider);
+			ct_v2_owner = NULL;
+			kfree(lease);
+			err = 0;
+		}
+	}
+	mutex_unlock(&ct_v2_lock);
+	return err;
+}
+
+static void ct_v2_irq_mask(struct airoha_ct_wed_lease_v2 *lease, u32 mask) {}
+static u32 ct_v2_irq_ack(struct airoha_ct_wed_lease_v2 *lease, u32 mask) { return 0; }
+
+const struct airoha_ct_wed_ops_v2 airoha_ct_wed_ops_v2 = {
+	.get = ct_v2_get, .put = ct_v2_put, .acquire = ct_v2_acquire,
+	.start_masked = ct_v2_start_masked, .quiesce = ct_v2_quiesce, .release = ct_v2_release,
+	.irq_mask = ct_v2_irq_mask, .irq_ack = ct_v2_irq_ack,
+};
+EXPORT_SYMBOL_GPL(airoha_ct_wed_ops_v2);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("HG5585F-CT WED v2 unexposed-lease guard");

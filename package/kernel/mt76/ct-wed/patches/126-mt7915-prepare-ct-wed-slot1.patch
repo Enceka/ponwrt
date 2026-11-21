@@ -1,22 +1,24 @@
 From: Enceka <enceka@yeah.net>
-Subject: [PATCH] wifi: mt76: prepare HG5585F-CT slot 1 rings before native TX
+Subject: [PATCH] wifi: mt76: test HG5585F-CT slot 1 cold ownership
 
-Let the opt-in slot 1 provider provision scratch rings after native DMA
-queues are declared. Fall back to native TX when the provider declines
-ownership; do not redirect IRQs or queue descriptors on that path.
+Prepare the two radio TX queues and WA0 with both HIFs stopped. Reserve
+the stock high token range while the lease is held, request the exclusive
+IRQ disabled, then release the unstarted lease and restore native TX.
+Keep hardware activation gated on fabric drain and unbind isolation.
 
 diff --git a/mt7915/Makefile b/mt7915/Makefile
 index 3d393e5..1ab027c 100644
 --- a/mt7915/Makefile
 +++ b/mt7915/Makefile
-@@ -7,6 +7,8 @@ mt7915e-y := pci.o init.o dma.o eeprom.o main.o mcu.o mac.o \
+@@ -7,6 +7,9 @@ mt7915e-y := pci.o init.o dma.o eeprom.o main.o mcu.o mac.o \
  	     debugfs.o mmio.o
  
  mt7915e-$(CONFIG_NL80211_TESTMODE) += testmode.o
 -mt7915e-$(CONFIG_MT7915_NPU) += npu.o
 +mt7915e-$(CONFIG_MT7915_NPU) += npu.o ct_wed.o
-+obj-m += ct_wed_platform.o
++obj-m += ct_wed_platform.o ct_wed_guard_v2.o
 +ct_wed_platform-y := ct-wed/ct_wed_platform.o
++ct_wed_guard_v2-y := ct-wed/ct_wed_guard_v2.o
  mt7915e-$(CONFIG_MT798X_WMAC) += soc.o
  mt7915e-$(CONFIG_DEV_COREDUMP) += coredump.o
 diff --git a/mt7915/ct-wed-provider-abi.h b/mt7915/ct-wed-provider-abi.h
@@ -72,27 +74,77 @@ index 0000000..96c382b
 +extern const struct airoha_ct_wed_ops airoha_ct_wed_ops_v1;
 +
 +#endif
+diff --git a/mt7915/ct-wed-provider-v2.h b/mt7915/ct-wed-provider-v2.h
+new file mode 100644
+index 0000000..b134f4d
+--- /dev/null
++++ b/mt7915/ct-wed-provider-v2.h
+@@ -0,0 +1,39 @@
++#ifndef __AIROHA_CT_WED_PROVIDER_V2_H
++#define __AIROHA_CT_WED_PROVIDER_V2_H
++
++#include "ct-wed-provider-abi.h"
++
++struct airoha_ct_wed_lease_v2;
++
++enum airoha_ct_wed_fence_v2 {
++	AIROHA_CT_WED_INGRESS_BLOCKED = 1U << 0,
++	AIROHA_CT_WED_WDMA_IDLE = 1U << 1,
++	AIROHA_CT_WED_WPDMA_IDLE = 1U << 2,
++	AIROHA_CT_WED_TXFREE_IDLE = 1U << 3,
++	AIROHA_CT_WED_BUS_DRAINED = 1U << 4,
++};
++
++#define AIROHA_CT_WED_REQUIRED_FENCES_V2 \
++	(AIROHA_CT_WED_INGRESS_BLOCKED | AIROHA_CT_WED_WDMA_IDLE | \
++	 AIROHA_CT_WED_WPDMA_IDLE | AIROHA_CT_WED_TXFREE_IDLE | AIROHA_CT_WED_BUS_DRAINED)
++
++struct airoha_ct_wed_drain_v2 {
++	u32 fences;
++};
++
++struct airoha_ct_wed_ops_v2 {
++	struct airoha_ct_wed *(*get)(struct device *radio);
++	void (*put)(struct airoha_ct_wed *wed);
++	int (*acquire)(struct airoha_ct_wed *wed, const struct airoha_ct_wed_plan *plan,
++		       struct airoha_ct_wed_view *view, struct airoha_ct_wed_lease_v2 **lease);
++	int (*start_masked)(struct airoha_ct_wed_lease_v2 *lease);
++	int (*quiesce)(struct airoha_ct_wed_lease_v2 *lease,
++		       struct airoha_ct_wed_drain_v2 *result);
++	int (*release)(struct airoha_ct_wed_lease_v2 *lease);
++	void (*irq_mask)(struct airoha_ct_wed_lease_v2 *lease, u32 mask);
++	u32 (*irq_ack)(struct airoha_ct_wed_lease_v2 *lease, u32 mask);
++};
++
++extern const struct airoha_ct_wed_ops_v2 airoha_ct_wed_ops_v2;
++
++#endif
 diff --git a/mt7915/ct_wed.c b/mt7915/ct_wed.c
 new file mode 100644
-index 0000000..280388d
+index 0000000..cad0ad5
 --- /dev/null
 +++ b/mt7915/ct_wed.c
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,326 @@
 +#include <linux/module.h>
 +#include <linux/of.h>
 +#include <linux/pci.h>
 +#include "mt7915.h"
 +#include "../dma.h"
-+#include "ct-wed-provider-abi.h"
++#include "ct-wed-provider-v2.h"
++
++enum mt7915_ct_owner { CT_PREPARED, CT_SWITCHING, CT_WED, CT_QUIESCING, CT_RETAINED };
 +
 +struct mt7915_ct_wed {
 +	struct mt7915_dev *dev;
-+	const struct airoha_ct_wed_ops *ops;
++	const struct airoha_ct_wed_ops_v2 *ops;
 +	struct airoha_ct_wed *handle;
++	struct airoha_ct_wed_lease_v2 *lease;
++	enum mt7915_ct_owner owner;
++	u32 token_start, token_count;
++	bool tokens_split;
 +	struct airoha_ct_wed_view view;
 +	struct mt76_queue *queue[AIROHA_CT_WED_RING_COUNT];
 +	struct mt76_queue_regs __iomem *native[AIROHA_CT_WED_RING_COUNT];
-+	u32 route, host;
 +};
 +
 +static const struct {
@@ -126,49 +178,140 @@ index 0000000..280388d
 +{
 +	struct mt7915_ct_wed *bridge;
 +
-+	rcu_read_lock();
-+	bridge = rcu_dereference(dev->ct_wed);
-+	if (bridge)
-+		bridge->ops->irq_mask(bridge->handle, mt7915_ct_irq_translate(mask, true));
-+	rcu_read_unlock();
-+	return !!bridge;
++	lockdep_assert_held(&dev->mt76.mmio.irq_lock);
++	bridge = rcu_dereference_protected(dev->ct_wed, lockdep_is_held(&dev->mt76.mmio.irq_lock));
++	if (!bridge || bridge->owner == CT_PREPARED)
++		return false;
++	if (bridge->owner == CT_WED)
++		bridge->ops->irq_mask(bridge->lease, mt7915_ct_irq_translate(mask, true));
++	return true;
 +}
 +
 +bool mt7915_ct_wed_ack(struct mt7915_dev *dev, u32 mask, u32 *pending)
 +{
 +	struct mt7915_ct_wed *bridge;
 +
-+	rcu_read_lock();
-+	bridge = rcu_dereference(dev->ct_wed);
-+	if (bridge) {
++	lockdep_assert_held(&dev->mt76.mmio.irq_lock);
++	bridge = rcu_dereference_protected(dev->ct_wed, lockdep_is_held(&dev->mt76.mmio.irq_lock));
++	if (!bridge || bridge->owner == CT_PREPARED)
++		return false;
++	*pending = 0;
++	if (bridge->owner == CT_WED) {
 +		u32 irq;
 +
-+		bridge->ops->irq_mask(bridge->handle, 0);
-+		irq = bridge->ops->irq_ack(bridge->handle, mt7915_ct_irq_translate(mask, true));
++		bridge->ops->irq_mask(bridge->lease, 0);
++		irq = bridge->ops->irq_ack(bridge->lease, mt7915_ct_irq_translate(mask, true));
 +		*pending = mt7915_ct_irq_translate(irq, false) & mask;
 +	}
-+	rcu_read_unlock();
-+	return !!bridge;
++	return true;
 +}
 +
-+static irqreturn_t mt7915_ct_wed_irq(int irq, void *data)
++bool mt7915_ct_wed_primary_native(struct mt7915_dev *dev)
 +{
-+	struct mt7915_ct_wed *bridge = data;
-+	struct mt7915_dev *dev = bridge->dev;
++	struct mt7915_ct_wed *bridge;
 +
-+	if (rcu_access_pointer(dev->ct_wed) != bridge)
-+		return IRQ_NONE;
-+	bridge->ops->irq_mask(bridge->handle, 0);
-+	if (test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state))
-+		tasklet_schedule(&dev->mt76.irq_tasklet);
-+	return IRQ_HANDLED;
++	lockdep_assert_held(&dev->mt76.mmio.irq_lock);
++	bridge = rcu_dereference_protected(dev->ct_wed, lockdep_is_held(&dev->mt76.mmio.irq_lock));
++	return !bridge || bridge->owner == CT_PREPARED;
 +}
 +
 +static void mt7915_ct_wed_put(struct mt7915_ct_wed *bridge)
 +{
 +	bridge->ops->put(bridge->handle);
-+	symbol_put(airoha_ct_wed_ops_v1);
++	symbol_put(airoha_ct_wed_ops_v2);
 +	kfree(bridge);
++}
++
++static int mt7915_ct_wed_tokens(struct mt7915_ct_wed *bridge, bool split)
++{
++	struct mt76_dev *mdev = &bridge->dev->mt76;
++	int err = 0;
++
++	spin_lock_bh(&mdev->token_lock);
++	if (mdev->token_count || !idr_is_empty(&mdev->token)) {
++		err = -EBUSY;
++		goto out;
++	}
++	if (split) {
++		if (mdev->token_start != 0 || mdev->token_size != MT7915_TOKEN_SIZE) {
++			err = -EINVAL;
++			goto out;
++		}
++		bridge->token_start = mdev->token_start;
++		bridge->token_count = mdev->token_size;
++		mdev->token_start = 8192;
++		mdev->token_size = 4096;
++	} else {
++		if (!bridge->tokens_split || mdev->token_start != 8192 || mdev->token_size != 4096) {
++			err = -ESTALE;
++			goto out;
++		}
++		mdev->token_start = bridge->token_start;
++		mdev->token_size = bridge->token_count;
++	}
++	bridge->tokens_split = split;
++out:
++	spin_unlock_bh(&mdev->token_lock);
++	return err;
++}
++
++static int mt7915_ct_wed_cold(struct mt7915_dev *dev)
++{
++	u32 disabled = MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN;
++	u32 hif1 = MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0);
++	u16 status;
++	unsigned int index;
++	struct pci_dev *peers[] = { to_pci_dev(dev->mt76.dev), to_pci_dev(dev->hif2->dev) };
++
++	if ((mt76_rr(dev, MT_WFDMA0_GLO_CFG) | mt76_rr(dev, MT_WFDMA0_GLO_CFG + hif1)) & disabled ||
++	    !mt76_poll(dev, MT_WFDMA_EXT_CSR_HIF_MISC, MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1000) ||
++	    READ_ONCE(dev->mt76.token_count))
++		return -EBUSY;
++	for (index = 0; index < ARRAY_SIZE(peers); index++) {
++		if (!pci_is_pcie(peers[index]) || pcie_capability_read_word(peers[index], PCI_EXP_DEVSTA, &status) ||
++		    status == 0xffff)
++			return -EIO;
++		if (status & PCI_EXP_DEVSTA_TRPND)
++			return -EAGAIN;
++	}
++	return 0;
++}
++
++int mt7915_ct_wed_verify_drain(struct mt7915_dev *dev)
++{
++	struct mt7915_ct_wed *bridge = rcu_access_pointer(dev->ct_wed);
++	struct airoha_ct_wed_drain_v2 result = {};
++	struct mt76_queue *queue;
++	unsigned int index;
++	u32 producer, consumer;
++	int err;
++
++	if (!bridge || READ_ONCE(bridge->owner) != CT_QUIESCING)
++		return -EINVAL;
++	err = bridge->ops->quiesce(bridge->lease, &result);
++	if (err)
++		return err;
++	if ((result.fences & AIROHA_CT_WED_REQUIRED_FENCES_V2) != AIROHA_CT_WED_REQUIRED_FENCES_V2)
++		return -EUCLEAN;
++	err = mt7915_ct_wed_cold(dev);
++	if (err)
++		return err;
++	for (index = 0; index < AIROHA_CT_WED_WA0; index++) {
++		queue = bridge->queue[index];
++		producer = readl(&queue->regs->cpu_idx);
++		consumer = readl(&queue->regs->dma_idx);
++		if (producer >= queue->ndesc || producer != consumer || producer != queue->head ||
++		    consumer != queue->tail || READ_ONCE(queue->queued))
++			return -EBUSY;
++	}
++	queue = bridge->queue[AIROHA_CT_WED_WA0];
++	consumer = readl(&queue->regs->dma_idx);
++	if (consumer >= queue->ndesc || consumer != queue->tail)
++		return -EBUSY;
++	dma_rmb();
++	if (le32_to_cpu(READ_ONCE(queue->desc[consumer].ctrl)) & MT_DMA_CTL_DMA_DONE)
++		return -EBUSY;
++	return 0;
 +}
 +
 +void mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2)
@@ -177,31 +320,40 @@ index 0000000..280388d
 +	struct airoha_ct_wed_plan plan = {};
 +	struct mt7915_ct_wed *bridge;
 +	struct pci_dev *pdev;
-+	u32 host, route;
++	unsigned long flags;
++	const char *gate = "native rings";
 +	unsigned int index;
 +	int err = -EINVAL;
 +
-+	if (!dev->ct_path || !dev->hif2 || !is_mt7916(&dev->mt76) || !dev_is_pci(device) ||
-+	    !of_find_property(device->of_node, "airoha,wed-provider", NULL) ||
-+	    test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state))
++	if (!of_find_property(device->of_node, "airoha,wed-provider", NULL))
 +		return;
++	if (!dev->ct_path || !dev->hif2 || !phy2 || !is_mt7916(&dev->mt76) ||
++	    !dev_is_pci(device) || !dev_is_pci(dev->hif2->dev) ||
++	    test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state)) {
++		dev_info(device, "CT WED v2 cold topology unavailable: rx=%u hif2=%u phy2=%u\n",
++			 !!dev->ct_path, !!dev->hif2, !!phy2);
++		return;
++	}
 +	pdev = to_pci_dev(device);
-+	if (pdev->irq == dev->hif2->irq || phy2->mt76->band_idx != 1 || dev->mphy.band_idx ||
-+	    (mt76_rr(dev, MT_WFDMA0_GLO_CFG) & (MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN)))
++	err = mt7915_ct_wed_cold(dev);
++	if (err || pdev->irq == dev->hif2->irq || phy2->mt76->band_idx != 1 || dev->mphy.band_idx) {
++		dev_info(device, "CT WED v2 cold gate=%d irq=%d/%d bands=%u/%u; native\n", err,
++			 pdev->irq, dev->hif2->irq, dev->mphy.band_idx, phy2->mt76->band_idx);
 +		return;
++	}
 +	bridge = kzalloc(sizeof(*bridge), GFP_KERNEL);
 +	if (!bridge)
 +		return;
-+	bridge->ops = symbol_get(airoha_ct_wed_ops_v1);
++	bridge->ops = symbol_get(airoha_ct_wed_ops_v2);
 +	if (!bridge->ops) {
 +		kfree(bridge);
 +		dev_info(device, "CT WED provider absent; native TX\n");
 +		return;
 +	}
 +	if (!bridge->ops->get || !bridge->ops->put || !bridge->ops->acquire ||
-+	    !bridge->ops->start || !bridge->ops->stop || !bridge->ops->release ||
++	    !bridge->ops->start_masked || !bridge->ops->quiesce || !bridge->ops->release ||
 +	    !bridge->ops->irq_mask || !bridge->ops->irq_ack) {
-+		symbol_put(airoha_ct_wed_ops_v1);
++		symbol_put(airoha_ct_wed_ops_v2);
 +		kfree(bridge);
 +		return;
 +	}
@@ -209,7 +361,7 @@ index 0000000..280388d
 +	if (IS_ERR_OR_NULL(bridge->handle)) {
 +		dev_info(device, "CT WED provider unavailable (%ld); native TX\n",
 +			 bridge->handle ? PTR_ERR(bridge->handle) : -ENODEV);
-+		symbol_put(airoha_ct_wed_ops_v1);
++		symbol_put(airoha_ct_wed_ops_v2);
 +		kfree(bridge);
 +		return;
 +	}
@@ -219,8 +371,7 @@ index 0000000..280388d
 +	bridge->queue[AIROHA_CT_WED_WA0] = &dev->mt76.q_rx[MT_RXQ_MAIN_WA];
 +	plan.bar = pci_resource_start(pdev, 0);
 +	plan.bar_len = pci_resource_len(pdev, 0);
-+	plan.host_token_start = dev->mt76.token_start;
-+	plan.host_token_count = dev->mt76.token_size;
++	err = -EINVAL;
 +	for (index = 0; index < ARRAY_SIZE(bridge->queue); index++) {
 +		struct mt76_queue *queue = bridge->queue[index];
 +		struct airoha_ct_wed_ring *ring = &plan.ring[index];
@@ -241,9 +392,19 @@ index 0000000..280388d
 +		    (index != AIROHA_CT_WED_WA0 && (ring->cidx != ring->didx || queue->queued)))
 +			goto put;
 +	}
-+	err = bridge->ops->acquire(bridge->handle, &plan, &bridge->view);
++	gate = "token partition";
++	err = mt7915_ct_wed_tokens(bridge, true);
 +	if (err)
 +		goto put;
++	plan.host_token_start = dev->mt76.token_start;
++	plan.host_token_count = dev->mt76.token_size;
++	gate = "acquire";
++	err = bridge->ops->acquire(bridge->handle, &plan, &bridge->view, &bridge->lease);
++	if (err)
++		goto put;
++	if (WARN_ON_ONCE(!bridge->lease))
++		goto put;
++	gate = "view";
 +	err = -EINVAL;
 +	if (bridge->view.irq <= 0 || bridge->view.irq == pdev->irq || bridge->view.irq == dev->hif2->irq)
 +		goto release;
@@ -256,79 +417,42 @@ index 0000000..280388d
 +			if (bridge->view.csr[index] == bridge->view.csr[prev])
 +				goto release;
 +	}
-+	bridge->route = mt76_rr(dev, MT_WFDMA_WED_RING_CONTROL);
-+	bridge->host = mt76_rr(dev, MT_WFDMA_HOST_CONFIG);
-+	err = bridge->ops->start(bridge->handle);
-+	if (err)
-+		goto release;
-+	err = request_irq(bridge->view.irq, mt7915_ct_wed_irq, 0, "mt7916-ct-wed", bridge);
-+	if (err)
-+		goto stop;
-+	route = (bridge->route & ~(MT_WFDMA_WED_RING_CONTROL_TX0 | MT_WFDMA_WED_RING_CONTROL_TX1 |
-+				    MT_WFDMA_WED_RING_CONTROL_RX1)) |
-+		FIELD_PREP(MT_WFDMA_WED_RING_CONTROL_TX0, 18) |
-+		FIELD_PREP(MT_WFDMA_WED_RING_CONTROL_TX1, 19) |
-+		FIELD_PREP(MT_WFDMA_WED_RING_CONTROL_RX1, 2);
-+	host = bridge->host | MT_WFDMA_HOST_CONFIG_WED;
-+	mt76_wr(dev, MT_WFDMA_WED_RING_CONTROL, route);
-+	mt76_wr(dev, MT_WFDMA_HOST_CONFIG, host);
-+	err = -EIO;
-+	if (mt76_rr(dev, MT_WFDMA_WED_RING_CONTROL) != route || mt76_rr(dev, MT_WFDMA_HOST_CONFIG) != host)
-+		goto undo_route;
-+	for (index = 0; index < ARRAY_SIZE(bridge->queue); index++) {
-+		struct mt76_queue_regs __iomem *regs = bridge->view.csr[index];
-+		struct airoha_ct_wed_ring *ring = &plan.ring[index];
-+
-+		if (readl(&regs->desc_base) != ring->desc || readl(&regs->ring_size) != ring->count ||
-+		    readl(&regs->cpu_idx) != ring->cidx || readl(&regs->dma_idx) != ring->didx)
-+			goto undo_route;
-+	}
-+	for (index = 0; index < ARRAY_SIZE(bridge->queue); index++)
-+		WRITE_ONCE(bridge->queue[index]->regs, bridge->view.csr[index]);
-+	rcu_assign_pointer(dev->ct_wed, bridge);
-+	dev_info(device, "CT WED owns primary TX0/TX1, WA0 and IRQ %d; WA1 native\n", bridge->view.irq);
-+	return;
-+
-+undo_route:
-+	mt76_wr(dev, MT_WFDMA_HOST_CONFIG, bridge->host);
-+	mt76_wr(dev, MT_WFDMA_WED_RING_CONTROL, bridge->route);
-+	free_irq(bridge->view.irq, bridge);
-+stop:
-+	bridge->ops->stop(bridge->handle);
++	gate = "fabric fence / unbind isolation missing";
++	err = -EOPNOTSUPP;
 +release:
-+	bridge->ops->release(bridge->handle);
++	if (bridge->ops->release(bridge->lease)) {
++		spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
++		bridge->owner = CT_PREPARED;
++		rcu_assign_pointer(dev->ct_wed, bridge);
++		spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
++		dev_err(device, "CT WED v2 unstarted lease retained after release refusal; native IRQ\n");
++		return;
++	}
 +put:
-+	dev_info(device, "CT WED declined (%d); native TX/WA/IRQ retained\n", err);
++	if (bridge->tokens_split && mt7915_ct_wed_tokens(bridge, false))
++		dev_err(device, "CT WED v2 host tokens remain in high partition\n");
++	dev_info(device, "CT WED v2 cold gate: %s (%d); native TX/WA/IRQ\n", gate, err);
 +	mt7915_ct_wed_put(bridge);
 +}
 +
 +void mt7915_ct_wed_detach(struct mt7915_dev *dev)
 +{
 +	struct mt7915_ct_wed *bridge = rcu_access_pointer(dev->ct_wed);
-+	unsigned int index;
++	unsigned long flags;
 +
 +	if (!bridge)
 +		return;
-+	tasklet_disable(&dev->mt76.irq_tasklet);
-+	bridge->ops->irq_mask(bridge->handle, 0);
-+	mt76_wr(dev, MT_INT_MASK_CSR, 0);
-+	mt76_clear(dev, MT_WFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
++	if (bridge->owner != CT_PREPARED || bridge->ops->release(bridge->lease))
++		return;
++	if (mt7915_ct_wed_tokens(bridge, false))
++		dev_err(dev->mt76.dev, "CT WED v2 host tokens remain in high partition\n");
++	spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
 +	RCU_INIT_POINTER(dev->ct_wed, NULL);
-+	free_irq(bridge->view.irq, bridge);
-+	synchronize_rcu();
-+	bridge->ops->irq_mask(bridge->handle, 0);
-+	bridge->ops->stop(bridge->handle);
-+	mt76_wr(dev, MT_WFDMA_HOST_CONFIG, bridge->host);
-+	mt76_wr(dev, MT_WFDMA_WED_RING_CONTROL, bridge->route);
-+	for (index = 0; index < ARRAY_SIZE(bridge->queue); index++)
-+		WRITE_ONCE(bridge->queue[index]->regs, bridge->native[index]);
-+	synchronize_net();
-+	bridge->ops->release(bridge->handle);
++	spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
 +	mt7915_ct_wed_put(bridge);
-+	tasklet_enable(&dev->mt76.irq_tasklet);
 +}
 diff --git a/mt7915/dma.c b/mt7915/dma.c
-index 0ed81c5..87ff400 100644
+index 0ed81c5..4934dc6 100644
 --- a/mt7915/dma.c
 +++ b/mt7915/dma.c
 @@ -176,6 +176,7 @@ void mt7915_dma_disable(struct mt7915_dev *dev, bool rst)
@@ -354,8 +478,8 @@ index 0ed81c5..87ff400 100644
  
 -	mt76_poll(dev, MT_WFDMA_EXT_CSR_HIF_MISC,
 -		  MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1000);
-+	if (mt76_poll(dev, MT_WFDMA_EXT_CSR_HIF_MISC,
-+		      MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1000) && phy2)
++	mt76_poll(dev, MT_WFDMA_EXT_CSR_HIF_MISC, MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1000);
++	if (phy2)
 +		mt7915_ct_wed_attach(dev, phy2);
  
  	return mt7915_dma_start(dev, reset, true);
@@ -412,7 +536,7 @@ index 17a6b05..cde47c7 100644
  	idr_init(&dev->mt76.token);
  
 diff --git a/mt7915/mmio.c b/mt7915/mmio.c
-index 28377c9..af2758c 100644
+index 28377c9..4b44699 100644
 --- a/mt7915/mmio.c
 +++ b/mt7915/mmio.c
 @@ -806,7 +806,7 @@ void mt7915_dual_hif_set_irq_mask(struct mt7915_dev *dev,
@@ -424,7 +548,15 @@ index 28377c9..af2758c 100644
  			mt76_wr(dev, MT_INT_MASK_CSR, mdev->mmio.irqmask);
  		mt76_wr(dev, MT_INT1_MASK_CSR, mdev->mmio.irqmask);
  	}
-@@ -834,6 +834,8 @@ static void mt7915_irq_tasklet(struct tasklet_struct *t)
+@@ -828,12 +828,16 @@ static void mt7915_irq_tasklet(struct tasklet_struct *t)
+ 	struct mt7915_dev *dev = from_tasklet(dev, t, mt76.irq_tasklet);
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+ 	u32 intr, intr1, mask;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
+ 	if (mtk_wed_device_active(wed)) {
+ 		mtk_wed_device_irq_set_mask(wed, 0);
  		if (dev->hif2)
  			mt76_wr(dev, MT_INT1_MASK_CSR, 0);
  		intr = mtk_wed_device_irq_get(wed, dev->mt76.mmio.irqmask);
@@ -433,12 +565,25 @@ index 28377c9..af2758c 100644
  	} else {
  		mt76_wr(dev, MT_INT_MASK_CSR, 0);
  		if (dev->hif2)
-@@ -898,9 +900,11 @@ irqreturn_t mt7915_irq_handler(int irq, void *dev_instance)
+@@ -851,6 +855,7 @@ static void mt7915_irq_tasklet(struct tasklet_struct *t)
+ 
+ 		intr |= intr1;
+ 	}
++	spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
+ 
+ 	trace_dev_irq(&dev->mt76, intr, dev->mt76.mmio.irqmask);
+ 
+@@ -897,14 +902,21 @@ irqreturn_t mt7915_irq_handler(int irq, void *dev_instance)
+ {
  	struct mt7915_dev *dev = dev_instance;
  	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
++	unsigned long flags;
  
-+	if (rcu_access_pointer(dev->ct_wed) && irq != dev->hif2->irq)
++	spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
++	if (!mt7915_ct_wed_primary_native(dev) && (!dev->hif2 || irq != dev->hif2->irq)) {
++		spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
 +		return IRQ_NONE;
++	}
  	if (mtk_wed_device_active(wed))
  		mtk_wed_device_irq_set_mask(wed, 0);
 -	else
@@ -446,8 +591,13 @@ index 28377c9..af2758c 100644
  		mt76_wr(dev, MT_INT_MASK_CSR, 0);
  
  	if (dev->hif2)
+ 		mt76_wr(dev, MT_INT1_MASK_CSR, 0);
++	spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
+ 
+ 	if (!test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state))
+ 		return IRQ_NONE;
 diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
-index 5ce6722..125281e 100644
+index 5ce6722..29c56e7 100644
 --- a/mt7915/mt7915.h
 +++ b/mt7915/mt7915.h
 @@ -266,6 +266,7 @@ struct mt7915_dev {
@@ -458,24 +608,27 @@ index 5ce6722..125281e 100644
  	struct mt7915_reg_desc reg;
  	u8 q_id[MT7915_MAX_QUEUE];
  	u32 q_int_mask[MT7915_MAX_QUEUE];
-@@ -481,6 +482,10 @@ bool mt7915_eeprom_has_background_radar(struct mt7915_dev *dev);
+@@ -481,6 +482,12 @@ bool mt7915_eeprom_has_background_radar(struct mt7915_dev *dev);
  #define MT7916_CT_MAX_WCID	150
  
  #ifdef CONFIG_MT7915_NPU
 +void mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2);
 +void mt7915_ct_wed_detach(struct mt7915_dev *dev);
 +bool mt7915_ct_wed_mask(struct mt7915_dev *dev, u32 mask);
++bool mt7915_ct_wed_primary_native(struct mt7915_dev *dev);
++int mt7915_ct_wed_verify_drain(struct mt7915_dev *dev);
 +bool mt7915_ct_wed_ack(struct mt7915_dev *dev, u32 mask, u32 *pending);
  void mt7915_npu_debugfs_ct(struct mt7915_dev *dev, struct dentry *dir);
  int mt7915_npu_request_rx_ct(struct mt7915_dev *dev, struct airoha_npu *npu,
  			     u32 ring_base[2]);
-@@ -518,6 +523,10 @@ static inline int mt7915_ct_set_ba(struct mt7915_dev *dev, u8 band, u16 wcid,
+@@ -518,6 +525,11 @@ static inline int mt7915_ct_set_ba(struct mt7915_dev *dev, u8 band, u16 wcid,
  	return 0;
  }
  static inline int mt7915_ct_prepare(struct mt7915_dev *dev) { return 0; }
 +static inline void mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2) {}
 +static inline void mt7915_ct_wed_detach(struct mt7915_dev *dev) {}
 +static inline bool mt7915_ct_wed_mask(struct mt7915_dev *dev, u32 mask) { return false; }
++static inline bool mt7915_ct_wed_primary_native(struct mt7915_dev *dev) { return true; }
 +static inline bool mt7915_ct_wed_ack(struct mt7915_dev *dev, u32 mask, u32 *pending) { return false; }
  static inline int mt7915_ct_bind(struct mt7915_dev *dev) { return 0; }
  static inline void mt7915_ct_stop(struct mt7915_dev *dev) {}
