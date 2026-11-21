@@ -2,12 +2,14 @@
 #include <linux/interrupt.h>
 #include <linux/irqdomain.h>
 #include <linux/kref.h>
+#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/overflow.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
+#include <linux/regmap.h>
 
 #include "../ct-wed-provider-abi.h"
 #include "ct_wdma_rx.h"
@@ -53,8 +55,11 @@ static DEFINE_MUTEX(ct_lock);
 static struct airoha_ct_wed *ct_slot;
 static bool prepare;
 static bool prepare_bm;
+static bool inspect;
 module_param(prepare, bool, 0444);
 module_param(prepare_bm, bool, 0444);
+module_param(inspect, bool, 0444);
+MODULE_PARM_DESC(inspect, "Read slot1 state after SCU reset and PCI preflight; never write registers");
 MODULE_PARM_DESC(prepare_bm, "Prepare stock hardware token buffers without enabling DMA");
 MODULE_PARM_DESC(prepare, "Permit a software-only dual-ring lease; engines stay disabled");
 
@@ -221,6 +226,70 @@ static int ct_check_plan(struct airoha_ct_wed *wed, const struct airoha_ct_wed_p
 	return 0;
 }
 
+static int ct_inspect_locked(struct airoha_ct_wed *wed)
+{
+	static const u16 wed_regs[] = {
+		0x000, 0x008, 0x00c, 0x09c, 0x208, 0x508, 0xa04,
+		0x504, 0x524, 0x560, 0x57c, 0xaa0, 0xaa4, 0xaa8,
+		0x2a0, 0x2a4, 0x5a0, 0x5a4, 0xae0, 0xae4,
+		0xae8, 0xaec, 0xaf0, 0xaf4,
+		0x300, 0x304, 0x308, 0x30c, 0x310, 0x314, 0x318, 0x31c,
+		0x410, 0x414, 0x418, 0x41c, 0x600, 0x604, 0x608, 0x60c,
+		0x610, 0x614, 0x618, 0x61c, 0x710, 0x714, 0x718, 0x71c,
+		0x900, 0x904, 0x908, 0x90c, 0x910, 0x914, 0x918, 0x91c,
+	};
+	static const u16 wdma_regs[] = { 0x204, 0x228, 0x100, 0x104, 0x108, 0x10c,
+					0x110, 0x114, 0x118, 0x11c };
+	struct regmap *scu;
+	u32 reset, value;
+	u16 command;
+	unsigned int index;
+	bool busy = false;
+	int err;
+
+	lockdep_assert_held(&ct_lock);
+	if (!inspect)
+		return 0;
+	scu = syscon_regmap_lookup_by_compatible("airoha,en7581-scu");
+	if (IS_ERR(scu))
+		return PTR_ERR(scu);
+	err = regmap_read(scu, 0x830, &reset);
+	if (err)
+		return err;
+	if (reset == U32_MAX)
+		return -EIO;
+	if (reset & (BIT(19) | BIT(21)))
+		return -EAGAIN;
+	if (wed->radio->current_state != PCI_D0)
+		return -EAGAIN;
+	err = pcibios_err_to_errno(pci_read_config_word(wed->radio, PCI_COMMAND, &command));
+	if (err)
+		return err;
+	if (command == U16_MAX || (command & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) !=
+				       (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER))
+		return -EIO;
+	dev_info(wed->dev, "slot1 read-only preflight SCU+830=%08x PCI=%04x; no reset or clock writes\n",
+		 reset, command);
+	for (index = 0; index < ARRAY_SIZE(wed_regs); index++) {
+		value = readl(wed->wed + wed_regs[index]);
+		dev_info(wed->dev, "slot1 snapshot WED+%03x=%08x\n", wed_regs[index], value);
+		if (wed_regs[index] == 0 && (!value || value == U32_MAX))
+			return -EIO;
+		if ((wed_regs[index] == 0x208 || wed_regs[index] == 0x508 ||
+		     wed_regs[index] == 0xa04) && (value & 0xf))
+			busy = true;
+		if (wed_regs[index] == 0x00c && (value & 0xf00))
+			busy = true;
+	}
+	for (index = 0; index < ARRAY_SIZE(wdma_regs); index++) {
+		value = readl(wed->wdma + wdma_regs[index]);
+		dev_info(wed->dev, "slot1 snapshot WDMA+%03x=%08x\n", wdma_regs[index], value);
+		if (wdma_regs[index] == 0x204 && (value & 0xf))
+			busy = true;
+	}
+	return busy ? -EBUSY : 0;
+}
+
 static int ct_prepare_bm(struct airoha_ct_wed *wed, const struct airoha_ct_wed_plan *host)
 {
 	unsigned int idx, pos;
@@ -297,6 +366,9 @@ static int ct_acquire(struct airoha_ct_wed *wed, const struct airoha_ct_wed_plan
 		goto out;
 	}
 	err = ct_check_plan(wed, plan);
+	if (err)
+		goto out;
+	err = ct_inspect_locked(wed);
 	if (err)
 		goto out;
 	for (idx = 0; idx < ARRAY_SIZE(wed->mid); idx++) {
