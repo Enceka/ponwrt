@@ -1,0 +1,98 @@
+diff --git a/mt7915/npu.c b/mt7915/npu.c
+index c5a350a..7b7c6bd 100644
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -11,6 +11,63 @@
+ #define MT7916_CT_HOST_COUNT	512
+ #define MT7916_CT_HOST_LEN	3500
+ #define MT7916_CT_HOST_STRIDE	ALIGN(MT7916_CT_HOST_LEN, 64)
++#define MT7916_CT_FAST_WORD	0x37c8
++#define MT7916_CT_FAST_FIELD	GENMASK(15, 8)
++#define MT7916_CT_COUNT_PACKETS	BIT(2)
++
++static DEFINE_MUTEX(mt7915_ct_count_mutex);
++
++static int mt7915_ct_read_mask(struct airoha_npu *npu, u32 *mask)
++{
++	u32 word;
++	int err;
++
++	err = regmap_read(npu->regmap, MT7916_CT_FAST_WORD, &word);
++	if (err)
++		return err;
++	*mask = FIELD_GET(MT7916_CT_FAST_FIELD, word);
++	return (*mask & ~GENMASK(2, 0)) ? -ERANGE : 0;
++}
++
++static int mt7915_ct_count_get(void *data, u64 *value)
++{
++	u32 mask;
++	int err = mt7915_ct_read_mask(data, &mask);
++
++	if (!err)
++		*value = !!(mask & MT7916_CT_COUNT_PACKETS);
++	return err;
++}
++
++static int mt7915_ct_count_set(void *data, u64 value)
++{
++	struct airoha_npu *npu = data;
++	u32 mask, requested;
++	int err;
++
++	if (value > 1)
++		return -EINVAL;
++	mutex_lock(&mt7915_ct_count_mutex);
++	err = mt7915_ct_read_mask(npu, &mask);
++	if (err)
++		goto out;
++	requested = (mask & ~MT7916_CT_COUNT_PACKETS) |
++		    (value ? MT7916_CT_COUNT_PACKETS : 0);
++	if (requested == mask)
++		goto out;
++	err = mt76_npu_send_msg(npu, 0, WLAN_FUNC_SET_WAIT_FAST_FLAG,
++				requested, GFP_KERNEL);
++	if (!err) {
++		err = mt7915_ct_read_mask(npu, &mask);
++		if (!err && mask != requested)
++			err = -EIO;
++	}
++out:
++	mutex_unlock(&mt7915_ct_count_mutex);
++	return err;
++}
++DEFINE_DEBUGFS_ATTRIBUTE(mt7915_ct_count_fops, mt7915_ct_count_get,
++			mt7915_ct_count_set, "%llu\n");
+ #define MT7916_CT_FRAG_COUNT	GENMASK(31, 29)
+ #define MT7916_CT_FRAG_ID	GENMASK(28, 26)
+ 
+@@ -40,8 +97,8 @@ static int mt7915_npu_counters_show(struct seq_file *seq, void *unused)
+ 
+ 		if (!base)
+ 			return -ENOMEM;
+-		seq_printf(seq, "selector=%u base=%08x rx_done=%u drop=%u host=%u tdma_attempt=%u tdma_full=%u tdma_submit=%u\n",
+-			   selector, bases[selector], readl(base + 8),
++		seq_printf(seq, "selector=%u base=%08x poll=%u rx_done=%u drop=%u host=%u tdma_attempt=%u tdma_full=%u tdma_submit=%u\n",
++			   selector, bases[selector], readl(base + 4), readl(base + 8),
+ 			   readl(base + 16), readl(base + 48), readl(base + 84),
+ 			   readl(base + 252), readl(base + 316));
+ 		iounmap(base);
+@@ -139,7 +196,8 @@ void mt7915_npu_debugfs_ct(struct mt7915_dev *dev, struct dentry *dir)
+ 	node = of_parse_phandle(device->of_node, "airoha,npu", 0);
+ 	if (!node)
+ 		return;
+-	match = !of_property_read_string_index(node, "firmware-name", 0, &name) &&
++	match = of_property_match_string(node, "memory-region-names", "connac2-pkt") >= 0 &&
++		!of_property_read_string_index(node, "firmware-name", 0, &name) &&
+ 		!strcmp(name, "airoha/hg5585f-ct/npu_rv32.bin");
+ 	of_node_put(node);
+ 	if (!match)
+@@ -149,6 +207,8 @@ void mt7915_npu_debugfs_ct(struct mt7915_dev *dev, struct dentry *dir)
+ 		return;
+ 	debugfs_create_file("connac2_counters", 0400, dir, npu,
+ 			    &mt7915_npu_counters_fops);
++	debugfs_create_file("connac2_packet_count", 0600, dir, npu,
++			    &mt7915_ct_count_fops);
+ }
+ 
+ static int mt7915_npu_prepare_ct(struct airoha_npu *npu, u8 band, phys_addr_t ba,
