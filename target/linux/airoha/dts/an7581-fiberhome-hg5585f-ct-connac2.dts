@@ -9,11 +9,15 @@
 		reg = <0 0x92a00000 0 0x600000>;
 		no-map;
 	};
+	npu_host_7916: npu-host-rx@93000000 {
+		reg = <0 0x93000000 0 0x380000>;
+		no-map;
+	};
 };
 
 &npu {
 	firmware-name = "airoha/hg5585f-ct/npu_rv32.bin",
 			"airoha/hg5585f-ct/npu_data.bin";
-	memory-region = <&npu_binary>, <&npu_ba_7916>, <&npu_pkt_7916>;
-	memory-region-names = "binary", "ba", "connac2-pkt";
+	memory-region = <&npu_binary>, <&npu_ba_7916>, <&npu_pkt_7916>, <&npu_host_7916>;
+	memory-region-names = "binary", "ba", "connac2-pkt", "connac2-host-rx";
 };

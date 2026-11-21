@@ -1,0 +1,105 @@
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index d722d8a..2cd3030 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -478,6 +478,14 @@ bool mt7915_eeprom_has_background_radar(struct mt7915_dev *dev);
+ void mt7915_npu_debugfs_ct(struct mt7915_dev *dev, struct dentry *dir);
+ int mt7915_npu_request_rx_ct(struct mt7915_dev *dev, struct airoha_npu *npu,
+ 			     u32 ring_base[2]);
++struct mt7915_npu_host_ct {
++	struct airoha_npu_rx_dma_desc __iomem *desc;
++	void __iomem *buffers;
++	u32 regs;
++	u16 tail;
++};
++int mt7915_npu_host_init_ct(struct mt7915_dev *dev, struct airoha_npu *npu,
++			    struct mt7915_npu_host_ct rings[2]);
+ #endif
+ int mt7915_dma_init(struct mt7915_dev *dev, struct mt7915_phy *phy2);
+ void mt7915_dma_prefetch(struct mt7915_dev *dev);
+diff --git a/mt7915/npu.c b/mt7915/npu.c
+index ca28d12..b705b60 100644
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -8,6 +8,9 @@
+ #define MT7916_CT_SRAM_END	0x1e878000
+ #define MT7916_CT_RX_COUNT	768
+ #define MT7916_CT_RX_BYTES	(MT7916_CT_RX_COUNT * sizeof(struct mt76_desc))
++#define MT7916_CT_HOST_COUNT	512
++#define MT7916_CT_HOST_LEN	3500
++#define MT7916_CT_HOST_STRIDE	ALIGN(MT7916_CT_HOST_LEN, 64)
+ 
+ static int mt7915_npu_counters_show(struct seq_file *seq, void *unused)
+ {
+@@ -204,3 +207,71 @@ int mt7915_npu_request_rx_ct(struct mt7915_dev *dev, struct airoha_npu *npu,
+ 	memcpy(ring_base, rings, sizeof(rings));
+ 	return 0;
+ }
++
++int mt7915_npu_host_init_ct(struct mt7915_dev *dev, struct airoha_npu *npu,
++			    struct mt7915_npu_host_ct rings[2])
++{
++	const size_t desc_size = MT7916_CT_HOST_COUNT * sizeof(*rings->desc);
++	const size_t buf_size = MT7916_CT_HOST_COUNT * MT7916_CT_HOST_STRIDE;
++	struct device *device = dev->mt76.dev;
++	struct resource region;
++	void __iomem *base;
++	u32 queue, index, value;
++	int err;
++
++	BUILD_BUG_ON(sizeof(*rings->desc) != 24);
++	if (!is_mt7916(&dev->mt76) || !of_machine_is_compatible("fiberhome,hg5585f-ct"))
++		return -ENODEV;
++	err = of_reserved_mem_region_to_resource_byname(npu->dev->of_node,
++						       "connac2-host-rx", &region);
++	if (err)
++		return err;
++	if (resource_size(&region) < 2 * (desc_size + buf_size) ||
++	    upper_32_bits(region.end) || !IS_ALIGNED(region.start, SZ_4K))
++		return -ERANGE;
++	base = devm_ioremap_wc(device, region.start, 2 * (desc_size + buf_size));
++	if (!base)
++		return -ENOMEM;
++	for (queue = 0; queue < 2; queue++) {
++		struct mt7915_npu_host_ct *ring = &rings[queue];
++
++		ring->regs = airoha_npu_wlan_get_queue_addr(npu, queue, false);
++		err = regmap_read(npu->regmap, ring->regs, &value);
++		if (err || value)
++			return err ?: -EBUSY;
++		ring->desc = base + queue * desc_size;
++		ring->buffers = base + 2 * desc_size + queue * buf_size;
++		ring->tail = 0;
++	}
++	memset_io(base, 0, 2 * desc_size);
++	for (queue = 0; queue < 2; queue++) {
++		u32 buffer = region.start + 2 * desc_size + queue * buf_size;
++
++		for (index = 0; index < MT7916_CT_HOST_COUNT; index++)
++			writel_relaxed(buffer + index * MT7916_CT_HOST_STRIDE,
++				       &rings[queue].desc[index].addr);
++	}
++	wmb();
++	for (queue = 0; queue < 2; queue++) {
++		u32 regs = rings[queue].regs;
++		u32 addr = region.start + queue * desc_size;
++
++		airoha_npu_wlan_disable_irq(npu, queue);
++		err = regmap_write(npu->regmap, regs + offsetof(struct mt76_queue_regs, ring_size),
++				   MT7916_CT_HOST_COUNT);
++		if (!err)
++			err = regmap_write(npu->regmap, regs + offsetof(struct mt76_queue_regs, dma_idx), 0);
++		if (!err)
++			err = regmap_write(npu->regmap, regs + offsetof(struct mt76_queue_regs, cpu_idx), 0);
++		if (!err)
++			err = regmap_write(npu->regmap, regs, addr);
++		if (!err)
++			err = regmap_read(npu->regmap, regs, &value);
++		if (err || value != addr)
++			return err ?: -EIO;
++		err = regmap_read(npu->regmap, regs + offsetof(struct mt76_queue_regs, ring_size), &value);
++		if (err || value != MT7916_CT_HOST_COUNT)
++			return err ?: -EIO;
++	}
++	return 0;
++}
