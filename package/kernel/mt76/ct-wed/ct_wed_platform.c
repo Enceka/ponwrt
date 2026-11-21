@@ -2,6 +2,7 @@
 #include <linux/interrupt.h>
 #include <linux/irqdomain.h>
 #include <linux/kref.h>
+#include <linux/ktime.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -14,6 +15,7 @@
 #include "../ct-wed-provider-abi.h"
 #include "ct_wdma_rx.h"
 #include "ct_wed_bm.h"
+#include "ct_wed_cold.h"
 
 #define CT_TX_COUNT 2048
 #define CT_TX_BYTES (CT_TX_COUNT * sizeof(struct ct_txd))
@@ -49,6 +51,8 @@ struct airoha_ct_wed {
 		size_t bytes;
 	} bm[2 + CT_BM_CHUNKS];
 	bool prepared;
+	bool retained;
+	struct ct_cold_result cold;
 };
 
 static DEFINE_MUTEX(ct_lock);
@@ -56,9 +60,12 @@ static struct airoha_ct_wed *ct_slot;
 static bool prepare;
 static bool prepare_bm;
 static bool inspect;
+static bool cold_config;
 module_param(prepare, bool, 0444);
 module_param(prepare_bm, bool, 0444);
 module_param(inspect, bool, 0444);
+module_param(cold_config, bool, 0444);
+MODULE_PARM_DESC(cold_config, "Test and restore five idle slot1 configuration registers; requires inspect");
 MODULE_PARM_DESC(inspect, "Read slot1 state after SCU reset and PCI preflight; never write registers");
 MODULE_PARM_DESC(prepare_bm, "Prepare stock hardware token buffers without enabling DMA");
 MODULE_PARM_DESC(prepare, "Permit a software-only dual-ring lease; engines stay disabled");
@@ -117,6 +124,8 @@ static void ct_release_locked(struct airoha_ct_wed *wed)
 	unsigned int idx;
 
 	lockdep_assert_held(&ct_lock);
+	if (wed->retained)
+		return;
 	for (idx = 0; idx < ARRAY_SIZE(wed->bm); idx++)
 		if (wed->bm[idx].cpu)
 			dma_free_coherent(wed->dev, wed->bm[idx].bytes,
@@ -151,6 +160,10 @@ static void ct_put(struct airoha_ct_wed *wed)
 	struct pci_dev *radio;
 
 	mutex_lock(&ct_lock);
+	if (wed->retained) {
+		mutex_unlock(&ct_lock);
+		return;
+	}
 	ct_release_locked(wed);
 	radio = wed->radio;
 	wed->radio = NULL;
@@ -290,6 +303,93 @@ static int ct_inspect_locked(struct airoha_ct_wed *wed)
 	return busy ? -EBUSY : 0;
 }
 
+static int ct_cold_current(void *ctx)
+{
+	struct airoha_ct_wed *wed = ctx;
+
+	lockdep_assert_held(&ct_lock);
+	return wed == ct_slot && wed->radio && !wed->prepared && !wed->retained ? 0 : -ESTALE;
+}
+
+static void __iomem *ct_cold_reg(struct airoha_ct_wed *wed, enum ct_cold_window window,
+				u32 offset)
+{
+	if (!IS_ALIGNED(offset, sizeof(u32)))
+		return NULL;
+	if (window == CT_COLD_WED && offset <= 0xb00 - sizeof(u32))
+		return wed->wed + offset;
+	if (window == CT_COLD_WDMA && offset <= 0x400 - sizeof(u32))
+		return wed->wdma + offset;
+	return NULL;
+}
+
+static int ct_cold_mmio_read(void *ctx, enum ct_cold_window window, u32 offset, u32 *value)
+{
+	void __iomem *reg = ct_cold_reg(ctx, window, offset);
+
+	if (!reg)
+		return -EINVAL;
+	*value = readl(reg);
+	return 0;
+}
+
+static int ct_cold_mmio_write(void *ctx, enum ct_cold_window window, u32 offset, u32 value)
+{
+	void __iomem *reg = ct_cold_reg(ctx, window, offset);
+
+	if (window == CT_COLD_WED) {
+		if (offset != 0xa04 && offset != 0xaa0 && offset != 0xaa4 && offset != 0xaa8)
+			return -EINVAL;
+	} else if (window != CT_COLD_WDMA || offset != 0x204) {
+		return -EINVAL;
+	}
+	if ((window == CT_COLD_WDMA && (value & 0xf)) ||
+	    (window == CT_COLD_WED && offset == 0xa04 && (value & 0x0400000f)))
+		return -EINVAL;
+	if (!reg)
+		return -EINVAL;
+	writel(value, reg);
+	return 0;
+}
+
+static u64 ct_cold_now(void *ctx)
+{
+	return ktime_get_ns();
+}
+
+static int ct_test_cold_locked(struct airoha_ct_wed *wed)
+{
+	struct ct_cold_io io = {
+		.ctx = wed, .ready = CT_COLD_REQUIRED, .lease_valid = ct_cold_current,
+		.read = ct_cold_mmio_read, .write = ct_cold_mmio_write, .now = ct_cold_now,
+	};
+	unsigned int index;
+	int err;
+
+	lockdep_assert_held(&ct_lock);
+	if (wed->retained)
+		return -EUCLEAN;
+	if (!cold_config)
+		return 0;
+	if (!inspect)
+		return -EINVAL;
+	err = ct_cold_transaction(&io, ktime_get_ns() + 250 * NSEC_PER_MSEC,
+				  150 * NSEC_PER_MSEC, &wed->cold);
+	dev_info(wed->dev, "slot1 cold config applied=%u restored=%u state=%u error=%d/%d; no DMA enable writes\n",
+		 wed->cold.applied, wed->cold.restored, wed->cold.state,
+		 wed->cold.transaction_error, wed->cold.restore_error);
+	for (index = 0; index < wed->cold.saved_count; index++)
+		dev_info(wed->dev, "slot1 cold %s+%03x saved=%08x desired=%08x\n",
+			 ct_cold_config[index].window == CT_COLD_WED ? "WED" : "WDMA",
+			 ct_cold_config[index].offset, wed->cold.saved[index], wed->cold.desired[index]);
+	if (wed->cold.state == CT_COLD_RETAINED) {
+		wed->retained = true;
+		__module_get(THIS_MODULE);
+		dev_err(wed->dev, "slot1 cold restore failed; provider, radio reference and MMIO retained until reboot\n");
+	}
+	return err;
+}
+
 static int ct_prepare_bm(struct airoha_ct_wed *wed, const struct airoha_ct_wed_plan *host)
 {
 	unsigned int idx, pos;
@@ -361,6 +461,10 @@ static int ct_acquire(struct airoha_ct_wed *wed, const struct airoha_ct_wed_plan
 		err = -ENODEV;
 		goto out;
 	}
+	if (wed->retained) {
+		err = -EUCLEAN;
+		goto out;
+	}
 	if (wed->prepared) {
 		err = -EBUSY;
 		goto out;
@@ -369,6 +473,9 @@ static int ct_acquire(struct airoha_ct_wed *wed, const struct airoha_ct_wed_plan
 	if (err)
 		goto out;
 	err = ct_inspect_locked(wed);
+	if (err)
+		goto out;
+	err = ct_test_cold_locked(wed);
 	if (err)
 		goto out;
 	for (idx = 0; idx < ARRAY_SIZE(wed->mid); idx++) {
