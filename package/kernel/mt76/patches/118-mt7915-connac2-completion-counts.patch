@@ -1,0 +1,55 @@
+diff --git a/mt7915/npu.c b/mt7915/npu.c
+index 566b11e..6e52e80 100644
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -74,10 +74,12 @@ DEFINE_DEBUGFS_ATTRIBUTE(mt7915_ct_count_fops, mt7915_ct_count_get,
+ static int mt7915_npu_counters_show(struct seq_file *seq, void *unused)
+ {
+ 	struct airoha_npu *npu = seq->private;
+-	u32 bases[2];
++	static const u32 lengths[] = { 320, 320, 24 };
++	u32 bases[ARRAY_SIZE(lengths)];
+ 	unsigned int selector;
+ 
+ 	for (selector = 0; selector < ARRAY_SIZE(bases); selector++) {
++		unsigned int prev;
+ 		int err = mt76_npu_get_msg(npu, selector,
+ 					   WLAN_FUNC_GET_WAIT_DBG_COUNTER,
+ 					   &bases[selector], GFP_KERNEL);
+@@ -86,21 +88,28 @@ static int mt7915_npu_counters_show(struct seq_file *seq, void *unused)
+ 			return err;
+ 		if (!IS_ALIGNED(bases[selector], 4) ||
+ 		    bases[selector] < MT7916_CT_SRAM_START ||
+-		    bases[selector] > MT7916_CT_SRAM_END - 320)
++		    bases[selector] > MT7916_CT_SRAM_END - lengths[selector])
+ 			return -ERANGE;
++		for (prev = 0; prev < selector; prev++)
++			if (bases[prev] < bases[selector] + lengths[selector] &&
++			    bases[selector] < bases[prev] + lengths[prev])
++				return -EINVAL;
+ 	}
+-	if (max(bases[0], bases[1]) - min(bases[0], bases[1]) < 320)
+-		return -EINVAL;
+ 
+ 	for (selector = 0; selector < ARRAY_SIZE(bases); selector++) {
+-		void __iomem *base = ioremap(bases[selector], 320);
++		void __iomem *base = ioremap(bases[selector], lengths[selector]);
+ 
+ 		if (!base)
+ 			return -ENOMEM;
+-		seq_printf(seq, "selector=%u base=%08x poll=%u rx_done=%u drop=%u host=%u tdma_attempt=%u tdma_full=%u tdma_submit=%u\n",
+-			   selector, bases[selector], readl(base + 4), readl(base + 8),
+-			   readl(base + 16), readl(base + 48), readl(base + 84),
+-			   readl(base + 252), readl(base + 316));
++		if (selector == 2)
++			seq_printf(seq, "common tdma_unbind=%u tdma_enq_fail=%u tdma_done=%u\n",
++				   readl(base + 8), readl(base + 12), readl(base + 20));
++		else
++			seq_printf(seq, "selector=%u base=%08x poll=%u rx_done=%u drop=%u host=%u tdma_attempt=%u tdma_full=%u tdma_submit=%u ba_in_order=%u non_ampdu=%u\n",
++				   selector, bases[selector], readl(base + 4), readl(base + 8),
++				   readl(base + 16), readl(base + 48), readl(base + 84),
++				   readl(base + 252), readl(base + 316), readl(base + 52),
++				   readl(base + 76));
+ 		iounmap(base);
+ 	}
+ 	return 0;
