@@ -1,0 +1,13 @@
+diff --git a/mt7915/npu.c b/mt7915/npu.c
+index 7b7c6bd..566b11e 100644
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -240,7 +240,7 @@ static int mt7915_npu_prepare_ct(struct airoha_npu *npu, u8 band, phys_addr_t ba
+ 	if (err)
+ 		return err;
+ 	err = mt76_npu_send_msg(npu, 0, WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE,
+-				3, GFP_KERNEL);
++				2, GFP_KERNEL);
+ 	if (err)
+ 		return err;
+ 	for (selector = 0; selector < 2; selector++) {
