@@ -1,0 +1,178 @@
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -4882,6 +4882,14 @@ error_netdev_free:
+ 	return err;
+ }
+ 
++static void airoha_shutdown(struct platform_device *pdev)
++{
++	struct airoha_eth *eth = platform_get_drvdata(pdev);
++
++	if (eth && test_bit(DEV_STATE_INITIALIZED, &eth->state))
++		airoha_ppe_ct_shutdown(eth);
++}
++
+ static void airoha_remove(struct platform_device *pdev)
+ {
+ 	struct airoha_eth *eth = platform_get_drvdata(pdev);
+@@ -5118,6 +5126,7 @@ MODULE_DEVICE_TABLE(of, of_airoha_match);
+ static struct platform_driver airoha_driver = {
+ 	.probe = airoha_probe,
+ 	.remove = airoha_remove,
++	.shutdown = airoha_shutdown,
+ 	.driver = {
+ 		.name = KBUILD_MODNAME,
+ 		.of_match_table = of_airoha_match,
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -724,6 +724,8 @@ struct airoha_ppe {
+ 	bool ct_host_ppe;
+ 	bool ct_restore_pending;
+ 	bool ct_owns_sram;
++	bool ct_stopping;
++	bool ct_start_reported;
+ 	struct {
+ 		u32 glo, regs[16];
+ 	} ct_saved[2];
+@@ -862,6 +864,7 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
+ int airoha_ppe_init(struct airoha_eth *eth);
+ void airoha_ppe_deinit(struct airoha_eth *eth);
++void airoha_ppe_ct_shutdown(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+ u32 airoha_ppe_get_total_num_entries(struct airoha_ppe *ppe);
+ struct airoha_foe_entry *airoha_ppe_foe_get_entry(struct airoha_ppe *ppe,
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1081,6 +1081,8 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 	u32 index, state;
+ 
+ 	spin_lock_bh(&ppe_lock);
++	if (ppe->ct_stopping)
++		goto unlock;
+ 
+ 	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 	if (!hwe)
+@@ -1652,7 +1654,9 @@ static bool airoha_ppe_ct_requested(struct airoha_eth *eth)
+ 	       of_property_read_bool(eth->dev->of_node, "airoha,connac2-host-ppe");
+ }
+ 
+-static int airoha_ppe_ct_check_sram(struct airoha_ppe *ppe, bool clear)
++enum airoha_ct_sram_op { CT_EXPECT_EMPTY, CT_CHECK_OWNED, CT_CLEAR_OWNED };
++
++static int airoha_ppe_ct_check_sram(struct airoha_ppe *ppe, enum airoha_ct_sram_op op)
+ {
+ 	u32 count = airoha_ppe_get_total_sram_num_entries(ppe);
+ 	u32 hash;
+@@ -1665,12 +1669,17 @@ static int airoha_ppe_ct_check_sram(struct airoha_ppe *ppe, bool clear)
+ 		entry = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 		if (!entry) {
+ 			err = -ETIMEDOUT;
+-		} else if (entry->ib1 & (AIROHA_FOE_IB1_BIND_STATE | AIROHA_FOE_IB1_BIND_STATIC)) {
+-			if (clear) {
++		} else if (entry->ib1 & AIROHA_FOE_IB1_BIND_STATIC) {
++			err = -EBUSY;
++		} else if (entry->ib1 & AIROHA_FOE_IB1_BIND_STATE) {
++			u32 type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, entry->ib1);
++
++			if (op == CT_EXPECT_EMPTY ||
++			    (type != PPE_PKT_TYPE_IPV4_HNAPT && type != PPE_PKT_TYPE_IPV4_ROUTE)) {
++				err = -EBUSY;
++			} else if (op == CT_CLEAR_OWNED) {
+ 				memset(entry, 0, sizeof(*entry));
+ 				err = airoha_ppe_foe_commit_sram_entry(ppe, hash);
+-			} else {
+-				err = -EBUSY;
+ 			}
+ 		}
+ 		spin_unlock_bh(&ppe_lock);
+@@ -1774,7 +1783,11 @@ static int airoha_ppe_ct_stop(struct airoha_ppe *ppe)
+ 	if (err)
+ 		return err;
+ 	if (ppe->ct_owns_sram) {
+-		err = airoha_ppe_ct_check_sram(ppe, true);
++		err = airoha_ppe_ct_check_sram(ppe, CT_CHECK_OWNED);
++		if (!err)
++			err = airoha_ppe_ct_check_sram(ppe, CT_CLEAR_OWNED);
++		if (!err)
++			err = airoha_ppe_ct_check_sram(ppe, CT_EXPECT_EMPTY);
+ 		if (err)
+ 			return err;
+ 		ppe->ct_owns_sram = false;
+@@ -1788,6 +1801,28 @@ static int airoha_ppe_ct_stop(struct airoha_ppe *ppe)
+ 	return 0;
+ }
+ 
++void airoha_ppe_ct_shutdown(struct airoha_eth *eth)
++{
++	struct airoha_ppe *ppe = eth->ppe;
++	int err;
++
++	if (!airoha_ppe_ct_requested(eth))
++		return;
++
++	mutex_lock(&flow_offload_mutex);
++	spin_lock_bh(&ppe_lock);
++	ppe->ct_stopping = true;
++	spin_unlock_bh(&ppe_lock);
++	if (ppe->ct_restore_pending) {
++		err = airoha_ppe_ct_stop(ppe);
++		if (err)
++			dev_err(eth->dev, "CT PPE shutdown: %d\n", err);
++		else
++			dev_info(eth->dev, "CT PPE shutdown: banks restored\n");
++	}
++	mutex_unlock(&flow_offload_mutex);
++}
++
+ static int airoha_ppe_ct_start(struct airoha_ppe *ppe, struct airoha_npu *npu)
+ {
+ 	struct device_node *np = npu->dev->of_node;
+@@ -1811,7 +1846,7 @@ static int airoha_ppe_ct_start(struct airoha_ppe *ppe, struct airoha_npu *npu)
+ 		ppe->ct_saved[bank].glo = airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank));
+ 		airoha_ppe_ct_regs(ppe, bank, false);
+ 	}
+-	err = airoha_ppe_ct_check_sram(ppe, false);
++	err = airoha_ppe_ct_check_sram(ppe, CT_EXPECT_EMPTY);
+ 	if (err)
+ 		return err;
+ 
+@@ -1856,8 +1891,17 @@ static int airoha_ppe_offload_setup(struct airoha_eth *eth)
+ 		return PTR_ERR(npu);
+ 	if (airoha_ppe_ct_requested(eth)) {
+ 		err = airoha_ppe_ct_start(ppe, npu);
+-		if (err)
++		if (err) {
++			if (!ppe->ct_start_reported) {
++				dev_warn(eth->dev, "CT PPE start: %d (bank flow %08x/%08x, base %08x/%08x)\n",
++					 err, airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)),
++					 airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)),
++					 airoha_fe_rr(eth, REG_PPE_TB_BASE(0)),
++					 airoha_fe_rr(eth, REG_PPE_TB_BASE(1)));
++				ppe->ct_start_reported = true;
++			}
+ 			goto error_npu_put;
++		}
+ 		goto publish;
+ 	}
+ 
+@@ -1909,7 +1953,9 @@ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data)
+ 
+ 	mutex_lock(&flow_offload_mutex);
+ 
+-	if (!eth->npu)
++	if (ppe->ct_stopping)
++		err = -ESHUTDOWN;
++	else if (!eth->npu)
+ 		err = airoha_ppe_offload_setup(eth);
+ 	if (!err)
+ 		err = airoha_ppe_flow_offload_cmd(eth, type_data);
+@@ -2100,7 +2146,7 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+ 				  lockdep_is_held(&flow_offload_mutex));
+ 	if (npu) {
+ 		synchronize_rcu();
+-		if (!eth->ppe->ct_restore_pending)
++		if (!eth->ppe->ct_restore_pending && !eth->ppe->ct_stopping)
+ 			npu->ops.ppe_deinit(npu);
+ 	}
+ 	if (eth->ppe->ct_restore_pending)
