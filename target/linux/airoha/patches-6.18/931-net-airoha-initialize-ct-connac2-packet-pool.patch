@@ -1,0 +1,176 @@
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -9,6 +9,7 @@
+ 
+ config NET_AIROHA_NPU
+ 	tristate "Airoha NPU support"
++	select CRYPTO_LIB_SHA256
+ 	select WANT_DEV_COREDUMP
+ 	select REGMAP_MMIO
+ 	help
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -4,6 +4,7 @@
+  * Author: Lorenzo Bianconi <lorenzo@kernel.org>
+  */
+ 
++#include <crypto/sha2.h>
+ #include <linux/devcoredump.h>
+ #include <linux/devm-helpers.h>
+ #include <linux/firmware.h>
+@@ -228,8 +229,16 @@
+ 	return __airoha_npu_send_msg(npu, func_id, data, len, data, len);
+ }
+ 
++static bool airoha_npu_is_connac2_ct(struct device *dev)
++{
++	return of_machine_is_compatible("fiberhome,hg5585f-ct") &&
++	       of_property_match_string(dev->of_node, "memory-region-names",
++					"connac2-pkt") >= 0;
++}
++
+ static int airoha_npu_load_firmware(struct device *dev, void __iomem *addr,
+-				    const char *fw_name, int fw_max_size)
++				    const char *fw_name, int fw_max_size,
++				    const u8 *expected_digest)
+ {
+ 	const struct firmware *fw;
+ 	int ret;
+@@ -246,6 +255,15 @@
+ 		goto out;
+ 	}
+ 
++	if (expected_digest) {
++		u8 digest[SHA256_DIGEST_SIZE];
++
++		sha256(fw->data, fw->size, digest);
++		if (memcmp(digest, expected_digest, sizeof(digest))) {
++			ret = dev_err_probe(dev, -EBADMSG, "unexpected %s digest\n", fw_name);
++			goto out;
++		}
++	}
+ 	memcpy_toio(addr, fw->data, fw->size);
+ out:
+ 	release_firmware(fw);
+@@ -257,6 +275,17 @@
+ airoha_npu_load_firmware_from_dts(struct device *dev, void __iomem *addr,
+ 				  void __iomem *base)
+ {
++	static const u8 ct_fw_sha256[][SHA256_DIGEST_SIZE] = {
++		{ 0xd7, 0x4a, 0xa2, 0xf8, 0x12, 0x14, 0xfd, 0xa2,
++		  0x47, 0x25, 0x52, 0x9a, 0x60, 0x00, 0xbb, 0x05,
++		  0xc2, 0x2c, 0x2d, 0xa6, 0xf4, 0x0d, 0xfd, 0x63,
++		  0xf0, 0xc2, 0x0e, 0xf0, 0x67, 0xdb, 0x08, 0xaf },
++		{ 0x11, 0x01, 0x3d, 0x49, 0x21, 0x20, 0xf4, 0x06,
++		  0x58, 0x64, 0x13, 0xba, 0xd2, 0x68, 0x93, 0x05,
++		  0xf2, 0x71, 0x3d, 0xa2, 0xf0, 0xeb, 0xdd, 0xe2,
++		  0x1f, 0xea, 0xf0, 0x3f, 0xc9, 0x3b, 0x0e, 0x3a },
++	};
++	bool ct = airoha_npu_is_connac2_ct(dev);
+ 	const char *fw_names[2];
+ 	int ret;
+ 
+@@ -267,13 +296,15 @@
+ 				     "invalid firmware-name property\n");
+ 
+ 	ret = airoha_npu_load_firmware(dev, addr, fw_names[0],
+-				       NPU_EN7581_FIRMWARE_RV32_MAX_SIZE);
++				       NPU_EN7581_FIRMWARE_RV32_MAX_SIZE,
++				       ct ? ct_fw_sha256[0] : NULL);
+ 	if (ret)
+ 		return ret;
+ 
+ 	return airoha_npu_load_firmware(dev, base + REG_NPU_LOCAL_SRAM,
+ 					fw_names[1],
+-					NPU_EN7581_FIRMWARE_DATA_MAX_SIZE);
++					NPU_EN7581_FIRMWARE_DATA_MAX_SIZE,
++					ct ? ct_fw_sha256[1] : NULL);
+ }
+ 
+ static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
+@@ -294,19 +325,19 @@
+ 	/* Try to load firmware images using the firmware names provided via
+ 	 * dts if available.
+ 	 */
+-	if (of_find_property(dev->of_node, "firmware-name", NULL))
++	if (airoha_npu_is_connac2_ct(dev) || of_find_property(dev->of_node, "firmware-name", NULL))
+ 		return airoha_npu_load_firmware_from_dts(dev, addr, base);
+ 
+ 	/* Load rv32 npu firmware */
+ 	ret = airoha_npu_load_firmware(dev, addr, soc->fw_rv32.name,
+-				       soc->fw_rv32.max_size);
++				       soc->fw_rv32.max_size, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* Load data npu firmware */
+ 	return airoha_npu_load_firmware(dev, base + REG_NPU_LOCAL_SRAM,
+ 					soc->fw_data.name,
+-					soc->fw_data.max_size);
++					soc->fw_data.max_size, NULL);
+ }
+ 
+ static irqreturn_t airoha_npu_mbox_handler(int irq, void *npu_instance)
+@@ -558,6 +589,41 @@
+ 					sizeof(val), GFP_KERNEL);
+ }
+ 
++static int airoha_npu_connac2_init_pool(struct airoha_npu *npu)
++{
++	struct resource pool;
++	void __iomem *base;
++	u32 val = 0;
++	int err;
++
++	err = of_reserved_mem_region_to_resource_byname(npu->dev->of_node,
++						       "connac2-pkt", &pool);
++	if (err)
++		return err;
++	if (resource_size(&pool) != 6 * SZ_1M || upper_32_bits(pool.end) ||
++	    !IS_ALIGNED(pool.start, SZ_64K))
++		return -EINVAL;
++	base = ioremap_wc(pool.start, resource_size(&pool));
++	if (!base)
++		return -ENOMEM;
++	memset_io(base, 0, resource_size(&pool));
++	wmb();
++	iounmap(base);
++
++	err = airoha_npu_wlan_msg_send(npu, 1, WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU,
++				       &val, sizeof(val), GFP_KERNEL);
++	if (err)
++		return err;
++	val = lower_32_bits(pool.start);
++	err = airoha_npu_wlan_msg_send(npu, 0, WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR,
++				       &val, sizeof(val), GFP_KERNEL);
++	if (err)
++		return err;
++	val = 0;
++	return airoha_npu_wlan_msg_send(npu, 0, WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU,
++					&val, sizeof(val), GFP_KERNEL);
++}
++
+ static int airoha_npu_wlan_init_memory(struct airoha_npu *npu)
+ {
+ 	enum airoha_npu_wlan_set_cmd cmd = WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU;
+@@ -836,10 +902,18 @@
+ 	regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER, 0x1);
+ 	msleep(100);
+ 
+-	if (!airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
+-				     &val, sizeof(val), GFP_KERNEL))
++	if (airoha_npu_is_connac2_ct(dev)) {
++		dev_info(dev, "verified Connac2 firmware 1456-50\n");
++		err = airoha_npu_connac2_init_pool(npu);
++		if (err)
++			dev_warn(dev, "Connac2 packet pool unavailable: %d\n", err);
++		else
++			dev_info(dev, "Connac2 packet pool registered\n");
++	} else if (!airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
++					    &val, sizeof(val), GFP_KERNEL)) {
+ 		dev_info(dev, "NPU fw version: %0d.%d\n",
+ 			 (val >> 16) & 0xffff, val & 0xffff);
++	}
+ 
+ 	platform_set_drvdata(pdev, npu);
+ 
