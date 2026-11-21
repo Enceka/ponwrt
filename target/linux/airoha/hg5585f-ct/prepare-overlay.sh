@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# != 2 ]]; then
+  echo "usage: bash $0 STOCK_USERFS NEW_OVERLAY_DIRECTORY" >&2
+  exit 2
+fi
+source_dir=$(cd "$1" && pwd)
+repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+package=package/firmware/hg5585f-ct-npu-firmware
+firmware=(npu_rv32.bin npu_data.bin)
+(cd "$source_dir" && sha256sum -c "$repo/$package/SHA256SUMS")
+mkdir -- "$2"
+overlay=$(cd "$2" && pwd)
+cd "$repo"
+for path in "$package/Makefile" "$package/SHA256SUMS" \
+  package/kernel/mt76/{Makefile,patches/111-mt7915-connac2-mailbox.patch} \
+  target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts}; do
+  install -D -m 644 "$path" "$overlay/tree/$path"
+done
+for name in "${firmware[@]}"; do
+  install -D -m 644 "$source_dir/$name" "$overlay/tree/$package/files/$name"
+done
+(cd "$overlay/tree/$package/files" && sha256sum -c ../SHA256SUMS)
+printf '%s\n' CONFIG_MT7915_NPU=y CONFIG_PACKAGE_hg5585f-ct-npu-firmware=y > "$overlay/local.config"

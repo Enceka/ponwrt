@@ -203,8 +203,8 @@ define Device/fiberhome_hg5585f-ct
   $(call Device/fiberhome_hg5585f-common)
   DEVICE_MODEL := HG5585F
   DEVICE_VARIANT := CT
-  DEVICE_DTS := an7581-fiberhome-hg5585f-ct
-  DEVICE_PACKAGES += kmod-phy-maxlinear
+  DEVICE_DTS := an7581-fiberhome-hg5585f-ct$(if $(filter y,$(CONFIG_PACKAGE_hg5585f-ct-npu-firmware)),-connac2)
+  DEVICE_PACKAGES += kmod-phy-maxlinear $(if $(filter y,$(CONFIG_PACKAGE_hg5585f-ct-npu-firmware)),hg5585f-ct-npu-firmware)
   SUPPORTED_DEVICES += fiberhome,hg5585f-ct-usb-sfp
   $(call Device/fiberhome_hg5585f-images)
 endef

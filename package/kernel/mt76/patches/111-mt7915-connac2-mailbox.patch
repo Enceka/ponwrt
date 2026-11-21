@@ -1,0 +1,115 @@
+diff --git a/mt7915/Kconfig b/mt7915/Kconfig
+index c24be82..da2f22a 100644
+--- a/mt7915/Kconfig
++++ b/mt7915/Kconfig
+@@ -14,6 +14,12 @@ config MT7915E
+ 
+ 	  To compile this driver as a module, choose M here.
+ 
++config MT7915_NPU
++	bool "MT7916 Connac2 NPU mailbox helpers"
++	depends on MT7915E
++	depends on NET_AIROHA_NPU=y || MT7915E=NET_AIROHA_NPU
++	default n
++
+ config MT798X_WMAC
+ 	bool "MT798x (SoC) WMAC support"
+ 	depends on MT7915E
+diff --git a/mt7915/Makefile b/mt7915/Makefile
+index 7ea5b05..3d393e5 100644
+--- a/mt7915/Makefile
++++ b/mt7915/Makefile
+@@ -7,5 +7,6 @@ mt7915e-y := pci.o init.o dma.o eeprom.o main.o mcu.o mac.o \
+ 	     debugfs.o mmio.o
+ 
+ mt7915e-$(CONFIG_NL80211_TESTMODE) += testmode.o
++mt7915e-$(CONFIG_MT7915_NPU) += npu.o
+ mt7915e-$(CONFIG_MT798X_WMAC) += soc.o
+ mt7915e-$(CONFIG_DEV_COREDUMP) += coredump.o
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 7ee9bed..a797823 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -474,6 +474,11 @@ int mt7915_eeprom_get_target_power(struct mt7915_dev *dev,
+ 				   u8 chain_idx);
+ s8 mt7915_eeprom_get_power_delta(struct mt7915_dev *dev, int band);
+ bool mt7915_eeprom_has_background_radar(struct mt7915_dev *dev);
++#ifdef CONFIG_MT7915_NPU
++int mt7915_npu_prepare_ct(struct airoha_npu *npu, u8 band, phys_addr_t ba,
++			  const phys_addr_t rx_csr[2]);
++int mt7915_npu_rx_ring_ct(struct airoha_npu *npu, u8 selector, u32 *base);
++#endif
+ int mt7915_dma_init(struct mt7915_dev *dev, struct mt7915_phy *phy2);
+ void mt7915_dma_prefetch(struct mt7915_dev *dev);
+ void mt7915_dma_cleanup(struct mt7915_dev *dev);
+diff --git a/mt7915/npu.c b/mt7915/npu.c
+new file mode 100644
+index 0000000..742d403
+--- /dev/null
++++ b/mt7915/npu.c
+@@ -0,0 +1,65 @@
++#include "mt7915.h"
++
++int mt7915_npu_prepare_ct(struct airoha_npu *npu, u8 band, phys_addr_t ba,
++			  const phys_addr_t rx_csr[2])
++{
++	u32 counter_base;
++	int selector, err;
++
++	if (!npu || band > 1 || !ba || upper_32_bits(ba) || !rx_csr)
++		return -EINVAL;
++	for (selector = 0; selector < 2; selector++)
++		if (!rx_csr[selector] || upper_32_bits(rx_csr[selector]))
++			return -EINVAL;
++
++	err = mt76_npu_send_msg(npu, band, WLAN_FUNC_SET_WAIT_DRIVER_MODEL,
++				2, GFP_KERNEL);
++	if (err)
++		return err;
++
++	for (selector = 0; selector < 3; selector++) {
++		err = mt76_npu_get_msg(npu, selector, WLAN_FUNC_GET_WAIT_DBG_COUNTER,
++				       &counter_base, GFP_KERNEL);
++		if (err)
++			return err;
++	}
++
++	err = mt76_npu_send_msg(npu, band, WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR,
++				ba, GFP_KERNEL);
++	if (err)
++		return err;
++	err = mt76_npu_send_msg(npu, 0, WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE,
++				3, GFP_KERNEL);
++	if (err)
++		return err;
++	for (selector = 0; selector < 2; selector++) {
++		err = mt76_npu_send_msg(npu, selector, WLAN_FUNC_SET_WAIT_PCIE_ADDR,
++					rx_csr[selector], GFP_KERNEL);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++int mt7915_npu_rx_ring_ct(struct airoha_npu *npu, u8 selector, u32 *base)
++{
++	u32 reply;
++	int err;
++
++	if (!base || !npu || selector > 1)
++		return -EINVAL;
++	*base = 0;
++	err = mt76_npu_send_msg(npu, selector, WLAN_FUNC_SET_WAIT_DESC,
++				768, GFP_KERNEL);
++	if (err)
++		return err;
++	err = mt76_npu_get_msg(npu, selector, WLAN_FUNC_GET_WAIT_RXDESC_BASE,
++			       &reply, GFP_KERNEL);
++	if (err)
++		return err;
++	if (!reply || !IS_ALIGNED(reply, 16))
++		return -EIO;
++	*base = reply;
++	return 0;
++}

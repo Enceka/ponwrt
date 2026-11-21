@@ -17,6 +17,7 @@ PKG_USE_NINJA:=0
 PKG_BUILD_PARALLEL:=1
 
 PKG_CONFIG_DEPENDS += \
+	CONFIG_MT7915_NPU \
 	CONFIG_PACKAGE_kmod-mt76-usb \
 	CONFIG_PACKAGE_kmod-mt76x02-common \
 	CONFIG_PACKAGE_kmod-mt76x0-common \
@@ -241,6 +242,13 @@ define KernelPackage/mt7915e
 ifneq ($(CONFIG_TARGET_mediatek_filogic)$(CONFIG_TARGET_mediatek_mt7622),)
   MODPARAMS.mt7915e:=wed_enable=Y
 endif
+endef
+
+define KernelPackage/mt7915e/config
+  config MT7915_NPU
+	bool "Build experimental MT7916 Connac2 NPU mailbox helpers"
+	depends on TARGET_airoha_an7581 && PACKAGE_kmod-mt7915e
+	default n
 endef
 
 define KernelPackage/mt7916-firmware
@@ -479,6 +487,10 @@ ifdef CONFIG_PACKAGE_kmod-mt7663u
 endif
 ifdef CONFIG_PACKAGE_kmod-mt7915e
   PKG_MAKE_FLAGS += CONFIG_MT7915E=m
+  ifdef CONFIG_MT7915_NPU
+    PKG_MAKE_FLAGS += CONFIG_MT7915_NPU=y
+    NOSTDINC_FLAGS += -DCONFIG_MT7915_NPU
+  endif
   ifdef CONFIG_TARGET_mediatek_filogic
     PKG_MAKE_FLAGS += CONFIG_MT798X_WMAC=y
     NOSTDINC_FLAGS += -DCONFIG_MT798X_WMAC
