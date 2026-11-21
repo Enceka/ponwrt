@@ -19,6 +19,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   package/kernel/mt76/patches/{117-mt7915-connac2-pcie-windows.patch,118-mt7915-connac2-completion-counts.patch} \
   package/kernel/mt76/patches/119-mt7915-keep-shared-hdr-trans.patch \
   package/kernel/mt76/patches/{120-mt7915-connac2-rx-path.patch,121-mt7915-connac2-ba-lifecycle.patch} \
+  package/kernel/mt76/patches/122-mt7915-connac2-dma-declaration.patch \
   target/linux/airoha/patches-6.18/931-net-airoha-initialize-ct-connac2-packet-pool.patch \
   target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts}; do
   install -D -m 644 "$path" "$overlay/tree/$path"

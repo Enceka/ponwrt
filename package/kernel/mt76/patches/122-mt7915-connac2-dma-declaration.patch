@@ -1,0 +1,12 @@
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 3bafaa2..8a468fc 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -7,6 +7,7 @@
+ #include <linux/of.h>
+ #include <linux/thermal.h>
+ #include "mt7915.h"
++#include "../dma.h"
+ #include "mac.h"
+ #include "mcu.h"
+ #include "coredump.h"
