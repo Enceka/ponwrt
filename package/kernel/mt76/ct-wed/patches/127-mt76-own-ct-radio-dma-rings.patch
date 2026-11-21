@@ -1,0 +1,336 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mt76: own CT radio DMA rings outside device-managed memory
+
+--- a/mt76.h
++++ b/mt76.h
+@@ -242,6 +242,7 @@
+ 
+ struct mt76_queue {
+ 	struct mt76_queue_regs __iomem *regs;
++	struct mt76_dma_capsule_queue *dma_capsule;
+ 
+ 	spinlock_t lock;
+ 	spinlock_t cleanup_lock;
+@@ -963,6 +964,7 @@
+ 	int (*init_wiphy)(struct mt76_dev *dev);
+ 	struct device *dev;
+ 	struct device *dma_dev;
++	struct mt76_dma_capsule *dma_capsule;
+ 
+ 	struct mt76_mcu mcu;
+ 
+@@ -1333,6 +1335,9 @@
+ 			 struct ieee80211_rate *rates, int n_rates);
+ void mt76_unregister_device(struct mt76_dev *dev);
+ void mt76_free_device(struct mt76_dev *dev);
++struct mt76_queue *mt76_dma_capsule_queue_alloc(struct mt76_dev *dev);
++void mt76_dma_capsule_queue_free(struct mt76_dev *dev, struct mt76_queue *queue);
++void mt76_dma_capsule_free(struct mt76_dev *dev);
+ void mt76_reset_device(struct mt76_dev *dev);
+ void mt76_unregister_phy(struct mt76_phy *phy);
+ 
+--- a/dma.c
++++ b/dma.c
+@@ -4,9 +4,154 @@
+  */
+ 
+ #include <linux/dma-mapping.h>
++#include <linux/of.h>
++#include <linux/pci.h>
+ #include "mt76.h"
+ #include "dma.h"
+ #include "mt76_connac.h"
++
++struct mt76_dma_capsule_queue {
++	struct list_head list;
++	struct mt76_queue *queue;
++	void *desc;
++	dma_addr_t dma;
++	size_t bytes;
++	struct mt76_queue_entry *entry;
++	bool owns_queue;
++};
++
++struct mt76_dma_capsule {
++	struct list_head queues;
++	struct device *dma_dev;
++};
++
++static struct mt76_dma_capsule *mt76_dma_capsule_get(struct mt76_dev *dev)
++{
++	struct mt76_dma_capsule *capsule;
++	struct pci_dev *radio;
++
++	if (dev->dma_capsule)
++		return dev->dma_capsule;
++	if (!IS_ENABLED(CONFIG_MT7915_NPU) || !dev_is_pci(dev->dev) ||
++	    !of_machine_is_compatible("fiberhome,hg5585f-ct") ||
++	    !of_find_property(dev->dev->of_node, "airoha,wed-provider", NULL))
++		return NULL;
++	radio = to_pci_dev(dev->dev);
++	if (radio->vendor != PCI_VENDOR_ID_MEDIATEK || radio->device != 0x7906 ||
++	    pci_domain_nr(radio->bus) != 1 || radio->bus->number != 1 || radio->devfn)
++		return NULL;
++	capsule = kzalloc(sizeof(*capsule), GFP_KERNEL);
++	if (!capsule)
++		return ERR_PTR(-ENOMEM);
++	INIT_LIST_HEAD(&capsule->queues);
++	capsule->dma_dev = get_device(dev->dma_dev);
++	dev->dma_capsule = capsule;
++	dev_info(dev->dev, "CT radio DMA capsule: explicit ring allocation active\n");
++	return capsule;
++}
++
++struct mt76_queue *mt76_dma_capsule_queue_alloc(struct mt76_dev *dev)
++{
++	struct mt76_dma_capsule *capsule = mt76_dma_capsule_get(dev);
++	struct mt76_dma_capsule_queue *allocation;
++	struct mt76_queue *queue;
++
++	if (IS_ERR_OR_NULL(capsule))
++		return (void *)capsule;
++	allocation = kzalloc(sizeof(*allocation), GFP_KERNEL);
++	if (!allocation)
++		return ERR_PTR(-ENOMEM);
++	queue = kzalloc(sizeof(*queue), GFP_KERNEL);
++	if (!queue) {
++		kfree(allocation);
++		return ERR_PTR(-ENOMEM);
++	}
++	allocation->queue = queue;
++	allocation->owns_queue = true;
++	queue->dma_capsule = allocation;
++	list_add_tail(&allocation->list, &capsule->queues);
++	return queue;
++}
++
++static void mt76_dma_capsule_ring_abort(struct mt76_dev *dev, struct mt76_queue *queue)
++{
++	struct mt76_dma_capsule_queue *allocation = queue->dma_capsule;
++
++	if (!allocation)
++		return;
++	if (queue->page_pool)
++		page_pool_destroy(queue->page_pool);
++	if (allocation->desc)
++		dma_free_coherent(dev->dma_capsule->dma_dev, allocation->bytes,
++				  allocation->desc, allocation->dma);
++	kfree(allocation->entry);
++	allocation->desc = NULL;
++	allocation->entry = NULL;
++	queue->page_pool = NULL;
++	queue->desc = NULL;
++	queue->entry = NULL;
++	queue->desc_dma = 0;
++	queue->ndesc = 0;
++	if (!allocation->owns_queue) {
++		list_del(&allocation->list);
++		queue->dma_capsule = NULL;
++		kfree(allocation);
++	}
++}
++
++void mt76_dma_capsule_queue_free(struct mt76_dev *dev, struct mt76_queue *queue)
++{
++	struct mt76_dma_capsule_queue *allocation = queue->dma_capsule;
++	bool owns_queue;
++
++	if (!allocation)
++		return;
++	owns_queue = allocation->owns_queue;
++	mt76_dma_capsule_ring_abort(dev, queue);
++	if (owns_queue) {
++		list_del(&allocation->list);
++		kfree(queue);
++		kfree(allocation);
++	}
++}
++
++static int mt76_dma_capsule_ring_alloc(struct mt76_dev *dev, struct mt76_queue *queue,
++				      size_t bytes)
++{
++	struct mt76_dma_capsule *capsule = mt76_dma_capsule_get(dev);
++	struct mt76_dma_capsule_queue *allocation;
++
++	if (IS_ERR(capsule))
++		return PTR_ERR(capsule);
++	if (!capsule)
++		return 0;
++	allocation = queue->dma_capsule;
++	if (!allocation) {
++		allocation = kzalloc(sizeof(*allocation), GFP_KERNEL);
++		if (!allocation)
++			return -ENOMEM;
++		allocation->queue = queue;
++		queue->dma_capsule = allocation;
++		list_add_tail(&allocation->list, &capsule->queues);
++	}
++	if (allocation->desc || allocation->entry)
++		return -EBUSY;
++	allocation->bytes = bytes;
++	allocation->desc = dma_alloc_coherent(capsule->dma_dev, bytes,
++					      &allocation->dma, GFP_KERNEL);
++	if (!allocation->desc)
++		goto fail;
++	allocation->entry = kcalloc(queue->ndesc, sizeof(*queue->entry), GFP_KERNEL);
++	if (!allocation->entry)
++		goto fail;
++	queue->desc = allocation->desc;
++	queue->desc_dma = allocation->dma;
++	queue->entry = allocation->entry;
++	return 1;
++fail:
++	mt76_dma_capsule_ring_abort(dev, queue);
++	return -ENOMEM;
++}
+ 
+ static struct mt76_txwi_cache *
+ mt76_alloc_txwi(struct mt76_dev *dev)
+@@ -850,25 +995,34 @@
+ 	else
+ 		size = sizeof(struct mt76_desc);
+ 
+-	q->desc = dmam_alloc_coherent(dev->dma_dev, q->ndesc * size,
+-				      &q->desc_dma, GFP_KERNEL);
++	ret = mt76_dma_capsule_ring_alloc(dev, q, q->ndesc * size);
++	if (ret < 0)
++		return ret;
++	if (!ret)
++		q->desc = dmam_alloc_coherent(dev->dma_dev, q->ndesc * size,
++					      &q->desc_dma, GFP_KERNEL);
+ 	if (!q->desc)
+ 		return -ENOMEM;
+ 
+ 	mt76_dma_queue_magic_cnt_init(dev, q);
+ 	size = q->ndesc * sizeof(*q->entry);
+-	q->entry = devm_kzalloc(dev->dev, size, GFP_KERNEL);
++	if (!q->dma_capsule)
++		q->entry = devm_kzalloc(dev->dev, size, GFP_KERNEL);
+ 	if (!q->entry)
+ 		return -ENOMEM;
+ 
+ 	ret = mt76_create_page_pool(dev, q);
+-	if (ret)
++	if (ret) {
++		mt76_dma_capsule_ring_abort(dev, q);
+ 		return ret;
++	}
+ 
+ 	mt76_npu_queue_setup(dev, q);
+ 	ret = mt76_wed_dma_setup(dev, q, false);
+-	if (ret)
++	if (ret) {
++		mt76_dma_capsule_ring_abort(dev, q);
+ 		return ret;
++	}
+ 
+ 	if (mtk_wed_device_active(&dev->mmio.wed)) {
+ 		if ((mtk_wed_get_rx_capa(&dev->mmio.wed) && mt76_queue_is_wed_rro(q)) ||
+@@ -1192,6 +1346,55 @@
+ }
+ EXPORT_SYMBOL_GPL(mt76_dma_attach);
+ 
++static void mt76_dma_capsule_flush(struct mt76_dev *dev)
++{
++	struct mt76_dma_capsule *capsule = dev->dma_capsule;
++	struct mt76_dma_capsule_queue *allocation;
++
++	if (!capsule)
++		return;
++	list_for_each_entry(allocation, &capsule->queues, list) {
++		struct mt76_queue *queue = allocation->queue;
++
++		if (mt76_queue_is_rx(dev, queue)) {
++			if (queue->queued || queue->rx_head)
++				mt76_dma_rx_cleanup(dev, queue);
++		} else if (queue->queued) {
++			mt76_dma_tx_cleanup(dev, queue, true);
++		}
++		if (queue->page_pool) {
++			page_pool_destroy(queue->page_pool);
++			queue->page_pool = NULL;
++		}
++	}
++}
++
++void mt76_dma_capsule_free(struct mt76_dev *dev)
++{
++	struct mt76_dma_capsule *capsule = dev->dma_capsule;
++	struct mt76_dma_capsule_queue *allocation, *next;
++
++	if (!capsule)
++		return;
++	mt76_dma_capsule_flush(dev);
++	mt76_free_pending_txwi(dev);
++	mt76_free_pending_rxwi(dev);
++	list_for_each_entry_safe(allocation, next, &capsule->queues, list) {
++		struct mt76_queue *queue = allocation->queue;
++		bool owns_queue = allocation->owns_queue;
++
++		mt76_dma_capsule_ring_abort(dev, queue);
++		if (owns_queue) {
++			list_del(&allocation->list);
++			kfree(queue);
++			kfree(allocation);
++		}
++	}
++	put_device(capsule->dma_dev);
++	kfree(capsule);
++	dev->dma_capsule = NULL;
++}
++
+ void mt76_dma_cleanup(struct mt76_dev *dev)
+ {
+ 	int i;
+@@ -1221,6 +1424,8 @@
+ 		mt76_dma_rx_cleanup(dev, q);
+ 
+ 		page_pool_destroy(q->page_pool);
++		if (q->dma_capsule)
++			q->page_pool = NULL;
+ 	}
+ 
+ 	if (mtk_wed_device_active(&dev->mmio.wed))
+@@ -1229,6 +1434,7 @@
+ 	if (mtk_wed_device_active(&dev->mmio.wed_hif2))
+ 		mtk_wed_device_detach(&dev->mmio.wed_hif2);
+ 
++	mt76_dma_capsule_flush(dev);
+ 	mt76_free_pending_txwi(dev);
+ 	mt76_free_pending_rxwi(dev);
+ 	free_netdev(dev->napi_dev);
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -828,6 +828,7 @@
+ 		dev->wq = NULL;
+ 	}
+ 	mt76_npu_deinit(dev);
++	mt76_dma_capsule_free(dev);
+ 	ieee80211_free_hw(dev->hw);
+ }
+ EXPORT_SYMBOL_GPL(mt76_free_device);
+@@ -2021,7 +2022,11 @@
+ 	struct mt76_queue *hwq;
+ 	int err;
+ 
+-	hwq = devm_kzalloc(dev->dev, sizeof(*hwq), GFP_KERNEL);
++	hwq = mt76_dma_capsule_queue_alloc(dev);
++	if (IS_ERR(hwq))
++		return hwq;
++	if (!hwq)
++		hwq = devm_kzalloc(dev->dev, sizeof(*hwq), GFP_KERNEL);
+ 	if (!hwq)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -2029,8 +2034,10 @@
+ 	hwq->wed = wed;
+ 
+ 	err = dev->queue_ops->alloc(dev, hwq, idx, n_desc, 0, ring_base);
+-	if (err < 0)
++	if (err < 0) {
++		mt76_dma_capsule_queue_free(dev, hwq);
+ 		return ERR_PTR(err);
++	}
+ 
+ 	return hwq;
+ }

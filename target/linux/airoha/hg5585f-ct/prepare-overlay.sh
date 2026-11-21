@@ -23,7 +23,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   package/kernel/mt76/patches/123-mt7915-connac2-check-rx-body.patch \
   package/kernel/mt76/patches/124-mt7915-connac2-host-ppe.patch \
   package/kernel/mt76/patches/125-mt7915-connac2-tdma-free-bufid.patch \
-  package/kernel/mt76/ct-wed/{ct_wdma_rx.h,ct_wed_bm.h,ct_wed_stop.h,ct_wed_cold.h,ct_wed_platform.c,ct_wed_guard_v2.c,patches/126-mt7915-prepare-ct-wed-slot1.patch} \
+  package/kernel/mt76/ct-wed/{ct_wdma_rx.h,ct_wed_bm.h,ct_wed_stop.h,ct_wed_cold.h,ct_wed_platform.c,ct_wed_guard_v2.c,patches/126-mt7915-prepare-ct-wed-slot1.patch,patches/127-mt76-own-ct-radio-dma-rings.patch} \
   target/linux/airoha/patches-6.18/931-net-airoha-initialize-ct-connac2-packet-pool.patch \
   target/linux/airoha/patches-6.18/932-net-airoha-initialize-ct-connac2-host-ppe.patch \
   target/linux/airoha/patches-6.18/933-net-airoha-quiesce-ct-ppe-on-shutdown.patch \
