@@ -11,12 +11,16 @@ def main():
     parser.add_argument("--connac2-rx", action="store_true")
     parser.add_argument("--connac2-host-ppe", action="store_true",
                         help="Enable host PPE in this RAM image (requires Connac2 RX and verified firmware)")
+    parser.add_argument("--wed-slot1", action="store_true",
+                        help="Describe the slot 1 WED supplier for the MT7916 RAM trial")
     parser.add_argument("--firmware-dir", type=Path, help="Directory containing the two packaged NPU binaries")
     args = parser.parse_args()
     if args.connac2_rx and not args.connac2:
         parser.error("--connac2-rx requires --connac2")
     if args.connac2_host_ppe and not args.connac2_rx:
         parser.error("--connac2-host-ppe requires --connac2-rx")
+    if args.wed_slot1 and not args.connac2_host_ppe:
+        parser.error("--wed-slot1 requires --connac2-host-ppe")
     if args.connac2_host_ppe != bool(args.firmware_dir):
         parser.error("--connac2-host-ppe and --firmware-dir must be used together")
     if args.connac2_host_ppe:
@@ -57,6 +61,18 @@ def main():
         print('&pcie1 { pcie@0,0 { wifi@0,0 { airoha,connac2-rx; }; }; };')
     if args.connac2_host_ppe:
         print('&eth { airoha,connac2-host-ppe; };')
+    if args.wed_slot1:
+        print('''&{/soc} {
+    ct_wed_slot1: wireless-offload@1fa03000 {
+        compatible = "fiberhome,hg5585f-ct-wed-slot1";
+        reg = <0 0x1fa03000 0 0xb00>, <0 0x1fa06400 0 0x400>;
+        reg-names = "wed", "wdma";
+        interrupts = <GIC_SPI 68 IRQ_TYPE_LEVEL_HIGH>, <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>,
+                     <GIC_SPI 73 IRQ_TYPE_LEVEL_HIGH>, <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "wed", "wdma0", "wdma1", "wdma2";
+    };
+};
+&pcie1 { pcie@0,0 { wifi@0,0 { airoha,wed-provider = <&ct_wed_slot1>; }; }; };''')
 
 
 if __name__ == "__main__":
