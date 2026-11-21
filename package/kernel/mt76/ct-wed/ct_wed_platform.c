@@ -32,6 +32,7 @@ struct airoha_ct_wed {
 	struct device *dev;
 	struct pci_dev *radio;
 	void __iomem *wed, *wdma;
+	struct resource *region[2];
 	int irq[4];
 	struct ct_mid_ring mid[2];
 	struct {
@@ -57,10 +58,23 @@ module_param(prepare_bm, bool, 0444);
 MODULE_PARM_DESC(prepare_bm, "Prepare stock hardware token buffers without enabling DMA");
 MODULE_PARM_DESC(prepare, "Permit a software-only dual-ring lease; engines stay disabled");
 
+static void ct_release_locked(struct airoha_ct_wed *wed);
+
 static void ct_free(struct kref *ref)
 {
 	struct airoha_ct_wed *wed = container_of(ref, struct airoha_ct_wed, ref);
+	unsigned int idx;
 
+	mutex_lock(&ct_lock);
+	ct_release_locked(wed);
+	mutex_unlock(&ct_lock);
+	if (!IS_ERR_OR_NULL(wed->wed))
+		iounmap(wed->wed);
+	if (!IS_ERR_OR_NULL(wed->wdma))
+		iounmap(wed->wdma);
+	for (idx = 0; idx < ARRAY_SIZE(wed->region); idx++)
+		if (wed->region[idx])
+			release_mem_region(wed->region[idx]->start, resource_size(wed->region[idx]));
 	put_device(wed->dev);
 	kfree(wed);
 }
@@ -360,6 +374,15 @@ const struct airoha_ct_wed_ops airoha_ct_wed_ops_v1 = {
 };
 EXPORT_SYMBOL_GPL(airoha_ct_wed_ops_v1);
 
+static void __iomem *ct_map(struct airoha_ct_wed *wed, const struct resource *res,
+			   unsigned int index)
+{
+	wed->region[index] = request_mem_region(res->start, resource_size(res), dev_name(wed->dev));
+	if (!wed->region[index])
+		return ERR_PTR(-EBUSY);
+	return ioremap(res->start, resource_size(res)) ?: ERR_PTR(-ENOMEM);
+}
+
 static int ct_probe(struct platform_device *pdev)
 {
 	static const unsigned int spi[] = { 68, 72, 73, 74 };
@@ -381,8 +404,8 @@ static int ct_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	kref_init(&wed->ref);
 	wed->dev = get_device(&pdev->dev);
-	wed->wed = devm_ioremap_resource(&pdev->dev, res);
-	wed->wdma = devm_ioremap_resource(&pdev->dev, wdma);
+	wed->wed = ct_map(wed, res, 0);
+	wed->wdma = ct_map(wed, wdma, 1);
 	if (IS_ERR(wed->wed) || IS_ERR(wed->wdma)) {
 		err = IS_ERR(wed->wed) ? PTR_ERR(wed->wed) : PTR_ERR(wed->wdma);
 		goto free;
@@ -433,8 +456,8 @@ static void ct_remove(struct platform_device *pdev)
 	struct airoha_ct_wed *wed = platform_get_drvdata(pdev);
 
 	mutex_lock(&ct_lock);
-	ct_slot = NULL;
-	ct_release_locked(wed);
+	if (ct_slot == wed)
+		ct_slot = NULL;
 	mutex_unlock(&ct_lock);
 	kref_put(&wed->ref, ct_free);
 }
