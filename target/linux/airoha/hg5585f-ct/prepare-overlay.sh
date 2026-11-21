@@ -22,6 +22,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   package/kernel/mt76/patches/122-mt7915-connac2-dma-declaration.patch \
   package/kernel/mt76/patches/123-mt7915-connac2-check-rx-body.patch \
   package/kernel/mt76/patches/124-mt7915-connac2-host-ppe.patch \
+  package/kernel/mt76/patches/125-mt7915-connac2-tdma-free-bufid.patch \
   target/linux/airoha/patches-6.18/931-net-airoha-initialize-ct-connac2-packet-pool.patch \
   target/linux/airoha/patches-6.18/932-net-airoha-initialize-ct-connac2-host-ppe.patch \
   target/linux/airoha/hg5585f-ct/ram-dts.py \

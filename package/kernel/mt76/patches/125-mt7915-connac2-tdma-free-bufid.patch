@@ -1,0 +1,15 @@
+diff --git a/mt7915/npu.c b/mt7915/npu.c
+index 8fbba8c..3ff9650 100644
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -332,8 +332,8 @@ static int mt7915_npu_counters_show(struct seq_file *seq, void *unused)
+ 		if (!base)
+ 			return -ENOMEM;
+ 		if (selector == 2)
+-			seq_printf(seq, "common tdma_unbind=%u tdma_enq_fail=%u tdma_done=%u\n",
+-				   readl(base + 8), readl(base + 12), readl(base + 20));
++			seq_printf(seq, "common tdma_unbind=%u tdma_enq_fail=%u tdma_done=%u tdma_free_bufid=%u\n",
++				   readl(base + 8), readl(base + 12), readl(base + 20), readl(base + 4));
+ 		else
+ 			seq_printf(seq, "selector=%u base=%08x poll=%u rx_done=%u drop=%u host=%u tdma_attempt=%u tdma_full=%u tdma_submit=%u ba_in_order=%u non_ampdu=%u\n",
+ 				   selector, bases[selector], readl(base + 4), readl(base + 8),
