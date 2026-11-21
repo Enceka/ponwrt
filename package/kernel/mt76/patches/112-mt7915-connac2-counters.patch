@@ -1,0 +1,105 @@
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index 7e561a4..b8e0826 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1309,6 +1309,11 @@ int mt7915_init_debugfs(struct mt7915_phy *phy)
+ 
+ 	dir = mt76_register_debugfs_fops(phy->mt76, NULL);
+ 
++#ifdef CONFIG_MT7915_NPU
++	if (!ext_phy)
++		mt7915_npu_debugfs_ct(dev, dir);
++#endif
++
+ 	debugfs_create_file("muru_debug", 0600, dir, dev, &fops_muru_debug);
+ 	debugfs_create_file("muru_stats", 0400, dir, phy,
+ 			    &mt7915_muru_stats_fops);
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index a797823..270da8d 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -475,6 +475,7 @@ int mt7915_eeprom_get_target_power(struct mt7915_dev *dev,
+ s8 mt7915_eeprom_get_power_delta(struct mt7915_dev *dev, int band);
+ bool mt7915_eeprom_has_background_radar(struct mt7915_dev *dev);
+ #ifdef CONFIG_MT7915_NPU
++void mt7915_npu_debugfs_ct(struct mt7915_dev *dev, struct dentry *dir);
+ int mt7915_npu_prepare_ct(struct airoha_npu *npu, u8 band, phys_addr_t ba,
+ 			  const phys_addr_t rx_csr[2]);
+ int mt7915_npu_rx_ring_ct(struct airoha_npu *npu, u8 selector, u32 *base);
+diff --git a/mt7915/npu.c b/mt7915/npu.c
+index 742d403..d6a4a37 100644
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -1,5 +1,72 @@
++#include <linux/of.h>
+ #include "mt7915.h"
+ 
++static int mt7915_npu_counters_show(struct seq_file *seq, void *unused)
++{
++	struct airoha_npu *npu = seq->private;
++	u32 bases[2];
++	unsigned int selector;
++
++	for (selector = 0; selector < ARRAY_SIZE(bases); selector++) {
++		int err = mt76_npu_get_msg(npu, selector,
++					   WLAN_FUNC_GET_WAIT_DBG_COUNTER,
++					   &bases[selector], GFP_KERNEL);
++
++		if (err)
++			return err;
++		if (!IS_ALIGNED(bases[selector], 4) ||
++		    bases[selector] < 0x1e800000 ||
++		    bases[selector] > 0x1e878000 - 320)
++			return -ERANGE;
++	}
++	if (max(bases[0], bases[1]) - min(bases[0], bases[1]) < 320)
++		return -EINVAL;
++
++	for (selector = 0; selector < ARRAY_SIZE(bases); selector++) {
++		void __iomem *base = ioremap(bases[selector], 320);
++
++		if (!base)
++			return -ENOMEM;
++		seq_printf(seq, "selector=%u base=%08x rx_done=%u drop=%u host=%u tdma_attempt=%u tdma_full=%u tdma_submit=%u\n",
++			   selector, bases[selector], readl(base + 8),
++			   readl(base + 16), readl(base + 48), readl(base + 84),
++			   readl(base + 252), readl(base + 316));
++		iounmap(base);
++	}
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mt7915_npu_counters);
++
++static void mt7915_npu_release(void *data)
++{
++	airoha_npu_put(data);
++}
++
++void mt7915_npu_debugfs_ct(struct mt7915_dev *dev, struct dentry *dir)
++{
++	struct device *device = dev->mt76.dev;
++	struct device_node *node;
++	struct airoha_npu *npu;
++	const char *name;
++	bool match;
++
++	if (!is_mt7916(&dev->mt76) || !of_machine_is_compatible("fiberhome,hg5585f-ct"))
++		return;
++	node = of_parse_phandle(device->of_node, "airoha,npu", 0);
++	if (!node)
++		return;
++	match = !of_property_read_string_index(node, "firmware-name", 0, &name) &&
++		!strcmp(name, "airoha/hg5585f-ct/npu_rv32.bin");
++	of_node_put(node);
++	if (!match)
++		return;
++	npu = airoha_npu_get(device);
++	if (IS_ERR(npu) || devm_add_action_or_reset(device, mt7915_npu_release, npu))
++		return;
++	debugfs_create_file("connac2_counters", 0400, dir, npu,
++			    &mt7915_npu_counters_fops);
++}
++
+ int mt7915_npu_prepare_ct(struct airoha_npu *npu, u8 band, phys_addr_t ba,
+ 			  const phys_addr_t rx_csr[2])
+ {
