@@ -1,0 +1,366 @@
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -721,6 +721,12 @@ struct airoha_gdm_port {
+ struct airoha_ppe {
+ 	struct airoha_ppe_dev dev;
+ 	struct airoha_eth *eth;
++	bool ct_host_ppe;
++	bool ct_restore_pending;
++	bool ct_owns_sram;
++	struct {
++		u32 glo, regs[16];
++	} ct_saved[2];
+ 
+ 	void *foe;
+ 	dma_addr_t foe_dma;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -136,7 +136,7 @@ void airoha_ppe_set_xmit_frame_size(struct airoha_gdm_dev *dev)
+ 		      __field_prep(FP_EGRESS_MTU_MASK(index), len));
+ }
+ 
+-static void airoha_ppe_hw_init(struct airoha_ppe *ppe)
++static void airoha_ppe_hw_init(struct airoha_ppe *ppe, bool sram_only)
+ {
+ 	u32 sram_ppe_num_data_entries = PPE_SRAM_NUM_ENTRIES, sram_num_entries;
+ 	u32 sram_tb_size, dram_num_entries;
+@@ -154,8 +154,8 @@ static void airoha_ppe_hw_init(struct airoha_ppe *ppe)
+ 		PPE_RAM_NUM_ENTRIES_SHIFT(sram_ppe_num_data_entries);
+ 
+ 	for (i = 0; i < eth->soc->num_ppe; i++) {
+-		airoha_fe_wr(eth, REG_PPE_TB_BASE(i),
+-			     ppe->foe_dma + sram_tb_size);
++		if (!sram_only)
++			airoha_fe_wr(eth, REG_PPE_TB_BASE(i), ppe->foe_dma + sram_tb_size);
+ 
+ 		airoha_fe_rmw(eth, REG_PPE_BND_AGE0(i),
+ 			      PPE_BIND_AGE0_DELTA_NON_L4 |
+@@ -171,7 +171,7 @@ static void airoha_ppe_hw_init(struct airoha_ppe *ppe)
+ 		airoha_fe_rmw(eth, REG_PPE_TB_HASH_CFG(i),
+ 			      PPE_SRAM_TABLE_EN_MASK |
+ 			      PPE_SRAM_HASH1_EN_MASK |
+-			      PPE_DRAM_TABLE_EN_MASK |
++			      PPE_DRAM_TABLE_EN_MASK | (sram_only ? PPE_DRAM_HASH1_EN_MASK : 0) |
+ 			      PPE_SRAM_HASH0_MODE_MASK |
+ 			      PPE_SRAM_HASH1_MODE_MASK |
+ 			      PPE_DRAM_HASH0_MODE_MASK |
+@@ -204,6 +204,12 @@ static void airoha_ppe_hw_init(struct airoha_ppe *ppe)
+ 		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(i),
+ 				PPE_FLOW_CFG_IP6_6RD_MASK);
+ 	}
++}
++
++static void airoha_ppe_hw_init_ports(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->ports); i++) {
+ 		struct airoha_gdm_port *port = eth->ports[i];
+@@ -1304,6 +1310,10 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 		flow_rule_match_ip(rule, &match);
+ 		dsfield = match.key->tos;
+ 	}
++	if (eth->ppe->ct_host_ppe &&
++	    (addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS ||
++	     (l4proto != IPPROTO_TCP && l4proto != IPPROTO_UDP)))
++		return -EOPNOTSUPP;
+ 
+ 	switch (addr_type) {
+ 	case 0:
+@@ -1369,6 +1379,8 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||
+ 	    !is_valid_ether_addr(data.eth.h_dest))
+ 		return -EINVAL;
++	if (eth->ppe->ct_host_ppe && !odev)
++		return -EOPNOTSUPP;
+ 
+ 	err = airoha_ppe_foe_entry_prepare(eth, &hwe, odev, offload_type,
+ 					   &data, l4proto, dsfield,
+@@ -1380,6 +1392,9 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   "PON egress has no unambiguous VLAN/P-bit to GEM mapping");
+ 		return err;
+ 	}
++	if (eth->ppe->ct_host_ppe &&
++	    (!egress_dev || test_bit(AIROHA_DEV_F_PON, &egress_dev->flags)))
++		return -EOPNOTSUPP;
+ 
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS)) {
+ 		struct flow_match_ports ports;
+@@ -1629,6 +1644,208 @@ static int airoha_ppe_wait_for_npu_init(struct airoha_eth *eth)
+ 	return err;
+ }
+ 
++#define CT_HOST_IPV4_FLOWS (PPE_FLOW_CFG_IP4_NAPT_MASK | PPE_FLOW_CFG_IP4_NAT_MASK)
++
++static bool airoha_ppe_ct_requested(struct airoha_eth *eth)
++{
++	return airoha_is_7581(eth) && of_machine_is_compatible("fiberhome,hg5585f-ct") &&
++	       of_property_read_bool(eth->dev->of_node, "airoha,connac2-host-ppe");
++}
++
++static int airoha_ppe_ct_check_sram(struct airoha_ppe *ppe, bool clear)
++{
++	u32 count = airoha_ppe_get_total_sram_num_entries(ppe);
++	u32 hash;
++
++	for (hash = 0; hash < count; hash++) {
++		struct airoha_foe_entry *entry;
++		int err = 0;
++
++		spin_lock_bh(&ppe_lock);
++		entry = airoha_ppe_foe_get_entry_locked(ppe, hash);
++		if (!entry) {
++			err = -ETIMEDOUT;
++		} else if (entry->ib1 & (AIROHA_FOE_IB1_BIND_STATE | AIROHA_FOE_IB1_BIND_STATIC)) {
++			if (clear) {
++				memset(entry, 0, sizeof(*entry));
++				err = airoha_ppe_foe_commit_sram_entry(ppe, hash);
++			} else {
++				err = -EBUSY;
++			}
++		}
++		spin_unlock_bh(&ppe_lock);
++		if (err)
++			return err;
++		if (!(hash % 256))
++			cond_resched();
++	}
++	return 0;
++}
++
++static const u16 ct_bank0_regs[] = {
++	REG_PPE_TB_CFG(0), REG_PPE_TB_HASH_CFG(0), REG_PPE_BND_AGE0(0),
++	REG_PPE_BND_AGE1(0), REG_PPE_BIND_RATE(0), REG_PPE_HASH_SEED(0),
++	REG_PPE_DFT_CPORT(0, 0), REG_PPE_DFT_CPORT(0, 8), REG_PPE_MTU(0, 0),
++	REG_PPE_MTU(0, 2), REG_PPE_MTU(0, 4), REG_PPE_MTU(0, 6), REG_PPE_PPE_FLOW_CFG(0),
++	REG_PPE_BIND_LIMIT0(0), REG_PPE_BIND_LIMIT1(0), REG_PPE_UNBIND_AGE(0),
++};
++
++static bool airoha_ppe_ct_learning_init(struct airoha_eth *eth, int bank)
++{
++	const u32 limits0 = PPE_BIND_LIMIT0_HALF_MASK | PPE_BIND_LIMIT0_QUARTER_MASK;
++	const u32 limits1 = PPE_BIND_LIMIT1_FULL_MASK | PPE_BIND_LIMIT1_NON_L4_MASK;
++	const u32 unbind = PPE_UNBIND_AGE_MIN_PACKETS_MASK | PPE_UNBIND_AGE_DELTA_MASK;
++	const u32 ages = PPE_TB_CFG_AGE_TCP_FIN_MASK | PPE_TB_CFG_AGE_UDP_MASK |
++			 PPE_TB_CFG_AGE_TCP_MASK | PPE_TB_CFG_AGE_UNBIND_MASK |
++			 PPE_TB_CFG_AGE_NON_L4_MASK;
++	const u32 half_quarter = FIELD_PREP(PPE_BIND_LIMIT0_HALF_MASK, 4000) |
++				 FIELD_PREP(PPE_BIND_LIMIT0_QUARTER_MASK, 4000);
++	const u32 full_non_l4 = FIELD_PREP(PPE_BIND_LIMIT1_FULL_MASK, 8000) |
++				FIELD_PREP(PPE_BIND_LIMIT1_NON_L4_MASK, 1);
++	const u32 aging = FIELD_PREP(PPE_UNBIND_AGE_MIN_PACKETS_MASK, 1000) |
++			  FIELD_PREP(PPE_UNBIND_AGE_DELTA_MASK, 3);
++	const u32 bnd0_mask = PPE_BIND_AGE0_DELTA_NON_L4 | PPE_BIND_AGE0_DELTA_UDP;
++	const u32 bnd1_mask = PPE_BIND_AGE1_DELTA_TCP_FIN | PPE_BIND_AGE1_DELTA_TCP;
++	const u32 bnd0 = FIELD_PREP(PPE_BIND_AGE0_DELTA_NON_L4, 15) |
++			 FIELD_PREP(PPE_BIND_AGE0_DELTA_UDP, 15);
++	const u32 bnd1 = FIELD_PREP(PPE_BIND_AGE1_DELTA_TCP_FIN, 5) |
++			 FIELD_PREP(PPE_BIND_AGE1_DELTA_TCP, 15);
++
++	airoha_fe_rmw(eth, REG_PPE_BIND_LIMIT0(bank), limits0, half_quarter);
++	airoha_fe_rmw(eth, REG_PPE_BIND_LIMIT1(bank), limits1, full_non_l4);
++	airoha_fe_rmw(eth, REG_PPE_UNBIND_AGE(bank), unbind, aging);
++	airoha_fe_rmw(eth, REG_PPE_BND_AGE0(bank), bnd0_mask, bnd0);
++	airoha_fe_rmw(eth, REG_PPE_BND_AGE1(bank), bnd1_mask, bnd1);
++	airoha_fe_set(eth, REG_PPE_TB_CFG(bank), ages);
++
++	return (airoha_fe_rr(eth, REG_PPE_BIND_LIMIT0(bank)) & limits0) == half_quarter &&
++	       (airoha_fe_rr(eth, REG_PPE_BIND_LIMIT1(bank)) & limits1) == full_non_l4 &&
++	       (airoha_fe_rr(eth, REG_PPE_UNBIND_AGE(bank)) & unbind) == aging &&
++	       (airoha_fe_rr(eth, REG_PPE_BND_AGE0(bank)) & bnd0_mask) == bnd0 &&
++	       (airoha_fe_rr(eth, REG_PPE_BND_AGE1(bank)) & bnd1_mask) == bnd1 &&
++	       (airoha_fe_rr(eth, REG_PPE_TB_CFG(bank)) & ages) == ages;
++}
++
++static void airoha_ppe_ct_regs(struct airoha_ppe *ppe, int bank, bool restore)
++{
++	struct airoha_eth *eth = ppe->eth;
++	unsigned int idx;
++
++	static_assert(ARRAY_SIZE(ct_bank0_regs) == ARRAY_SIZE(ppe->ct_saved[0].regs));
++	for (idx = 0; idx < ARRAY_SIZE(ct_bank0_regs); idx++) {
++		u32 reg = ct_bank0_regs[idx] + bank * (PPE2_BASE - PPE1_BASE);
++
++		if (restore)
++			airoha_fe_wr(eth, reg, ppe->ct_saved[bank].regs[idx]);
++		else
++			ppe->ct_saved[bank].regs[idx] = airoha_fe_rr(eth, reg);
++	}
++}
++
++static int airoha_ppe_ct_quiesce(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	int bank, err;
++	u32 val;
++
++	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
++		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(bank), CT_HOST_IPV4_FLOWS);
++		airoha_fe_clear(eth, REG_PPE_GLO_CFG(bank), PPE_GLO_CFG_EN_MASK);
++	}
++	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
++		err = read_poll_timeout(airoha_fe_rr, val,
++					!(val & (PPE_GLO_CFG_EN_MASK | PPE_GLO_CFG_BUSY_MASK)),
++					10, 100000, false, eth, REG_PPE_GLO_CFG(bank));
++		if (err) {
++			dev_err(eth->dev, "PPE%d still active, restoration deferred\n", bank);
++			return err;
++		}
++	}
++	return 0;
++}
++
++static int airoha_ppe_ct_stop(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	int bank, err;
++
++	WRITE_ONCE(ppe->ct_host_ppe, false);
++	err = airoha_ppe_ct_quiesce(ppe);
++	if (err)
++		return err;
++	if (ppe->ct_owns_sram) {
++		err = airoha_ppe_ct_check_sram(ppe, true);
++		if (err)
++			return err;
++		ppe->ct_owns_sram = false;
++	}
++	for (bank = 0; bank < eth->soc->num_ppe; bank++)
++		airoha_ppe_ct_regs(ppe, bank, true);
++	for (bank = 0; bank < eth->soc->num_ppe; bank++)
++		airoha_fe_rmw(eth, REG_PPE_GLO_CFG(bank), PPE_GLO_CFG_EN_MASK,
++			      ppe->ct_saved[bank].glo & PPE_GLO_CFG_EN_MASK);
++	ppe->ct_restore_pending = false;
++	return 0;
++}
++
++static int airoha_ppe_ct_start(struct airoha_ppe *ppe, struct airoha_npu *npu)
++{
++	struct device_node *np = npu->dev->of_node;
++	struct airoha_eth *eth = ppe->eth;
++	int bank, err;
++
++	if (ppe->ct_restore_pending)
++		return -EBUSY;
++
++	if (of_property_match_string(np, "memory-region-names", "connac2-pkt") < 0 ||
++	    of_property_match_string(np, "firmware-name", "airoha/hg5585f-ct/npu_rv32.bin") != 0 ||
++	    of_property_match_string(np, "firmware-name", "airoha/hg5585f-ct/npu_data.bin") != 1 ||
++	    eth->soc->num_ppe != ARRAY_SIZE(ppe->ct_saved) ||
++	    IS_ENABLED(CONFIG_NET_AIROHA_FLOW_STATS))
++		return -EOPNOTSUPP;
++
++	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
++		if (airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)) ||
++		    airoha_fe_rr(eth, REG_PPE_TB_BASE(bank)))
++			return -EBUSY;
++		ppe->ct_saved[bank].glo = airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank));
++		airoha_ppe_ct_regs(ppe, bank, false);
++	}
++	err = airoha_ppe_ct_check_sram(ppe, false);
++	if (err)
++		return err;
++
++	ppe->ct_restore_pending = true;
++	err = airoha_ppe_ct_quiesce(ppe);
++	if (err)
++		return err;
++	ppe->ct_owns_sram = true;
++	airoha_ppe_hw_init(ppe, true);
++	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
++		u32 hash = airoha_fe_rr(eth, REG_PPE_TB_HASH_CFG(bank));
++
++		if (!(hash & PPE_SRAM_TABLE_EN_MASK) ||
++		    (hash & (PPE_DRAM_TABLE_EN_MASK | PPE_DRAM_HASH1_EN_MASK)) ||
++		    !airoha_ppe_ct_learning_init(eth, bank))
++			goto rollback;
++	}
++	for (bank = 0; bank < eth->soc->num_ppe; bank++)
++		airoha_fe_set(eth, REG_PPE_GLO_CFG(bank), PPE_GLO_CFG_EN_MASK);
++	airoha_ppe_hw_init_ports(ppe);
++	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
++		airoha_fe_set(eth, REG_PPE_PPE_FLOW_CFG(bank), CT_HOST_IPV4_FLOWS);
++		if (!airoha_ppe_is_enabled(eth, bank) ||
++		    airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)) != CT_HOST_IPV4_FLOWS)
++			goto rollback;
++	}
++	WRITE_ONCE(ppe->ct_host_ppe, true);
++	return 0;
++
++rollback:
++	err = airoha_ppe_ct_stop(ppe);
++	return err ?: -EIO;
++}
++
+ static int airoha_ppe_offload_setup(struct airoha_eth *eth)
+ {
+ 	struct airoha_npu *npu = airoha_ppe_npu_get(eth);
+@@ -1637,6 +1854,12 @@ static int airoha_ppe_offload_setup(struct airoha_eth *eth)
+ 
+ 	if (IS_ERR(npu))
+ 		return PTR_ERR(npu);
++	if (airoha_ppe_ct_requested(eth)) {
++		err = airoha_ppe_ct_start(ppe, npu);
++		if (err)
++			goto error_npu_put;
++		goto publish;
++	}
+ 
+ 	err = npu->ops.ppe_init(npu);
+ 	if (err)
+@@ -1655,9 +1878,11 @@ static int airoha_ppe_offload_setup(struct airoha_eth *eth)
+ 			goto error_npu_put;
+ 	}
+ 
+-	airoha_ppe_hw_init(ppe);
++	airoha_ppe_hw_init(ppe, false);
++	airoha_ppe_hw_init_ports(ppe);
+ 	airoha_ppe_foe_flow_stats_reset(ppe, npu);
+ 
++publish:
+ 	rcu_assign_pointer(eth->npu, npu);
+ 	synchronize_rcu();
+ 
+@@ -1701,6 +1926,10 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 	u32 ppe_hash_mask = airoha_ppe_get_total_num_entries(ppe) - 1;
+ 	u16 now, diff;
+ 
++	if (READ_ONCE(ppe->ct_host_ppe) &&
++	    (!rx_wlan || hash >= airoha_ppe_get_total_sram_num_entries(ppe)))
++		return;
++
+ 	if (hash > ppe_hash_mask)
+ 		return;
+ 
+@@ -1833,9 +2062,11 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	if (!ppe->foe_check_time)
+ 		return -ENOMEM;
+ 
+-	err = airoha_ppe_flush_sram_entries(ppe);
+-	if (err)
+-		return err;
++	if (!airoha_ppe_ct_requested(eth)) {
++		err = airoha_ppe_flush_sram_entries(ppe);
++		if (err)
++			return err;
++	}
+ 
+ 	err = rhashtable_init(&eth->flow_table, &airoha_flow_table_params);
+ 	if (err)
+@@ -1869,9 +2100,13 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+ 				  lockdep_is_held(&flow_offload_mutex));
+ 	if (npu) {
+ 		synchronize_rcu();
+-		npu->ops.ppe_deinit(npu);
+-		airoha_npu_put(npu);
++		if (!eth->ppe->ct_restore_pending)
++			npu->ops.ppe_deinit(npu);
+ 	}
++	if (eth->ppe->ct_restore_pending)
++		airoha_ppe_ct_stop(eth->ppe);
++	if (npu)
++		airoha_npu_put(npu);
+ 
+ 	mutex_unlock(&flow_offload_mutex);
+ 
