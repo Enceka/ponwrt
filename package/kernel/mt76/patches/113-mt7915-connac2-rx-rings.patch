@@ -1,0 +1,148 @@
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 270da8d..d722d8a 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -476,9 +476,8 @@ s8 mt7915_eeprom_get_power_delta(struct mt7915_dev *dev, int band);
+ bool mt7915_eeprom_has_background_radar(struct mt7915_dev *dev);
+ #ifdef CONFIG_MT7915_NPU
+ void mt7915_npu_debugfs_ct(struct mt7915_dev *dev, struct dentry *dir);
+-int mt7915_npu_prepare_ct(struct airoha_npu *npu, u8 band, phys_addr_t ba,
+-			  const phys_addr_t rx_csr[2]);
+-int mt7915_npu_rx_ring_ct(struct airoha_npu *npu, u8 selector, u32 *base);
++int mt7915_npu_request_rx_ct(struct mt7915_dev *dev, struct airoha_npu *npu,
++			     u32 ring_base[2]);
+ #endif
+ int mt7915_dma_init(struct mt7915_dev *dev, struct mt7915_phy *phy2);
+ void mt7915_dma_prefetch(struct mt7915_dev *dev);
+diff --git a/mt7915/npu.c b/mt7915/npu.c
+index d6a4a37..ca28d12 100644
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -1,5 +1,13 @@
+ #include <linux/of.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/pci.h>
+ #include "mt7915.h"
++#include "../dma.h"
++
++#define MT7916_CT_SRAM_START	0x1e800000
++#define MT7916_CT_SRAM_END	0x1e878000
++#define MT7916_CT_RX_COUNT	768
++#define MT7916_CT_RX_BYTES	(MT7916_CT_RX_COUNT * sizeof(struct mt76_desc))
+ 
+ static int mt7915_npu_counters_show(struct seq_file *seq, void *unused)
+ {
+@@ -15,8 +23,8 @@ static int mt7915_npu_counters_show(struct seq_file *seq, void *unused)
+ 		if (err)
+ 			return err;
+ 		if (!IS_ALIGNED(bases[selector], 4) ||
+-		    bases[selector] < 0x1e800000 ||
+-		    bases[selector] > 0x1e878000 - 320)
++		    bases[selector] < MT7916_CT_SRAM_START ||
++		    bases[selector] > MT7916_CT_SRAM_END - 320)
+ 			return -ERANGE;
+ 	}
+ 	if (max(bases[0], bases[1]) - min(bases[0], bases[1]) < 320)
+@@ -67,7 +75,7 @@ void mt7915_npu_debugfs_ct(struct mt7915_dev *dev, struct dentry *dir)
+ 			    &mt7915_npu_counters_fops);
+ }
+ 
+-int mt7915_npu_prepare_ct(struct airoha_npu *npu, u8 band, phys_addr_t ba,
++static int mt7915_npu_prepare_ct(struct airoha_npu *npu, u8 band, phys_addr_t ba,
+ 			  const phys_addr_t rx_csr[2])
+ {
+ 	u32 counter_base;
+@@ -109,7 +117,7 @@ int mt7915_npu_prepare_ct(struct airoha_npu *npu, u8 band, phys_addr_t ba,
+ 	return 0;
+ }
+ 
+-int mt7915_npu_rx_ring_ct(struct airoha_npu *npu, u8 selector, u32 *base)
++static int mt7915_npu_rx_ring_ct(struct airoha_npu *npu, u8 selector, u32 *base)
+ {
+ 	u32 reply;
+ 	int err;
+@@ -118,15 +126,81 @@ int mt7915_npu_rx_ring_ct(struct airoha_npu *npu, u8 selector, u32 *base)
+ 		return -EINVAL;
+ 	*base = 0;
+ 	err = mt76_npu_send_msg(npu, selector, WLAN_FUNC_SET_WAIT_DESC,
+-				768, GFP_KERNEL);
++				MT7916_CT_RX_COUNT, GFP_KERNEL);
+ 	if (err)
+ 		return err;
+ 	err = mt76_npu_get_msg(npu, selector, WLAN_FUNC_GET_WAIT_RXDESC_BASE,
+ 			       &reply, GFP_KERNEL);
+ 	if (err)
+ 		return err;
+-	if (!reply || !IS_ALIGNED(reply, 16))
+-		return -EIO;
++	if (!IS_ALIGNED(reply, 16) || reply < MT7916_CT_SRAM_START ||
++	    reply > MT7916_CT_SRAM_END - MT7916_CT_RX_BYTES)
++		return -ERANGE;
+ 	*base = reply;
+ 	return 0;
+ }
++
++static int mt7915_npu_rx_csr_ct(struct device *hif, u32 offset, phys_addr_t *addr)
++{
++	struct pci_dev *pdev;
++
++	if (!dev_is_pci(hif))
++		return -ENODEV;
++	pdev = to_pci_dev(hif);
++	if (!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM) ||
++	    !pci_resource_start(pdev, 0) || upper_32_bits(pci_resource_end(pdev, 0)) ||
++	    pci_resource_len(pdev, 0) < offset + sizeof(struct mt76_queue_regs))
++		return -ERANGE;
++	*addr = pci_resource_start(pdev, 0) + offset;
++	return 0;
++}
++
++int mt7915_npu_request_rx_ct(struct mt7915_dev *dev, struct airoha_npu *npu,
++			     u32 ring_base[2])
++{
++	struct resource ba;
++	phys_addr_t csr[2];
++	void __iomem *base;
++	u32 rings[2];
++	int err;
++
++	if (!ring_base)
++		return -EINVAL;
++	ring_base[0] = ring_base[1] = 0;
++	if (!npu || !is_mt7916(&dev->mt76) || !dev->hif2 ||
++	    !of_machine_is_compatible("fiberhome,hg5585f-ct"))
++		return -ENODEV;
++	err = mt7915_npu_rx_csr_ct(dev->hif2->dev, MT_WFDMA0_PCIE1(0x500) +
++				   MT7916_RXQ_BAND1 * MT_RING_SIZE, &csr[0]);
++	if (err)
++		return err;
++	err = mt7915_npu_rx_csr_ct(dev->mt76.dev, MT_WFDMA0(0x500) +
++				   MT7916_RXQ_BAND0 * MT_RING_SIZE, &csr[1]);
++	if (err)
++		return err;
++	err = of_reserved_mem_region_to_resource_byname(npu->dev->of_node, "ba", &ba);
++	if (err)
++		return err;
++	if (resource_size(&ba) != SZ_512K || upper_32_bits(ba.end) ||
++	    !IS_ALIGNED(ba.start, SZ_64K))
++		return -ERANGE;
++	base = ioremap_wc(ba.start, resource_size(&ba));
++	if (!base)
++		return -ENOMEM;
++	memset_io(base, 0, resource_size(&ba));
++	wmb();
++	iounmap(base);
++	err = mt7915_npu_prepare_ct(npu, dev->mphy.band_idx, ba.start, csr);
++	if (err)
++		return err;
++	err = mt7915_npu_rx_ring_ct(npu, 1, &rings[1]);
++	if (err)
++		return err;
++	err = mt7915_npu_rx_ring_ct(npu, 0, &rings[0]);
++	if (err)
++		return err;
++	if (max(rings[0], rings[1]) - min(rings[0], rings[1]) < MT7916_CT_RX_BYTES)
++		return -ERANGE;
++	memcpy(ring_base, rings, sizeof(rings));
++	return 0;
++}

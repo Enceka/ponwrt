@@ -14,7 +14,7 @@ mkdir -- "$2"
 overlay=$(cd "$2" && pwd)
 cd "$repo"
 for path in "$package/Makefile" "$package/SHA256SUMS" \
-  package/kernel/mt76/{Makefile,patches/111-mt7915-connac2-mailbox.patch,patches/112-mt7915-connac2-counters.patch} \
+  package/kernel/mt76/{Makefile,patches/111-mt7915-connac2-mailbox.patch,patches/112-mt7915-connac2-counters.patch,patches/113-mt7915-connac2-rx-rings.patch} \
   target/linux/airoha/patches-6.18/931-net-airoha-initialize-ct-connac2-packet-pool.patch \
   target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts}; do
   install -D -m 644 "$path" "$overlay/tree/$path"
