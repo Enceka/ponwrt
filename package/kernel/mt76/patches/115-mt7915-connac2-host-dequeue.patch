@@ -1,0 +1,104 @@
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 2cd3030..bd400e2 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -486,6 +486,8 @@ struct mt7915_npu_host_ct {
+ };
+ int mt7915_npu_host_init_ct(struct mt7915_dev *dev, struct airoha_npu *npu,
+ 			    struct mt7915_npu_host_ct rings[2]);
++int mt7915_npu_host_rx_ct(struct mt7915_npu_host_ct *ring, struct airoha_npu *npu,
++			  struct napi_struct *napi, struct sk_buff **skb, u32 *info);
+ #endif
+ int mt7915_dma_init(struct mt7915_dev *dev, struct mt7915_phy *phy2);
+ void mt7915_dma_prefetch(struct mt7915_dev *dev);
+diff --git a/mt7915/npu.c b/mt7915/npu.c
+index b705b60..c5a350a 100644
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -11,6 +11,8 @@
+ #define MT7916_CT_HOST_COUNT	512
+ #define MT7916_CT_HOST_LEN	3500
+ #define MT7916_CT_HOST_STRIDE	ALIGN(MT7916_CT_HOST_LEN, 64)
++#define MT7916_CT_FRAG_COUNT	GENMASK(31, 29)
++#define MT7916_CT_FRAG_ID	GENMASK(28, 26)
+ 
+ static int mt7915_npu_counters_show(struct seq_file *seq, void *unused)
+ {
+@@ -48,6 +50,77 @@ static int mt7915_npu_counters_show(struct seq_file *seq, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(mt7915_npu_counters);
+ 
++int mt7915_npu_host_rx_ct(struct mt7915_npu_host_ct *ring, struct airoha_npu *npu,
++			  struct napi_struct *napi, struct sk_buff **skb, u32 *info)
++{
++	u16 lengths[7];
++	struct airoha_npu_rx_dma_desc __iomem *desc = &ring->desc[ring->tail];
++	unsigned int total, count, pos, index, copied = 0, consumed = 0;
++	u32 ctrl = readl(&desc->ctrl);
++	int err;
++
++	*skb = NULL;
++	if (!(ctrl & NPU_RX_DMA_DESC_DONE_MASK))
++		return 0;
++	rmb();
++	*info = readl(&desc->info);
++	total = FIELD_GET(NPU_RX_DMA_DESC_LEN_MASK, ctrl);
++	count = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, ctrl) == total ?
++		1 : FIELD_GET(MT7916_CT_FRAG_COUNT, *info);
++	if (!total || !count) {
++		consumed = 1;
++		goto release;
++	}
++	for (pos = 0; pos < count; pos++) {
++		u32 metadata;
++
++		index = (ring->tail + pos) % MT7916_CT_HOST_COUNT;
++		desc = &ring->desc[index];
++		ctrl = readl(&desc->ctrl);
++		if (!(ctrl & NPU_RX_DMA_DESC_DONE_MASK))
++			return 0;
++		rmb();
++		metadata = readl(&desc->info);
++		lengths[pos] = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, ctrl);
++		if (count > 1 && (FIELD_GET(MT7916_CT_FRAG_ID, metadata) != pos + 1 ||
++				  FIELD_GET(NPU_RX_DMA_DESC_LEN_MASK, ctrl) != total ||
++				  !!(ctrl & NPU_RX_DMA_DESC_LAST_MASK) != (pos + 1 == count))) {
++			consumed = max(pos, 1U);
++			goto release;
++		}
++		consumed++;
++		if (!lengths[pos] || lengths[pos] > MT7916_CT_HOST_LEN || copied + lengths[pos] > total)
++			goto release;
++		copied += lengths[pos];
++	}
++	if (copied != total)
++		goto release;
++	*skb = napi_alloc_skb(napi, total);
++	if (*skb) {
++		for (pos = 0; pos < count; pos++) {
++			index = (ring->tail + pos) % MT7916_CT_HOST_COUNT;
++			memcpy_fromio(skb_put(*skb, lengths[pos]),
++				      ring->buffers + index * MT7916_CT_HOST_STRIDE, lengths[pos]);
++		}
++	}
++release:
++	for (pos = 0; pos < consumed; pos++) {
++		desc = &ring->desc[ring->tail];
++		writel_relaxed(0, &desc->info);
++		writel(0, &desc->ctrl);
++		ring->tail = (ring->tail + 1) % MT7916_CT_HOST_COUNT;
++	}
++	wmb();
++	err = regmap_write(npu->regmap, ring->regs + offsetof(struct mt76_queue_regs, dma_idx),
++			   ring->tail);
++	if (err) {
++		dev_kfree_skb_any(*skb);
++		*skb = NULL;
++		return err;
++	}
++	return 1;
++}
++
+ static void mt7915_npu_release(void *data)
+ {
+ 	airoha_npu_put(data);
