@@ -124,7 +124,7 @@ new file mode 100644
 index 0000000..cad0ad5
 --- /dev/null
 +++ b/mt7915/ct_wed.c
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,358 @@
 +#include <linux/module.h>
 +#include <linux/of.h>
 +#include <linux/pci.h>
@@ -142,6 +142,7 @@ index 0000000..cad0ad5
 +	enum mt7915_ct_owner owner;
 +	u32 token_start, token_count;
 +	bool tokens_split;
++	bool irq_requested;
 +	struct airoha_ct_wed_view view;
 +	struct mt76_queue *queue[AIROHA_CT_WED_RING_COUNT];
 +	struct mt76_queue_regs __iomem *native[AIROHA_CT_WED_RING_COUNT];
@@ -213,6 +214,25 @@ index 0000000..cad0ad5
 +	lockdep_assert_held(&dev->mt76.mmio.irq_lock);
 +	bridge = rcu_dereference_protected(dev->ct_wed, lockdep_is_held(&dev->mt76.mmio.irq_lock));
 +	return !bridge || bridge->owner == CT_PREPARED;
++}
++
++static irqreturn_t mt7915_ct_wed_irq(int irq, void *data)
++{
++	struct mt7915_ct_wed *bridge = data;
++	struct mt7915_dev *dev = bridge->dev;
++	unsigned long flags;
++	irqreturn_t result = IRQ_NONE;
++
++	spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
++	if (irq == bridge->view.irq && bridge->owner == CT_WED) {
++		bridge->ops->irq_mask(bridge->lease, 0);
++		if (test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state)) {
++			tasklet_schedule(&dev->mt76.irq_tasklet);
++			result = IRQ_HANDLED;
++		}
++	}
++	spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
++	return result;
 +}
 +
 +static void mt7915_ct_wed_put(struct mt7915_ct_wed *bridge)
@@ -417,9 +437,21 @@ index 0000000..cad0ad5
 +			if (bridge->view.csr[index] == bridge->view.csr[prev])
 +				goto release;
 +	}
++	gate = "exclusive disabled IRQ";
++	err = request_irq(bridge->view.irq, mt7915_ct_wed_irq, IRQF_NO_AUTOEN,
++			  "mt7915-ct-wed", bridge);
++	if (err)
++		goto release;
++	bridge->irq_requested = true;
++	dev_info(device, "CT WED v2 IRQ %d reserved disabled; no DMA or IRQ routing change\n",
++		 bridge->view.irq);
 +	gate = "fabric fence / unbind isolation missing";
 +	err = -EOPNOTSUPP;
 +release:
++	if (bridge->irq_requested) {
++		free_irq(bridge->view.irq, bridge);
++		bridge->irq_requested = false;
++	}
 +	if (bridge->ops->release(bridge->lease)) {
 +		spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
 +		bridge->owner = CT_PREPARED;
