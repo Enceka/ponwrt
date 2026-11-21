@@ -9,9 +9,27 @@ def main():
     parser.add_argument("sha256", help="Digest read independently from the board's factory volume")
     parser.add_argument("--connac2", action="store_true")
     parser.add_argument("--connac2-rx", action="store_true")
+    parser.add_argument("--connac2-host-ppe", action="store_true",
+                        help="Enable host PPE in this RAM image (requires Connac2 RX and verified firmware)")
+    parser.add_argument("--firmware-dir", type=Path, help="Directory containing the two packaged NPU binaries")
     args = parser.parse_args()
     if args.connac2_rx and not args.connac2:
         parser.error("--connac2-rx requires --connac2")
+    if args.connac2_host_ppe and not args.connac2_rx:
+        parser.error("--connac2-host-ppe requires --connac2-rx")
+    if args.connac2_host_ppe != bool(args.firmware_dir):
+        parser.error("--connac2-host-ppe and --firmware-dir must be used together")
+    if args.connac2_host_ppe:
+        manifest = (Path(__file__).resolve().parents[4] / "package/firmware/hg5585f-ct-npu-firmware/SHA256SUMS")
+        try:
+            hashes = dict(line.split()[::-1] for line in manifest.read_text().splitlines())
+            if set(hashes) != {"npu_rv32.bin", "npu_data.bin"}:
+                parser.error("incomplete Connac2 firmware identity")
+            for name, digest in hashes.items():
+                if hashlib.sha256((args.firmware_dir / name).read_bytes()).hexdigest() != digest:
+                    parser.error(f"Connac2 firmware digest mismatch: {name}")
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
     data = args.factory.read_bytes()
     if len(data) != 1 << 20 or hashlib.sha256(data).hexdigest() != args.sha256:
         parser.error("factory size or live digest mismatch")
@@ -37,6 +55,8 @@ def main():
     print(']; }; }; };')
     if args.connac2_rx:
         print('&pcie1 { pcie@0,0 { wifi@0,0 { airoha,connac2-rx; }; }; };')
+    if args.connac2_host_ppe:
+        print('&eth { airoha,connac2-host-ppe; };')
 
 
 if __name__ == "__main__":

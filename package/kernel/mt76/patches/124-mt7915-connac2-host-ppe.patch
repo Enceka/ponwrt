@@ -1,0 +1,348 @@
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 8a468fc..27fb260 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -410,7 +410,7 @@ mt7915_init_wiphy(struct mt7915_phy *phy)
+ 	hw->max_tx_aggregation_subframes = IEEE80211_MAX_AMPDU_BUF_HE;
+ 	hw->netdev_features = NETIF_F_RXCSUM;
+ 
+-	if (mtk_wed_device_active(&mdev->mmio.wed))
++	if (mtk_wed_device_active(&mdev->mmio.wed) || mt7915_ct_ppe_enabled(dev))
+ 		hw->netdev_features |= NETIF_F_HW_TC;
+ 
+ 	hw->radiotap_timestamp.units_pos =
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 93fd99b..17a6b05 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -526,6 +526,13 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 		}
+ 	} else {
+ 		status->flag |= RX_FLAG_8023;
++#ifdef CONFIG_MT7915_NPU
++		if ((q == MT_RXQ_NPU0 || q == MT_RXQ_NPU1) && unicast &&
++		    (status->flag & RX_FLAG_DECRYPTED) &&
++		    !(status->flag & (RX_FLAG_ONLY_MONITOR | RX_FLAG_FAILED_FCS_CRC |
++				      RX_FLAG_MMIC_ERROR)) && !(rxd2 & MT_RXD2_NORMAL_HDR_TRANS_ERROR))
++			mt7915_ct_check_ppe(dev, msta, skb, *info);
++#endif
+ 		mt7915_wed_check_ppe(dev, &dev->mt76.q_rx[q], msta, skb,
+ 				     *info);
+ 	}
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 3d8dde1..d549592 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -822,6 +822,9 @@ __mt7915_drop_sta(void *ptr, u8 *mac, struct ieee80211_vif *vif)
+ 		return;
+ 
+ 	msta = (struct mt7915_sta *)sta->drv_priv;
++#ifdef CONFIG_MT7915_NPU
++	WRITE_ONCE(msta->ct_authorized, false);
++#endif
+ 	mt7915_mcu_add_sta(data->dev, vif, sta, CONN_STATE_DISCONNECT, false);
+ 	msta->wcid.tx_info &= ~MT_WCID_TX_INFO_SET;
+ 	msta->wcid.sta_disabled = 1;
+@@ -1882,6 +1885,23 @@ mt7915_reconfig_complete(struct ieee80211_hw *hw,
+ 				     MT7915_WATCHDOG_TIME);
+ }
+ 
++#ifdef CONFIG_MT7915_NPU
++static int mt7915_ct_sta_state(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			      struct ieee80211_sta *sta, enum ieee80211_sta_state old,
++			      enum ieee80211_sta_state new)
++{
++	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
++	int err;
++
++	if (old == IEEE80211_STA_AUTHORIZED)
++		WRITE_ONCE(msta->ct_authorized, false);
++	err = mt76_sta_state(hw, vif, sta, old, new);
++	if (!err && new == IEEE80211_STA_AUTHORIZED && vif->type == NL80211_IFTYPE_AP)
++		WRITE_ONCE(msta->ct_authorized, true);
++	return err;
++}
++#endif
++
+ const struct ieee80211_ops mt7915_ops = {
+ 	.add_chanctx = ieee80211_emulate_add_chanctx,
+ 	.remove_chanctx = ieee80211_emulate_remove_chanctx,
+@@ -1898,7 +1918,11 @@ const struct ieee80211_ops mt7915_ops = {
+ 	.bss_info_changed = mt7915_bss_info_changed,
+ 	.start_ap = mt7915_start_ap,
+ 	.stop_ap = mt7915_stop_ap,
++#ifdef CONFIG_MT7915_NPU
++	.sta_state = mt7915_ct_sta_state,
++#else
+ 	.sta_state = mt76_sta_state,
++#endif
+ 	.sta_pre_rcu_remove = mt76_sta_pre_rcu_remove,
+ 	.link_sta_rc_update = mt7915_sta_rc_update,
+ 	.set_key = mt7915_set_key,
+@@ -1938,6 +1962,10 @@ const struct ieee80211_ops mt7915_ops = {
+ 	.set_radar_background = mt7915_set_radar_background,
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	.net_fill_forward_path = mt7915_net_fill_forward_path,
++#endif
++#ifdef CONFIG_MT7915_NPU
++	.net_setup_tc = mt7915_ct_setup_tc,
++#elif defined(CONFIG_NET_MEDIATEK_SOC_WED)
+ 	.net_setup_tc = mt76_wed_net_setup_tc,
+ #endif
+ 	.reconfig_complete = mt7915_reconfig_complete,
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index a84819e..5ce6722 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -146,6 +146,9 @@ enum vow_drr_ctrl_id {
+ 
+ struct mt7915_sta {
+ 	struct mt76_wcid wcid; /* must be first */
++#ifdef CONFIG_MT7915_NPU
++	bool ct_authorized;
++#endif
+ 
+ 	struct mt7915_vif *vif;
+ 
+@@ -494,10 +497,16 @@ int mt7915_npu_host_rx_ct(struct mt7915_npu_host_ct *ring, struct airoha_npu *np
+ int mt7915_ct_prepare(struct mt7915_dev *dev);
+ int mt7915_ct_bind(struct mt7915_dev *dev);
+ void mt7915_ct_stop(struct mt7915_dev *dev);
++bool mt7915_ct_ppe_enabled(struct mt7915_dev *dev);
++void mt7915_ct_check_ppe(struct mt7915_dev *dev, struct mt7915_sta *msta,
++			 struct sk_buff *skb, u32 info);
++int mt7915_ct_setup_tc(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++		       struct net_device *netdev, enum tc_setup_type type, void *data);
+ int mt7915_ct_clear_sta(struct mt7915_dev *dev, u8 band, u16 wcid);
+ int mt7915_ct_set_ba(struct mt7915_dev *dev, u8 band, u16 wcid,
+ 		     u8 tid, u16 size, u16 ssn);
+ #else
++static inline bool mt7915_ct_ppe_enabled(struct mt7915_dev *dev) { return false; }
+ static inline int mt7915_ct_clear_sta(struct mt7915_dev *dev, u8 band, u16 wcid)
+ {
+ 	return 0;
+diff --git a/mt7915/npu.c b/mt7915/npu.c
+index fead151..8fbba8c 100644
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -3,6 +3,7 @@
+ #include <linux/pci.h>
+ #include <linux/if_vlan.h>
+ #include <linux/unaligned.h>
++#include <net/pkt_cls.h>
+ #include "mt7915.h"
+ #include "../dma.h"
+ #include "mac.h"
+@@ -89,12 +90,180 @@ struct mt7915_ct_poll {
+ struct mt7915_ct_path {
+ 	struct mt7915_dev *dev;
+ 	struct airoha_npu *npu;
++	struct airoha_ppe_dev *ppe;
++	struct list_head blocks;
+ 	struct mt7915_npu_host_ct rings[2];
+ 	struct mt7915_ct_poll poll[2];
+ 	u32 bases[2];
+ 	bool stopping;
+ };
+ 
++struct mt7915_ct_block {
++	struct mt7915_ct_path *path;
++	struct xarray cookies;
++	struct mutex lock;
++	int ifindex;
++};
++
++bool mt7915_ct_ppe_enabled(struct mt7915_dev *dev)
++{
++	return dev->ct_path && dev->ct_path->ppe;
++}
++
++static bool mt7915_ct_flow_ingress(struct flow_rule *rule, int ifindex)
++{
++	struct flow_match_basic basic;
++	struct flow_match_meta meta;
++	const struct flow_action_entry *act;
++	int index;
++
++	if (!rule || !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META) ||
++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC))
++		return false;
++	flow_rule_match_meta(rule, &meta);
++	flow_rule_match_basic(rule, &basic);
++	if (meta.mask->ingress_ifindex != U32_MAX || meta.key->ingress_ifindex != ifindex ||
++	    basic.mask->n_proto != htons(0xffff) || basic.key->n_proto != htons(ETH_P_IP))
++		return false;
++	flow_action_for_each(index, act, &rule->action) {
++		if (act->id == FLOW_ACTION_REDIRECT)
++			return act->dev && !act->dev->ieee80211_ptr;
++	}
++	return false;
++}
++
++static int mt7915_ct_flow_cb(enum tc_setup_type type, void *data, void *priv)
++{
++	struct mt7915_ct_block *block = priv;
++	struct flow_cls_offload *flow = data;
++	int err = -EOPNOTSUPP;
++
++	if (type != TC_SETUP_CLSFLOWER)
++		return err;
++	mutex_lock(&block->lock);
++	switch (flow->command) {
++	case FLOW_CLS_REPLACE:
++		if (READ_ONCE(block->path->stopping) ||
++		    !mt7915_ct_flow_ingress(flow_cls_offload_flow_rule(flow), block->ifindex))
++			break;
++		if (xa_load(&block->cookies, flow->cookie)) {
++			err = 0;
++			break;
++		}
++		err = xa_insert(&block->cookies, flow->cookie, xa_mk_value(1), GFP_KERNEL);
++		if (err)
++			break;
++		err = airoha_ppe_dev_setup_tc_block_cb(block->path->ppe, flow);
++		if (err)
++			xa_erase(&block->cookies, flow->cookie);
++		break;
++	case FLOW_CLS_DESTROY:
++	case FLOW_CLS_STATS:
++		if (!xa_load(&block->cookies, flow->cookie))
++			break;
++		err = airoha_ppe_dev_setup_tc_block_cb(block->path->ppe, flow);
++		if (flow->command == FLOW_CLS_DESTROY && (!err || err == -ENOENT))
++			xa_erase(&block->cookies, flow->cookie);
++		break;
++	}
++	mutex_unlock(&block->lock);
++	return err;
++}
++
++static void mt7915_ct_block_release(void *priv)
++{
++	struct mt7915_ct_block *block = priv;
++	struct flow_cls_offload destroy = { .command = FLOW_CLS_DESTROY };
++	unsigned long cookie;
++	void *entry;
++
++	xa_for_each(&block->cookies, cookie, entry) {
++		destroy.cookie = cookie;
++		airoha_ppe_dev_setup_tc_block_cb(block->path->ppe, &destroy);
++	}
++	xa_destroy(&block->cookies);
++	kfree(block);
++}
++
++int mt7915_ct_setup_tc(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++		       struct net_device *netdev, enum tc_setup_type type, void *data)
++{
++	struct mt7915_dev *dev = mt7915_hw_dev(hw);
++	struct mt7915_ct_path *path = dev->ct_path;
++	struct flow_block_offload *offload = data;
++	struct flow_block_cb *cb;
++	struct mt7915_ct_block *block;
++
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed))
++		return mt76_wed_net_setup_tc(hw, vif, netdev, type, data);
++#endif
++	if (!mt7915_ct_ppe_enabled(dev) || type != TC_SETUP_FT ||
++	    offload->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++		return -EOPNOTSUPP;
++	offload->driver_block_list = &path->blocks;
++	cb = flow_block_cb_lookup(offload->block, mt7915_ct_flow_cb, netdev);
++	switch (offload->command) {
++	case FLOW_BLOCK_BIND:
++		if (!tc_can_offload(netdev) || vif->type != NL80211_IFTYPE_AP || READ_ONCE(path->stopping))
++			return -EOPNOTSUPP;
++		if (!cb) {
++			block = kzalloc(sizeof(*block), GFP_KERNEL);
++			if (!block)
++				return -ENOMEM;
++			block->path = path;
++			block->ifindex = netdev->ifindex;
++			xa_init(&block->cookies);
++			mutex_init(&block->lock);
++			cb = flow_block_cb_alloc(mt7915_ct_flow_cb, netdev, block, mt7915_ct_block_release);
++			if (IS_ERR(cb)) {
++				kfree(block);
++				return PTR_ERR(cb);
++			}
++			flow_block_cb_add(cb, offload);
++			list_add_tail(&cb->driver_list, &path->blocks);
++		}
++		flow_block_cb_incref(cb);
++		return 0;
++	case FLOW_BLOCK_UNBIND:
++		if (!cb)
++			return -ENOENT;
++		if (!flow_block_cb_decref(cb)) {
++			flow_block_cb_remove(cb, offload);
++			list_del(&cb->driver_list);
++		}
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++void mt7915_ct_check_ppe(struct mt7915_dev *dev, struct mt7915_sta *msta,
++			 struct sk_buff *skb, u32 info)
++{
++	struct mt7915_ct_path *path = dev->ct_path;
++	struct ieee80211_sta *sta;
++	const struct ethhdr *hdr;
++
++	if (!mt7915_ct_ppe_enabled(dev) || READ_ONCE(path->stopping) || !msta ||
++	    FIELD_GET(NPU_RX_DMA_CRSN_MASK, info) != PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED ||
++	    skb->len < ETH_HLEN)
++		return;
++	sta = wcid_to_sta(&msta->wcid);
++	hdr = (const void *)skb->data;
++	if (!sta || !READ_ONCE(msta->ct_authorized) || hdr->h_proto != htons(ETH_P_IP) ||
++	    is_multicast_ether_addr(hdr->h_dest) ||
++	    !ether_addr_equal(hdr->h_source, sta->addr))
++		return;
++	skb_reset_mac_header(skb);
++	airoha_ppe_dev_check_skb(path->ppe, skb, FIELD_GET(NPU_RX_DMA_FOE_ID_MASK, info), true);
++}
++
++static void mt7915_ct_put_ppe(void *data)
++{
++	airoha_ppe_put_dev(data);
++}
++
+ int mt7915_ct_clear_sta(struct mt7915_dev *dev, u8 band, u16 wcid)
+ {
+ 	struct mt7915_ct_path *path = dev->ct_path;
+@@ -458,10 +627,12 @@ static int mt7915_npu_rx_csr_ct(struct device *hif, u32 offset, phys_addr_t *add
+ int mt7915_ct_prepare(struct mt7915_dev *dev)
+ {
+ 	struct device *device = dev->mt76.dev;
++	struct device_node *ethernet;
+ 	struct mt7915_ct_path *path;
+ 	struct resource pool;
+ 	const char *firmware;
+ 	unsigned int queue, index;
++	bool host_ppe;
+ 	int err;
+ 
+ 	if (!of_property_read_bool(device->of_node, "airoha,connac2-rx"))
+@@ -474,6 +645,18 @@ int mt7915_ct_prepare(struct mt7915_dev *dev)
+ 	if (!path)
+ 		return -ENOMEM;
+ 	path->dev = dev;
++	INIT_LIST_HEAD(&path->blocks);
++	ethernet = of_parse_phandle(device->of_node, "airoha,eth", 0);
++	host_ppe = ethernet && of_property_read_bool(ethernet, "airoha,connac2-host-ppe");
++	of_node_put(ethernet);
++	if (host_ppe) {
++		path->ppe = airoha_ppe_get_dev(device);
++		if (IS_ERR(path->ppe))
++			return PTR_ERR(path->ppe);
++		err = devm_add_action_or_reset(device, mt7915_ct_put_ppe, path->ppe);
++		if (err)
++			return err;
++	}
+ 	path->npu = airoha_npu_get(device);
+ 	if (IS_ERR(path->npu))
+ 		return PTR_ERR(path->npu);

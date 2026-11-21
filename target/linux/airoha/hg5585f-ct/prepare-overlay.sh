@@ -21,12 +21,17 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   package/kernel/mt76/patches/{120-mt7915-connac2-rx-path.patch,121-mt7915-connac2-ba-lifecycle.patch} \
   package/kernel/mt76/patches/122-mt7915-connac2-dma-declaration.patch \
   package/kernel/mt76/patches/123-mt7915-connac2-check-rx-body.patch \
+  package/kernel/mt76/patches/124-mt7915-connac2-host-ppe.patch \
   target/linux/airoha/patches-6.18/931-net-airoha-initialize-ct-connac2-packet-pool.patch \
+  target/linux/airoha/patches-6.18/932-net-airoha-initialize-ct-connac2-host-ppe.patch \
+  target/linux/airoha/hg5585f-ct/ram-dts.py \
   target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts}; do
-  install -D -m 644 "$path" "$overlay/tree/$path"
+  mkdir -p "$overlay/tree/$(dirname "$path")"
+  install -m 644 "$path" "$overlay/tree/$path"
 done
+mkdir -p "$overlay/tree/$package/files"
 for name in "${firmware[@]}"; do
-  install -D -m 644 "$source_dir/$name" "$overlay/tree/$package/files/$name"
+  install -m 644 "$source_dir/$name" "$overlay/tree/$package/files/$name"
 done
 (cd "$overlay/tree/$package/files" && sha256sum -c ../SHA256SUMS)
 printf '%s\n' CONFIG_MT7915_NPU=y CONFIG_PACKAGE_hg5585f-ct-npu-firmware=y > "$overlay/local.config"
