@@ -8,7 +8,10 @@ def main():
     parser.add_argument("factory", type=Path)
     parser.add_argument("sha256", help="Digest read independently from the board's factory volume")
     parser.add_argument("--connac2", action="store_true")
+    parser.add_argument("--connac2-rx", action="store_true")
     args = parser.parse_args()
+    if args.connac2_rx and not args.connac2:
+        parser.error("--connac2-rx requires --connac2")
     data = args.factory.read_bytes()
     if len(data) != 1 << 20 or hashlib.sha256(data).hexdigest() != args.sha256:
         parser.error("factory size or live digest mismatch")
@@ -32,6 +35,8 @@ def main():
     for start in range(0, len(eeprom), 32):
         print(eeprom[start:start + 32].hex(" "))
     print(']; }; }; };')
+    if args.connac2_rx:
+        print('&pcie1 { pcie@0,0 { wifi@0,0 { airoha,connac2-rx; }; }; };')
 
 
 if __name__ == "__main__":
