@@ -16,8 +16,10 @@ PKG_MAINTAINER:=Felix Fietkau <nbd@nbd.name>
 PKG_USE_NINJA:=0
 PKG_BUILD_PARALLEL:=1
 
+PKG_PREPARED_DEPENDS += CONFIG_PACKAGE_kmod-mt7916-ct-wed-prepare
 PKG_CONFIG_DEPENDS += \
 	CONFIG_MT7915_NPU \
+	CONFIG_PACKAGE_kmod-mt7916-ct-wed-prepare \
 	CONFIG_PACKAGE_kmod-mt76-usb \
 	CONFIG_PACKAGE_kmod-mt76x02-common \
 	CONFIG_PACKAGE_kmod-mt76x0-common \
@@ -255,6 +257,15 @@ define KernelPackage/mt7916-firmware
   $(KernelPackage/mt76-default)
   DEPENDS+=+kmod-mt7915e
   TITLE:=MediaTek MT7916 firmware
+endef
+
+define KernelPackage/mt7916-ct-wed-prepare
+  SUBMENU:=Wireless Drivers
+  TITLE:=HG5585F-CT MT7916 slot 1 cold ring preparation
+  DEPENDS:=@TARGET_airoha_an7581_DEVICE_fiberhome_hg5585f-ct @MT7915_NPU kmod-mt7915e
+  FILES:=$(PKG_BUILD_DIR)/mt7915/ct_wed_platform.ko
+  AUTOLOAD:=$(call AutoLoad,19,ct_wed_platform,1)
+  MODPARAMS.ct_wed_platform:=prepare=1
 endef
 
 define KernelPackage/mt7981-firmware
@@ -533,6 +544,15 @@ ifdef CONFIG_PACKAGE_kmod-mt7925e
   PKG_MAKE_FLAGS += CONFIG_MT7925E=m
 endif
 
+ifneq ($(filter y m,$(CONFIG_PACKAGE_kmod-mt7916-ct-wed-prepare)),)
+  define Build/Prepare
+	$(call Build/Prepare/Default)
+	$(call PatchDir,$(PKG_BUILD_DIR),$(CURDIR)/ct-wed/patches,ct-wed/)
+	$(INSTALL_DIR) $(PKG_BUILD_DIR)/mt7915/ct-wed
+	$(CP) $(CURDIR)/ct-wed/ct_wed_platform.c $(CURDIR)/ct-wed/ct_wdma_rx.h $(PKG_BUILD_DIR)/mt7915/ct-wed/
+  endef
+endif
+
 define Build/Compile
 	+$(KERNEL_MAKE) $(PKG_JOBS) \
 		$(PKG_MAKE_FLAGS) \
@@ -781,6 +801,7 @@ $(eval $(call KernelPackage,mt7663u))
 $(eval $(call KernelPackage,mt7663s))
 $(eval $(call KernelPackage,mt7915-firmware))
 $(eval $(call KernelPackage,mt7915e))
+$(eval $(call KernelPackage,mt7916-ct-wed-prepare))
 $(eval $(call KernelPackage,mt7916-firmware))
 $(eval $(call KernelPackage,mt7981-firmware))
 $(eval $(call KernelPackage,mt7986-firmware))
