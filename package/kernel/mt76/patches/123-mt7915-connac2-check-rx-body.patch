@@ -1,0 +1,16 @@
+diff --git a/mt7915/npu.c b/mt7915/npu.c
+index f7f2247..fead151 100644
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -278,8 +278,10 @@ static bool mt7915_ct_normal_frame(struct sk_buff *skb)
+ 		__le16 fc = get_unaligned((const __le16 *)(skb->data + hdr));
+ 
+ 		minimum = ieee80211_hdrlen(fc);
++		if (ieee80211_is_back_req(fc))
++			minimum = sizeof(struct ieee80211_bar);
+ 		if (le32_get_bits(rxd[4], MT_RXD4_NORMAL_PAYLOAD_FORMAT))
+-			minimum += 2;
++			minimum += 2 + ETH_ALEN;
+ 	}
+ 	if (payload < minimum)
+ 		return false;
