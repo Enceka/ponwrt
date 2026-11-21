@@ -1,0 +1,107 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1659,10 +1659,14 @@ enum airoha_ct_sram_op { CT_EXPECT_EMPTY, CT_CHECK_OWNED, CT_CLEAR_OWNED };
+ static int airoha_ppe_ct_check_sram(struct airoha_ppe *ppe, enum airoha_ct_sram_op op)
+ {
+ 	u32 count = airoha_ppe_get_total_sram_num_entries(ppe);
++	struct airoha_eth *eth = ppe->eth;
++	u32 cleared[2] = {};
+ 	u32 hash;
+ 
+ 	for (hash = 0; hash < count; hash++) {
+ 		struct airoha_foe_entry *entry;
++		unsigned int bank = hash / PPE_SRAM_NUM_ENTRIES;
++		const char *access = "read";
+ 		int err = 0;
+ 
+ 		spin_lock_bh(&ppe_lock);
+@@ -1678,16 +1682,31 @@ static int airoha_ppe_ct_check_sram(struct airoha_ppe *ppe, enum airoha_ct_sram_
+ 			    (type != PPE_PKT_TYPE_IPV4_HNAPT && type != PPE_PKT_TYPE_IPV4_ROUTE)) {
+ 				err = -EBUSY;
+ 			} else if (op == CT_CLEAR_OWNED) {
++				access = "write";
+ 				memset(entry, 0, sizeof(*entry));
+ 				err = airoha_ppe_foe_commit_sram_entry(ppe, hash);
++				if (!err)
++					cleared[bank]++;
+ 			}
+ 		}
+ 		spin_unlock_bh(&ppe_lock);
+-		if (err)
++		if (err) {
++			if (ppe->ct_owns_sram)
++				dev_err(eth->dev, "CT PPE %s %s bank=%u row=%u err=%d ctrl=%08x glo=%08x flow=%08x tb=%08x\n",
++					op == CT_CHECK_OWNED ? "preflight" :
++					op == CT_CLEAR_OWNED ? "clear" : "verify", access,
++					bank, hash % PPE_SRAM_NUM_ENTRIES, err,
++					airoha_fe_rr(eth, REG_PPE_RAM_CTRL(bank)),
++					airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank)),
++					airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)),
++					airoha_fe_rr(eth, REG_PPE_TB_CFG(bank)));
+ 			return err;
++		}
+ 		if (!(hash % 256))
+ 			cond_resched();
+ 	}
++	if (op == CT_CLEAR_OWNED)
++		dev_info(eth->dev, "CT PPE cleared rows bank0=%u bank1=%u\n", cleared[0], cleared[1]);
+ 	return 0;
+ }
+ 
+@@ -1773,13 +1792,43 @@ static int airoha_ppe_ct_quiesce(struct airoha_ppe *ppe)
+ 	return 0;
+ }
+ 
++static int airoha_ppe_ct_stop_learning(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	u32 no_foe = FIELD_PREP(PPE_TB_CFG_SEARCH_MISS_MASK, 2);
++	int bank, err;
++	u32 val;
++
++	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
++		airoha_fe_rmw(eth, REG_PPE_TB_CFG(bank), PPE_TB_CFG_SEARCH_MISS_MASK, no_foe);
++		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(bank), CT_HOST_IPV4_FLOWS);
++	}
++	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
++		u32 flow = airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank));
++		u32 tb = airoha_fe_rr(eth, REG_PPE_TB_CFG(bank));
++
++		if (flow || (tb & PPE_TB_CFG_SEARCH_MISS_MASK) != no_foe) {
++			dev_err(eth->dev, "CT PPE stop learning bank=%d flow=%08x tb=%08x\n", bank, flow, tb);
++			return -EBUSY;
++		}
++		err = read_poll_timeout(airoha_fe_rr, val, !(val & PPE_GLO_CFG_BUSY_MASK),
++					10, 100000, false, eth, REG_PPE_GLO_CFG(bank));
++		if (err || !(val & PPE_GLO_CFG_EN_MASK)) {
++			dev_err(eth->dev, "CT PPE drain bank=%d glo=%08x\n", bank, val);
++			return err ?: -EIO;
++		}
++	}
++	return 0;
++}
++
+ static int airoha_ppe_ct_stop(struct airoha_ppe *ppe)
+ {
+ 	struct airoha_eth *eth = ppe->eth;
++	bool live = ppe->ct_host_ppe && ppe->ct_owns_sram;
+ 	int bank, err;
+ 
+ 	WRITE_ONCE(ppe->ct_host_ppe, false);
+-	err = airoha_ppe_ct_quiesce(ppe);
++	err = live ? airoha_ppe_ct_stop_learning(ppe) : airoha_ppe_ct_quiesce(ppe);
+ 	if (err)
+ 		return err;
+ 	if (ppe->ct_owns_sram) {
+@@ -1792,6 +1841,11 @@ static int airoha_ppe_ct_stop(struct airoha_ppe *ppe)
+ 			return err;
+ 		ppe->ct_owns_sram = false;
+ 	}
++	if (live) {
++		err = airoha_ppe_ct_quiesce(ppe);
++		if (err)
++			return err;
++	}
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++)
+ 		airoha_ppe_ct_regs(ppe, bank, true);
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++)
