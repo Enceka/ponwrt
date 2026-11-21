@@ -11,6 +11,7 @@
 
 #include "../ct-wed-provider-abi.h"
 #include "ct_wdma_rx.h"
+#include "ct_wed_bm.h"
 
 #define CT_TX_COUNT 2048
 #define CT_TX_BYTES (CT_TX_COUNT * sizeof(struct ct_txd))
@@ -39,13 +40,21 @@ struct airoha_ct_wed {
 		struct ct_rx_plan plan;
 	} rx[CT_WDMA_RX_RINGS];
 	struct airoha_ct_wed_plan host;
+	struct {
+		void *cpu;
+		dma_addr_t dma;
+		size_t bytes;
+	} bm[2 + CT_BM_CHUNKS];
 	bool prepared;
 };
 
 static DEFINE_MUTEX(ct_lock);
 static struct airoha_ct_wed *ct_slot;
 static bool prepare;
+static bool prepare_bm;
 module_param(prepare, bool, 0444);
+module_param(prepare_bm, bool, 0444);
+MODULE_PARM_DESC(prepare_bm, "Prepare stock hardware token buffers without enabling DMA");
 MODULE_PARM_DESC(prepare, "Permit a software-only dual-ring lease; engines stay disabled");
 
 static void ct_free(struct kref *ref)
@@ -89,6 +98,11 @@ static void ct_release_locked(struct airoha_ct_wed *wed)
 	unsigned int idx;
 
 	lockdep_assert_held(&ct_lock);
+	for (idx = 0; idx < ARRAY_SIZE(wed->bm); idx++)
+		if (wed->bm[idx].cpu)
+			dma_free_coherent(wed->dev, wed->bm[idx].bytes,
+					  wed->bm[idx].cpu, wed->bm[idx].dma);
+	memset(wed->bm, 0, sizeof(wed->bm));
 	for (idx = 0; idx < ARRAY_SIZE(wed->rx); idx++) {
 		if (wed->rx[idx].desc)
 			dma_free_coherent(wed->dev, CT_WDMA_RX_COUNT * sizeof(struct ct_txd),
@@ -193,6 +207,60 @@ static int ct_check_plan(struct airoha_ct_wed *wed, const struct airoha_ct_wed_p
 	return 0;
 }
 
+static int ct_prepare_bm(struct airoha_ct_wed *wed, const struct airoha_ct_wed_plan *host)
+{
+	unsigned int idx, pos;
+
+	lockdep_assert_held(&ct_lock);
+	static_assert(sizeof(struct ct_bm_desc) == 16);
+	if (!prepare_bm)
+		return 0;
+	if (host->host_token_start != CT_BM_COUNT || host->host_token_count != 4096)
+		return -EINVAL;
+	for (idx = 0; idx < ARRAY_SIZE(wed->bm); idx++) {
+		size_t bytes = idx == 0 ? CT_BM_COUNT * sizeof(struct ct_bm_desc) :
+			       idx == 1 ? CT_BM_COUNT * CT_BM_HEADER_SIZE :
+			       CT_BM_CHUNK_TOKENS * CT_BM_PAYLOAD_STRIDE;
+		dma_addr_t dma;
+		void *cpu = dma_alloc_coherent(wed->dev, bytes, &dma, GFP_KERNEL);
+
+		if (!cpu)
+			return -ENOMEM;
+		wed->bm[idx].cpu = cpu;
+		wed->bm[idx].dma = dma;
+		wed->bm[idx].bytes = bytes;
+		if (!dma || dma > U32_MAX - bytes + 1 || !IS_ALIGNED(dma, 16))
+			return -ERANGE;
+		for (pos = 0; pos < ARRAY_SIZE(host->ring); pos++)
+			if (ct_overlap(dma, bytes, host->ring[pos].desc,
+				       host->ring[pos].count * sizeof(struct ct_txd)))
+				return -EINVAL;
+		for (pos = 0; pos < ARRAY_SIZE(wed->mid); pos++)
+			if (ct_overlap(dma, bytes, wed->mid[pos].dma, CT_TX_BYTES))
+				return -EINVAL;
+		for (pos = 0; pos < ARRAY_SIZE(wed->rx); pos++)
+			if (ct_overlap(dma, bytes, wed->rx[pos].dma,
+				       CT_WDMA_RX_COUNT * sizeof(struct ct_txd)))
+				return -EINVAL;
+		for (pos = 0; pos < idx; pos++)
+			if (ct_overlap(dma, bytes, wed->bm[pos].dma, wed->bm[pos].bytes))
+				return -EINVAL;
+		memset(cpu, 0, bytes);
+	}
+	for (idx = 0; idx < CT_BM_COUNT; idx++) {
+		struct ct_bm_desc *desc = wed->bm[0].cpu;
+		unsigned int chunk = 2 + idx / CT_BM_CHUNK_TOKENS;
+		unsigned int offset = idx % CT_BM_CHUNK_TOKENS * CT_BM_PAYLOAD_STRIDE;
+
+		ct_bm_encode(&desc[idx], wed->bm[1].cpu + idx * CT_BM_HEADER_SIZE,
+			     lower_32_bits(wed->bm[1].dma + idx * CT_BM_HEADER_SIZE),
+			     lower_32_bits(wed->bm[chunk].dma + offset), idx);
+	}
+	dev_info(wed->dev, "prepared BM: %u hardware tokens, %u-byte headers, %u-byte payloads; no register writes\n",
+		 CT_BM_COUNT, CT_BM_HEADER_SIZE, CT_BM_PAYLOAD_SIZE);
+	return 0;
+}
+
 static int ct_acquire(struct airoha_ct_wed *wed, const struct airoha_ct_wed_plan *plan,
 		      struct airoha_ct_wed_view *view)
 {
@@ -246,6 +314,9 @@ static int ct_acquire(struct airoha_ct_wed *wed, const struct airoha_ct_wed_plan
 		ring->producer = 0;
 	}
 	err = ct_prepare_rx(wed, plan);
+	if (err)
+		goto unwind;
+	err = ct_prepare_bm(wed, plan);
 	if (err)
 		goto unwind;
 	dev_info(wed->dev, "prepared WDMA RX %u/%u, WDMA+%03x/%03x WED+%03x/%03x; no register writes\n",
