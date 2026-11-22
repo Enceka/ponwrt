@@ -1,0 +1,57 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mt76: use INTx for the active CT slot1 WED path
+
+Keep the original IRQ allocation policy unless the gated CT WED activation
+is requested for the MT7916 primary PCI device with a WED provider. Its
+stock interrupt agent polls the root controller INTx status, so require a
+legacy vector before exposing any WED rings. Leave the secondary PCI
+function and the default native path unchanged.
+
+--- a/mt7915/ct_wed.c
++++ b/mt7915/ct_wed.c
+@@ -10,6 +10,14 @@
+ module_param(ct_wed_activate, bool, 0444);
+ MODULE_PARM_DESC(ct_wed_activate, "Activate the cold CT slot1 dual-ring WED path; retained until reboot");
+ 
++bool mt7915_ct_wed_legacy_irq(struct mt7915_dev *dev)
++{
++	return ct_wed_activate && dev_is_pci(dev->mt76.dev) &&
++	       to_pci_dev(dev->mt76.dev)->device == 0x7906 &&
++	       of_find_property(dev->mt76.dev->of_node,
++				"airoha,wed-provider", NULL);
++}
++
+ enum mt7915_ct_owner { CT_PREPARED, CT_SWITCHING, CT_WED, CT_QUIESCING, CT_RETAINED };
+ 
+ struct mt7915_ct_wed {
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -486,6 +486,7 @@
+ #define MT7916_CT_MAX_WCID	150
+ 
+ #ifdef CONFIG_MT7915_NPU
++bool mt7915_ct_wed_legacy_irq(struct mt7915_dev *dev);
+ int mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2);
+ int mt7915_ct_wed_detach(struct mt7915_dev *dev);
+ int mt7915_ct_wed_expose(struct mt7915_dev *dev, struct mt7915_phy *phy2);
+@@ -531,6 +532,7 @@
+ 	return 0;
+ }
+ static inline int mt7915_ct_prepare(struct mt7915_dev *dev) { return 0; }
++static inline bool mt7915_ct_wed_legacy_irq(struct mt7915_dev *dev) { return false; }
+ static inline int mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2) { return 0; }
+ static inline int mt7915_ct_wed_detach(struct mt7915_dev *dev) { return 0; }
+ static inline bool mt7915_ct_wed_retained(struct mt7915_dev *dev) { return false; }
+--- a/mt7915/pci.c
++++ b/mt7915/pci.c
+@@ -145,7 +145,9 @@
+ 	if (!ret) {
+ 		hif2 = mt7915_pci_init_hif2(pdev);
+ 
+-		ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
++		ret = pci_alloc_irq_vectors(pdev, 1, 1,
++					    mt7915_ct_wed_legacy_irq(dev) ?
++					    PCI_IRQ_INTX : PCI_IRQ_ALL_TYPES);
+ 		if (ret < 0) {
+ 			mt7915_put_hif2(hif2);
+ 			goto free_device;

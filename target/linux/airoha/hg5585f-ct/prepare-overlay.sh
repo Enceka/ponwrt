@@ -23,7 +23,12 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   package/kernel/mt76/patches/123-mt7915-connac2-check-rx-body.patch \
   package/kernel/mt76/patches/124-mt7915-connac2-host-ppe.patch \
   package/kernel/mt76/patches/125-mt7915-connac2-tdma-free-bufid.patch \
-  package/kernel/mt76/ct-wed/{ct_wdma_rx.h,ct_wed_bm.h,ct_wed_stop.h,ct_wed_cold.h,ct_wed_platform.c,ct_wed_guard_v2.c,patches/126-mt7915-prepare-ct-wed-slot1.patch,patches/127-mt76-own-ct-radio-dma-rings.patch} \
+  package/kernel/mt76/ct-wed/{ct_wdma_rx.h,ct_wed_bm.h,ct_wed_stop.h,ct_wed_cold.h,ct_wed_start.h,ct_wed_platform.c,ct_wed_guard_v2.c} \
+  package/kernel/mt76/ct-wed/patches/{126-mt7915-prepare-ct-wed-slot1.patch,127-mt76-own-ct-radio-dma-rings.patch,128-mt7915-retain-exposed-ct-wed.patch,129-mt7915-start-ct-wed-slot1.patch,130-mt7915-configure-ct-radio-csr-aliases.patch} \
+  package/kernel/mt76/ct-wed/patches/131-mt76-bound-ct-txfree-to-wed-didx.patch \
+  package/kernel/mt76/ct-wed/patches/132-mt7915-rearm-ct-irq-before-mcu-init.patch \
+  package/kernel/mt76/ct-wed/patches/133-mt7915-use-intx-for-active-ct-wed.patch \
+  package/kernel/mt76/ct-wed/patches/134-mt7915-gate-exclusive-ct-primary-irq.patch \
   target/linux/airoha/patches-6.18/931-net-airoha-initialize-ct-connac2-packet-pool.patch \
   target/linux/airoha/patches-6.18/932-net-airoha-initialize-ct-connac2-host-ppe.patch \
   target/linux/airoha/patches-6.18/933-net-airoha-quiesce-ct-ppe-on-shutdown.patch \

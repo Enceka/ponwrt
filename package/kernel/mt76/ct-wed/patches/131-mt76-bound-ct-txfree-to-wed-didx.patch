@@ -1,0 +1,34 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mt76: bound CT TXFREE consumption to the WED DMA index
+
+--- a/mt76.h
++++ b/mt76.h
+@@ -44,6 +44,7 @@
+ #define MT_QFLAG_WED_RRO_EN	BIT(7)
+ #define MT_QFLAG_EMI_EN		BIT(8)
+ #define MT_QFLAG_NPU		BIT(9)
++#define MT_QFLAG_CT_TXFREE	BIT(10)
+ 
+ #define __MT_WED_Q(_type, _n)	(MT_QFLAG_WED | \
+ 				 FIELD_PREP(MT_QFLAG_WED_TYPE, _type) | \
+--- a/dma.c
++++ b/dma.c
+@@ -1182,7 +1182,7 @@ mt76_dma_rx_process(struct mt76_dev *dev, struct mt76_queue *q, int budget)
+ 			    !mt76_queue_is_wed_rro_rxdmad_c(q);
+ 	bool more;
+ 
+-	if ((q->flags & MT_QFLAG_WED_RRO_EN) ||
++	if ((q->flags & (MT_QFLAG_WED_RRO_EN | MT_QFLAG_CT_TXFREE)) ||
+ 	    (IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED) &&
+ 	     mt76_queue_is_wed_tx_free(q))) {
+ 		dma_idx = mt76_dma_read_dma_idx(q, q->tail);
+--- a/mt7915/ct_wed.c
++++ b/mt7915/ct_wed.c
+@@ -285,6 +285,7 @@ static int mt7915_ct_wed_activate_bridge(struct mt7915_ct_wed *bridge,
+ 	spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
+ 	for (index = 0; index < ARRAY_SIZE(bridge->queue); index++)
+ 		bridge->queue[index]->regs = bridge->view.csr[index];
++	bridge->queue[AIROHA_CT_WED_WA0]->flags |= MT_QFLAG_CT_TXFREE;
+ 	bridge->owner = CT_WED;
+ 	spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
+ 	enable_irq(bridge->view.irq);

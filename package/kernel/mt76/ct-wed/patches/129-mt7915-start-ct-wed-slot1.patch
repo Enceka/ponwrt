@@ -1,0 +1,123 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mt76: pass the cold start readiness and source mask
+
+--- a/mt7915/ct-wed-provider-abi.h
++++ b/mt7915/ct-wed-provider-abi.h
+@@ -25,6 +25,7 @@
+ struct airoha_ct_wed_plan {
+ 	resource_size_t bar, bar_len;
+ 	u32 host_token_start, host_token_count;
++	u32 source_mask;
+ 	struct airoha_ct_wed_ring ring[AIROHA_CT_WED_RING_COUNT];
+ };
+ 
+@@ -38,7 +39,7 @@
+ 	void (*put)(struct airoha_ct_wed *wed);
+ 	int (*acquire)(struct airoha_ct_wed *wed, const struct airoha_ct_wed_plan *plan,
+ 		       struct airoha_ct_wed_view *view);
+-	int (*start)(struct airoha_ct_wed *wed);
++	int (*start)(struct airoha_ct_wed *wed, u32 ready);
+ 	void (*stop)(struct airoha_ct_wed *wed);
+ 	void (*release)(struct airoha_ct_wed *wed);
+ 	void (*irq_mask)(struct airoha_ct_wed *wed, u32 mask);
+--- a/mt7915/ct-wed-provider-v2.h
++++ b/mt7915/ct-wed-provider-v2.h
+@@ -28,7 +28,7 @@
+ 	void (*put)(struct airoha_ct_wed *wed);
+ 	int (*acquire)(struct airoha_ct_wed *wed, const struct airoha_ct_wed_plan *plan,
+ 		       struct airoha_ct_wed_view *view, struct airoha_ct_wed_lease_v2 **lease);
+-	int (*start_masked)(struct airoha_ct_wed_lease_v2 *lease);
++	int (*start_masked)(struct airoha_ct_wed_lease_v2 *lease, u32 ready);
+ 	int (*quiesce)(struct airoha_ct_wed_lease_v2 *lease,
+ 		       struct airoha_ct_wed_drain_v2 *result);
+ 	int (*release)(struct airoha_ct_wed_lease_v2 *lease);
+--- a/mt7915/ct_wed.c
++++ b/mt7915/ct_wed.c
+@@ -4,6 +4,11 @@
+ #include "mt7915.h"
+ #include "../dma.h"
+ #include "ct-wed-provider-v2.h"
++#include "ct-wed/ct_wed_start.h"
++
++static bool ct_wed_activate;
++module_param(ct_wed_activate, bool, 0444);
++MODULE_PARM_DESC(ct_wed_activate, "Activate the cold CT slot1 dual-ring WED path; retained until reboot");
+ 
+ enum mt7915_ct_owner { CT_PREPARED, CT_SWITCHING, CT_WED, CT_QUIESCING, CT_RETAINED };
+ 
+@@ -210,6 +215,48 @@
+ 	return 0;
+ }
+ 
++static int mt7915_ct_wed_activate_bridge(struct mt7915_ct_wed *bridge,
++					 struct mt7915_phy *phy2)
++{
++	struct mt7915_dev *dev = bridge->dev;
++	unsigned long flags;
++	unsigned int index;
++	int err;
++
++	spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
++	bridge->owner = CT_SWITCHING;
++	rcu_assign_pointer(dev->ct_wed, bridge);
++	mt76_wr(dev, MT_INT_MASK_CSR, 0);
++	mt76_wr(dev, MT_INT1_MASK_CSR, 0);
++	spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
++	synchronize_irq(to_pci_dev(dev->mt76.dev)->irq);
++	synchronize_irq(dev->hif2->irq);
++	err = mt7915_ct_wed_cold(dev);
++	if (!err)
++		err = mt7915_ct_wed_expose(dev, phy2);
++	if (err) {
++		spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
++		RCU_INIT_POINTER(dev->ct_wed, NULL);
++		bridge->owner = CT_PREPARED;
++		spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
++		return err;
++	}
++	err = bridge->ops->start_masked(bridge->lease, CT_START_REQUIRED);
++	if (err) {
++		dev_err(dev->mt76.dev, "CT WED activation failed (%d); exposed rings retained for software park\n", err);
++		return err;
++	}
++	spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
++	for (index = 0; index < ARRAY_SIZE(bridge->queue); index++)
++		bridge->queue[index]->regs = bridge->view.csr[index];
++	bridge->owner = CT_WED;
++	spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
++	enable_irq(bridge->view.irq);
++	dev_info(dev->mt76.dev, "CT WED activated: two TX rings and WA0; main IRQ %d, host tokens 8192..12287\n",
++		 bridge->view.irq);
++	return 0;
++}
++
+ int mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2)
+ {
+ 	struct device *device = dev->mt76.dev;
+@@ -272,6 +319,10 @@
+ 	bridge->queue[AIROHA_CT_WED_WA0] = &dev->mt76.q_rx[MT_RXQ_MAIN_WA];
+ 	plan.bar = pci_resource_start(pdev, 0);
+ 	plan.bar_len = pci_resource_len(pdev, 0);
++	plan.source_mask = mt7915_ct_irq_translate(MT_INT_RX_DONE_MCU | MT_INT_TX_DONE_MCU |
++		MT_INT_MCU_CMD | MT_INT_BAND0_RX_DONE | MT_INT_BAND1_RX_DONE |
++		MT_INT_TX_DONE_BAND0 | MT_INT_TX_DONE_BAND1, true);
++
+ 	err = -EINVAL;
+ 	for (index = 0; index < ARRAY_SIZE(bridge->queue); index++) {
+ 		struct mt76_queue *queue = bridge->queue[index];
+@@ -332,6 +383,15 @@
+ 	bridge->irq_requested = true;
+ 	dev_info(device, "CT WED v2 IRQ %d reserved disabled; no DMA or IRQ routing change\n",
+ 		 bridge->view.irq);
++	if (ct_wed_activate) {
++		gate = "cold activation";
++		err = mt7915_ct_wed_activate_bridge(bridge, phy2);
++		if (!err)
++			return 0;
++		if (bridge->ever_exposed)
++			return err;
++		goto release;
++	}
+ 	gate = "fabric fence / unbind isolation missing";
+ 	err = -EOPNOTSUPP;
+ release:

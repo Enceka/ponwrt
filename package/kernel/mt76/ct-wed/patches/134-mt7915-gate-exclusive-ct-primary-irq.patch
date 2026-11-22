@@ -1,0 +1,54 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mt76: gate the exclusive CT primary INTx before exposure
+
+--- a/mt7915/pci.c
++++ b/mt7915/pci.c
+@@ -157,7 +157,8 @@ static int mt7915_pci_probe(struct pci_dev *pdev,
+ 	}
+ 
+ 	ret = devm_request_irq(mdev->dev, irq, mt7915_irq_handler,
+-			       IRQF_SHARED, KBUILD_MODNAME, dev);
++			       mt7915_ct_wed_legacy_irq(dev) ? 0 : IRQF_SHARED,
++			       KBUILD_MODNAME, dev);
+ 	if (ret) {
+ 		mt7915_put_hif2(hif2);
+ 		goto free_wed_or_irq_vector;
+--- a/mt7915/ct_wed.c
++++ b/mt7915/ct_wed.c
+@@ -32,5 +32,6 @@ struct mt7915_ct_wed {
+ 	bool tokens_split;
+ 	bool irq_requested;
++	bool native_irq_disabled;
+ 	bool ever_exposed;
+ 	bool module_pinned;
+ 	bool software_parked;
+@@ -272,6 +273,10 @@ static int mt7915_ct_wed_activate_bridge(struct mt7915_ct_wed *bridge,
+ 	spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
+ 	synchronize_irq(to_pci_dev(dev->mt76.dev)->irq);
+ 	synchronize_irq(dev->hif2->irq);
++	if (mt7915_ct_wed_legacy_irq(dev)) {
++		disable_irq(to_pci_dev(dev->mt76.dev)->irq);
++		bridge->native_irq_disabled = true;
++	}
+ 	err = mt7915_ct_wed_cold(dev);
+ 	if (!err)
+ 		err = mt7915_ct_wed_expose(dev, phy2);
+@@ -280,6 +285,10 @@ static int mt7915_ct_wed_activate_bridge(struct mt7915_ct_wed *bridge,
+ 		RCU_INIT_POINTER(dev->ct_wed, NULL);
+ 		bridge->owner = CT_PREPARED;
+ 		spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
++		if (bridge->native_irq_disabled) {
++			enable_irq(to_pci_dev(dev->mt76.dev)->irq);
++			bridge->native_irq_disabled = false;
++		}
+ 		return err;
+ 	}
+ 	err = mt7915_ct_wed_radio_alias(bridge);
+@@ -468,6 +477,7 @@ void mt7915_ct_wed_park(struct mt7915_dev *dev, bool from_reset)
+ 	wake_up(&mdev->mcu.wait);
+ 	wake_up(&dev->reset_wait);
+ 	devm_free_irq(mdev->dev, to_pci_dev(mdev->dev)->irq, dev);
++	bridge->native_irq_disabled = false;
+ 	if (dev->hif2)
+ 		devm_free_irq(mdev->dev, dev->hif2->irq, dev);
+ 	mt7915_ct_stop(dev);

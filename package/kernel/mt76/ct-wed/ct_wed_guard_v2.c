@@ -62,7 +62,7 @@ unlock:
 	return err;
 }
 
-static int ct_v2_start_masked(struct airoha_ct_wed_lease_v2 *lease)
+static int ct_v2_start_masked(struct airoha_ct_wed_lease_v2 *lease, u32 ready)
 {
 	int err;
 
@@ -71,8 +71,12 @@ static int ct_v2_start_masked(struct airoha_ct_wed_lease_v2 *lease)
 		err = -ESTALE;
 	else if (lease->exposure != CT_NEVER_EXPOSED)
 		err = -EUCLEAN;
-	else
-		err = -EOPNOTSUPP;
+	else {
+		WRITE_ONCE(lease->exposure, CT_EXPOSED);
+		err = airoha_ct_wed_ops_v1.start(lease->provider, ready);
+		if (err)
+			WRITE_ONCE(lease->exposure, CT_RETAINED);
+	}
 	mutex_unlock(&ct_v2_lock);
 	return err;
 }
@@ -89,7 +93,8 @@ static int ct_v2_quiesce(struct airoha_ct_wed_lease_v2 *lease, struct airoha_ct_
 		if (lease->exposure == CT_NEVER_EXPOSED)
 			err = -EALREADY;
 		else {
-			lease->exposure = CT_RETAINED;
+			airoha_ct_wed_ops_v1.stop(lease->provider);
+			WRITE_ONCE(lease->exposure, CT_RETAINED);
 			err = -EUCLEAN;
 		}
 	}
@@ -138,4 +143,4 @@ const struct airoha_ct_wed_ops_v2 airoha_ct_wed_ops_v2 = {
 };
 EXPORT_SYMBOL_GPL(airoha_ct_wed_ops_v2);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("HG5585F-CT WED v2 unexposed-lease guard");
+MODULE_DESCRIPTION("HG5585F-CT WED v2 cold-start and retained-lease guard");

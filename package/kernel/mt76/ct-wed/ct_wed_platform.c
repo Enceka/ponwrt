@@ -1,4 +1,5 @@
 #include <linux/dma-mapping.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/irqdomain.h>
 #include <linux/kref.h>
@@ -11,11 +12,13 @@
 #include <linux/pci.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+#include <linux/sysfs.h>
 
 #include "../ct-wed-provider-abi.h"
 #include "ct_wdma_rx.h"
 #include "ct_wed_bm.h"
 #include "ct_wed_cold.h"
+#include "ct_wed_start.h"
 
 #define CT_TX_COUNT 2048
 #define CT_TX_BYTES (CT_TX_COUNT * sizeof(struct ct_txd))
@@ -35,7 +38,7 @@ struct airoha_ct_wed {
 	struct kref ref;
 	struct device *dev;
 	struct pci_dev *radio;
-	void __iomem *wed, *wdma;
+	void __iomem *wed, *wdma, *bar;
 	struct resource *region[2];
 	int irq[4];
 	struct ct_mid_ring mid[2];
@@ -53,7 +56,9 @@ struct airoha_ct_wed {
 	bool prepared;
 	bool retained;
 	bool irq_ready;
+	bool ever_exposed;
 	struct ct_cold_result cold;
+	struct ct_start_result start;
 };
 
 static DEFINE_MUTEX(ct_lock);
@@ -62,10 +67,13 @@ static bool prepare;
 static bool prepare_bm;
 static bool inspect;
 static bool cold_config;
+static bool start_trace;
 module_param(prepare, bool, 0444);
 module_param(prepare_bm, bool, 0444);
 module_param(inspect, bool, 0444);
 module_param(cold_config, bool, 0444);
+module_param(start_trace, bool, 0444);
+MODULE_PARM_DESC(start_trace, "Trace each cold-start MMIO access with a ten-second transaction deadline");
 MODULE_PARM_DESC(cold_config, "Test and restore five idle slot1 configuration registers; requires inspect");
 MODULE_PARM_DESC(inspect, "Read slot1 state after SCU reset and PCI preflight; never write registers");
 MODULE_PARM_DESC(prepare_bm, "Prepare stock hardware token buffers without enabling DMA");
@@ -85,6 +93,8 @@ static void ct_free(struct kref *ref)
 		iounmap(wed->wed);
 	if (!IS_ERR_OR_NULL(wed->wdma))
 		iounmap(wed->wdma);
+	if (!IS_ERR_OR_NULL(wed->bar))
+		iounmap(wed->bar);
 	for (idx = 0; idx < ARRAY_SIZE(wed->region); idx++)
 		if (wed->region[idx])
 			release_mem_region(wed->region[idx]->start, resource_size(wed->region[idx]));
@@ -534,17 +544,201 @@ out:
 	return err;
 }
 
-static int ct_start(struct airoha_ct_wed *wed)
+static int ct_start_current(void *ctx)
 {
+	struct airoha_ct_wed *wed = ctx;
+
+	lockdep_assert_held(&ct_lock);
+	return wed == ct_slot && wed->radio && wed->prepared ? 0 : -ESTALE;
+}
+
+static int ct_start_expose(void *ctx)
+{
+	struct airoha_ct_wed *wed = ctx;
+
+	lockdep_assert_held(&ct_lock);
+	if (ct_start_current(wed) || wed->ever_exposed || wed->retained)
+		return -ESTALE;
+	wed->ever_exposed = true;
+	wed->retained = true;
+	__module_get(THIS_MODULE);
+	return 0;
+}
+
+static void __iomem *ct_start_reg(struct airoha_ct_wed *wed,
+				 enum ct_start_window window, u32 offset)
+{
+	if (!IS_ALIGNED(offset, sizeof(u32)))
+		return NULL;
+	if (window == CT_START_WED && offset <= 0xb00 - sizeof(u32))
+		return wed->wed + offset;
+	if (window == CT_START_WDMA && offset <= 0x400 - sizeof(u32))
+		return wed->wdma + offset;
+	if (window == CT_START_BAR && wed->bar && offset <= wed->host.bar_len - sizeof(u32))
+		return wed->bar + offset;
+	return NULL;
+}
+
+static int ct_start_mmio_read(void *ctx, enum ct_start_window window, u32 offset, u32 *value)
+{
+	struct airoha_ct_wed *wed = ctx;
+	void __iomem *reg = ct_start_reg(wed, window, offset);
+
+	if (!reg)
+		return -EINVAL;
+	if (start_trace)
+		dev_info(wed->dev, "slot1 start read %u+%05x begin\n", window, offset);
+	*value = readl(reg);
+	if (start_trace)
+		dev_info(wed->dev, "slot1 start read %u+%05x=%08x\n", window, offset, *value);
+	return 0;
+}
+
+static int ct_start_mmio_write(void *ctx, enum ct_start_window window, u32 offset, u32 value)
+{
+	static const u16 wed_writes[] = {
+		0x008, 0x00c, 0x028, 0x080, 0x084, 0x088, 0x08c, 0x0a0,
+		0x204, 0x208, 0x300, 0x304, 0x308, 0x310, 0x314, 0x318,
+		0x410, 0x414, 0x418, 0x504, 0x508, 0x520, 0x524,
+		0x560, 0x564, 0x570, 0x57c, 0x580,
+		0x600, 0x604, 0x608, 0x610, 0x614, 0x618,
+		0x710, 0x714, 0x718, 0x900, 0x904, 0x910, 0x914,
+		0xa04, 0xa28, 0xa2c, 0xaa0, 0xaa4, 0xaa8,
+	};
+	static const u16 wdma_writes[] = {
+		0x100, 0x104, 0x108, 0x110, 0x114, 0x118, 0x204, 0x228, 0x254,
+	};
+	static const u32 bar_writes[] = {
+		0xd7204, 0xd7300, 0xd7304, 0xd7308, 0xd7310, 0xd7314, 0xd7318,
+		0xd7410, 0xd7414, 0xd7418,
+	};
+	struct airoha_ct_wed *wed = ctx;
+	void __iomem *reg = ct_start_reg(wed, window, offset);
+	unsigned int index;
+	bool allowed = false;
+
+	lockdep_assert_held(&ct_lock);
+	if (!wed->ever_exposed || !wed->retained || !reg)
+		return -EPERM;
+	if (window == CT_START_WED) {
+		for (index = 0; index < ARRAY_SIZE(wed_writes); index++)
+			allowed |= offset == wed_writes[index];
+		if ((offset == 8 && value != 1) || (offset == 0x28 && value) ||
+		    (offset == 0x204 && value))
+			return -EINVAL;
+	} else if (window == CT_START_WDMA) {
+		for (index = 0; index < ARRAY_SIZE(wdma_writes); index++)
+			allowed |= offset == wdma_writes[index];
+		if (offset == 0x204 && (value & 0xf))
+			return -EINVAL;
+	} else if (window == CT_START_BAR) {
+		for (index = 0; index < ARRAY_SIZE(bar_writes); index++)
+			allowed |= offset == bar_writes[index];
+	}
+	if (!allowed)
+		return -EINVAL;
+	if (start_trace)
+		dev_info(wed->dev, "slot1 start write %u+%05x=%08x begin\n", window, offset, value);
+	writel(value, reg);
+	if (start_trace)
+		dev_info(wed->dev, "slot1 start write %u+%05x done\n", window, offset);
+	return 0;
+}
+
+static void ct_start_wait(void *ctx)
+{
+	udelay(1);
+}
+
+static int ct_start(struct airoha_ct_wed *wed, u32 ready)
+{
+	struct ct_start_plan plan = {};
+	struct ct_start_io io = {
+		.ctx = wed, .ready = ready, .lease_valid = ct_start_current,
+		.expose = ct_start_expose, .read = ct_start_mmio_read,
+		.write = ct_start_mmio_write, .now = ct_cold_now, .wait = ct_start_wait,
+	};
+	unsigned int index;
 	int err;
 
 	mutex_lock(&ct_lock);
-	err = wed != ct_slot ? -ENODEV : !wed->prepared ? -EINVAL : -EOPNOTSUPP;
+	err = -EINVAL;
+	if (ct_start_current(wed) || !prepare_bm || !inspect || wed->retained ||
+	    wed->ever_exposed || !wed->bm[0].cpu || !wed->host.source_mask ||
+	    (ready & CT_START_REQUIRED) != CT_START_REQUIRED)
+		goto out;
+	for (index = 0; index < ARRAY_SIZE(plan.host); index++) {
+		const struct airoha_ct_wed_ring *ring = &wed->host.ring[index];
+
+		plan.host[index] = (struct ct_start_ring) {
+			.desc = lower_32_bits(ring->desc), .count = ring->count,
+			.cidx = ring->cidx, .didx = ring->didx,
+		};
+	}
+	for (index = 0; index < ARRAY_SIZE(plan.mid); index++) {
+		plan.mid[index] = lower_32_bits(wed->mid[index].dma);
+		plan.rx[index] = lower_32_bits(wed->rx[index].dma);
+	}
+	if (upper_32_bits(wed->host.bar))
+		goto out;
+	plan.bar_phys = lower_32_bits(wed->host.bar);
+	plan.bm_dma = lower_32_bits(wed->bm[0].dma);
+	plan.source_mask = wed->host.source_mask;
+	err = ct_start_plan_valid(&plan);
+	if (err)
+		goto out;
+	if (!wed->bar)
+		wed->bar = ioremap(wed->host.bar, wed->host.bar_len);
+	if (!wed->bar) {
+		err = -ENOMEM;
+		goto out;
+	}
+	dma_wmb();
+	err = ct_start_configure(&io, &plan,
+		ktime_get_ns() + (start_trace ? 10000 : 500) * NSEC_PER_MSEC, &wed->start);
+	if (!err) {
+		io.ready &= ~CT_START_NEVER_EXPOSED;
+		err = ct_start_enable(&io, &plan, &wed->start);
+	}
+	if (!err)
+		WRITE_ONCE(wed->irq_ready, true);
+	dev_info(wed->dev, "slot1 start state=%u writes=%u verified=%u DIDX=%u error=%d last=%u+%03x; runtime IRQ masked\n",
+		 wed->start.state, wed->start.writes, wed->start.verified, wed->start.didx_count,
+		 err, wed->start.last_window, wed->start.last_offset);
+out:
 	mutex_unlock(&ct_lock);
 	return err;
 }
 
-static void ct_stop(struct airoha_ct_wed *wed) {}
+static void ct_stop(struct airoha_ct_wed *wed)
+{
+	static const u16 wed_regs[] = {
+		0x200, 0x204, 0x208, 0x504, 0x508, 0x520, 0x524,
+		0x564, 0x570, 0x57c, 0x580,
+	};
+	static const u32 bar_regs[] = {
+		0xd7200, 0xd7204, 0xd4410, 0xd4414, 0xd4418, 0xd441c,
+		0xd4500, 0xd4504, 0xd4508, 0xd450c,
+	};
+	unsigned int index;
+
+	mutex_lock(&ct_lock);
+	if (wed->ever_exposed) {
+		if (start_trace && wed == ct_slot && READ_ONCE(wed->irq_ready)) {
+			for (index = 0; index < ARRAY_SIZE(wed_regs); index++)
+				dev_info(wed->dev, "slot1 before park WED+%03x=%08x\n",
+					 wed_regs[index], readl(wed->wed + wed_regs[index]));
+			for (index = 0; wed->bar && index < ARRAY_SIZE(bar_regs); index++)
+				dev_info(wed->dev, "slot1 before park BAR+%05x=%08x\n",
+					 bar_regs[index], readl(wed->bar + bar_regs[index]));
+		}
+		writel(0, wed->wed + 0x204);
+		readl(wed->wed + 0x204);
+		WRITE_ONCE(wed->irq_ready, false);
+		wed->retained = true;
+	}
+	mutex_unlock(&ct_lock);
+}
 static void ct_irq_mask(struct airoha_ct_wed *wed, u32 mask)
 {
 	if (!wed || !READ_ONCE(wed->irq_ready))
@@ -661,6 +855,69 @@ static void ct_remove(struct platform_device *pdev)
 	kref_put(&wed->ref, ct_free);
 }
 
+static ssize_t status_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	static const struct {
+		const char *name;
+		u16 offset;
+		bool wdma;
+	} registers[] = {
+		{ "tx_mib0", 0x2a0 }, { "tx_mib1", 0x2a4 },
+		{ "wpdma_tx_mib0", 0x5a0 }, { "wpdma_tx_mib1", 0x5a4 },
+		{ "wdma_rx_mib0", 0xae0 }, { "wdma_rx_mib1", 0xae4 },
+		{ "wdma_recycle_mib0", 0xae8 }, { "wdma_recycle_mib1", 0xaec },
+		{ "wdma_processed_mib0", 0xaf0 }, { "wdma_processed_mib1", 0xaf4 },
+		{ "host_tx0_cidx", 0x308 }, { "host_tx0_didx", 0x30c },
+		{ "host_tx1_cidx", 0x318 }, { "host_tx1_didx", 0x31c },
+		{ "mid_tx0_cidx", 0x608 }, { "mid_tx0_didx", 0x60c },
+		{ "mid_tx1_cidx", 0x618 }, { "mid_tx1_didx", 0x61c },
+		{ "host_wa0_cidx", 0x418 }, { "host_wa0_didx", 0x41c },
+		{ "mid_wa0_cidx", 0x718 }, { "mid_wa0_didx", 0x71c },
+		{ "rx0_cidx", 0x108, true }, { "rx0_didx", 0x10c, true },
+		{ "rx1_cidx", 0x118, true }, { "rx1_didx", 0x11c, true },
+		{ "rx0_cidx", 0x908 }, { "rx0_didx", 0x90c },
+		{ "rx1_cidx", 0x918 }, { "rx1_didx", 0x91c },
+		{ "dma_ctrl", 0x208 }, { "wpdma_ctrl", 0x508 },
+		{ "wdma_ctrl", 0xa04 }, { "dma_ctrl", 0x204, true },
+	};
+	struct airoha_ct_wed *wed;
+	unsigned int index;
+	bool irq_ready;
+	ssize_t length;
+
+	mutex_lock(&ct_lock);
+	wed = dev_get_drvdata(dev);
+	if (!wed) {
+		length = -ENODEV;
+		goto out;
+	}
+	irq_ready = READ_ONCE(wed->irq_ready);
+	length = sysfs_emit_at(buf, 0,
+		"state=%u ever_exposed=%u irq_ready=%u error=%d writes=%u verified=%u retained=%u\n",
+		wed->start.state, wed->ever_exposed, irq_ready, wed->start.error,
+		wed->start.writes, wed->start.verified, wed->retained);
+	if (wed != ct_slot || !irq_ready)
+		goto out;
+	for (index = 0; index < ARRAY_SIZE(registers); index++) {
+		void __iomem *base = registers[index].wdma ? wed->wdma : wed->wed;
+		u32 value = readl(base + registers[index].offset);
+
+		length += sysfs_emit_at(buf, length, "%s+%03x %s=%08x\n",
+			registers[index].wdma ? "WDMA" : "WED", registers[index].offset,
+			registers[index].name, value);
+	}
+out:
+	mutex_unlock(&ct_lock);
+	return length;
+}
+static DEVICE_ATTR_RO(status);
+
+static struct attribute *ct_wed_attrs[] = {
+	&dev_attr_status.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(ct_wed);
+
 static const struct of_device_id ct_wed_ids[] = {
 	{ .compatible = "fiberhome,hg5585f-ct-wed-slot1" }, {},
 };
@@ -668,7 +925,7 @@ MODULE_DEVICE_TABLE(of, ct_wed_ids);
 
 static struct platform_driver ct_wed_driver = {
 	.probe = ct_probe, .remove = ct_remove,
-	.driver = { .name = "ct-wed-platform", .of_match_table = ct_wed_ids },
+	.driver = { .name = "ct-wed-platform", .of_match_table = ct_wed_ids, .dev_groups = ct_wed_groups },
 };
 module_platform_driver(ct_wed_driver);
 MODULE_DESCRIPTION("AN7581 HG5585F-CT wireless offload resource provider");
