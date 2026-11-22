@@ -870,6 +870,10 @@ static ssize_t status_show(struct device *dev, struct device_attribute *attr, ch
 	} registers[] = {
 		{ "tx_mib0", 0x2a0 }, { "tx_mib1", 0x2a4 },
 		{ "wpdma_tx_mib0", 0x5a0 }, { "wpdma_tx_mib1", 0x5a4 },
+		{ "txfree_mib", 0x2e4 }, { "wpdma_txfree_mib", 0x5e4 },
+		{ "wpdma_free_token_mib", 0x5f8 },
+		{ "tx_bm_state", 0x090 }, { "txfree_to_bm_mib", 0x1c0 },
+		{ "txbm_to_wdma_mib", 0x1c4 },
 		{ "wdma_rx_mib0", 0xae0 }, { "wdma_rx_mib1", 0xae4 },
 		{ "wdma_recycle_mib0", 0xae8 }, { "wdma_recycle_mib1", 0xaec },
 		{ "wdma_processed_mib0", 0xaf0 }, { "wdma_processed_mib1", 0xaf4 },
