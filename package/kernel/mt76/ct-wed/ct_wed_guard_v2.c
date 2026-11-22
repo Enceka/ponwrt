@@ -115,8 +115,21 @@ static int ct_v2_release(struct airoha_ct_wed_lease_v2 *lease)
 	return err;
 }
 
-static void ct_v2_irq_mask(struct airoha_ct_wed_lease_v2 *lease, u32 mask) {}
-static u32 ct_v2_irq_ack(struct airoha_ct_wed_lease_v2 *lease, u32 mask) { return 0; }
+static void ct_v2_irq_mask(struct airoha_ct_wed_lease_v2 *lease, u32 mask)
+{
+	if (!lease || lease != READ_ONCE(ct_v2_owner) ||
+	    READ_ONCE(lease->exposure) != CT_EXPOSED)
+		return;
+	airoha_ct_wed_ops_v1.irq_mask(lease->provider, mask);
+}
+
+static u32 ct_v2_irq_ack(struct airoha_ct_wed_lease_v2 *lease, u32 mask)
+{
+	if (!lease || lease != READ_ONCE(ct_v2_owner) ||
+	    READ_ONCE(lease->exposure) != CT_EXPOSED)
+		return 0;
+	return airoha_ct_wed_ops_v1.irq_ack(lease->provider, mask);
+}
 
 const struct airoha_ct_wed_ops_v2 airoha_ct_wed_ops_v2 = {
 	.get = ct_v2_get, .put = ct_v2_put, .acquire = ct_v2_acquire,

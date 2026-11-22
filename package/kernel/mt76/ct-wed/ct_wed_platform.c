@@ -52,6 +52,7 @@ struct airoha_ct_wed {
 	} bm[2 + CT_BM_CHUNKS];
 	bool prepared;
 	bool retained;
+	bool irq_ready;
 	struct ct_cold_result cold;
 };
 
@@ -544,8 +545,27 @@ static int ct_start(struct airoha_ct_wed *wed)
 }
 
 static void ct_stop(struct airoha_ct_wed *wed) {}
-static void ct_irq_mask(struct airoha_ct_wed *wed, u32 mask) {}
-static u32 ct_irq_ack(struct airoha_ct_wed *wed, u32 mask) { return 0; }
+static void ct_irq_mask(struct airoha_ct_wed *wed, u32 mask)
+{
+	if (!wed || !READ_ONCE(wed->irq_ready))
+		return;
+	writel(mask, wed->wed + 0x204);
+	readl(wed->wed + 0x204);
+}
+
+static u32 ct_irq_ack(struct airoha_ct_wed *wed, u32 mask)
+{
+	u32 pending;
+
+	if (!wed || !READ_ONCE(wed->irq_ready))
+		return 0;
+	pending = readl(wed->wed + 0x200) & mask;
+	if (pending) {
+		writel(pending, wed->wed + 0x200);
+		readl(wed->wed + 0x200);
+	}
+	return pending;
+}
 
 const struct airoha_ct_wed_ops airoha_ct_wed_ops_v1 = {
 	.get = ct_get, .put = ct_put, .acquire = ct_acquire, .start = ct_start,
