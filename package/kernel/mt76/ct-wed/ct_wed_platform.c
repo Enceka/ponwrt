@@ -18,6 +18,7 @@
 #include "ct_wdma_rx.h"
 #include "ct_wed_live_sample.h"
 #include "ct_wed_refill_sample.h"
+#include "ct_wed_reclaim_hw.h"
 #include "ct_wed_bm.h"
 #include "ct_wed_bm_snapshot.h"
 #include "ct_wed_rx_snapshot.h"
@@ -805,6 +806,30 @@ static bool ct_live_platform_pair(void *ctx, u32 payload, u32 header)
 	return wed->bm[payload_chunk].dma + delta == payload;
 }
 
+static int ct_live_platform_ready(const struct airoha_ct_wed *wed, const struct device *radio)
+{
+	unsigned int index;
+
+	lockdep_assert_held(&ct_lock);
+	if (!wed || !radio || wed != ct_slot || !wed->radio || &wed->radio->dev != radio)
+		return -ESTALE;
+	if (!wed->prepared || !wed->ever_exposed || !wed->retained ||
+	    !READ_ONCE(wed->irq_ready) || wed->start.state != CT_START_ENABLED)
+		return -ESHUTDOWN;
+	if (!wed->wed || !wed->wdma ||
+	    !wed->bm[1].cpu || !wed->bm[1].dma ||
+	    wed->bm[1].bytes != CT_BM_COUNT * CT_BM_HEADER_SIZE)
+		return -EIO;
+	for (index = 0; index < CT_WDMA_RX_RINGS; index++)
+		if (!wed->rx[index].desc)
+			return -EIO;
+	for (index = 2; index < ARRAY_SIZE(wed->bm); index++)
+		if (!wed->bm[index].cpu || !wed->bm[index].dma ||
+		    wed->bm[index].bytes != CT_BM_CHUNK_TOKENS * CT_BM_PAYLOAD_STRIDE)
+			return -EIO;
+	return 0;
+}
+
 int airoha_ct_wed_platform_read_live(struct airoha_ct_wed *wed,
 				    const struct device *radio,
 				    struct airoha_ct_wed_live_sample *sample)
@@ -813,31 +838,15 @@ int airoha_ct_wed_platform_read_live(struct airoha_ct_wed *wed,
 		.ctx = wed, .read = ct_live_platform_read, .desc = ct_live_platform_desc,
 		.buffer_pair_valid = ct_live_platform_pair,
 	};
-	unsigned int index;
-	int err = -ESTALE;
+	int err;
 
 	if (!sample)
 		return -EINVAL;
 	*sample = (struct airoha_ct_wed_live_sample) {};
 	mutex_lock(&ct_lock);
-	if (!wed || !radio || wed != ct_slot || !wed->radio || &wed->radio->dev != radio)
+	err = ct_live_platform_ready(wed, radio);
+	if (err)
 		goto out;
-	err = -ESHUTDOWN;
-	if (!wed->prepared || !wed->ever_exposed || !wed->retained ||
-	    !READ_ONCE(wed->irq_ready) || wed->start.state != CT_START_ENABLED)
-		goto out;
-	err = -EIO;
-	if (!wed->wed || !wed->wdma ||
-	    !wed->bm[1].cpu || !wed->bm[1].dma ||
-	    wed->bm[1].bytes != CT_BM_COUNT * CT_BM_HEADER_SIZE)
-		goto out;
-	for (index = 0; index < CT_WDMA_RX_RINGS; index++)
-		if (!wed->rx[index].desc)
-			goto out;
-	for (index = 2; index < ARRAY_SIZE(wed->bm); index++)
-		if (!wed->bm[index].cpu || !wed->bm[index].dma ||
-		    wed->bm[index].bytes != CT_BM_CHUNK_TOKENS * CT_BM_PAYLOAD_STRIDE)
-			goto out;
 	err = ct_live_sample_read(&io, sample);
 out:
 	mutex_unlock(&ct_lock);
@@ -856,7 +865,7 @@ int airoha_ct_wed_platform_read_refill(struct airoha_ct_wed *wed,
 	};
 	u32 selected[CT_LIVE_RX_RINGS];
 	unsigned int index;
-	int err = -ESTALE;
+	int err;
 
 	if (!sample)
 		return -EINVAL;
@@ -869,30 +878,127 @@ int airoha_ct_wed_platform_read_refill(struct airoha_ct_wed *wed,
 			return -EINVAL;
 	}
 	mutex_lock(&ct_lock);
-	if (!wed || !radio || wed != ct_slot || !wed->radio || &wed->radio->dev != radio)
+	err = ct_live_platform_ready(wed, radio);
+	if (err)
 		goto out;
-	err = -ESHUTDOWN;
-	if (!wed->prepared || !wed->ever_exposed || !wed->retained ||
-	    !READ_ONCE(wed->irq_ready) || wed->start.state != CT_START_ENABLED)
-		goto out;
-	err = -EIO;
-	if (!wed->wed || !wed->wdma ||
-	    !wed->bm[1].cpu || !wed->bm[1].dma ||
-	    wed->bm[1].bytes != CT_BM_COUNT * CT_BM_HEADER_SIZE)
-		goto out;
-	for (index = 0; index < CT_WDMA_RX_RINGS; index++)
-		if (!wed->rx[index].desc)
-			goto out;
-	for (index = 2; index < ARRAY_SIZE(wed->bm); index++)
-		if (!wed->bm[index].cpu || !wed->bm[index].dma ||
-		    wed->bm[index].bytes != CT_BM_CHUNK_TOKENS * CT_BM_PAYLOAD_STRIDE)
-			goto out;
 	err = ct_refill_sample_read(&io, selected, sample);
 out:
 	mutex_unlock(&ct_lock);
 	return err;
 }
 EXPORT_SYMBOL_GPL(airoha_ct_wed_platform_read_refill);
+
+static int ct_reclaim_hw_read_ring(void __iomem *base, u32 count,
+				   struct ct_wed_reclaim_hw_ring *ring)
+{
+	u32 cpu;
+
+	ring->count = readl(base + 4);
+	cpu = readl(base + 8);
+	ring->didx = readl(base + 12);
+	if (!count || ring->count != count || !ct_live_word_valid(cpu) ||
+	    ring->didx >= count)
+		return -EIO;
+	ring->cidx = cpu & 0xffff;
+	ring->cidx_mirror = cpu >> 16;
+	if (ring->cidx >= count || ring->cidx_mirror >= count)
+		return -EIO;
+	return 0;
+}
+
+static int ct_reclaim_hw_read_dma(const struct airoha_ct_wed *wed,
+				  struct ct_wed_reclaim_hw_dma *dma)
+{
+	const u32 wa_count = wed->host.ring[AIROHA_CT_WED_WA0].count;
+	unsigned int index;
+	int err;
+
+	for (index = 0; index < CT_WED_RECLAIM_TX_RINGS; index++) {
+		err = ct_reclaim_hw_read_ring(wed->wed + 0x300 + index * 16,
+					      wed->host.ring[index].count, &dma->host[index]);
+		if (!err)
+			err = ct_reclaim_hw_read_ring(wed->wed + wed->mid[index].wed_csr,
+						      wed->mid[index].count, &dma->mid[index]);
+		if (!err)
+			err = ct_reclaim_hw_read_ring(wed->bar + wed->mid[index].bar_csr,
+						      wed->mid[index].count, &dma->bar_tx[index]);
+		if (err)
+			return err;
+	}
+	err = ct_reclaim_hw_read_ring(wed->wed + 0x410, wa_count, &dma->host_wa);
+	if (!err)
+		err = ct_reclaim_hw_read_ring(wed->wed + 0x710, wa_count, &dma->mid_wa);
+	if (!err)
+		err = ct_reclaim_hw_read_ring(wed->bar + 0xd7410, wa_count, &dma->bar_wa);
+	if (err)
+		return err;
+
+	dma->wed_dma = readl(wed->wed + 0x208);
+	dma->wpdma_dma = readl(wed->wed + 0x508);
+	dma->wdma_driver = readl(wed->wed + 0xa04);
+	dma->wdma_dma = readl(wed->wdma + 0x204);
+	dma->wed_ctrl = readl(wed->wed + 0x00c);
+	dma->bar_dma = readl(wed->bar + 0xd4208);
+	dma->wed_irq_mask = readl(wed->wed + 0x204);
+	dma->bar_irq_mask = readl(wed->bar + 0xd7204);
+	if (!ct_live_word_valid(dma->wed_dma) || !ct_live_word_valid(dma->wpdma_dma) ||
+	    !ct_live_word_valid(dma->wdma_driver) || !ct_live_word_valid(dma->wdma_dma) ||
+	    !ct_live_word_valid(dma->wed_ctrl) || !ct_live_word_valid(dma->bar_dma) ||
+	    !ct_live_word_valid(dma->wed_irq_mask) || !ct_live_word_valid(dma->bar_irq_mask))
+		return -EIO;
+	return 0;
+}
+
+int airoha_ct_wed_platform_read_reclaim_hw(struct airoha_ct_wed *wed,
+					  const struct device *radio,
+					  const u32 indices[CT_LIVE_RX_RINGS],
+					  struct airoha_ct_wed_reclaim_hw *sample)
+{
+	const struct ct_live_sample_io io = {
+		.ctx = wed, .read = ct_live_platform_read, .desc = ct_live_platform_desc,
+		.buffer_pair_valid = ct_live_platform_pair,
+	};
+	struct airoha_ct_wed_reclaim_hw first = {};
+	struct ct_wed_reclaim_hw_dma second = {};
+	u32 selected[CT_LIVE_RX_RINGS];
+	unsigned int index;
+	int err;
+
+	if (!sample)
+		return -EINVAL;
+	*sample = (struct airoha_ct_wed_reclaim_hw) {};
+	if (indices)
+		for (index = 0; index < CT_LIVE_RX_RINGS; index++) {
+			selected[index] = READ_ONCE(indices[index]);
+			if (selected[index] >= CT_LIVE_RX_COUNT)
+				return -EINVAL;
+		}
+
+	mutex_lock(&ct_lock);
+	err = ct_live_platform_ready(wed, radio);
+	if (err)
+		goto out;
+	if (!wed->bar || wed->host.bar_len < 0xd7420) {
+		err = -EIO;
+		goto out;
+	}
+
+	err = ct_reclaim_hw_read_dma(wed, &first.dma);
+	if (!err && indices)
+		err = ct_refill_sample_read(&io, selected, &first.refill);
+	else if (!err)
+		err = ct_live_sample_read(&io, &first.refill.live);
+	if (!err)
+		err = ct_reclaim_hw_read_dma(wed, &second);
+	if (!err && memcmp(&first.dma, &second, sizeof(second)))
+		err = -EAGAIN;
+	if (!err)
+		*sample = first;
+out:
+	mutex_unlock(&ct_lock);
+	return err;
+}
+EXPORT_SYMBOL_GPL(airoha_ct_wed_platform_read_reclaim_hw);
 
 const struct airoha_ct_wed_ops airoha_ct_wed_ops_v1 = {
 	.get = ct_get, .put = ct_put, .acquire = ct_acquire, .start = ct_start,
