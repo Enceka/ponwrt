@@ -4,6 +4,7 @@
 
 #include "../ct-wed-provider-v2.h"
 #include "ct_wed_live_sample.h"
+#include "ct_wed_refill_sample.h"
 
 enum ct_exposure {
 	CT_NEVER_EXPOSED,
@@ -159,6 +160,39 @@ out:
 	return err;
 }
 EXPORT_SYMBOL_GPL(airoha_ct_wed_read_live);
+
+int airoha_ct_wed_read_refill(struct airoha_ct_wed_lease_v2 *lease,
+			     const struct device *radio,
+			     const u32 indices[CT_LIVE_RX_RINGS],
+			     struct airoha_ct_wed_refill_sample *sample)
+{
+	u32 selected[CT_LIVE_RX_RINGS];
+	unsigned int index;
+	int err = -ESTALE;
+
+	if (!sample)
+		return -EINVAL;
+	*sample = (struct airoha_ct_wed_refill_sample) {};
+	if (!indices)
+		return -EINVAL;
+	for (index = 0; index < CT_LIVE_RX_RINGS; index++) {
+		selected[index] = READ_ONCE(indices[index]);
+		if (selected[index] >= CT_LIVE_RX_COUNT)
+			return -EINVAL;
+	}
+	mutex_lock(&ct_v2_lock);
+	if (!lease || lease != ct_v2_owner)
+		goto out;
+	if (lease->exposure != CT_EXPOSED) {
+		err = -ESHUTDOWN;
+		goto out;
+	}
+	err = airoha_ct_wed_platform_read_refill(lease->provider, radio, selected, sample);
+out:
+	mutex_unlock(&ct_v2_lock);
+	return err;
+}
+EXPORT_SYMBOL_GPL(airoha_ct_wed_read_refill);
 
 const struct airoha_ct_wed_ops_v2 airoha_ct_wed_ops_v2 = {
 	.get = ct_v2_get, .put = ct_v2_put, .acquire = ct_v2_acquire,

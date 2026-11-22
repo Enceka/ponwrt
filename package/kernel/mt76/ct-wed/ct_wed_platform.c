@@ -17,6 +17,7 @@
 #include "../ct-wed-provider-abi.h"
 #include "ct_wdma_rx.h"
 #include "ct_wed_live_sample.h"
+#include "ct_wed_refill_sample.h"
 #include "ct_wed_bm.h"
 #include "ct_wed_bm_snapshot.h"
 #include "ct_wed_rx_snapshot.h"
@@ -843,6 +844,55 @@ out:
 	return err;
 }
 EXPORT_SYMBOL_GPL(airoha_ct_wed_platform_read_live);
+
+int airoha_ct_wed_platform_read_refill(struct airoha_ct_wed *wed,
+				      const struct device *radio,
+				      const u32 indices[CT_LIVE_RX_RINGS],
+				      struct airoha_ct_wed_refill_sample *sample)
+{
+	const struct ct_live_sample_io io = {
+		.ctx = wed, .read = ct_live_platform_read, .desc = ct_live_platform_desc,
+		.buffer_pair_valid = ct_live_platform_pair,
+	};
+	u32 selected[CT_LIVE_RX_RINGS];
+	unsigned int index;
+	int err = -ESTALE;
+
+	if (!sample)
+		return -EINVAL;
+	*sample = (struct airoha_ct_wed_refill_sample) {};
+	if (!indices)
+		return -EINVAL;
+	for (index = 0; index < CT_LIVE_RX_RINGS; index++) {
+		selected[index] = READ_ONCE(indices[index]);
+		if (selected[index] >= CT_LIVE_RX_COUNT)
+			return -EINVAL;
+	}
+	mutex_lock(&ct_lock);
+	if (!wed || !radio || wed != ct_slot || !wed->radio || &wed->radio->dev != radio)
+		goto out;
+	err = -ESHUTDOWN;
+	if (!wed->prepared || !wed->ever_exposed || !wed->retained ||
+	    !READ_ONCE(wed->irq_ready) || wed->start.state != CT_START_ENABLED)
+		goto out;
+	err = -EIO;
+	if (!wed->wed || !wed->wdma ||
+	    !wed->bm[1].cpu || !wed->bm[1].dma ||
+	    wed->bm[1].bytes != CT_BM_COUNT * CT_BM_HEADER_SIZE)
+		goto out;
+	for (index = 0; index < CT_WDMA_RX_RINGS; index++)
+		if (!wed->rx[index].desc)
+			goto out;
+	for (index = 2; index < ARRAY_SIZE(wed->bm); index++)
+		if (!wed->bm[index].cpu || !wed->bm[index].dma ||
+		    wed->bm[index].bytes != CT_BM_CHUNK_TOKENS * CT_BM_PAYLOAD_STRIDE)
+			goto out;
+	err = ct_refill_sample_read(&io, selected, sample);
+out:
+	mutex_unlock(&ct_lock);
+	return err;
+}
+EXPORT_SYMBOL_GPL(airoha_ct_wed_platform_read_refill);
 
 const struct airoha_ct_wed_ops airoha_ct_wed_ops_v1 = {
 	.get = ct_get, .put = ct_put, .acquire = ct_acquire, .start = ct_start,
