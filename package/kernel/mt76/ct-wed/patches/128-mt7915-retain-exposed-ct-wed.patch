@@ -1,0 +1,795 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mt76: retain exposed CT WED DMA owners until reboot
+
+Pin the radio module and DMA capsule before the first WED exposure.
+Keep both hardware objects, rings, token payloads and provider leases
+after a stop or probe failure. Park software producers and consumers,
+withdraw wireless registration, and let PCI devres expire only after
+installing persistent offline bus operations. Keep activation gated.
+
+--- a/mt76.h
++++ b/mt76.h
+@@ -1338,6 +1338,8 @@
+ struct mt76_queue *mt76_dma_capsule_queue_alloc(struct mt76_dev *dev);
+ void mt76_dma_capsule_queue_free(struct mt76_dev *dev, struct mt76_queue *queue);
+ void mt76_dma_capsule_free(struct mt76_dev *dev);
++int mt76_dma_capsule_retain(struct mt76_dev *dev);
++bool mt76_dma_capsule_retained(struct mt76_dev *dev);
+ void mt76_reset_device(struct mt76_dev *dev);
+ void mt76_unregister_phy(struct mt76_phy *phy);
+ 
+--- a/dma.c
++++ b/dma.c
+@@ -23,7 +23,23 @@
+ struct mt76_dma_capsule {
+ 	struct list_head queues;
+ 	struct device *dma_dev;
++	bool retained;
+ };
++
++bool mt76_dma_capsule_retained(struct mt76_dev *dev)
++{
++	return dev->dma_capsule && READ_ONCE(dev->dma_capsule->retained);
++}
++EXPORT_SYMBOL_GPL(mt76_dma_capsule_retained);
++
++int mt76_dma_capsule_retain(struct mt76_dev *dev)
++{
++	if (!dev->dma_capsule)
++		return -EINVAL;
++	WRITE_ONCE(dev->dma_capsule->retained, true);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mt76_dma_capsule_retain);
+ 
+ static struct mt76_dma_capsule *mt76_dma_capsule_get(struct mt76_dev *dev)
+ {
+@@ -58,6 +74,8 @@
+ 
+ 	if (IS_ERR_OR_NULL(capsule))
+ 		return (void *)capsule;
++	if (READ_ONCE(capsule->retained))
++		return ERR_PTR(-ESHUTDOWN);
+ 	allocation = kzalloc(sizeof(*allocation), GFP_KERNEL);
+ 	if (!allocation)
+ 		return ERR_PTR(-ENOMEM);
+@@ -77,7 +95,7 @@
+ {
+ 	struct mt76_dma_capsule_queue *allocation = queue->dma_capsule;
+ 
+-	if (!allocation)
++	if (!allocation || mt76_dma_capsule_retained(dev))
+ 		return;
+ 	if (queue->page_pool)
+ 		page_pool_destroy(queue->page_pool);
+@@ -104,7 +122,7 @@
+ 	struct mt76_dma_capsule_queue *allocation = queue->dma_capsule;
+ 	bool owns_queue;
+ 
+-	if (!allocation)
++	if (!allocation || mt76_dma_capsule_retained(dev))
+ 		return;
+ 	owns_queue = allocation->owns_queue;
+ 	mt76_dma_capsule_ring_abort(dev, queue);
+@@ -125,6 +143,8 @@
+ 		return PTR_ERR(capsule);
+ 	if (!capsule)
+ 		return 0;
++	if (READ_ONCE(capsule->retained))
++		return -ESHUTDOWN;
+ 	allocation = queue->dma_capsule;
+ 	if (!allocation) {
+ 		allocation = kzalloc(sizeof(*allocation), GFP_KERNEL);
+@@ -1374,7 +1394,7 @@
+ 	struct mt76_dma_capsule *capsule = dev->dma_capsule;
+ 	struct mt76_dma_capsule_queue *allocation, *next;
+ 
+-	if (!capsule)
++	if (!capsule || READ_ONCE(capsule->retained))
+ 		return;
+ 	mt76_dma_capsule_flush(dev);
+ 	mt76_free_pending_txwi(dev);
+@@ -1399,6 +1419,8 @@
+ {
+ 	int i;
+ 
++	if (mt76_dma_capsule_retained(dev))
++		return;
+ 	mt76_worker_disable(&dev->tx_worker);
+ 	napi_disable(&dev->tx_napi);
+ 	netif_napi_del(&dev->tx_napi);
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -822,6 +822,8 @@
+ 
+ void mt76_free_device(struct mt76_dev *dev)
+ {
++	if (mt76_dma_capsule_retained(dev))
++		return;
+ 	mt76_worker_teardown(&dev->tx_worker);
+ 	if (dev->wq) {
+ 		destroy_workqueue(dev->wq);
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -265,6 +265,7 @@
+ 	};
+ 
+ 	struct mt7915_hif *hif2;
++	struct device_link *hif2_link;
+ 	struct mt7915_ct_path *ct_path;
+ 	struct mt7915_ct_wed __rcu *ct_wed;
+ 	struct mt7915_reg_desc reg;
+@@ -465,6 +466,7 @@
+ struct mt7915_dev *mt7915_mmio_probe(struct device *pdev,
+ 				     void __iomem *mem_base, u32 device_id);
+ void mt7915_wfsys_reset(struct mt7915_dev *dev);
++void mt7915_mmio_park(struct mt7915_dev *dev);
+ irqreturn_t mt7915_irq_handler(int irq, void *dev_instance);
+ u64 __mt7915_get_tsf(struct ieee80211_hw *hw, struct mt7915_vif *mvif);
+ u32 mt7915_wed_init_buf(void *ptr, dma_addr_t phys, int token_id);
+@@ -482,8 +484,11 @@
+ #define MT7916_CT_MAX_WCID	150
+ 
+ #ifdef CONFIG_MT7915_NPU
+-void mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2);
+-void mt7915_ct_wed_detach(struct mt7915_dev *dev);
++int mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2);
++int mt7915_ct_wed_detach(struct mt7915_dev *dev);
++int mt7915_ct_wed_expose(struct mt7915_dev *dev, struct mt7915_phy *phy2);
++bool mt7915_ct_wed_retained(struct mt7915_dev *dev);
++void mt7915_ct_wed_park(struct mt7915_dev *dev, bool from_reset);
+ bool mt7915_ct_wed_mask(struct mt7915_dev *dev, u32 mask);
+ bool mt7915_ct_wed_primary_native(struct mt7915_dev *dev);
+ int mt7915_ct_wed_verify_drain(struct mt7915_dev *dev);
+@@ -525,8 +530,10 @@
+ 	return 0;
+ }
+ static inline int mt7915_ct_prepare(struct mt7915_dev *dev) { return 0; }
+-static inline void mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2) {}
+-static inline void mt7915_ct_wed_detach(struct mt7915_dev *dev) {}
++static inline int mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2) { return 0; }
++static inline int mt7915_ct_wed_detach(struct mt7915_dev *dev) { return 0; }
++static inline bool mt7915_ct_wed_retained(struct mt7915_dev *dev) { return false; }
++static inline void mt7915_ct_wed_park(struct mt7915_dev *dev, bool from_reset) {}
+ static inline bool mt7915_ct_wed_mask(struct mt7915_dev *dev, u32 mask) { return false; }
+ static inline bool mt7915_ct_wed_primary_native(struct mt7915_dev *dev) { return true; }
+ static inline bool mt7915_ct_wed_ack(struct mt7915_dev *dev, u32 mask, u32 *pending) { return false; }
+--- a/mt7915/ct_wed.c
++++ b/mt7915/ct_wed.c
+@@ -16,6 +16,10 @@
+ 	u32 token_start, token_count;
+ 	bool tokens_split;
+ 	bool irq_requested;
++	bool ever_exposed;
++	bool module_pinned;
++	bool software_parked;
++	struct mt76_phy *retained_phy2;
+ 	struct airoha_ct_wed_view view;
+ 	struct mt76_queue *queue[AIROHA_CT_WED_RING_COUNT];
+ 	struct mt76_queue_regs __iomem *native[AIROHA_CT_WED_RING_COUNT];
+@@ -207,7 +211,7 @@
+ 	return 0;
+ }
+ 
+-void mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2)
++int mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2)
+ {
+ 	struct device *device = dev->mt76.dev;
+ 	struct airoha_ct_wed_plan plan = {};
+@@ -219,36 +223,36 @@
+ 	int err = -EINVAL;
+ 
+ 	if (!of_find_property(device->of_node, "airoha,wed-provider", NULL))
+-		return;
++		return 0;
+ 	if (!dev->ct_path || !dev->hif2 || !phy2 || !is_mt7916(&dev->mt76) ||
+ 	    !dev_is_pci(device) || !dev_is_pci(dev->hif2->dev) ||
+ 	    test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state)) {
+ 		dev_info(device, "CT WED v2 cold topology unavailable: rx=%u hif2=%u phy2=%u\n",
+ 			 !!dev->ct_path, !!dev->hif2, !!phy2);
+-		return;
++		return 0;
+ 	}
+ 	pdev = to_pci_dev(device);
+ 	err = mt7915_ct_wed_cold(dev);
+ 	if (err || pdev->irq == dev->hif2->irq || phy2->mt76->band_idx != 1 || dev->mphy.band_idx) {
+ 		dev_info(device, "CT WED v2 cold gate=%d irq=%d/%d bands=%u/%u; native\n", err,
+ 			 pdev->irq, dev->hif2->irq, dev->mphy.band_idx, phy2->mt76->band_idx);
+-		return;
++		return 0;
+ 	}
+ 	bridge = kzalloc(sizeof(*bridge), GFP_KERNEL);
+ 	if (!bridge)
+-		return;
++		return 0;
+ 	bridge->ops = symbol_get(airoha_ct_wed_ops_v2);
+ 	if (!bridge->ops) {
+ 		kfree(bridge);
+ 		dev_info(device, "CT WED provider absent; native TX\n");
+-		return;
++		return 0;
+ 	}
+ 	if (!bridge->ops->get || !bridge->ops->put || !bridge->ops->acquire ||
+ 	    !bridge->ops->start_masked || !bridge->ops->quiesce || !bridge->ops->release ||
+ 	    !bridge->ops->irq_mask || !bridge->ops->irq_ack) {
+ 		symbol_put(airoha_ct_wed_ops_v2);
+ 		kfree(bridge);
+-		return;
++		return 0;
+ 	}
+ 	bridge->handle = bridge->ops->get(device);
+ 	if (IS_ERR_OR_NULL(bridge->handle)) {
+@@ -256,7 +260,7 @@
+ 			 bridge->handle ? PTR_ERR(bridge->handle) : -ENODEV);
+ 		symbol_put(airoha_ct_wed_ops_v2);
+ 		kfree(bridge);
+-		return;
++		return 0;
+ 	}
+ 	bridge->dev = dev;
+ 	bridge->queue[AIROHA_CT_WED_TX0] = dev->mphy.q_tx[0];
+@@ -331,28 +335,131 @@
+ 		rcu_assign_pointer(dev->ct_wed, bridge);
+ 		spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
+ 		dev_err(device, "CT WED v2 unstarted lease retained after release refusal; native IRQ\n");
+-		return;
++		return 0;
+ 	}
+ put:
+ 	if (bridge->tokens_split && mt7915_ct_wed_tokens(bridge, false))
+ 		dev_err(device, "CT WED v2 host tokens remain in high partition\n");
+ 	dev_info(device, "CT WED v2 cold gate: %s (%d); native TX/WA/IRQ\n", gate, err);
+ 	mt7915_ct_wed_put(bridge);
+-}
+-
+-void mt7915_ct_wed_detach(struct mt7915_dev *dev)
++	return 0;
++}
++
++bool mt7915_ct_wed_retained(struct mt7915_dev *dev)
+ {
+ 	struct mt7915_ct_wed *bridge = rcu_access_pointer(dev->ct_wed);
++
++	return bridge && READ_ONCE(bridge->ever_exposed);
++}
++
++int mt7915_ct_wed_expose(struct mt7915_dev *dev, struct mt7915_phy *phy2)
++{
++	struct mt7915_ct_wed *bridge = rcu_access_pointer(dev->ct_wed);
++	int err;
++
++	if (!bridge || bridge->dev != dev || !bridge->lease || bridge->owner != CT_SWITCHING ||
++	    bridge->ever_exposed || !bridge->irq_requested || !phy2 || !phy2->mt76)
++		return -EINVAL;
++	if (!try_module_get(THIS_MODULE))
++		return -ENODEV;
++	err = mt76_dma_capsule_retain(&dev->mt76);
++	if (err) {
++		module_put(THIS_MODULE);
++		return err;
++	}
++	bridge->module_pinned = true;
++	bridge->retained_phy2 = phy2->mt76;
++	WRITE_ONCE(bridge->ever_exposed, true);
++	return 0;
++}
++
++void mt7915_ct_wed_park(struct mt7915_dev *dev, bool from_reset)
++{
++	struct mt7915_ct_wed *bridge = rcu_access_pointer(dev->ct_wed);
++	struct mt76_dev *mdev = &dev->mt76;
++	struct mt76_phy *phy2;
++	unsigned int index;
++
++	if (!bridge || !bridge->ever_exposed || xchg(&bridge->software_parked, true))
++		return;
++	phy2 = bridge->retained_phy2;
++	dev->recovery.hw_init_done = false;
++	set_bit(MT76_REMOVED, &dev->mphy.state);
++	set_bit(MT76_RESET, &dev->mphy.state);
++	set_bit(MT76_MCU_RESET, &dev->mphy.state);
++	clear_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
++	clear_bit(MT76_STATE_RUNNING, &dev->mphy.state);
++	if (test_bit(MT76_STATE_REGISTERED, &dev->mphy.state))
++		ieee80211_stop_queues(dev->mphy.hw);
++	if (phy2) {
++		set_bit(MT76_REMOVED, &phy2->state);
++		set_bit(MT76_RESET, &phy2->state);
++		set_bit(MT76_MCU_RESET, &phy2->state);
++		clear_bit(MT76_STATE_RUNNING, &phy2->state);
++		if (test_bit(MT76_STATE_REGISTERED, &phy2->state))
++			ieee80211_stop_queues(phy2->hw);
++	}
++	wake_up(&mdev->mcu.wait);
++	wake_up(&dev->reset_wait);
++	devm_free_irq(mdev->dev, to_pci_dev(mdev->dev)->irq, dev);
++	if (dev->hif2)
++		devm_free_irq(mdev->dev, dev->hif2->irq, dev);
++	mt7915_ct_stop(dev);
++	tasklet_kill(&mdev->irq_tasklet);
++	cancel_work_sync(&dev->init_work);
++	if (!from_reset)
++		cancel_work_sync(&dev->reset_work);
++	cancel_work_sync(&dev->dump_work);
++	cancel_work_sync(&dev->rc_work);
++	cancel_delayed_work_sync(&dev->mphy.mac_work);
++	if (phy2)
++		cancel_delayed_work_sync(&phy2->mac_work);
++	if (mdev->tx_worker.task)
++		mt76_worker_disable(&mdev->tx_worker);
++	mt76_for_each_q_rx(mdev, index)
++		if (mdev->q_rx[index].ndesc)
++			napi_disable(&mdev->napi[index]);
++	napi_disable(&mdev->tx_napi);
++	mt7915_mmio_park(dev);
++	dev_warn(mdev->dev, "CT WED radio parked; DMA allocations and module retained until reboot\n");
++}
++
++int mt7915_ct_wed_detach(struct mt7915_dev *dev)
++{
++	struct mt7915_ct_wed *bridge = rcu_access_pointer(dev->ct_wed);
++	struct airoha_ct_wed_drain_v2 result = {};
+ 	unsigned long flags;
++	int err;
+ 
+ 	if (!bridge)
+-		return;
+-	if (bridge->owner != CT_PREPARED || bridge->ops->release(bridge->lease))
+-		return;
++		return 0;
++	if (bridge->ever_exposed) {
++		if (READ_ONCE(bridge->owner) == CT_RETAINED)
++			return -EUCLEAN;
++		spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
++		bridge->owner = CT_QUIESCING;
++		bridge->ops->irq_mask(bridge->lease, 0);
++		spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
++		err = bridge->ops->quiesce(bridge->lease, &result);
++		spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
++		bridge->owner = CT_RETAINED;
++		spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
++		if (bridge->irq_requested) {
++			free_irq(bridge->view.irq, bridge);
++			bridge->irq_requested = false;
++		}
++		return err ?: -EUCLEAN;
++	}
++	if (bridge->owner != CT_PREPARED)
++		return -EBUSY;
++	err = bridge->ops->release(bridge->lease);
++	if (err)
++		return err;
+ 	if (mt7915_ct_wed_tokens(bridge, false))
+ 		dev_err(dev->mt76.dev, "CT WED v2 host tokens remain in high partition\n");
+ 	spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
+ 	RCU_INIT_POINTER(dev->ct_wed, NULL);
+ 	spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
+ 	mt7915_ct_wed_put(bridge);
+-}
++	return 0;
++}
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -176,7 +176,10 @@
+ 
+ 	if (dev->hif2)
+ 		hif1_ofs = MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0);
+-	mt7915_ct_wed_detach(dev);
++	if (mt7915_ct_wed_detach(dev)) {
++		mt7915_ct_wed_park(dev, false);
++		return;
++	}
+ 
+ 	/* reset */
+ 	if (rst) {
+@@ -336,6 +339,7 @@
+ {
+ 	struct mt76_dev *mdev = &dev->mt76;
+ 	u32 hif1_ofs = 0;
++	int ret;
+ 
+ 	if (dev->hif2)
+ 		hif1_ofs = MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0);
+@@ -401,8 +405,11 @@
+ 	}
+ 
+ 	mt76_poll(dev, MT_WFDMA_EXT_CSR_HIF_MISC, MT_WFDMA_EXT_CSR_HIF_MISC_BUSY, 0, 1000);
+-	if (phy2)
+-		mt7915_ct_wed_attach(dev, phy2);
++	if (phy2) {
++		ret = mt7915_ct_wed_attach(dev, phy2);
++		if (ret)
++			return ret;
++	}
+ 
+ 	return mt7915_dma_start(dev, reset, true);
+ }
+@@ -598,18 +605,18 @@
+ 		return ret;
+ 	}
+ 
+-	mt7915_dma_enable(dev, false, phy2);
+-
+-	return 0;
++	return mt7915_dma_enable(dev, false, phy2);
+ }
+ 
+ int mt7915_dma_reset(struct mt7915_dev *dev, bool force)
+ {
+ 	struct mt76_phy *mphy_ext = dev->mt76.phys[MT_BAND1];
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+-	int i;
+-
+-	mt7915_ct_wed_detach(dev);
++	int i, ret;
++
++	ret = mt7915_ct_wed_detach(dev);
++	if (ret)
++		return ret;
+ 
+ 	/* clean up hw queues */
+ 	for (i = 0; i < ARRAY_SIZE(dev->mt76.phy.q_tx); i++) {
+@@ -660,13 +667,15 @@
+ 		mt76_rmw(dev, MT_WFDMA0_EXT0_CFG, MT_WFDMA0_EXT0_RXWB_KEEP,
+ 			 MT_WFDMA0_EXT0_RXWB_KEEP);
+ 
+-	mt7915_dma_enable(dev, !force, NULL);
+-
+-	return 0;
++	return mt7915_dma_enable(dev, !force, NULL);
+ }
+ 
+ void mt7915_dma_cleanup(struct mt7915_dev *dev)
+ {
++	if (mt7915_ct_wed_detach(dev)) {
++		mt7915_ct_wed_park(dev, false);
++		return;
++	}
+ 	mt7915_dma_disable(dev, true);
+ 
+ 	mt76_dma_cleanup(&dev->mt76);
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1278,19 +1278,25 @@
+ 
+ 	mt7915_unregister_thermal(phy);
+ 	mt76_unregister_phy(mphy);
+-	ieee80211_free_hw(mphy->hw);
++	if (mt7915_ct_wed_retained(dev))
++		clear_bit(MT76_STATE_REGISTERED, &mphy->state);
++	else
++		ieee80211_free_hw(mphy->hw);
+ }
+ 
+ static void mt7915_stop_hardware(struct mt7915_dev *dev)
+ {
+ 	int i;
+ 
++	if (mt7915_ct_wed_detach(dev)) {
++		mt7915_ct_wed_park(dev, false);
++		return;
++	}
+ 	mt76_for_each_q_rx(&dev->mt76, i) {
+ 		if (!mt76_queue_is_wed_rro(&dev->mt76.q_rx[i]))
+ 			napi_disable(&dev->mt76.napi[i]);
+ 	}
+ 	mt7915_mcu_exit(dev);
+-	mt7915_ct_wed_detach(dev);
+ 	mt76_connac2_tx_token_put(&dev->mt76);
+ 	mt7915_dma_cleanup(dev);
+ 	tasklet_disable(&dev->mt76.irq_tasklet);
+@@ -1325,6 +1331,11 @@
+ 
+ 	ret = mt7915_init_hardware(dev, phy2);
+ 	if (ret) {
++		if (mt7915_ct_wed_retained(dev)) {
++			mt7915_ct_wed_detach(dev);
++			mt7915_ct_wed_park(dev, false);
++			goto free_phy2;
++		}
+ 		if (dev->ct_path) {
+ 			int index;
+ 
+@@ -1375,6 +1386,10 @@
+ 	return 0;
+ 
+ unreg_ext_phy:
++	if (mt7915_ct_wed_retained(dev)) {
++		mt7915_ct_wed_detach(dev);
++		mt7915_ct_wed_park(dev, false);
++	}
+ 	mt7915_ct_stop(dev);
+ 	if (phy2) {
+ 		mt7915_unregister_ext_phy(dev);
+@@ -1383,13 +1398,17 @@
+ unreg_thermal:
+ 	mt7915_unregister_thermal(&dev->phy);
+ unreg_dev:
++	if (mt7915_ct_wed_retained(dev)) {
++		mt7915_ct_wed_detach(dev);
++		mt7915_ct_wed_park(dev, false);
++	}
+ 	mt7915_ct_stop(dev);
+ 	mt76_unregister_device(&dev->mt76);
+ stop_hw:
+ 	mt7915_ct_stop(dev);
+ 	mt7915_stop_hardware(dev);
+ free_phy2:
+-	if (phy2)
++	if (phy2 && !mt7915_ct_wed_retained(dev))
+ 		ieee80211_free_hw(phy2->mt76->hw);
+ 	return ret;
+ }
+@@ -1399,11 +1418,25 @@
+ 	cancel_work_sync(&dev->dump_work);
+ 	cancel_work_sync(&dev->reset_work);
+ 	cancel_work_sync(&dev->rc_work);
++	mt7915_ct_wed_detach(dev);
++	if (mt7915_ct_wed_retained(dev))
++		mt7915_ct_wed_park(dev, false);
+ 	mt7915_ct_stop(dev);
+ 	mt7915_unregister_ext_phy(dev);
+ 	mt7915_coredump_unregister(dev);
+ 	mt7915_unregister_thermal(&dev->phy);
+ 	mt76_unregister_device(&dev->mt76);
++	if (mt7915_ct_wed_retained(dev)) {
++		clear_bit(MT76_STATE_REGISTERED, &dev->mphy.state);
++		mt76_worker_teardown(&dev->mt76.tx_worker);
++		if (dev->mt76.wq) {
++			destroy_workqueue(dev->mt76.wq);
++			dev->mt76.wq = NULL;
++		}
++		dev->ct_path = NULL;
++		dev->hif2 = NULL;
++		return;
++	}
+ 	mt7915_stop_hardware(dev);
+ 
+ 	mt76_free_device(&dev->mt76);
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1307,6 +1307,9 @@
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+ 	phy2 = ext_phy ? ext_phy->priv : NULL;
+ 
++	ret = mt7915_ct_wed_detach(dev);
++	if (ret)
++		return ret;
+ 	if (dev->hif2) {
+ 		mt76_wr(dev, MT_INT1_MASK_CSR, 0x0);
+ 		mt76_wr(dev, MT_INT1_SOURCE_CSR, ~0);
+@@ -1342,7 +1345,6 @@
+ 	napi_disable(&dev->mt76.tx_napi);
+ 
+ 	/* token reinit */
+-	mt7915_ct_wed_detach(dev);
+ 	mt76_connac2_tx_token_put(&dev->mt76);
+ 	idr_init(&dev->mt76.token);
+ 
+@@ -1497,6 +1499,11 @@
+ 	int i;
+ 
+ 	dev = container_of(work, struct mt7915_dev, reset_work);
++	if (mt7915_ct_wed_retained(dev)) {
++		mt7915_ct_wed_detach(dev);
++		mt7915_ct_wed_park(dev, true);
++		return;
++	}
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+ 	phy2 = ext_phy ? ext_phy->priv : NULL;
+ 	if (dev->ct_path && (dev->recovery.restart ||
+--- a/mt7915/mmio.c
++++ b/mt7915/mmio.c
+@@ -519,8 +519,13 @@
+ void mt7915_memcpy_fromio(struct mt7915_dev *dev, void *buf, u32 offset,
+ 			  size_t len)
+ {
+-	u32 addr = __mt7915_reg_addr(dev, offset);
+-
++	u32 addr;
++
++	if (test_bit(MT76_REMOVED, &dev->mphy.state)) {
++		memset(buf, 0, len);
++		return;
++	}
++	addr = __mt7915_reg_addr(dev, offset);
+ 	if (addr) {
+ 		memcpy_fromio(buf, dev->mt76.mmio.regs + addr, len);
+ 		return;
+@@ -535,8 +540,11 @@
+ static u32 mt7915_rr(struct mt76_dev *mdev, u32 offset)
+ {
+ 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
+-	u32 addr = __mt7915_reg_addr(dev, offset), val;
+-
++	u32 addr, val;
++
++	if (test_bit(MT76_REMOVED, &dev->mphy.state))
++		return 0;
++	addr = __mt7915_reg_addr(dev, offset);
+ 	if (addr)
+ 		return dev->bus_ops->rr(mdev, addr);
+ 
+@@ -550,8 +558,11 @@
+ static void mt7915_wr(struct mt76_dev *mdev, u32 offset, u32 val)
+ {
+ 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
+-	u32 addr = __mt7915_reg_addr(dev, offset);
+-
++	u32 addr;
++
++	if (test_bit(MT76_REMOVED, &dev->mphy.state))
++		return;
++	addr = __mt7915_reg_addr(dev, offset);
+ 	if (addr) {
+ 		dev->bus_ops->wr(mdev, addr, val);
+ 		return;
+@@ -565,8 +576,11 @@
+ static u32 mt7915_rmw(struct mt76_dev *mdev, u32 offset, u32 mask, u32 val)
+ {
+ 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
+-	u32 addr = __mt7915_reg_addr(dev, offset);
+-
++	u32 addr;
++
++	if (test_bit(MT76_REMOVED, &dev->mphy.state))
++		return 0;
++	addr = __mt7915_reg_addr(dev, offset);
+ 	if (addr)
+ 		return dev->bus_ops->rmw(mdev, addr, mask, val);
+ 
+@@ -575,6 +589,46 @@
+ 	spin_unlock_bh(&dev->reg_lock);
+ 
+ 	return val;
++}
++
++static void mt7915_offline_write_copy(struct mt76_dev *mdev, u32 offset,
++				      const void *data, int len)
++{
++}
++
++static void mt7915_offline_read_copy(struct mt76_dev *mdev, u32 offset,
++				     void *data, int len)
++{
++	memset(data, 0, len);
++}
++
++static int mt7915_offline_wr_rp(struct mt76_dev *mdev, u32 base,
++			       const struct mt76_reg_pair *rp, int len)
++{
++	return -ESHUTDOWN;
++}
++
++static int mt7915_offline_rd_rp(struct mt76_dev *mdev, u32 base,
++			       struct mt76_reg_pair *rp, int len)
++{
++	return -ESHUTDOWN;
++}
++
++void mt7915_mmio_park(struct mt7915_dev *dev)
++{
++	static const struct mt76_bus_ops offline_ops = {
++		.rr = mt7915_rr,
++		.wr = mt7915_wr,
++		.rmw = mt7915_rmw,
++		.write_copy = mt7915_offline_write_copy,
++		.read_copy = mt7915_offline_read_copy,
++		.wr_rp = mt7915_offline_wr_rp,
++		.rd_rp = mt7915_offline_rd_rp,
++		.type = MT76_BUS_MMIO,
++	};
++
++	WARN_ON_ONCE(!test_bit(MT76_REMOVED, &dev->mphy.state));
++	WRITE_ONCE(dev->mt76.bus, &offline_ops);
+ }
+ 
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+@@ -802,7 +856,7 @@
+ 	mdev->mmio.irqmask &= ~clear;
+ 	mdev->mmio.irqmask |= set;
+ 
+-	if (write_reg) {
++	if (write_reg && !test_bit(MT76_REMOVED, &dev->mphy.state)) {
+ 		if (mtk_wed_device_active(&mdev->mmio.wed))
+ 			mtk_wed_device_irq_set_mask(&mdev->mmio.wed,
+ 						    mdev->mmio.irqmask);
+@@ -830,6 +884,8 @@
+ 	u32 intr, intr1, mask;
+ 	unsigned long flags;
+ 
++	if (test_bit(MT76_REMOVED, &dev->mphy.state))
++		return;
+ 	spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
+ 	if (mtk_wed_device_active(wed)) {
+ 		mtk_wed_device_irq_set_mask(wed, 0);
+@@ -904,6 +960,8 @@
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+ 	unsigned long flags;
+ 
++	if (test_bit(MT76_REMOVED, &dev->mphy.state))
++		return IRQ_NONE;
+ 	spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
+ 	if (!mt7915_ct_wed_primary_native(dev) && (!dev->hif2 || irq != dev->hif2->irq)) {
+ 		spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
+--- a/mt7915/pci.c
++++ b/mt7915/pci.c
+@@ -15,6 +15,7 @@
+ static LIST_HEAD(hif_list);
+ static DEFINE_SPINLOCK(hif_lock);
+ static u32 hif_idx;
++static bool ct_retained_radio;
+ 
+ static const struct pci_device_id mt7915_pci_device_table[] = {
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_MEDIATEK, 0x7915) },
+@@ -109,6 +110,8 @@
+ 	int irq;
+ 	int ret;
+ 
++	if (READ_ONCE(ct_retained_radio))
++		return -EBUSY;
+ 	ret = pcim_enable_device(pdev);
+ 	if (ret)
+ 		return ret;
+@@ -164,6 +167,12 @@
+ 
+ 	if (hif2) {
+ 		dev->hif2 = hif2;
++		dev->hif2_link = device_link_add(mdev->dev, hif2->dev,
++					       DL_FLAG_AUTOREMOVE_CONSUMER);
++		if (!dev->hif2_link) {
++			ret = -ENOMEM;
++			goto free_hif2;
++		}
+ 
+ 		mt76_wr(dev, MT_INT1_MASK_CSR, 0);
+ 		/* master switch of PCIe tnterrupt enable */
+@@ -186,9 +195,25 @@
+ 	return 0;
+ 
+ free_hif2_irq:
++	if (mt7915_ct_wed_retained(dev)) {
++		WRITE_ONCE(ct_retained_radio, true);
++		mt7915_unregister_device(dev);
++		if (dev->hif2_link) {
++			device_link_del(dev->hif2_link);
++			dev->hif2_link = NULL;
++		}
++		mt7915_put_hif2(hif2);
++		pci_free_irq_vectors(pdev);
++		pci_set_drvdata(pdev, NULL);
++		return ret;
++	}
+ 	if (dev->hif2)
+ 		devm_free_irq(mdev->dev, dev->hif2->irq, dev);
+ free_hif2:
++	if (dev->hif2_link) {
++		device_link_del(dev->hif2_link);
++		dev->hif2_link = NULL;
++	}
+ 	if (dev->hif2)
+ 		put_device(dev->hif2->dev);
+ 	devm_free_irq(mdev->dev, irq, dev);
+@@ -214,11 +239,21 @@
+ {
+ 	struct mt76_dev *mdev;
+ 	struct mt7915_dev *dev;
++	struct device *hif2_device;
++	bool retained;
+ 
+ 	mdev = pci_get_drvdata(pdev);
+ 	dev = container_of(mdev, struct mt7915_dev, mt76);
+-	mt7915_put_hif2(dev->hif2);
++	hif2_device = dev->hif2 ? dev->hif2->dev : NULL;
++	retained = mt7915_ct_wed_retained(dev);
++	if (retained)
++		WRITE_ONCE(ct_retained_radio, true);
++	pci_set_drvdata(pdev, NULL);
+ 	mt7915_unregister_device(dev);
++	if (hif2_device)
++		put_device(hif2_device);
++	if (retained)
++		pci_free_irq_vectors(pdev);
+ }
+ 
+ struct pci_driver mt7915_hif_driver = {
