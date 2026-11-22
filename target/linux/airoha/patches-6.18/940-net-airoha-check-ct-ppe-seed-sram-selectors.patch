@@ -1,0 +1,49 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: verify CT PPE seed SRAM selectors
+
+Qualify the SRAM controller acknowledgement before trusting the seed
+write or its readback. The AN7581 controller clears REQ and preserves
+the absolute SRAM index and operation direction in both banks.
+
+Leave the ordinary, non-CT flow access path unchanged.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -3035,6 +3035,20 @@
+ 	return 0;
+ }
+ 
++static bool airoha_ppe_ct_sram_ack(struct airoha_eth *eth, u32 hash, bool write)
++{
++	u32 expected = FIELD_PREP(PPE_SRAM_CTRL_ENTRY_MASK, hash) |
++		       PPE_SRAM_CTRL_ACK_MASK;
++	u32 mask = PPE_SRAM_CTRL_ENTRY_MASK | PPE_SRAM_CTRL_ACK_MASK |
++		   PPE_SRAM_CTRL_WR_MASK | PPE_SRAM_CTRL_REQ_MASK;
++	u32 ctrl = airoha_fe_rr(eth, REG_PPE_RAM_CTRL(hash >= PPE_SRAM_NUM_ENTRIES));
++
++	if (write)
++		expected |= PPE_SRAM_CTRL_WR_MASK;
++
++	return (ctrl & mask) == expected;
++}
++
+ static int airoha_ppe_ct_probe_seed(struct airoha_ppe *ppe)
+ {
+ 	struct airoha_foe_entry invalid = {};
+@@ -3082,12 +3096,15 @@
+ 		spin_lock_bh(&ppe_lock);
+ 		*entry = invalid;
+ 		err = airoha_ppe_foe_commit_sram_entry(ppe, hash);
++		if (!err && !airoha_ppe_ct_sram_ack(eth, hash, true))
++			err = -EIO;
+ 		if (!err) {
+ 			access = "readback";
+ 			entry = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 			if (!entry)
+ 				err = -ETIMEDOUT;
+-			else if (memcmp(entry, &invalid, sizeof(invalid)))
++			else if (!airoha_ppe_ct_sram_ack(eth, hash, false) ||
++				 memcmp(entry, &invalid, sizeof(invalid)))
+ 				err = -EIO;
+ 		}
+ 		spin_unlock_bh(&ppe_lock);
