@@ -1,0 +1,72 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1667,10 +1667,16 @@ static int airoha_ppe_ct_check_sram(struct airoha_ppe *ppe, enum airoha_ct_sram_op op)
+ 		struct airoha_foe_entry *entry;
+ 		unsigned int bank = hash / PPE_SRAM_NUM_ENTRIES;
+ 		const char *access = "read";
++		u32 ib1 = 0;
++		bool valid = false;
+ 		int err = 0;
+ 
+ 		spin_lock_bh(&ppe_lock);
+ 		entry = airoha_ppe_foe_get_entry_locked(ppe, hash);
++		if (entry) {
++			ib1 = entry->ib1;
++			valid = true;
++		}
+ 		if (!entry) {
+ 			err = -ETIMEDOUT;
+ 		} else if (entry->ib1 & AIROHA_FOE_IB1_BIND_STATIC) {
+@@ -1691,15 +1697,15 @@ static int airoha_ppe_ct_check_sram(struct airoha_ppe *ppe, enum airoha_ct_sram_op op)
+ 		}
+ 		spin_unlock_bh(&ppe_lock);
+ 		if (err) {
+-			if (ppe->ct_owns_sram)
+-				dev_err(eth->dev, "CT PPE %s %s bank=%u row=%u err=%d ctrl=%08x glo=%08x flow=%08x tb=%08x\n",
+-					op == CT_CHECK_OWNED ? "preflight" :
+-					op == CT_CLEAR_OWNED ? "clear" : "verify", access,
+-					bank, hash % PPE_SRAM_NUM_ENTRIES, err,
+-					airoha_fe_rr(eth, REG_PPE_RAM_CTRL(bank)),
+-					airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank)),
+-					airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)),
+-					airoha_fe_rr(eth, REG_PPE_TB_CFG(bank)));
++			dev_err(eth->dev, "CT PPE %s %s bank=%u row=%u err=%d valid=%u ib1=%08x pending=%u owns=%u ctrl=%08x glo=%08x flow=%08x tb=%08x\n",
++				op == CT_CHECK_OWNED ? "preflight" :
++				op == CT_CLEAR_OWNED ? "clear" : "verify", access,
++				bank, hash % PPE_SRAM_NUM_ENTRIES, err, valid, ib1,
++				ppe->ct_restore_pending, ppe->ct_owns_sram,
++				airoha_fe_rr(eth, REG_PPE_RAM_CTRL(bank)),
++				airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank)),
++				airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)),
++				airoha_fe_rr(eth, REG_PPE_TB_CFG(bank)));
+ 			return err;
+ 		}
+ 		if (!(hash % 256))
+@@ -1883,8 +1889,11 @@ static int airoha_ppe_ct_start(struct airoha_ppe *ppe, struct airoha_npu *npu)
+ 	struct airoha_eth *eth = ppe->eth;
+ 	int bank, err;
+ 
+-	if (ppe->ct_restore_pending)
++	if (ppe->ct_restore_pending) {
++		dev_err(eth->dev, "CT PPE cold refused: restore pending=%u owns=%u\n",
++			ppe->ct_restore_pending, ppe->ct_owns_sram);
+ 		return -EBUSY;
++	}
+ 
+ 	if (of_property_match_string(np, "memory-region-names", "connac2-pkt") < 0 ||
+ 	    of_property_match_string(np, "firmware-name", "airoha/hg5585f-ct/npu_rv32.bin") != 0 ||
+@@ -1896,7 +1905,12 @@ static int airoha_ppe_ct_start(struct airoha_ppe *ppe, struct airoha_npu *npu)
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+-		if (airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)) ||
+-		    airoha_fe_rr(eth, REG_PPE_TB_BASE(bank)))
++		u32 flow = airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank));
++		u32 base = airoha_fe_rr(eth, REG_PPE_TB_BASE(bank));
++
++		if (flow || base) {
++			dev_err(eth->dev, "CT PPE cold refused: bank=%d flow=%08x base=%08x pending=%u owns=%u\n",
++				bank, flow, base, ppe->ct_restore_pending, ppe->ct_owns_sram);
+ 			return -EBUSY;
++		}
+ 		ppe->ct_saved[bank].glo = airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank));
+ 		airoha_ppe_ct_regs(ppe, bank, false);
+ 	}
