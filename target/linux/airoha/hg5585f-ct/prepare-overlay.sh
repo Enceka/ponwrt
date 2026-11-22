@@ -29,11 +29,14 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   package/kernel/mt76/ct-wed/patches/132-mt7915-rearm-ct-irq-before-mcu-init.patch \
   package/kernel/mt76/ct-wed/patches/133-mt7915-use-intx-for-active-ct-wed.patch \
   package/kernel/mt76/ct-wed/patches/134-mt7915-gate-exclusive-ct-primary-irq.patch \
+  package/kernel/mt76/ct-wed/patches/135-mt7915-wait-for-ct-ppe-cold-ready.patch \
   target/linux/airoha/patches-6.18/931-net-airoha-initialize-ct-connac2-packet-pool.patch \
   target/linux/airoha/patches-6.18/932-net-airoha-initialize-ct-connac2-host-ppe.patch \
   target/linux/airoha/patches-6.18/933-net-airoha-quiesce-ct-ppe-on-shutdown.patch \
   target/linux/airoha/patches-6.18/934-net-airoha-drain-ct-sram-before-disabling-ppe.patch \
   target/linux/airoha/patches-6.18/935-net-airoha-report-ct-ppe-cold-ownership.patch \
+  target/linux/airoha/patches-6.18/936-net-airoha-prepare-ct-ppe-before-radio-exposure.patch \
+  target/linux/airoha/patches-6.18/937-net-airoha-limit-repeated-ct-ppe-cold-diagnostics.patch \
   target/linux/airoha/hg5585f-ct/ram-dts.py \
   target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts}; do
   mkdir -p "$overlay/tree/$(dirname "$path")"

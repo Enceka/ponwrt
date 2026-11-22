@@ -1,0 +1,51 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: report cold PPE rejection once per startup
+
+Log each cold startup refusal before the shared setup path records the
+failure. Suppress repeated pending, bank configuration and SRAM messages
+on later attempts while retaining every owned SRAM drain diagnostic.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1698,13 +1698,14 @@ static int airoha_ppe_ct_check_sram(struct airoha_ppe *ppe, enum airoha_ct_sram_op op)
+ 		spin_unlock_bh(&ppe_lock);
+ 		if (err) {
+-			dev_err(eth->dev, "CT PPE %s %s bank=%u row=%u err=%d valid=%u ib1=%08x pending=%u owns=%u ctrl=%08x glo=%08x flow=%08x tb=%08x\n",
++			if (ppe->ct_owns_sram || !ppe->ct_start_reported)
++				dev_err(eth->dev, "CT PPE %s %s bank=%u row=%u err=%d valid=%u ib1=%08x pending=%u owns=%u ctrl=%08x glo=%08x flow=%08x tb=%08x\n",
+-				op == CT_CHECK_OWNED ? "preflight" :
+-				op == CT_CLEAR_OWNED ? "clear" : "verify", access,
+-				bank, hash % PPE_SRAM_NUM_ENTRIES, err, valid, ib1,
+-				ppe->ct_restore_pending, ppe->ct_owns_sram,
+-				airoha_fe_rr(eth, REG_PPE_RAM_CTRL(bank)),
+-				airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank)),
+-				airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)),
+-				airoha_fe_rr(eth, REG_PPE_TB_CFG(bank)));
++					op == CT_CHECK_OWNED ? "preflight" :
++					op == CT_CLEAR_OWNED ? "clear" : "verify", access,
++					bank, hash % PPE_SRAM_NUM_ENTRIES, err, valid, ib1,
++					ppe->ct_restore_pending, ppe->ct_owns_sram,
++					airoha_fe_rr(eth, REG_PPE_RAM_CTRL(bank)),
++					airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank)),
++					airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)),
++					airoha_fe_rr(eth, REG_PPE_TB_CFG(bank)));
+ 			return err;
+ 		}
+@@ -1892,5 +1893,6 @@ static int airoha_ppe_ct_start(struct airoha_ppe *ppe, struct airoha_npu *npu)
+ 	if (ppe->ct_restore_pending) {
+-		dev_err(eth->dev, "CT PPE cold refused: restore pending=%u owns=%u\n",
+-			ppe->ct_restore_pending, ppe->ct_owns_sram);
++		if (!ppe->ct_start_reported)
++			dev_err(eth->dev, "CT PPE cold refused: restore pending=%u owns=%u\n",
++				ppe->ct_restore_pending, ppe->ct_owns_sram);
+ 		return -EBUSY;
+ 	}
+@@ -1911,5 +1913,6 @@ static int airoha_ppe_ct_start(struct airoha_ppe *ppe, struct airoha_npu *npu)
+ 		if (flow || base) {
+-			dev_err(eth->dev, "CT PPE cold refused: bank=%d flow=%08x base=%08x pending=%u owns=%u\n",
+-				bank, flow, base, ppe->ct_restore_pending, ppe->ct_owns_sram);
++			if (!ppe->ct_start_reported)
++				dev_err(eth->dev, "CT PPE cold refused: bank=%d flow=%08x base=%08x pending=%u owns=%u\n",
++					bank, flow, base, ppe->ct_restore_pending, ppe->ct_owns_sram);
+ 			return -EBUSY;
+ 		}
