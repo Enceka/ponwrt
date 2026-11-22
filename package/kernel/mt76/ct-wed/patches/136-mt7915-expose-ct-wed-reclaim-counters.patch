@@ -1,0 +1,115 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mt76: expose CT WED reclaim counters
+
+Expose a read-only snapshot of both WDMA rings and the TX completion and
+buffer manager counters on the primary PHY. Check the active bridge before
+and after the provider snapshot so a concurrent quiesce drops the sample.
+The exposed bridge retains its lease until reboot, allowing the provider
+to take its mutexes after the consumer drops the IRQ lock.
+
+--- a/mt7915/ct_wed.c
++++ b/mt7915/ct_wed.c
+@@ -1,9 +1,12 @@
++#include <linux/debugfs.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/pci.h>
++#include <linux/seq_file.h>
+ #include "mt7915.h"
+ #include "../dma.h"
+ #include "ct-wed-provider-v2.h"
++#include "ct-wed/ct_wed_live_sample.h"
+ #include "ct-wed/ct_wed_start.h"
+ 
+ static bool ct_wed_activate;
+@@ -471,6 +474,66 @@ bool mt7915_ct_wed_retained(struct mt7915_dev *dev)
+ 	return bridge && READ_ONCE(bridge->ever_exposed);
+ }
+ 
++static struct mt7915_ct_wed *mt7915_ct_wed_reclaim_bridge(struct mt7915_dev *dev)
++{
++	struct mt7915_ct_wed *bridge;
++	unsigned long flags;
++
++	spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
++	bridge = rcu_dereference_protected(dev->ct_wed,
++					  lockdep_is_held(&dev->mt76.mmio.irq_lock));
++	if (!bridge || bridge->owner != CT_WED || !bridge->ever_exposed ||
++	    READ_ONCE(bridge->software_parked))
++		bridge = NULL;
++	spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
++
++	return bridge;
++}
++
++static int mt7915_ct_wed_reclaim_show(struct seq_file *seq, void *unused)
++{
++	struct mt7915_dev *dev = seq->private;
++	struct mt7915_ct_wed *bridge = mt7915_ct_wed_reclaim_bridge(dev);
++	struct airoha_ct_wed_live_sample sample;
++	typeof(&airoha_ct_wed_read_live) read_live;
++	unsigned int index;
++	int err;
++
++	if (!bridge)
++		return -ESHUTDOWN;
++	read_live = symbol_get(airoha_ct_wed_read_live);
++	if (!read_live)
++		return -EOPNOTSUPP;
++	err = read_live(bridge->lease, dev->mt76.dev, &sample);
++	symbol_put(airoha_ct_wed_read_live);
++	if (err)
++		return err;
++	if (mt7915_ct_wed_reclaim_bridge(dev) != bridge)
++		return -ESHUTDOWN;
++
++	seq_printf(seq, "txfree=%u wpdma_txfree=%u free_token=%u bm_issued=%u bm_returned=%u\n",
++		   sample.txfree, sample.wpdma_txfree, sample.wpdma_free_token,
++		   sample.bm_issued, sample.bm_returned);
++	for (index = 0; index < ARRAY_SIZE(sample.ring); index++) {
++		const struct ct_live_ring_sample *ring = &sample.ring[index];
++
++		seq_printf(seq, "ring=%u cidx=%u didx=%u wed_cidx=%u wed_didx=%u "
++			   "received=%u processed=%u recycled=%u wpdma_tx=%u\n",
++			   index, ring->wdma_cidx, ring->wdma_didx, ring->wed_cidx,
++			   ring->wed_didx, ring->received, ring->processed,
++			   ring->recycled, ring->wpdma_tx);
++	}
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mt7915_ct_wed_reclaim);
++
++void mt7915_ct_wed_reclaim_debugfs(struct mt7915_dev *dev, struct dentry *dir)
++{
++	if (mt7915_ct_wed_reclaim_bridge(dev))
++		debugfs_create_file("ct_wed_reclaim", 0400, dir, dev,
++				    &mt7915_ct_wed_reclaim_fops);
++}
++
+ int mt7915_ct_wed_expose(struct mt7915_dev *dev, struct mt7915_phy *phy2)
+ {
+ 	struct mt7915_ct_wed *bridge = rcu_access_pointer(dev->ct_wed);
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1310,8 +1310,10 @@ int mt7915_init_debugfs(struct mt7915_phy *phy)
+ 	dir = mt76_register_debugfs_fops(phy->mt76, NULL);
+ 
+ #ifdef CONFIG_MT7915_NPU
+-	if (!ext_phy)
++	if (!ext_phy) {
+ 		mt7915_npu_debugfs_ct(dev, dir);
++		mt7915_ct_wed_reclaim_debugfs(dev, dir);
++	}
+ #endif
+ 
+ 	debugfs_create_file("muru_debug", 0600, dir, dev, &fops_muru_debug);
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -488,6 +488,7 @@ int mt7915_ct_wed_attach(struct mt7915_dev *dev, struct mt7915_phy *phy2);
+ int mt7915_ct_wed_detach(struct mt7915_dev *dev);
+ int mt7915_ct_wed_expose(struct mt7915_dev *dev, struct mt7915_phy *phy2);
+ bool mt7915_ct_wed_retained(struct mt7915_dev *dev);
++void mt7915_ct_wed_reclaim_debugfs(struct mt7915_dev *dev, struct dentry *dir);
+ void mt7915_ct_wed_park(struct mt7915_dev *dev, bool from_reset);
+ bool mt7915_ct_wed_mask(struct mt7915_dev *dev, u32 mask);
+ bool mt7915_ct_wed_primary_native(struct mt7915_dev *dev);

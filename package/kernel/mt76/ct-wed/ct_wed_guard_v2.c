@@ -3,6 +3,7 @@
 #include <linux/slab.h>
 
 #include "../ct-wed-provider-v2.h"
+#include "ct_wed_live_sample.h"
 
 enum ct_exposure {
 	CT_NEVER_EXPOSED,
@@ -135,6 +136,29 @@ static u32 ct_v2_irq_ack(struct airoha_ct_wed_lease_v2 *lease, u32 mask)
 		return 0;
 	return airoha_ct_wed_ops_v1.irq_ack(lease->provider, mask);
 }
+
+int airoha_ct_wed_read_live(struct airoha_ct_wed_lease_v2 *lease,
+			   const struct device *radio,
+			   struct airoha_ct_wed_live_sample *sample)
+{
+	int err = -ESTALE;
+
+	if (!sample)
+		return -EINVAL;
+	*sample = (struct airoha_ct_wed_live_sample) {};
+	mutex_lock(&ct_v2_lock);
+	if (!lease || lease != ct_v2_owner)
+		goto out;
+	if (lease->exposure != CT_EXPOSED) {
+		err = -ESHUTDOWN;
+		goto out;
+	}
+	err = airoha_ct_wed_platform_read_live(lease->provider, radio, sample);
+out:
+	mutex_unlock(&ct_v2_lock);
+	return err;
+}
+EXPORT_SYMBOL_GPL(airoha_ct_wed_read_live);
 
 const struct airoha_ct_wed_ops_v2 airoha_ct_wed_ops_v2 = {
 	.get = ct_v2_get, .put = ct_v2_put, .acquire = ct_v2_acquire,
