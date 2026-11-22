@@ -1,0 +1,131 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: seed opt-in CT SRAM during reset-owned probe
+
+Initialize the CT SRAM table after the exclusive FE reset and before
+DEV_STATE_INITIALIZED, QDMA NAPI start or GDM registration. Stop both
+PPE banks, seed every entry with a full INVALID image, and check every
+write ACK and complete SRAM readback. Do not interpret uninitialized POR
+entry bits as ownership. Keep both banks disabled for later CT startup.
+
+The new device-tree property is opt-in. Late preparation and repeated
+attempts cannot seed the table. A failed seed preserves native Ethernet
+but prevents CT startup, including after a partial seed. Existing CT
+cold-start checks remain.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -728,5 +728,7 @@ struct airoha_ppe {
+ 	bool ct_stopping;
+ 	bool ct_start_reported;
++	bool ct_probe_seed_attempted;
++	bool ct_probe_seed_verified;
+ 	struct {
+ 		u32 glo, regs[16];
+ 	} ct_saved[2];
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1717,6 +1717,82 @@ static int airoha_ppe_ct_check_sram(struct airoha_ppe *ppe, enum airoha_ct_sram_op op)
+ 	return 0;
+ }
+ 
++static int airoha_ppe_ct_probe_seed(struct airoha_ppe *ppe)
++{
++	struct airoha_foe_entry invalid = {};
++	struct airoha_eth *eth = ppe->eth;
++	u32 count = airoha_ppe_get_total_sram_num_entries(ppe);
++	u32 hash, val;
++	int bank, err = 0;
++
++	if (!of_property_read_bool(eth->dev->of_node, "airoha,connac2-ppe-probe-seed"))
++		return 0;
++	if (!airoha_ppe_ct_requested(eth) || eth->soc->num_ppe != ARRAY_SIZE(ppe->ct_saved))
++		return -EOPNOTSUPP;
++
++	mutex_lock(&flow_offload_mutex);
++	if (test_bit(DEV_STATE_INITIALIZED, &eth->state) ||
++	    test_bit(DEV_STATE_REGISTERED, &eth->state) || rcu_access_pointer(eth->npu) ||
++	    ppe->ct_probe_seed_attempted || ppe->ct_restore_pending ||
++	    ppe->ct_owns_sram || ppe->ct_host_ppe || ppe->ct_stopping) {
++		err = -EBUSY;
++		goto out;
++	}
++	ppe->ct_probe_seed_attempted = true;
++	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
++		if (airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)) ||
++		    airoha_fe_rr(eth, REG_PPE_TB_BASE(bank))) {
++			err = -EBUSY;
++			goto out;
++		}
++	}
++	for (bank = 0; bank < eth->soc->num_ppe; bank++)
++		airoha_fe_clear(eth, REG_PPE_GLO_CFG(bank), PPE_GLO_CFG_EN_MASK);
++	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
++		err = read_poll_timeout(airoha_fe_rr, val,
++					!(val & (PPE_GLO_CFG_EN_MASK | PPE_GLO_CFG_BUSY_MASK)),
++					10, 100000, false, eth, REG_PPE_GLO_CFG(bank));
++		if (err)
++			goto out;
++	}
++	for (hash = 0; hash < count; hash++) {
++		struct airoha_foe_entry *entry = ppe->foe + hash * sizeof(*entry);
++
++		spin_lock_bh(&ppe_lock);
++		*entry = invalid;
++		err = airoha_ppe_foe_commit_sram_entry(ppe, hash);
++		if (!err) {
++			entry = airoha_ppe_foe_get_entry_locked(ppe, hash);
++			if (!entry)
++				err = -ETIMEDOUT;
++			else if (memcmp(entry, &invalid, sizeof(invalid)))
++				err = -EIO;
++		}
++		spin_unlock_bh(&ppe_lock);
++		if (err) {
++			dev_err(eth->dev, "CT PPE probe seed bank=%u row=%u error=%d\n",
++				hash / PPE_SRAM_NUM_ENTRIES, hash % PPE_SRAM_NUM_ENTRIES, err);
++			goto out;
++		}
++		if (!(hash % 256))
++			cond_resched();
++	}
++	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
++		if ((airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank)) &
++		     (PPE_GLO_CFG_EN_MASK | PPE_GLO_CFG_BUSY_MASK)) ||
++		    airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)) ||
++		    airoha_fe_rr(eth, REG_PPE_TB_BASE(bank))) {
++			err = -EBUSY;
++			goto out;
++		}
++	}
++	ppe->ct_probe_seed_verified = true;
++	dev_info(eth->dev, "CT PPE probe seeded %u checked INVALID rows; banks disabled\n", count);
++out:
++	mutex_unlock(&flow_offload_mutex);
++	return err;
++}
++
+ static const u16 ct_bank0_regs[] = {
+ 	REG_PPE_TB_CFG(0), REG_PPE_TB_HASH_CFG(0), REG_PPE_BND_AGE0(0),
+ 	REG_PPE_BND_AGE1(0), REG_PPE_BIND_RATE(0), REG_PPE_HASH_SEED(0),
+@@ -1890,6 +1966,10 @@ static int airoha_ppe_ct_start(struct airoha_ppe *ppe, struct airoha_npu *npu)
+ 	struct airoha_eth *eth = ppe->eth;
+ 	int bank, err;
+ 
++	if (of_property_read_bool(eth->dev->of_node, "airoha,connac2-ppe-probe-seed") &&
++	    (!ppe->ct_probe_seed_attempted || !ppe->ct_probe_seed_verified))
++		return -EUCLEAN;
++
+ 	if (ppe->ct_restore_pending) {
+ 		if (!ppe->ct_start_reported)
+ 			dev_err(eth->dev, "CT PPE cold refused: restore pending=%u owns=%u\n",
+@@ -2218,6 +2298,10 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	if (!ppe->foe_check_time)
+ 		return -ENOMEM;
+ 
++	err = airoha_ppe_ct_probe_seed(ppe);
++	if (err)
++		dev_warn(eth->dev, "CT PPE probe seed: %d; native Ethernet retained, CT disabled\n", err);
++
+ 	if (!airoha_ppe_ct_requested(eth)) {
+ 		err = airoha_ppe_flush_sram_entries(ppe);
+ 		if (err)

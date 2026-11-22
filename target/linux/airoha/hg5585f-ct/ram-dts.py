@@ -11,6 +11,8 @@ def main():
     parser.add_argument("--connac2-rx", action="store_true")
     parser.add_argument("--connac2-host-ppe", action="store_true",
                         help="Enable host PPE in this RAM image (requires Connac2 RX and verified firmware)")
+    parser.add_argument("--ct-ppe-probe-seed", action="store_true",
+                        help="Initialize CT SRAM during the reset-owned Ethernet probe before publishing ports")
     parser.add_argument("--wed-slot1", action="store_true",
                         help="Describe the slot 1 WED supplier for the MT7916 RAM trial")
     parser.add_argument("--wed-bm-debug", action="store_true",
@@ -23,6 +25,8 @@ def main():
         parser.error("--connac2-host-ppe requires --connac2-rx")
     if args.wed_slot1 and not args.connac2_host_ppe:
         parser.error("--wed-slot1 requires --connac2-host-ppe")
+    if args.ct_ppe_probe_seed and not args.connac2_host_ppe:
+        parser.error("--ct-ppe-probe-seed requires --connac2-host-ppe")
     if args.wed_bm_debug and not args.wed_slot1:
         parser.error("--wed-bm-debug requires --wed-slot1")
     if args.connac2_host_ppe != bool(args.firmware_dir):
@@ -65,6 +69,8 @@ def main():
         print('&pcie1 { pcie@0,0 { wifi@0,0 { airoha,connac2-rx; }; }; };')
     if args.connac2_host_ppe:
         print('&eth { airoha,connac2-host-ppe; };')
+    if args.ct_ppe_probe_seed:
+        print('&eth { airoha,connac2-ppe-probe-seed; };')
     if args.wed_slot1:
         wed_size = "0x1000" if args.wed_bm_debug else "0xb00"
         description = '''&{/soc} {

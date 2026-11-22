@@ -37,6 +37,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   target/linux/airoha/patches-6.18/935-net-airoha-report-ct-ppe-cold-ownership.patch \
   target/linux/airoha/patches-6.18/936-net-airoha-prepare-ct-ppe-before-radio-exposure.patch \
   target/linux/airoha/patches-6.18/937-net-airoha-limit-repeated-ct-ppe-cold-diagnostics.patch \
+  target/linux/airoha/patches-6.18/938-net-airoha-seed-ct-ppe-at-reset-owned-probe.patch \
   target/linux/airoha/hg5585f-ct/ram-dts.py \
   target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts}; do
   mkdir -p "$overlay/tree/$(dirname "$path")"
