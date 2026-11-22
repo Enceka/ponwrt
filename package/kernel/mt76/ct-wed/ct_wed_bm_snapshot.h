@@ -40,7 +40,7 @@ static inline int ct_bm_snapshot_read(const struct ct_bm_snapshot_io *io, u64 de
 
 	if (!err)
 		err = io->read(io->ctx, offset, value);
-	if (!err && *value == 0xffffffff && offset < 0xc00)
+	if (!err && offset < 0xc00 && (*value == 0xffffffff || *value == 0xdeadbeef))
 		err = -EIO;
 	return err ?: ct_bm_snapshot_gate(io, deadline);
 }

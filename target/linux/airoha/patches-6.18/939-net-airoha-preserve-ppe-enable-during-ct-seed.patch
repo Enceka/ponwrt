@@ -1,0 +1,71 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: preserve the PPE enable bit during CT seed
+
+The CT probe seed timed out on the first row after clearing the PPE
+enable bit on HG5585F-CT. Preserve the reset configuration, as the
+ordinary probe-time SRAM flush does. Require enabled, idle banks with
+zero flow and table base before writing any SRAM. Nothing in this path
+changes the native forwarding configuration on success or failure.
+
+Report which SRAM transaction failed and the controller state to make
+write and readback failures distinguishable on the board.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1746,20 +1746,24 @@ static int airoha_ppe_ct_probe_seed(struct airoha_ppe *ppe)
+ 			goto out;
+ 		}
+ 	}
+-	for (bank = 0; bank < eth->soc->num_ppe; bank++)
+-		airoha_fe_clear(eth, REG_PPE_GLO_CFG(bank), PPE_GLO_CFG_EN_MASK);
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+ 		err = read_poll_timeout(airoha_fe_rr, val,
+-					!(val & (PPE_GLO_CFG_EN_MASK | PPE_GLO_CFG_BUSY_MASK)),
++					!(val & PPE_GLO_CFG_BUSY_MASK),
+ 					10, 100000, false, eth, REG_PPE_GLO_CFG(bank));
+ 		if (err)
+ 			goto out;
++		if (!(val & PPE_GLO_CFG_EN_MASK)) {
++			err = -EOPNOTSUPP;
++			goto out;
++		}
+ 	}
+ 	for (hash = 0; hash < count; hash++) {
+ 		struct airoha_foe_entry *entry = ppe->foe + hash * sizeof(*entry);
++		const char *access = "write";
+ 
+ 		spin_lock_bh(&ppe_lock);
+ 		*entry = invalid;
+ 		err = airoha_ppe_foe_commit_sram_entry(ppe, hash);
+ 		if (!err) {
++			access = "readback";
+ 			entry = airoha_ppe_foe_get_entry_locked(ppe, hash);
+@@ -1771,6 +1775,10 @@ static int airoha_ppe_ct_probe_seed(struct airoha_ppe *ppe)
+ 		spin_unlock_bh(&ppe_lock);
+ 		if (err) {
+-			dev_err(eth->dev, "CT PPE probe seed bank=%u row=%u error=%d\n",
+-				hash / PPE_SRAM_NUM_ENTRIES, hash % PPE_SRAM_NUM_ENTRIES, err);
++			bank = hash / PPE_SRAM_NUM_ENTRIES;
++			dev_err(eth->dev, "CT PPE probe seed %s bank=%d row=%u error=%d ctrl=%08x glo=%08x hash=%08x\n",
++				access, bank, hash % PPE_SRAM_NUM_ENTRIES, err,
++				airoha_fe_rr(eth, REG_PPE_RAM_CTRL(bank)),
++				airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank)),
++				airoha_fe_rr(eth, REG_PPE_TB_HASH_CFG(bank)));
+ 			goto out;
+ 		}
+@@ -1779,7 +1787,7 @@ static int airoha_ppe_ct_probe_seed(struct airoha_ppe *ppe)
+ 	}
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+ 		if ((airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank)) &
+-		     (PPE_GLO_CFG_EN_MASK | PPE_GLO_CFG_BUSY_MASK)) ||
++		     (PPE_GLO_CFG_EN_MASK | PPE_GLO_CFG_BUSY_MASK)) != PPE_GLO_CFG_EN_MASK ||
+ 		    airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)) ||
+ 		    airoha_fe_rr(eth, REG_PPE_TB_BASE(bank))) {
+ 			err = -EBUSY;
+@@ -1788,5 +1796,5 @@ static int airoha_ppe_ct_probe_seed(struct airoha_ppe *ppe)
+ 	}
+ 	ppe->ct_probe_seed_verified = true;
+-	dev_info(eth->dev, "CT PPE probe seeded %u checked INVALID rows; banks disabled\n", count);
++	dev_info(eth->dev, "CT PPE probe seeded %u checked INVALID rows; native configuration retained\n", count);
+ out:
+ 	mutex_unlock(&flow_offload_mutex);

@@ -18,6 +18,7 @@
 #include "ct_wdma_rx.h"
 #include "ct_wed_bm.h"
 #include "ct_wed_bm_snapshot.h"
+#include "ct_wed_rx_snapshot.h"
 #include "ct_wed_cold.h"
 #include "ct_wed_start.h"
 
@@ -988,9 +989,122 @@ static ssize_t bm_snapshot_show(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR_RO(bm_snapshot);
 
+static int ct_rx_debug_current(void *ctx)
+{
+	struct airoha_ct_wed *wed = ctx;
+	unsigned int index;
+	int err = ct_bm_debug_current(ctx);
+
+	if (err)
+		return err;
+	for (index = 0; index < CT_WDMA_RX_RINGS; index++)
+		if (!wed->rx[index].desc)
+			return -EAGAIN;
+	if (!wed->bm[1].cpu || wed->bm[1].bytes != CT_BM_COUNT * CT_BM_HEADER_SIZE)
+		return -EAGAIN;
+	for (index = 2; index < ARRAY_SIZE(wed->bm); index++)
+		if (!wed->bm[index].cpu ||
+		    wed->bm[index].bytes != CT_BM_CHUNK_TOKENS * CT_BM_PAYLOAD_STRIDE)
+			return -EAGAIN;
+	return 0;
+}
+
+static int ct_rx_debug_read(void *ctx, unsigned int ring, unsigned int field, u32 *value)
+{
+	static const u32 offsets[CT_RX_SNAPSHOT_FIELDS] = {
+		0x108, 0x10c, 0x908, 0x90c, 0xae0, 0xae8, 0xaf0,
+	};
+	struct airoha_ct_wed *wed = ctx;
+	u32 offset;
+	int err = ct_rx_debug_current(ctx);
+
+	if (err)
+		return err;
+	if (ring >= CT_WDMA_RX_RINGS || field >= CT_RX_SNAPSHOT_FIELDS)
+		return -EINVAL;
+	offset = offsets[field] + ring * (field < CT_RX_SNAPSHOT_FRONTIERS ? 0x10 : 4);
+	*value = readl((field < 2 ? wed->wdma : wed->wed) + offset);
+	return 0;
+}
+
+static int ct_rx_debug_desc_read(void *ctx, unsigned int ring, unsigned int index, u32 words[4])
+{
+	struct airoha_ct_wed *wed = ctx;
+	struct ct_txd *desc;
+	int err = ct_rx_debug_current(ctx);
+
+	if (err)
+		return err;
+	if (ring >= CT_WDMA_RX_RINGS || index >= CT_WDMA_RX_COUNT)
+		return -EINVAL;
+	desc = &wed->rx[ring].desc[index];
+	dma_rmb();
+	words[0] = le32_to_cpu(READ_ONCE(desc->buf0));
+	words[1] = le32_to_cpu(READ_ONCE(desc->ctrl));
+	words[2] = le32_to_cpu(READ_ONCE(desc->buf1));
+	words[3] = le32_to_cpu(READ_ONCE(desc->info));
+	return 0;
+}
+
+static ssize_t rx_snapshot_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ct_rx_snapshot result;
+	struct ct_rx_snapshot_io io = {
+		.owner_valid = ct_rx_debug_current, .read = ct_rx_debug_read,
+		.desc_read = ct_rx_debug_desc_read, .now = ct_cold_now,
+	};
+	struct airoha_ct_wed *wed;
+	unsigned int ring, index;
+	ssize_t length;
+	int err;
+
+	mutex_lock(&ct_lock);
+	wed = dev_get_drvdata(dev);
+	io.ctx = wed;
+	err = ct_rx_snapshot_run(&io, ktime_get_ns() + 50 * NSEC_PER_MSEC, &result);
+	length = sysfs_emit(buf, "error=%d before_valid=%u after_valid=%u stable=%u\n",
+			err, result.before_valid, result.after_valid, result.stable);
+	if (result.before_valid && !ct_rx_debug_current(wed)) {
+		length += sysfs_emit_at(buf, length,
+			"bm_header=%08llx/%zx token_count=%u header_stride=%u payload_stride=%u\n",
+			(unsigned long long)wed->bm[1].dma, wed->bm[1].bytes,
+			CT_BM_COUNT, CT_BM_HEADER_SIZE, CT_BM_PAYLOAD_STRIDE);
+		for (index = 0; index < CT_BM_CHUNKS; index++)
+			length += sysfs_emit_at(buf, length, "bm_payload%02u=%08llx/%zx\n",
+				index, (unsigned long long)wed->bm[2 + index].dma, wed->bm[2 + index].bytes);
+	}
+	for (ring = 0; ring < CT_WDMA_RX_RINGS; ring++) {
+		struct ct_rx_snapshot_ring *sample = &result.ring[ring];
+
+		if (result.before_valid)
+			length += sysfs_emit_at(buf, length,
+				"rx%u before c=[%08x %08x %08x %08x] mib=[%08x %08x %08x]\n",
+				ring, sample->before[0], sample->before[1], sample->before[2], sample->before[3],
+				sample->before[4], sample->before[5], sample->before[6]);
+		if (result.after_valid)
+			length += sysfs_emit_at(buf, length,
+				"rx%u after c=[%08x %08x %08x %08x] mib=[%08x %08x %08x]\n",
+				ring, sample->after[0], sample->after[1], sample->after[2], sample->after[3],
+				sample->after[4], sample->after[5], sample->after[6]);
+		for (index = 0; index < sample->count; index++) {
+			struct ct_rx_snapshot_desc *desc = &sample->desc[index];
+
+			length += sysfs_emit_at(buf, length,
+				"rx%u[%04u] b=%08x,%08x,%08x,%08x a=%08x,%08x,%08x,%08x seed=%u/%u\n",
+				ring, desc->index, desc->before[0], desc->before[1], desc->before[2], desc->before[3],
+				desc->after[0], desc->after[1], desc->after[2], desc->after[3],
+				ct_rx_snapshot_seed(desc->before), ct_rx_snapshot_seed(desc->after));
+		}
+	}
+	mutex_unlock(&ct_lock);
+	return length;
+}
+static DEVICE_ATTR_RO(rx_snapshot);
+
 static struct attribute *ct_wed_attrs[] = {
 	&dev_attr_status.attr,
 	&dev_attr_bm_snapshot.attr,
+	&dev_attr_rx_snapshot.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(ct_wed);

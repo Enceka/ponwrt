@@ -23,7 +23,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   package/kernel/mt76/patches/123-mt7915-connac2-check-rx-body.patch \
   package/kernel/mt76/patches/124-mt7915-connac2-host-ppe.patch \
   package/kernel/mt76/patches/125-mt7915-connac2-tdma-free-bufid.patch \
-  package/kernel/mt76/ct-wed/{ct_wdma_rx.h,ct_wed_bm.h,ct_wed_bm_snapshot.h,ct_wed_stop.h,ct_wed_cold.h,ct_wed_start.h,ct_wed_platform.c,ct_wed_guard_v2.c} \
+  package/kernel/mt76/ct-wed/{ct_wdma_rx.h,ct_wed_bm.h,ct_wed_bm_snapshot.h,ct_wed_rx_snapshot.h,ct_wed_stop.h,ct_wed_cold.h,ct_wed_start.h,ct_wed_platform.c,ct_wed_guard_v2.c} \
   package/kernel/mt76/ct-wed/patches/{126-mt7915-prepare-ct-wed-slot1.patch,127-mt76-own-ct-radio-dma-rings.patch,128-mt7915-retain-exposed-ct-wed.patch,129-mt7915-start-ct-wed-slot1.patch,130-mt7915-configure-ct-radio-csr-aliases.patch} \
   package/kernel/mt76/ct-wed/patches/131-mt76-bound-ct-txfree-to-wed-didx.patch \
   package/kernel/mt76/ct-wed/patches/132-mt7915-rearm-ct-irq-before-mcu-init.patch \
@@ -38,6 +38,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   target/linux/airoha/patches-6.18/936-net-airoha-prepare-ct-ppe-before-radio-exposure.patch \
   target/linux/airoha/patches-6.18/937-net-airoha-limit-repeated-ct-ppe-cold-diagnostics.patch \
   target/linux/airoha/patches-6.18/938-net-airoha-seed-ct-ppe-at-reset-owned-probe.patch \
+  target/linux/airoha/patches-6.18/939-net-airoha-preserve-ppe-enable-during-ct-seed.patch \
   target/linux/airoha/hg5585f-ct/ram-dts.py \
   target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts}; do
   mkdir -p "$overlay/tree/$(dirname "$path")"
