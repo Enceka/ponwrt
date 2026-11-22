@@ -111,15 +111,7 @@ installing persistent offline bus operations. Keep activation gated.
  		destroy_workqueue(dev->wq);
 --- a/mt7915/mt7915.h
 +++ b/mt7915/mt7915.h
-@@ -265,6 +265,7 @@
- 	};
- 
- 	struct mt7915_hif *hif2;
-+	struct device_link *hif2_link;
- 	struct mt7915_ct_path *ct_path;
- 	struct mt7915_ct_wed __rcu *ct_wed;
- 	struct mt7915_reg_desc reg;
-@@ -465,6 +466,7 @@
+@@ -465,6 +465,7 @@
  struct mt7915_dev *mt7915_mmio_probe(struct device *pdev,
  				     void __iomem *mem_base, u32 device_id);
  void mt7915_wfsys_reset(struct mt7915_dev *dev);
@@ -127,7 +119,7 @@ installing persistent offline bus operations. Keep activation gated.
  irqreturn_t mt7915_irq_handler(int irq, void *dev_instance);
  u64 __mt7915_get_tsf(struct ieee80211_hw *hw, struct mt7915_vif *mvif);
  u32 mt7915_wed_init_buf(void *ptr, dma_addr_t phys, int token_id);
-@@ -482,8 +484,11 @@
+@@ -482,8 +483,11 @@
  #define MT7916_CT_MAX_WCID	150
  
  #ifdef CONFIG_MT7915_NPU
@@ -141,7 +133,7 @@ installing persistent offline bus operations. Keep activation gated.
  bool mt7915_ct_wed_mask(struct mt7915_dev *dev, u32 mask);
  bool mt7915_ct_wed_primary_native(struct mt7915_dev *dev);
  int mt7915_ct_wed_verify_drain(struct mt7915_dev *dev);
-@@ -525,8 +530,10 @@
+@@ -525,8 +529,10 @@
  	return 0;
  }
  static inline int mt7915_ct_prepare(struct mt7915_dev *dev) { return 0; }
@@ -450,6 +442,24 @@ installing persistent offline bus operations. Keep activation gated.
  	mt76_dma_cleanup(&dev->mt76);
 --- a/mt7915/init.c
 +++ b/mt7915/init.c
+@@ -757,6 +757,8 @@
+ 	phy->dev = dev;
+ 	phy->mt76 = mphy;
+ 
++	INIT_DELAYED_WORK(&mphy->mac_work, mt7915_mac_work);
++
+ 	/* Bind main phy to band0 and ext_phy to band1 for dbdc case */
+ 	phy->mt76->band_idx = 1;
+ 
+@@ -769,8 +771,6 @@
+ 	struct mt76_phy *mphy = phy->mt76;
+ 	int ret;
+ 
+-	INIT_DELAYED_WORK(&mphy->mac_work, mt7915_mac_work);
+-
+ 	mt7915_eeprom_parse_hw_cap(dev, phy);
+ 
+ 	memcpy(mphy->macaddr, dev->mt76.eeprom.data + MT_EE_MAC_ADDR2,
 @@ -1278,19 +1278,25 @@
  
  	mt7915_unregister_thermal(phy);
@@ -731,30 +741,32 @@ installing persistent offline bus operations. Keep activation gated.
  	ret = pcim_enable_device(pdev);
  	if (ret)
  		return ret;
-@@ -164,6 +167,12 @@
+@@ -164,6 +167,11 @@
  
  	if (hif2) {
  		dev->hif2 = hif2;
-+		dev->hif2_link = device_link_add(mdev->dev, hif2->dev,
-+					       DL_FLAG_AUTOREMOVE_CONSUMER);
-+		if (!dev->hif2_link) {
++		if (!device_link_add(mdev->dev, hif2->dev,
++				     DL_FLAG_AUTOREMOVE_CONSUMER)) {
 +			ret = -ENOMEM;
 +			goto free_hif2;
 +		}
  
  		mt76_wr(dev, MT_INT1_MASK_CSR, 0);
  		/* master switch of PCIe tnterrupt enable */
-@@ -186,9 +195,25 @@
+@@ -186,9 +194,24 @@
  	return 0;
  
  free_hif2_irq:
 +	if (mt7915_ct_wed_retained(dev)) {
 +		WRITE_ONCE(ct_retained_radio, true);
-+		mt7915_unregister_device(dev);
-+		if (dev->hif2_link) {
-+			device_link_del(dev->hif2_link);
-+			dev->hif2_link = NULL;
++		mt7915_ct_wed_park(dev, false);
++		mt76_worker_teardown(&mdev->tx_worker);
++		if (mdev->wq) {
++			destroy_workqueue(mdev->wq);
++			mdev->wq = NULL;
 +		}
++		dev->ct_path = NULL;
++		dev->hif2 = NULL;
 +		mt7915_put_hif2(hif2);
 +		pci_free_irq_vectors(pdev);
 +		pci_set_drvdata(pdev, NULL);
@@ -763,14 +775,10 @@ installing persistent offline bus operations. Keep activation gated.
  	if (dev->hif2)
  		devm_free_irq(mdev->dev, dev->hif2->irq, dev);
  free_hif2:
-+	if (dev->hif2_link) {
-+		device_link_del(dev->hif2_link);
-+		dev->hif2_link = NULL;
-+	}
  	if (dev->hif2)
  		put_device(dev->hif2->dev);
  	devm_free_irq(mdev->dev, irq, dev);
-@@ -214,11 +239,21 @@
+@@ -214,11 +237,21 @@
  {
  	struct mt76_dev *mdev;
  	struct mt7915_dev *dev;
