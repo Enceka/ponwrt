@@ -17,6 +17,7 @@
 #include "../ct-wed-provider-abi.h"
 #include "ct_wdma_rx.h"
 #include "ct_wed_bm.h"
+#include "ct_wed_bm_snapshot.h"
 #include "ct_wed_cold.h"
 #include "ct_wed_start.h"
 
@@ -68,11 +69,14 @@ static bool prepare_bm;
 static bool inspect;
 static bool cold_config;
 static bool start_trace;
+static bool bm_debug;
 module_param(prepare, bool, 0444);
 module_param(prepare_bm, bool, 0444);
 module_param(inspect, bool, 0444);
 module_param(cold_config, bool, 0444);
 module_param(start_trace, bool, 0444);
+module_param(bm_debug, bool, 0444);
+MODULE_PARM_DESC(bm_debug, "Permit owned slot1 BM selector snapshots without writing the bitmap");
 MODULE_PARM_DESC(start_trace, "Trace each cold-start MMIO access with a ten-second transaction deadline");
 MODULE_PARM_DESC(cold_config, "Test and restore five idle slot1 configuration registers; requires inspect");
 MODULE_PARM_DESC(inspect, "Read slot1 state after SCU reset and PCI preflight; never write registers");
@@ -789,7 +793,8 @@ static int ct_probe(struct platform_device *pdev)
 		return -ENODEV;
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wed");
 	wdma = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wdma");
-	if (!res || res->start != 0x1fa03000 || resource_size(res) != 0xb00 ||
+	if (!res || res->start != 0x1fa03000 ||
+	    (resource_size(res) != 0xb00 && resource_size(res) != 0x1000) ||
 	    !wdma || wdma->start != 0x1fa06400 || resource_size(wdma) != 0x400)
 		return -EINVAL;
 	wed = kzalloc(sizeof(*wed), GFP_KERNEL);
@@ -912,8 +917,80 @@ out:
 }
 static DEVICE_ATTR_RO(status);
 
+static int ct_bm_debug_current(void *ctx)
+{
+	struct airoha_ct_wed *wed = ctx;
+
+	lockdep_assert_held(&ct_lock);
+	if (!wed || !bm_debug || wed != ct_slot || !wed->ever_exposed ||
+	    !READ_ONCE(wed->irq_ready) || wed->start.state != CT_START_ENABLED)
+		return -EAGAIN;
+	if (!wed->region[0] || resource_size(wed->region[0]) != 0x1000)
+		return -EOPNOTSUPP;
+	return 0;
+}
+
+static int ct_bm_debug_read(void *ctx, u32 offset, u32 *value)
+{
+	struct airoha_ct_wed *wed = ctx;
+	int err = ct_bm_debug_current(ctx);
+
+	if (err)
+		return err;
+	if (offset != 0xbc0 && offset != 0xbd4 &&
+	    (offset < 0xc00 || offset > 0xffc || (offset & 3)))
+		return -EINVAL;
+	*value = readl(wed->wed + offset);
+	return 0;
+}
+
+static int ct_bm_debug_write(void *ctx, u32 offset, u32 value)
+{
+	struct airoha_ct_wed *wed = ctx;
+	int err = ct_bm_debug_current(ctx);
+
+	if (err)
+		return err;
+	if (offset != 0xbc0)
+		return -EINVAL;
+	writel(value, wed->wed + offset);
+	return 0;
+}
+
+static ssize_t bm_snapshot_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ct_bm_snapshot result;
+	struct ct_bm_snapshot_io io = {
+		.owner_valid = ct_bm_debug_current, .read = ct_bm_debug_read,
+		.write = ct_bm_debug_write, .now = ct_cold_now,
+	};
+	ssize_t length;
+	unsigned int index;
+	int err;
+
+	mutex_lock(&ct_lock);
+	io.ctx = dev_get_drvdata(dev);
+	err = ct_bm_snapshot_run(&io, ktime_get_ns() + 50 * NSEC_PER_MSEC, &result);
+	length = sysfs_emit(buf,
+		"error=%d restore_error=%d words=%u selector=%08x bitmap_free=%u before_free=%u before_usage=%u after_free=%u after_usage=%u counters_stable=%u\n",
+		err, result.restore_error, result.words, result.saved_selector, result.bitmap_free,
+		result.before >> 16, result.before & 0xffff,
+		result.after >> 16, result.after & 0xffff, result.counters_stable);
+	for (index = 0; index < result.words; index++) {
+		if (!(index % 8))
+			length += sysfs_emit_at(buf, length, "bm+%03x", 0xc00 + index * 4);
+		length += sysfs_emit_at(buf, length, " %08x", result.bitmap[index]);
+		if (index % 8 == 7 || index + 1 == result.words)
+			length += sysfs_emit_at(buf, length, "\n");
+	}
+	mutex_unlock(&ct_lock);
+	return length;
+}
+static DEVICE_ATTR_RO(bm_snapshot);
+
 static struct attribute *ct_wed_attrs[] = {
 	&dev_attr_status.attr,
+	&dev_attr_bm_snapshot.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(ct_wed);
