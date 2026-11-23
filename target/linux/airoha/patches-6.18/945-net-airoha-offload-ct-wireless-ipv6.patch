@@ -1,0 +1,964 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: offload CT wireless IPv6 routed flows
+
+Enable untagged TCP/UDP IPv6 five-tuple routing through CT PPE and WED.
+Retain software forwarding for NAT66, encapsulated and non-unicast flows.
+Accept CT IPv6 only from netfilter flowtable. Keep separate FT and flower
+callbacks so ordinary flower IPv6 rules stay in software, including fixed
+TOS matches that the five-tuple hardware cannot express. Retain IPv4 and
+non-CT callback behavior. Validate IPv6 keys and masks at the shared PPE
+callback, rejecting TTL, unsupported TCP flags and extra matches.
+Use immutable source-MAC slots owned by CT for IPv6 entries. Poll write
+completion, quarantine failed slots, and zero owned words only after both
+PPE SRAM banks have drained and quiesced. Serialize the update window
+with native GDM MAC updates. Avoid UPDMEM reads: CT returns the last
+DATA write instead of the addressed table word.
+
+Extend the short-frame IFC guard to IPv6 payload lengths 0..17, preserving
+separate IPv4 and IPv6 rule state and retryable rollback. Decode the proper
+IPv4 or IPv6 egress layout when flushing stations, and include packet type
+in tuple matching to avoid invalidating a reused row of another type.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -3890,7 +3890,7 @@
+ 	}
+ }
+ 
+-static int airoha_dev_setup_tc_block_cb(enum tc_setup_type type,
++static int airoha_dev_setup_ft_block_cb(enum tc_setup_type type,
+ 					void *type_data, void *cb_priv)
+ {
+ 	struct net_device *netdev = cb_priv;
+@@ -3910,10 +3910,36 @@
+ 	}
+ }
+ 
++static int airoha_dev_setup_tc_block_cb(enum tc_setup_type type,
++					void *type_data, void *cb_priv)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(cb_priv);
++	struct airoha_eth *eth = dev->eth;
++
++	if (type == TC_SETUP_CLSFLOWER && airoha_ppe_ct_requested(eth)) {
++		struct flow_cls_offload *f = type_data;
++
++		if (f->command == FLOW_CLS_REPLACE) {
++			struct flow_rule *rule = flow_cls_offload_flow_rule(f);
++			struct flow_match_control control;
++
++			/* The CT IPv6 tuple cannot express arbitrary flower matches. */
++			if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL)) {
++				flow_rule_match_control(rule, &control);
++				if (control.key->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS)
++					return -EOPNOTSUPP;
++			}
++		}
++	}
++
++	return airoha_dev_setup_ft_block_cb(type, type_data, cb_priv);
++}
++
+ static int airoha_dev_setup_tc_block(struct net_device *dev,
+-				     struct flow_block_offload *f)
+-{
+-	flow_setup_cb_t *cb = airoha_dev_setup_tc_block_cb;
++				     struct flow_block_offload *f, bool flowtable)
++{
++	flow_setup_cb_t *cb = flowtable ? airoha_dev_setup_ft_block_cb :
++					 airoha_dev_setup_tc_block_cb;
+ 	static LIST_HEAD(block_cb_list);
+ 	struct flow_block_cb *block_cb;
+ 
+@@ -4150,8 +4176,9 @@
+ 	case TC_SETUP_QDISC_HTB:
+ 		return airoha_tc_setup_qdisc_htb(dev, type_data);
+ 	case TC_SETUP_BLOCK:
++		return airoha_dev_setup_tc_block(dev, type_data, false);
+ 	case TC_SETUP_FT:
+-		return airoha_dev_setup_tc_block(dev, type_data);
++		return airoha_dev_setup_tc_block(dev, type_data, true);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -501,6 +501,10 @@
+ static_assert(offsetof(struct airoha_foe_entry, l2b.data) == 40);
+ static_assert(offsetof(struct airoha_foe_entry, l2b.ib2) == 44);
+ static_assert(offsetof(struct airoha_foe_entry, l2b.vlan1) == 48);
++static_assert(offsetof(struct airoha_foe_entry, ipv6.ports) == 36);
++static_assert(offsetof(struct airoha_foe_entry, ipv6.data) == 40);
++static_assert(offsetof(struct airoha_foe_entry, ipv6.ib2) == 44);
++static_assert(offsetof(struct airoha_foe_entry, ipv6.l2.src_mac_hi) == 60);
+ static_assert(sizeof(struct airoha_foe_entry) == PPE_ENTRY_SIZE);
+ 
+ struct airoha_foe_stats {
+@@ -722,12 +726,21 @@
+ 	struct airoha_ppe_dev dev;
+ 	struct airoha_eth *eth;
+ 	struct {
+-		u32 udf, lut[2], tcam[9][2], action[3][3];
+-		u16 tcam_dirty;
+-		u8 lut_index, action_dirty;
+-		bool cfg_owned, udf_owned, lut_dirty;
++		u32 udf, udf_owned;
++		struct {
++			u32 lut[2], tcam[9][2], action[3][3];
++			u16 tcam_dirty;
++			u8 lut_index, action_dirty;
++			bool lut_dirty;
++		} rule[2];
++		bool cfg_owned;
+ 	} ct_ifc;
+ 	bool ct_host_ppe;
++	struct {
++		u8 addr[ETH_ALEN];
++		u8 dirty;
++		bool valid;
++	} ct_smac[10];
+ 	bool ct_restore_pending;
+ 	bool ct_owns_sram;
+ 	bool ct_stopping;
+@@ -874,6 +887,7 @@
+ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 			  u16 hash, bool rx_wlan);
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
++bool airoha_ppe_ct_requested(struct airoha_eth *eth);
+ int airoha_ppe_init(struct airoha_eth *eth);
+ void airoha_ppe_deinit(struct airoha_eth *eth);
+ int airoha_ifc_scope_ports(struct airoha_eth *eth, u32 scope);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -24,6 +24,7 @@
+ static DEFINE_SPINLOCK(ppe_lock);
+ 
+ #include "airoha_ct_ifc.h"
++#include "airoha_ct_smac.h"
+ 
+ static const struct rhashtable_params airoha_flow_table_params = {
+ 	.head_offset = offsetof(struct airoha_flow_table_entry, node),
+@@ -461,7 +462,8 @@
+ 			if (READ_ONCE(eth->ppe->ct_host_ppe)) {
+ 				if (info.idx > 1 || !info.wcid || info.wcid > 150 || info.bss > 63)
+ 					return -ERANGE;
+-				if (type != PPE_PKT_TYPE_IPV4_HNAPT || data->vlan.num ||
++				if ((type != PPE_PKT_TYPE_IPV4_HNAPT &&
++				     type != PPE_PKT_TYPE_IPV6_ROUTE_5T) || data->vlan.num ||
+ 				    data->pppoe.num || is_multicast_ether_addr(data->eth.h_dest))
+ 					return -EOPNOTSUPP;
+ 				val |= AIROHA_FOE_IB2_PSE_QOS |
+@@ -870,7 +872,8 @@
+ 	int type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, e->data.ib1);
+ 	int len;
+ 
+-	if ((hwe->ib1 ^ e->data.ib1) & AIROHA_FOE_IB1_BIND_UDP)
++	if ((hwe->ib1 ^ e->data.ib1) &
++	    (AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP))
+ 		return false;
+ 
+ 	if (type > PPE_PKT_TYPE_IPV4_DSLITE)
+@@ -1022,24 +1025,58 @@
+ 	}
+ }
+ 
++static bool airoha_ppe_ct_wlan_dest(const struct airoha_foe_entry *hwe,
++				    u8 *band, u16 *wcid)
++{
++	u32 type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1);
++	u32 ib2, data, nbq;
++	u16 etype;
++
++	switch (type) {
++	case PPE_PKT_TYPE_IPV4_HNAPT:
++		ib2 = hwe->ipv4.ib2;
++		data = hwe->ipv4.data;
++		etype = hwe->ipv4.l2.common.etype;
++		break;
++	case PPE_PKT_TYPE_IPV6_ROUTE_5T:
++		ib2 = hwe->ipv6.ib2;
++		data = hwe->ipv6.data;
++		etype = hwe->ipv6.l2.etype;
++		break;
++	default:
++		return false;
++	}
++	nbq = FIELD_GET(AIROHA_FOE_IB2_NBQ, ib2);
++	if (FIELD_GET(AIROHA_FOE_IB2_PSE_PORT, ib2) != FE_PSE_PORT_GDM3 ||
++	    nbq < 2 || nbq > 3 ||
++	    FIELD_GET(AIROHA_FOE_CHANNEL, data) != 6 + nbq ||
++	    !(etype >> 6) || (etype >> 6) > 150)
++		return false;
++	*band = nbq - 2;
++	*wcid = etype >> 6;
++	return true;
++}
++
+ static bool airoha_ppe_ct_wlan_entry(const struct airoha_foe_entry *hwe,
+ 				    u8 band, u16 wcid)
+ {
+-	return FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) ==
+-		PPE_PKT_TYPE_IPV4_HNAPT &&
+-	       FIELD_GET(AIROHA_FOE_IB2_PSE_PORT, hwe->ipv4.ib2) == FE_PSE_PORT_GDM3 &&
+-	       FIELD_GET(AIROHA_FOE_IB2_NBQ, hwe->ipv4.ib2) == 2 + band &&
+-	       FIELD_GET(AIROHA_FOE_CHANNEL, hwe->ipv4.data) == 8 + band &&
+-	       hwe->ipv4.l2.common.etype >> 6 == wcid;
++	u16 actual_wcid;
++	u8 actual_band;
++
++	return airoha_ppe_ct_wlan_dest(hwe, &actual_band, &actual_wcid) &&
++	       band == actual_band && wcid == actual_wcid;
+ }
+ 
+ static int airoha_ppe_ct_remove_wlan_flow(struct airoha_ppe *ppe,
+ 					 struct airoha_flow_table_entry *e)
+ {
+ 	struct airoha_foe_entry *hwe, invalid;
+-	u8 band = FIELD_GET(AIROHA_FOE_IB2_NBQ, e->data.ipv4.ib2) - 2;
+-	u16 wcid = e->data.ipv4.l2.common.etype >> 6;
++	u8 band;
++	u16 wcid;
+ 	int err = 0;
++
++	if (!airoha_ppe_ct_wlan_dest(&e->data, &band, &wcid))
++		return -EINVAL;
+ 
+ 	spin_lock_bh(&ppe_lock);
+ 	hlist_del_init(&e->list);
+@@ -1375,6 +1412,63 @@
+ 	return airoha_ppe_get_entry_idle_time(ppe, e->data.ib1);
+ }
+ 
++static bool airoha_ppe_ct_ipv6_rule_supported(struct flow_rule *rule)
++{
++	const u64 required_keys = BIT_ULL(FLOW_DISSECTOR_KEY_META) |
++		BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
++		BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
++		BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS) |
++		BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
++	const u64 allowed_keys = required_keys | BIT_ULL(FLOW_DISSECTOR_KEY_IP) |
++		BIT_ULL(FLOW_DISSECTOR_KEY_TCP);
++	struct flow_match_ipv6_addrs addrs;
++	struct flow_match_control control;
++	struct flow_match_basic basic;
++	struct flow_match_ports ports;
++	struct flow_match_meta meta;
++	u64 used_keys = rule->match.dissector->used_keys;
++
++	/* Keep netfilter flowtable's exact five-tuple match contract. */
++	if ((used_keys & required_keys) != required_keys || used_keys & ~allowed_keys)
++		return false;
++	flow_rule_match_meta(rule, &meta);
++	flow_rule_match_control(rule, &control);
++	flow_rule_match_basic(rule, &basic);
++	if (meta.mask->ingress_ifindex != U32_MAX || meta.mask->ingress_iftype ||
++	    meta.mask->l2_miss || control.key->addr_type != FLOW_DISSECTOR_KEY_IPV6_ADDRS ||
++	    control.mask->addr_type != U16_MAX || control.mask->thoff ||
++	    control.mask->flags || control.key->flags ||
++	    basic.key->n_proto != htons(ETH_P_IPV6) || basic.mask->n_proto != htons(U16_MAX) ||
++	    basic.mask->ip_proto != U8_MAX ||
++	    (basic.key->ip_proto != IPPROTO_TCP && basic.key->ip_proto != IPPROTO_UDP))
++		return false;
++	flow_rule_match_ipv6_addrs(rule, &addrs);
++	if (memchr_inv(&addrs.mask->src, 0xff, sizeof(addrs.mask->src)) ||
++	    memchr_inv(&addrs.mask->dst, 0xff, sizeof(addrs.mask->dst)))
++		return false;
++	flow_rule_match_ports(rule, &ports);
++	if (ports.mask->src != htons(U16_MAX) || ports.mask->dst != htons(U16_MAX))
++		return false;
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IP)) {
++		struct flow_match_ip ip;
++
++		flow_rule_match_ip(rule, &ip);
++		/* Flowtable supplies TOS for QoS, outside its lookup key. */
++		if (ip.mask->ttl || (ip.mask->tos && ip.mask->tos != U8_MAX))
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_TCP)) {
++		struct flow_match_tcp tcp;
++
++		flow_rule_match_tcp(rule, &tcp);
++		/* nf_flow_table excludes FIN/RST; the PPE sends them to the CPU. */
++		if (basic.key->ip_proto != IPPROTO_TCP || tcp.key->flags ||
++		    tcp.mask->flags != htons(0x0005))
++			return false;
++	}
++	return true;
++}
++
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+@@ -1408,11 +1502,22 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	if (eth->ppe->ct_host_ppe && addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS &&
++	    !airoha_ppe_ct_ipv6_rule_supported(rule))
++		return -EOPNOTSUPP;
++
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
+ 		struct flow_match_basic match;
+ 
+ 		flow_rule_match_basic(rule, &match);
+ 		l4proto = match.key->ip_proto;
++		if (eth->ppe->ct_host_ppe &&
++		    (match.mask->ip_proto != U8_MAX || match.mask->n_proto != htons(U16_MAX) ||
++		     (addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS &&
++		      match.key->n_proto != htons(ETH_P_IP)) ||
++		     (addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS &&
++		      match.key->n_proto != htons(ETH_P_IPV6))))
++			return -EOPNOTSUPP;
+ 	} else {
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -1424,7 +1529,8 @@
+ 		dsfield = match.key->tos;
+ 	}
+ 	if (eth->ppe->ct_host_ppe &&
+-	    (addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS ||
++	    ((addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS &&
++	      addr_type != FLOW_DISSECTOR_KEY_IPV6_ADDRS) ||
+ 	     (l4proto != IPPROTO_TCP && l4proto != IPPROTO_UDP)))
+ 		return -EOPNOTSUPP;
+ 
+@@ -1456,6 +1562,10 @@
+ 		case FLOW_ACTION_MANGLE:
+ 			if (offload_type == PPE_PKT_TYPE_BRIDGE)
+ 				return -EOPNOTSUPP;
++			/* IPv6 5T hardware routes the original tuple; it cannot do NAT66. */
++			if (eth->ppe->ct_host_ppe && addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS &&
++			    act->mangle.htype != FLOW_ACT_MANGLE_HDR_TYPE_ETH)
++				return -EOPNOTSUPP;
+ 
+ 			if (act->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_ETH)
+ 				airoha_ppe_flow_mangle_eth(act, &data.eth);
+@@ -1494,6 +1604,14 @@
+ 		return -EINVAL;
+ 	if (eth->ppe->ct_host_ppe && !odev)
+ 		return -EOPNOTSUPP;
++	if (eth->ppe->ct_host_ppe && addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS &&
++	    (data.vlan.num || data.pppoe.num ||
++	     is_multicast_ether_addr(data.eth.h_dest) ||
++	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN) ||
++	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN) ||
++	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE) ||
++	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_CONTROL)))
++		return -EOPNOTSUPP;
+ 
+ 	err = airoha_ppe_foe_entry_prepare(eth, &hwe, odev, offload_type,
+ 					   &data, l4proto, dsfield,
+@@ -1519,6 +1637,9 @@
+ 			return -EOPNOTSUPP;
+ 
+ 		flow_rule_match_ports(rule, &ports);
++		if (eth->ppe->ct_host_ppe && addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS &&
++		    (ports.mask->src != htons(U16_MAX) || ports.mask->dst != htons(U16_MAX)))
++			return -EOPNOTSUPP;
+ 		data.src_port = ports.key->src;
+ 		data.dst_port = ports.key->dst;
+ 	} else if (offload_type != PPE_PKT_TYPE_BRIDGE) {
+@@ -1537,7 +1658,18 @@
+ 	if (addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
+ 		struct flow_match_ipv6_addrs addrs;
+ 
++		if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV6_ADDRS))
++			return -EOPNOTSUPP;
+ 		flow_rule_match_ipv6_addrs(rule, &addrs);
++		if (eth->ppe->ct_host_ppe &&
++		    (memchr_inv(&addrs.mask->src, 0xff, sizeof(addrs.mask->src)) ||
++		     memchr_inv(&addrs.mask->dst, 0xff, sizeof(addrs.mask->dst)) ||
++		     (ipv6_addr_type(&addrs.key->src) &
++		      (IPV6_ADDR_MULTICAST | IPV6_ADDR_LINKLOCAL | IPV6_ADDR_LOOPBACK)) ||
++		     (ipv6_addr_type(&addrs.key->dst) &
++		      (IPV6_ADDR_MULTICAST | IPV6_ADDR_LINKLOCAL | IPV6_ADDR_LOOPBACK)) ||
++		     ipv6_addr_any(&addrs.key->src) || ipv6_addr_any(&addrs.key->dst)))
++			return -EOPNOTSUPP;
+ 
+ 		data.v6.src_addr = addrs.key->src;
+ 		data.v6.dst_addr = addrs.key->dst;
+@@ -1575,6 +1707,16 @@
+ 		if (err)
+ 			return err;
+ 	}
++	if (eth->ppe->ct_host_ppe && addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
++		u8 smac_id;
++
++		/* Keep each referenced source MAC immutable until the banks are drained. */
++		err = airoha_ppe_ct_smac_get(eth->ppe, data.eth.h_source, &smac_id);
++		if (err)
++			return err;
++		hwe.ipv6.l2.src_mac_hi &= ~AIROHA_FOE_MAC_SMAC_ID;
++		hwe.ipv6.l2.src_mac_hi |= FIELD_PREP(AIROHA_FOE_MAC_SMAC_ID, smac_id);
++	}
+ 
+ 	e = kzalloc(sizeof(*e), GFP_KERNEL);
+ 	if (!e)
+@@ -1767,9 +1909,10 @@
+ 	return err;
+ }
+ 
+-#define CT_HOST_IPV4_FLOWS (PPE_FLOW_CFG_IP4_NAPT_MASK | PPE_FLOW_CFG_IP4_NAT_MASK)
+-
+-static bool airoha_ppe_ct_requested(struct airoha_eth *eth)
++#define CT_HOST_IP_FLOWS (PPE_FLOW_CFG_IP4_NAPT_MASK | PPE_FLOW_CFG_IP4_NAT_MASK | \
++			 PPE_FLOW_CFG_IP6_5T_ROUTE_MASK)
++
++bool airoha_ppe_ct_requested(struct airoha_eth *eth)
+ {
+ 	return airoha_is_7581(eth) && of_machine_is_compatible("fiberhome,hg5585f-ct") &&
+ 	       of_property_read_bool(eth->dev->of_node, "airoha,connac2-host-ppe");
+@@ -1806,7 +1949,8 @@
+ 			u32 type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, entry->ib1);
+ 
+ 			if (op == CT_EXPECT_EMPTY ||
+-			    (type != PPE_PKT_TYPE_IPV4_HNAPT && type != PPE_PKT_TYPE_IPV4_ROUTE)) {
++			    (type != PPE_PKT_TYPE_IPV4_HNAPT && type != PPE_PKT_TYPE_IPV4_ROUTE &&
++			     type != PPE_PKT_TYPE_IPV6_ROUTE_5T)) {
+ 				err = -EBUSY;
+ 			} else if (op == CT_CLEAR_OWNED) {
+ 				access = "write";
+@@ -2006,7 +2150,7 @@
+ 	u32 val;
+ 
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+-		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(bank), CT_HOST_IPV4_FLOWS);
++		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(bank), CT_HOST_IP_FLOWS);
+ 		airoha_fe_clear(eth, REG_PPE_GLO_CFG(bank), PPE_GLO_CFG_EN_MASK);
+ 	}
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+@@ -2030,7 +2174,7 @@
+ 
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+ 		airoha_fe_rmw(eth, REG_PPE_TB_CFG(bank), PPE_TB_CFG_SEARCH_MISS_MASK, no_foe);
+-		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(bank), CT_HOST_IPV4_FLOWS);
++		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(bank), CT_HOST_IP_FLOWS);
+ 	}
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+ 		u32 flow = airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank));
+@@ -2078,6 +2222,9 @@
+ 	err = airoha_ppe_ct_ifc_stop(ppe);
+ 	if (err)
+ 		return err;
++	err = airoha_ppe_ct_smac_stop(ppe);
++	if (err)
++		return err;
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++)
+ 		airoha_ppe_ct_regs(ppe, bank, true);
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++)
+@@ -2168,9 +2315,9 @@
+ 		airoha_fe_set(eth, REG_PPE_GLO_CFG(bank), PPE_GLO_CFG_EN_MASK);
+ 	airoha_ppe_hw_init_ports(ppe);
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+-		airoha_fe_set(eth, REG_PPE_PPE_FLOW_CFG(bank), CT_HOST_IPV4_FLOWS);
++		airoha_fe_set(eth, REG_PPE_PPE_FLOW_CFG(bank), CT_HOST_IP_FLOWS);
+ 		if (!airoha_ppe_is_enabled(eth, bank) ||
+-		    airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)) != CT_HOST_IPV4_FLOWS)
++		    airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)) != CT_HOST_IP_FLOWS)
+ 			goto rollback;
+ 	}
+ 	WRITE_ONCE(ppe->ct_host_ppe, true);
+@@ -2332,20 +2479,16 @@
+ {
+ 	struct airoha_gdm_port *port = dev->port;
+ 	struct airoha_eth *eth = dev->eth;
+-	u32 val;
+-
+-	val = (addr[2] << 24) | (addr[3] << 16) | (addr[4] << 8) | addr[5];
+-	airoha_fe_wr(eth, REG_UPDMEM_DATA(0), val);
+-	airoha_fe_wr(eth, REG_UPDMEM_CTRL(0),
+-		     FIELD_PREP(PPE_UPDMEM_ADDR_MASK, port->id) |
+-		     PPE_UPDMEM_WR_MASK | PPE_UPDMEM_REQ_MASK);
+-
+-	val = (addr[0] << 8) | addr[1];
+-	airoha_fe_wr(eth, REG_UPDMEM_DATA(0), val);
+-	airoha_fe_wr(eth, REG_UPDMEM_CTRL(0),
+-		     FIELD_PREP(PPE_UPDMEM_ADDR_MASK, port->id) |
+-		     FIELD_PREP(PPE_UPDMEM_OFFSET_MASK, 1) |
+-		     PPE_UPDMEM_WR_MASK | PPE_UPDMEM_REQ_MASK);
++	int err;
++
++	spin_lock_bh(&ppe_lock);
++	err = airoha_ppe_smac_write(eth, port->id, 0, get_unaligned_be32(addr + 2));
++	if (!err)
++		err = airoha_ppe_smac_write(eth, port->id, 1, get_unaligned_be16(addr));
++	spin_unlock_bh(&ppe_lock);
++	if (err)
++		dev_warn(eth->dev, "source MAC table update failed for GDM%u: %d\n",
++			 port->id, err);
+ }
+ 
+ struct airoha_ppe_dev *airoha_ppe_get_dev(struct device *dev)
+--- a/drivers/net/ethernet/airoha/airoha_ct_ifc.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_ifc.h
+@@ -7,13 +7,13 @@
+ #define CT_IFC_DATA(_word)		(0x210 + 4 * (_word))
+ #define CT_IFC_UDF0			0x220
+ #define CT_IFC_UDF0_MASK		GENMASK(15, 0)
+-#define CT_IFC_UDF0_IPV4_LENGTH		((2 << 2) | 1)
++#define CT_IFC_UDF_L3(_offset)		(((_offset) << 2) | 1)
+ #define CT_IFC_TCAM_BANK		0
+ #define CT_IFC_LUT1_BANK		1
+ #define CT_IFC_ACTION_BANK		2
+ #define CT_IFC_RULE_COUNT		64
+ #define CT_IFC_LUT1_COUNT		32
+-#define CT_IFC_RULE			(CT_IFC_RULE_COUNT - 1)
++#define CT_IFC_RULE(_guard)		(CT_IFC_RULE_COUNT - 1 - (_guard))
+ #define CT_IFC_ACTION_ENABLE		BIT(31)
+ #define CT_IFC_ACTION_STOP		BIT(30)
+ #define CT_IFC_ACTION_FORCE_CPU		BIT(28)
+@@ -24,8 +24,10 @@
+ #define CT_IFC_TCAM_TYPE1		0x40
+ #define CT_IFC_TCAM_TYPE_MASK		0xc0
+ #define CT_IFC_TCAM_IPV4_VALID		BIT(1)
++#define CT_IFC_TCAM_IPV6_VALID		BIT(0)
+ #define CT_IFC_CPU_RX_RING		1
+ #define CT_IFC_IPV4_LEN_MAX		57
++#define CT_IFC_IPV6_PAYLOAD_MAX		17
+ 
+ static struct net_device *airoha_ppe_ct_ifc_ingress(struct airoha_eth *eth)
+ {
+@@ -64,7 +66,8 @@
+ 
+ 	flow_rule_match_basic(rule, &basic);
+ 	if (basic.mask->n_proto != htons(U16_MAX) ||
+-	    basic.key->n_proto != htons(ETH_P_IP))
++	    (basic.key->n_proto != htons(ETH_P_IP) &&
++	     basic.key->n_proto != htons(ETH_P_IPV6)))
+ 		return false;
+ 	flow_rule_match_meta(rule, &match);
+ 	return (u32)match.mask->ingress_ifindex == U32_MAX &&
+@@ -126,12 +129,34 @@
+ 
+ static const u8 ct_ifc_action_words[] = { 2, 3, 1 };
+ 
++/* UDF0/UDF1 occupy the low/high halfwords of the same register. */
++static const struct {
++	u16 udf, min, max;
++	u8 valid;
++} ct_ifc_guard[] = {
++	{ CT_IFC_UDF_L3(2), sizeof(struct iphdr), CT_IFC_IPV4_LEN_MAX,
++	  CT_IFC_TCAM_IPV4_VALID },
++	{ CT_IFC_UDF_L3(4), 0, CT_IFC_IPV6_PAYLOAD_MAX,
++	  CT_IFC_TCAM_IPV6_VALID },
++};
++
++static bool ct_ifc_pending(struct airoha_ppe *ppe)
++{
++	unsigned int guard;
++
++	if (ppe->ct_ifc.cfg_owned || ppe->eth->ct_ifc_port_mask || ppe->ct_ifc.udf_owned)
++		return true;
++	for (guard = 0; guard < ARRAY_SIZE(ppe->ct_ifc.rule); guard++)
++		if (ppe->ct_ifc.rule[guard].lut_dirty || ppe->ct_ifc.rule[guard].tcam_dirty ||
++		    ppe->ct_ifc.rule[guard].action_dirty)
++			return true;
++	return false;
++}
++
+ static int ct_ifc_audit(struct airoha_ppe *ppe)
+ {
+ 	struct airoha_eth *eth = ppe->eth;
+-	u64 active = 0;
+-	u32 used_lut = 0;
+-	unsigned int index, page;
++	unsigned int index, page, guard = 0;
+ 	u32 words[2];
+ 	int err;
+ 
+@@ -140,35 +165,35 @@
+ 		if (err)
+ 			return err;
+ 		if (words[0] & CT_IFC_ACTION_ENABLE)
+-			active |= BIT_ULL(index);
+-		if (index == CT_IFC_RULE)
+-			ppe->ct_ifc.action[2][0] = words[0];
+-	}
+-	for (index = 0; index < CT_IFC_LUT1_COUNT; index++) {
++			return -EBUSY;
++	}
++	for (index = CT_IFC_LUT1_COUNT; index-- > 0;) {
+ 		err = ct_ifc_access(eth, CT_IFC_LUT1_BANK, index, 0, false, words, 2);
+ 		if (err)
+ 			return err;
+-		if (words[1] & CT_IFC_LUT1_ENABLE) {
+-			used_lut |= BIT(index);
+-		} else {
+-			ppe->ct_ifc.lut_index = index;
+-			memcpy(ppe->ct_ifc.lut, words, sizeof(words));
+-		}
+-	}
+-	if (active || used_lut == U32_MAX)
++		if (!(words[1] & CT_IFC_LUT1_ENABLE) && guard < ARRAY_SIZE(ppe->ct_ifc.rule)) {
++			ppe->ct_ifc.rule[guard].lut_index = index;
++			memcpy(ppe->ct_ifc.rule[guard].lut, words, sizeof(words));
++			guard++;
++		}
++	}
++	if (guard != ARRAY_SIZE(ppe->ct_ifc.rule))
+ 		return -EBUSY;
+ 
+-	for (page = 0; page < 2; page++) {
+-		err = ct_ifc_access(eth, CT_IFC_ACTION_BANK, CT_IFC_RULE, page, false,
+-				    ppe->ct_ifc.action[page], ct_ifc_action_words[page]);
+-		if (err)
+-			return err;
+-	}
+-	for (page = 0; page < ARRAY_SIZE(ppe->ct_ifc.tcam); page++) {
+-		err = ct_ifc_access(eth, CT_IFC_TCAM_BANK, CT_IFC_RULE, page, false,
+-				    ppe->ct_ifc.tcam[page], 2);
+-		if (err)
+-			return err;
++	for (guard = 0; guard < ARRAY_SIZE(ppe->ct_ifc.rule); guard++) {
++		for (page = 0; page < ARRAY_SIZE(ct_ifc_action_words); page++) {
++			err = ct_ifc_access(eth, CT_IFC_ACTION_BANK, CT_IFC_RULE(guard), page,
++					    false, ppe->ct_ifc.rule[guard].action[page],
++					    ct_ifc_action_words[page]);
++			if (err)
++				return err;
++		}
++		for (page = 0; page < ARRAY_SIZE(ppe->ct_ifc.rule[guard].tcam); page++) {
++			err = ct_ifc_access(eth, CT_IFC_TCAM_BANK, CT_IFC_RULE(guard), page,
++					    false, ppe->ct_ifc.rule[guard].tcam[page], 2);
++			if (err)
++				return err;
++		}
+ 	}
+ 	return 0;
+ }
+@@ -184,12 +209,11 @@
+ static int airoha_ppe_ct_ifc_stop(struct airoha_ppe *ppe)
+ {
+ 	struct airoha_eth *eth = ppe->eth;
+-	unsigned int page;
++	unsigned int guard, page;
+ 	int err = 0;
+ 
+ 	lockdep_assert_held(&flow_offload_mutex);
+-	if (!ppe->ct_ifc.cfg_owned && !eth->ct_ifc_port_mask && !ppe->ct_ifc.udf_owned &&
+-	    !ppe->ct_ifc.lut_dirty && !ppe->ct_ifc.tcam_dirty && !ppe->ct_ifc.action_dirty)
++	if (!ct_ifc_pending(ppe))
+ 		return 0;
+ 	if (ppe->ct_ifc.cfg_owned) {
+ 		err = ct_ifc_write_reg(eth, REG_FE_CSR_IFC_CFG, FE_IFC_EN_MASK, 0);
+@@ -203,45 +227,52 @@
+ 		dev_err(eth->dev, "CT IFC classifier is owned elsewhere; restoration deferred\n");
+ 		return -EBUSY;
+ 	}
+-	for (page = ARRAY_SIZE(ct_ifc_action_words); page-- > 0;) {
+-		if (ppe->ct_ifc.action_dirty & BIT(page)) {
+-			int ret = ct_ifc_write_verify(eth, CT_IFC_ACTION_BANK, CT_IFC_RULE,
+-						      page, ppe->ct_ifc.action[page],
+-						      ct_ifc_action_words[page]);
++	for (guard = 0; guard < ARRAY_SIZE(ppe->ct_ifc.rule); guard++) {
++		for (page = ARRAY_SIZE(ct_ifc_action_words); page-- > 0;) {
++			if (ppe->ct_ifc.rule[guard].action_dirty & BIT(page)) {
++				int ret = ct_ifc_write_verify(eth, CT_IFC_ACTION_BANK,
++							      CT_IFC_RULE(guard), page,
++							      ppe->ct_ifc.rule[guard].action[page],
++							      ct_ifc_action_words[page]);
++
++				if (ret)
++					err = ret;
++				else
++					ppe->ct_ifc.rule[guard].action_dirty &= ~BIT(page);
++			}
++		}
++		for (page = 0; page < ARRAY_SIZE(ppe->ct_ifc.rule[guard].tcam); page++) {
++			if (ppe->ct_ifc.rule[guard].tcam_dirty & BIT(page)) {
++				int ret = ct_ifc_write_verify(eth, CT_IFC_TCAM_BANK,
++							      CT_IFC_RULE(guard), page,
++							      ppe->ct_ifc.rule[guard].tcam[page],
++							      2);
++
++				if (ret)
++					err = ret;
++				else
++					ppe->ct_ifc.rule[guard].tcam_dirty &= ~BIT(page);
++			}
++		}
++		if (ppe->ct_ifc.rule[guard].lut_dirty) {
++			int ret = ct_ifc_write_verify(eth, CT_IFC_LUT1_BANK,
++						      ppe->ct_ifc.rule[guard].lut_index, 0,
++						      ppe->ct_ifc.rule[guard].lut, 2);
+ 
+ 			if (ret)
+ 				err = ret;
+ 			else
+-				ppe->ct_ifc.action_dirty &= ~BIT(page);
+-		}
+-	}
+-	for (page = 0; page < ARRAY_SIZE(ppe->ct_ifc.tcam); page++) {
+-		if (ppe->ct_ifc.tcam_dirty & BIT(page)) {
+-			int ret = ct_ifc_write_verify(eth, CT_IFC_TCAM_BANK, CT_IFC_RULE,
+-						      page, ppe->ct_ifc.tcam[page], 2);
+-
+-			if (ret)
+-				err = ret;
+-			else
+-				ppe->ct_ifc.tcam_dirty &= ~BIT(page);
+-		}
+-	}
+-	if (ppe->ct_ifc.lut_dirty) {
+-		int ret = ct_ifc_write_verify(eth, CT_IFC_LUT1_BANK, ppe->ct_ifc.lut_index, 0,
+-					      ppe->ct_ifc.lut, ARRAY_SIZE(ppe->ct_ifc.lut));
++				ppe->ct_ifc.rule[guard].lut_dirty = false;
++		}
++	}
++	if (ppe->ct_ifc.udf_owned) {
++		int ret = ct_ifc_write_reg(eth, CT_IFC_UDF0, ppe->ct_ifc.udf_owned,
++					    ppe->ct_ifc.udf);
+ 
+ 		if (ret)
+ 			err = ret;
+ 		else
+-			ppe->ct_ifc.lut_dirty = false;
+-	}
+-	if (ppe->ct_ifc.udf_owned) {
+-		int ret = ct_ifc_write_reg(eth, CT_IFC_UDF0, CT_IFC_UDF0_MASK, ppe->ct_ifc.udf);
+-
+-		if (ret)
+-			err = ret;
+-		else
+-			ppe->ct_ifc.udf_owned = false;
++			ppe->ct_ifc.udf_owned = 0;
+ 	}
+ 	if (eth->ct_ifc_port_mask && airoha_ifc_scope_ports(eth, 0))
+ 		err = -EIO;
+@@ -253,18 +284,14 @@
+ static void airoha_ppe_ct_ifc_start(struct airoha_ppe *ppe)
+ {
+ 	struct airoha_eth *eth = ppe->eth;
+-	u32 range[] = { (CT_IFC_IPV4_LEN_MAX << 16) | sizeof(struct iphdr),
+-			CT_IFC_LUT1_ENABLE | CT_IFC_LUT1_END | CT_IFC_LUT1_RANGE | CT_IFC_LUT1_UDF0 };
+ 	u32 action[][3] = { {}, { 0, 0, CT_IFC_CPU_RX_RING << 10 },
+-			    { CT_IFC_ACTION_ENABLE | CT_IFC_ACTION_STOP | CT_IFC_ACTION_FORCE_CPU } };
+-	unsigned int page;
++			    { CT_IFC_ACTION_ENABLE | CT_IFC_ACTION_STOP |
++			      CT_IFC_ACTION_FORCE_CPU } };
++	unsigned int guard, page;
+ 	int err;
+ 
+ 	lockdep_assert_held(&flow_offload_mutex);
+-	if (!READ_ONCE(ppe->ct_host_ppe))
+-		return;
+-	if (ppe->ct_ifc.cfg_owned || eth->ct_ifc_port_mask || ppe->ct_ifc.udf_owned ||
+-	    ppe->ct_ifc.lut_dirty || ppe->ct_ifc.tcam_dirty || ppe->ct_ifc.action_dirty)
++	if (!READ_ONCE(ppe->ct_host_ppe) || ct_ifc_pending(ppe))
+ 		return;
+ 	if (!airoha_ppe_ct_ifc_ingress(eth)) {
+ 		err = -ENODEV;
+@@ -278,38 +305,48 @@
+ 	if (err)
+ 		goto fail;
+ 	ppe->ct_ifc.udf = airoha_fe_rr(eth, CT_IFC_UDF0);
+-	if ((ppe->ct_ifc.udf & CT_IFC_UDF0_MASK) != CT_IFC_UDF0_IPV4_LENGTH) {
+-		ppe->ct_ifc.udf_owned = true;
+-		err = ct_ifc_write_reg(eth, CT_IFC_UDF0, CT_IFC_UDF0_MASK, CT_IFC_UDF0_IPV4_LENGTH);
++	for (guard = 0; guard < ARRAY_SIZE(ct_ifc_guard); guard++) {
++		u32 mask = CT_IFC_UDF0_MASK << (guard * 16);
++		u32 udf = (u32)ct_ifc_guard[guard].udf << (guard * 16);
++		u32 range[] = { (ct_ifc_guard[guard].max << 16) | ct_ifc_guard[guard].min,
++				CT_IFC_LUT1_ENABLE | CT_IFC_LUT1_END | CT_IFC_LUT1_RANGE |
++				(CT_IFC_LUT1_UDF0 + guard) };
++
++		if ((ppe->ct_ifc.udf & mask) != udf) {
++			ppe->ct_ifc.udf_owned |= mask;
++			err = ct_ifc_write_reg(eth, CT_IFC_UDF0, mask, udf);
++			if (err)
++				goto fail;
++		}
++		ppe->ct_ifc.rule[guard].lut_dirty = true;
++		err = ct_ifc_write_verify(eth, CT_IFC_LUT1_BANK,
++					  ppe->ct_ifc.rule[guard].lut_index, 0,
++					  range, ARRAY_SIZE(range));
+ 		if (err)
+ 			goto fail;
+-	}
+-	ppe->ct_ifc.lut_dirty = true;
+-	err = ct_ifc_write_verify(eth, CT_IFC_LUT1_BANK, ppe->ct_ifc.lut_index, 0,
+-				  range, ARRAY_SIZE(range));
+-	if (err)
+-		goto fail;
+-	for (page = ARRAY_SIZE(ppe->ct_ifc.tcam); page-- > 0;) {
+-		u32 words[2] = {};
+-
+-		if (page == 8) {
+-			words[0] = CT_IFC_TCAM_TYPE1 | CT_IFC_TCAM_IPV4_VALID;
+-			words[1] = CT_IFC_TCAM_TYPE_MASK | CT_IFC_TCAM_IPV4_VALID;
+-		} else if (page == 4) {
+-			words[0] = BIT(ppe->ct_ifc.lut_index);
+-			words[1] = words[0];
+-		}
+-		ppe->ct_ifc.tcam_dirty |= BIT(page);
+-		err = ct_ifc_write_verify(eth, CT_IFC_TCAM_BANK, CT_IFC_RULE, page, words, 2);
+-		if (err)
+-			goto fail;
+-	}
+-	for (page = 0; page < ARRAY_SIZE(ct_ifc_action_words); page++) {
+-		ppe->ct_ifc.action_dirty |= BIT(page);
+-		err = ct_ifc_write_verify(eth, CT_IFC_ACTION_BANK, CT_IFC_RULE, page,
+-					  action[page], ct_ifc_action_words[page]);
+-		if (err)
+-			goto fail;
++		for (page = ARRAY_SIZE(ppe->ct_ifc.rule[guard].tcam); page-- > 0;) {
++			u32 words[2] = {};
++
++			if (page == 8) {
++				words[0] = CT_IFC_TCAM_TYPE1 | ct_ifc_guard[guard].valid;
++				words[1] = CT_IFC_TCAM_TYPE_MASK | ct_ifc_guard[guard].valid;
++			} else if (page == 4) {
++				words[0] = BIT(ppe->ct_ifc.rule[guard].lut_index);
++				words[1] = words[0];
++			}
++			ppe->ct_ifc.rule[guard].tcam_dirty |= BIT(page);
++			err = ct_ifc_write_verify(eth, CT_IFC_TCAM_BANK, CT_IFC_RULE(guard),
++						  page, words, 2);
++			if (err)
++				goto fail;
++		}
++		for (page = 0; page < ARRAY_SIZE(ct_ifc_action_words); page++) {
++			ppe->ct_ifc.rule[guard].action_dirty |= BIT(page);
++			err = ct_ifc_write_verify(eth, CT_IFC_ACTION_BANK, CT_IFC_RULE(guard), page,
++						  action[page], ct_ifc_action_words[page]);
++			if (err)
++				goto fail;
++		}
+ 	}
+ 	err = airoha_ifc_scope_ports(eth, XSI_ETH_VIP_PORT_MASK);
+ 	if (err)
+@@ -322,7 +359,7 @@
+ 
+ fail:
+ 	airoha_ppe_ct_ifc_stop(ppe);
+-	dev_warn(eth->dev, "CT WLAN egress short IPv4 guard unavailable: %d\n", err);
++	dev_warn(eth->dev, "CT WLAN egress short packet guards unavailable: %d\n", err);
+ }
+ 
+ #endif
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_smac.h
+@@ -0,0 +1,122 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __AIROHA_CT_SMAC_H
++#define __AIROHA_CT_SMAC_H
++
++/* GDM uses 1..4 and 15 preserves the ingress source address.  CT owns 5..14
++ * after taking over two empty PPE SRAM banks with DRAM lookup disabled.
++ * Entries reference immutable slots until both banks have been drained.
++ */
++#define AIROHA_CT_SMAC_FIRST	5
++#define AIROHA_CT_SMAC_COUNT	10
++
++static int airoha_ppe_smac_write(struct airoha_eth *eth, u8 id, u8 word,
++				 u32 value)
++{
++	u32 ctrl, val;
++
++	lockdep_assert_held(&ppe_lock);
++	if (id > 15 || word > 1)
++		return -EINVAL;
++
++	ctrl = FIELD_PREP(PPE_UPDMEM_ADDR_MASK, id) |
++	       FIELD_PREP(PPE_UPDMEM_OFFSET_MASK, word) |
++	       PPE_UPDMEM_WR_MASK | PPE_UPDMEM_REQ_MASK;
++	airoha_fe_wr(eth, REG_UPDMEM_DATA(0), value);
++
++	/* The source MAC table is shared through bank 0, including PPE2 flows. */
++	wmb();
++	airoha_fe_wr(eth, REG_UPDMEM_CTRL(0), ctrl);
++	return read_poll_timeout_atomic(airoha_fe_rr, val,
++					val & PPE_UPDMEM_ACK_MASK,
++					10, 1000, false, eth,
++					REG_UPDMEM_CTRL(0));
++}
++
++static int airoha_ppe_ct_smac_get(struct airoha_ppe *ppe, const u8 *addr,
++				  u8 *id)
++{
++	u32 values[2] = {
++		get_unaligned_be32(addr + 2), get_unaligned_be16(addr),
++	};
++	unsigned int i, word;
++	int err = -ENOSPC;
++
++	BUILD_BUG_ON(ARRAY_SIZE(ppe->ct_smac) != AIROHA_CT_SMAC_COUNT);
++	spin_lock_bh(&ppe_lock);
++	if (!ppe->ct_host_ppe || !ppe->ct_owns_sram || ppe->ct_stopping) {
++		err = -EBUSY;
++		goto out;
++	}
++	for (i = 0; i < ARRAY_SIZE(ppe->ct_smac); i++) {
++		if (ppe->ct_smac[i].valid &&
++		    ether_addr_equal(ppe->ct_smac[i].addr, addr)) {
++			*id = AIROHA_CT_SMAC_FIRST + i;
++			err = 0;
++			goto out;
++		}
++	}
++
++	for (i = 0; i < ARRAY_SIZE(ppe->ct_smac); i++) {
++		u8 slot = AIROHA_CT_SMAC_FIRST + i;
++
++		if (ppe->ct_smac[i].valid || ppe->ct_smac[i].dirty)
++			continue;
++
++		for (word = 0; word < ARRAY_SIZE(values); word++) {
++			/* A timed-out write can already have changed the table. */
++			ppe->ct_smac[i].dirty |= BIT(word);
++			err = airoha_ppe_smac_write(ppe->eth, slot, word,
++						    values[word]);
++			if (err)
++				goto out;
++		}
++
++		ether_addr_copy(ppe->ct_smac[i].addr, addr);
++		ppe->ct_smac[i].valid = true;
++		*id = slot;
++		err = 0;
++		break;
++	}
++out:
++	spin_unlock_bh(&ppe_lock);
++	return err;
++}
++
++/* Stop admissions, drain and quiesce both PPE banks before clearing owned
++ * words.  Failed writes retain their dirty bit so cleanup is retryable.
++ */
++static int airoha_ppe_ct_smac_stop(struct airoha_ppe *ppe)
++{
++	unsigned int i, word;
++	int err, ret = 0;
++
++	spin_lock_bh(&ppe_lock);
++	if (ppe->ct_host_ppe || ppe->ct_owns_sram) {
++		ret = -EBUSY;
++		goto out;
++	}
++	for (i = 0; i < ARRAY_SIZE(ppe->ct_smac); i++) {
++		/* A partially cleared entry must never satisfy a later get(). */
++		ppe->ct_smac[i].valid = false;
++		for (word = 0; word < 2; word++) {
++			if (!(ppe->ct_smac[i].dirty & BIT(word)))
++				continue;
++
++			err = airoha_ppe_smac_write(ppe->eth,
++						    AIROHA_CT_SMAC_FIRST + i,
++						    word, 0);
++			if (err) {
++				if (!ret)
++					ret = err;
++				continue;
++			}
++			ppe->ct_smac[i].dirty &= ~BIT(word);
++		}
++	}
++out:
++	spin_unlock_bh(&ppe_lock);
++
++	return ret;
++}
++
++#endif /* __AIROHA_CT_SMAC_H */

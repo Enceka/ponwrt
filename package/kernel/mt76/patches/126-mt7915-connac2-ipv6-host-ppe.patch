@@ -1,0 +1,223 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] mt7915: admit and learn CT host PPE IPv6 routed flows
+
+Allow untagged IPv4 and IPv6 TCP/UDP flowtable rules on the CT wireless
+ingress path. Require complete protocol, address and port masks with a
+matching address family. Reject unsupported keys and encapsulation actions,
+IPv6 tuple rewriting, duplicate redirects and wireless-to-wireless output.
+Preserve IPv4 address/port translation and the normal netfilter IP/TCP keys.
+
+Accept both IP families at wireless RX learning after validating complete
+IP and transport headers. Use skb_header_pointer for fragmented skbs and
+leave VLAN, IPv4 options/fragments, IPv6 extension headers/jumbograms,
+TCP FIN/RST and malformed lengths on the CPU. Keep station authorization,
+source MAC, destination unicast and PPE CPU-reason checks in place.
+
+---
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -2,7 +2,12 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/pci.h>
+ #include <linux/if_vlan.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <linux/tcp.h>
++#include <linux/udp.h>
+ #include <linux/unaligned.h>
++#include <net/ip.h>
+ #include <net/pkt_cls.h>
+ #include "mt7915.h"
+ #include "../dma.h"
+@@ -123,24 +128,99 @@
+ 
+ static bool mt7915_ct_flow_ingress(struct flow_rule *rule, int ifindex)
+ {
++	const u64 common_keys = BIT_ULL(FLOW_DISSECTOR_KEY_META) |
++		BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
++		BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
++		BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
++	struct flow_match_control control;
+ 	struct flow_match_basic basic;
+ 	struct flow_match_meta meta;
++	struct flow_match_ports ports;
+ 	const struct flow_action_entry *act;
++	bool redirect = false, ipv6;
++	u64 allowed_keys;
+ 	int index;
+ 
+-	if (!rule || !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META) ||
+-	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC))
++	if (!rule || (rule->match.dissector->used_keys & common_keys) != common_keys)
+ 		return false;
+ 	flow_rule_match_meta(rule, &meta);
++	flow_rule_match_control(rule, &control);
+ 	flow_rule_match_basic(rule, &basic);
+ 	if (meta.mask->ingress_ifindex != U32_MAX || meta.key->ingress_ifindex != ifindex ||
+-	    basic.mask->n_proto != htons(0xffff) || basic.key->n_proto != htons(ETH_P_IP))
+-		return false;
++	    meta.mask->ingress_iftype || meta.mask->l2_miss ||
++	    control.mask->addr_type != U16_MAX || control.mask->thoff ||
++	    control.mask->flags || control.key->flags ||
++	    basic.mask->n_proto != htons(U16_MAX) || basic.mask->ip_proto != U8_MAX ||
++	    (basic.key->ip_proto != IPPROTO_TCP && basic.key->ip_proto != IPPROTO_UDP))
++		return false;
++	ipv6 = basic.key->n_proto == htons(ETH_P_IPV6);
++	if (basic.key->n_proto != htons(ETH_P_IP) && !ipv6)
++		return false;
++	if (control.key->addr_type != (ipv6 ? FLOW_DISSECTOR_KEY_IPV6_ADDRS :
++						 FLOW_DISSECTOR_KEY_IPV4_ADDRS))
++		return false;
++	allowed_keys = common_keys | BIT_ULL(control.key->addr_type) |
++		BIT_ULL(FLOW_DISSECTOR_KEY_IP) | BIT_ULL(FLOW_DISSECTOR_KEY_TCP);
++	/* Reject VLAN, PPPoE, tunnels and other matches the PPE cannot preserve. */
++	if (rule->match.dissector->used_keys & ~allowed_keys ||
++	    !flow_rule_match_key(rule, control.key->addr_type))
++		return false;
++	if (ipv6) {
++		struct flow_match_ipv6_addrs addrs;
++
++		flow_rule_match_ipv6_addrs(rule, &addrs);
++		if (memchr_inv(&addrs.mask->src, 0xff, sizeof(addrs.mask->src)) ||
++		    memchr_inv(&addrs.mask->dst, 0xff, sizeof(addrs.mask->dst)))
++			return false;
++	} else {
++		struct flow_match_ipv4_addrs addrs;
++
++		flow_rule_match_ipv4_addrs(rule, &addrs);
++		if (addrs.mask->src != htonl(U32_MAX) || addrs.mask->dst != htonl(U32_MAX))
++			return false;
++	}
++	flow_rule_match_ports(rule, &ports);
++	if (ports.mask->src != htons(U16_MAX) || ports.mask->dst != htons(U16_MAX))
++		return false;
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IP)) {
++		struct flow_match_ip ip;
++
++		flow_rule_match_ip(rule, &ip);
++		if (ip.mask->ttl || (ip.mask->tos && ip.mask->tos != U8_MAX))
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_TCP)) {
++		struct flow_match_tcp tcp;
++
++		flow_rule_match_tcp(rule, &tcp);
++		/* nf_flow_table excludes FIN/RST; the PPE handles these in software. */
++		if (basic.key->ip_proto != IPPROTO_TCP || tcp.key->flags ||
++		    tcp.mask->flags != htons(0x0005))
++			return false;
++	}
+ 	flow_action_for_each(index, act, &rule->action) {
+-		if (act->id == FLOW_ACTION_REDIRECT)
+-			return act->dev && !act->dev->ieee80211_ptr;
+-	}
+-	return false;
++		switch (act->id) {
++		case FLOW_ACTION_REDIRECT:
++			if (redirect || !act->dev || act->dev->ieee80211_ptr)
++				return false;
++			redirect = true;
++			break;
++		case FLOW_ACTION_MANGLE:
++			if (act->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_ETH)
++				break;
++			if (ipv6 || (act->mangle.htype != FLOW_ACT_MANGLE_HDR_TYPE_IP4 &&
++			    act->mangle.htype != (basic.key->ip_proto == IPPROTO_TCP ?
++				FLOW_ACT_MANGLE_HDR_TYPE_TCP : FLOW_ACT_MANGLE_HDR_TYPE_UDP)))
++				return false;
++			break;
++		case FLOW_ACTION_CSUM:
++		case FLOW_ACTION_PRIORITY:
++			break;
++		default:
++			return false;
++		}
++	}
++	return redirect;
+ }
+ 
+ static int mt7915_ct_flow_cb(enum tc_setup_type type, void *data, void *priv)
+@@ -249,11 +329,68 @@
+ 	}
+ }
+ 
++static bool mt7915_ct_skb_supported(struct sk_buff *skb, __be16 proto)
++{
++	unsigned int offset = ETH_HLEN, len;
++	u8 l4proto;
++
++	if (skb_vlan_tag_present(skb) || skb->len < ETH_HLEN)
++		return false;
++	if (proto == htons(ETH_P_IP)) {
++		struct iphdr buffer;
++		const struct iphdr *ip;
++
++		ip = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++		if (!ip || ip->version != 4 || ip->ihl != 5 ||
++		    (ntohs(ip->frag_off) & (IP_MF | IP_OFFSET)))
++			return false;
++		len = ntohs(ip->tot_len);
++		if (len < sizeof(buffer) || len > skb->len - offset)
++			return false;
++		len -= sizeof(buffer);
++		offset += sizeof(buffer);
++		l4proto = ip->protocol;
++	} else if (proto == htons(ETH_P_IPV6)) {
++		struct ipv6hdr buffer;
++		const struct ipv6hdr *ip;
++
++		ip = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++		if (!ip || ip->version != 6)
++			return false;
++		len = ntohs(ip->payload_len);
++		offset += sizeof(buffer);
++		if (!len || len > skb->len - offset)
++			return false;
++		/* Extension headers, fragments and jumbograms stay on the CPU. */
++		l4proto = ip->nexthdr;
++	} else {
++		return false;
++	}
++	if (l4proto == IPPROTO_TCP) {
++		struct tcphdr buffer;
++		const struct tcphdr *tcp;
++
++		tcp = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++		return tcp && len >= sizeof(buffer) && tcp->doff >= 5 &&
++		       tcp->doff * 4 <= len && !tcp->fin && !tcp->rst;
++	}
++	if (l4proto == IPPROTO_UDP) {
++		struct udphdr buffer;
++		const struct udphdr *udp;
++
++		udp = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++		return udp && len >= sizeof(buffer) && ntohs(udp->len) == len &&
++		       (proto != htons(ETH_P_IPV6) || udp->check);
++	}
++	return false;
++}
++
+ void mt7915_ct_check_ppe(struct mt7915_dev *dev, struct mt7915_sta *msta,
+ 			 struct sk_buff *skb, u32 info)
+ {
+ 	struct mt7915_ct_path *path = dev->ct_path;
+ 	struct ieee80211_sta *sta;
++	struct ethhdr buffer;
+ 	const struct ethhdr *hdr;
+ 
+ 	if (!mt7915_ct_ppe_enabled(dev) || READ_ONCE(path->stopping) || !msta ||
+@@ -261,10 +398,11 @@
+ 	    skb->len < ETH_HLEN)
+ 		return;
+ 	sta = wcid_to_sta(&msta->wcid);
+-	hdr = (const void *)skb->data;
+-	if (!sta || !READ_ONCE(msta->ct_authorized) || hdr->h_proto != htons(ETH_P_IP) ||
++	hdr = skb_header_pointer(skb, 0, sizeof(buffer), &buffer);
++	if (!sta || !READ_ONCE(msta->ct_authorized) || !hdr ||
+ 	    is_multicast_ether_addr(hdr->h_dest) ||
+-	    !ether_addr_equal(hdr->h_source, sta->addr))
++	    !ether_addr_equal(hdr->h_source, sta->addr) ||
++	    !mt7915_ct_skb_supported(skb, hdr->h_proto))
+ 		return;
+ 	skb_reset_mac_header(skb);
+ 	airoha_ppe_dev_check_skb(path->ppe, skb, FIELD_GET(NPU_RX_DMA_FOE_ID_MASK, info), true);

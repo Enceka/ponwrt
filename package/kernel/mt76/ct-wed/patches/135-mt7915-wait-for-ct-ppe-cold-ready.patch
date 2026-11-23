@@ -25,7 +25,7 @@ receive path. Leave the default non-activated path and TC setup unchanged.
 +
  static bool mt7915_ct_flow_ingress(struct flow_rule *rule, int ifindex)
  {
- 	struct flow_match_basic basic;
+ 	const u64 common_keys = BIT_ULL(FLOW_DISSECTOR_KEY_META) |
 --- a/mt7915/mt7915.h
 +++ b/mt7915/mt7915.h
 @@ -510,6 +510,7 @@ int mt7915_ct_prepare(struct mt7915_dev *dev);

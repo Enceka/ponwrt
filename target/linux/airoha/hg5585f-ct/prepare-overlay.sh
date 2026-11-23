@@ -23,6 +23,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   package/kernel/mt76/patches/123-mt7915-connac2-check-rx-body.patch \
   package/kernel/mt76/patches/124-mt7915-connac2-host-ppe.patch \
   package/kernel/mt76/patches/125-mt7915-connac2-tdma-free-bufid.patch \
+  package/kernel/mt76/patches/126-mt7915-connac2-ipv6-host-ppe.patch \
   package/kernel/mt76/ct-wed/{*.h,ct_wed_platform.c,ct_wed_guard_v2.c} \
   package/kernel/mt76/ct-wed/patches/{126-mt7915-prepare-ct-wed-slot1.patch,127-mt76-own-ct-radio-dma-rings.patch,128-mt7915-retain-exposed-ct-wed.patch,129-mt7915-start-ct-wed-slot1.patch,130-mt7915-configure-ct-radio-csr-aliases.patch} \
   package/kernel/mt76/ct-wed/patches/131-mt76-bound-ct-txfree-to-wed-didx.patch \
@@ -49,6 +50,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   target/linux/airoha/patches-6.18/942-net-airoha-encode-ct-wed-wireless-egress.patch \
   target/linux/airoha/patches-6.18/943-net-airoha-bypass-short-ipv4-before-ct-wlan-offload.patch \
   target/linux/airoha/patches-6.18/944-net-airoha-invalidate-ct-wlan-station-flows.patch \
+  target/linux/airoha/patches-6.18/945-net-airoha-offload-ct-wireless-ipv6.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config} \
   target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts}; do
   mkdir -p "$overlay/tree/$(dirname "$path")"
