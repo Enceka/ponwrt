@@ -1,0 +1,20 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mt76: configure WA for CT WED transmit offload
+
+Advertise the TX-only WED capability to WA after firmware download.
+Connac2 owns the separate receive path, so no native WED receive
+capability is advertised and native WED RED configuration is unchanged.
+
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -2463,2 +2463,10 @@ int mt7915_mcu_init_firmware(struct mt7915_dev *dev)
++#ifdef CONFIG_MT7915_NPU
++	if (mt7915_ct_wed_active(dev)) {
++		ret = mt7915_mcu_wa_cmd(dev, MCU_WA_PARAM_CMD(CAPABILITY), 0, 0, 0);
++		if (ret)
++			return ret;
++	}
++#endif
++
+ #if IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED)
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {

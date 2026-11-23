@@ -1,0 +1,509 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: bypass short IPv4 before CT WLAN offload
+
+CT WED cannot transmit Ethernet frames shorter than 72 bytes through the
+hardware egress path. This includes TCP acknowledgements and control
+packets. Classify untagged IPv4 packets with total length 20..57 at the
+wired ingress and send them to CPU RX ring 1 before PPE forwarding.
+
+Acquire an unused IFC classifier, scope it to the GDM4 Ethernet ingress,
+and admit WLAN flow offload only when that ingress is covered. Preserve
+port configuration changes while scoped, verify programmed state, and
+restore owned state after draining PPE; failed restoration remains
+retryable. If the classifier is unavailable, retain software WLAN egress.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -721,6 +721,12 @@
+ struct airoha_ppe {
+ 	struct airoha_ppe_dev dev;
+ 	struct airoha_eth *eth;
++	struct {
++		u32 udf, lut[2], tcam[9][2], action[3][3];
++		u16 tcam_dirty;
++		u8 lut_index, action_dirty;
++		bool cfg_owned, udf_owned, lut_dirty;
++	} ct_ifc;
+ 	bool ct_host_ppe;
+ 	bool ct_restore_pending;
+ 	bool ct_owns_sram;
+@@ -771,6 +777,10 @@
+ 
+ 	struct airoha_ppe *ppe;
+ 	struct rhashtable flow_table;
++
++	spinlock_t ifc_port_lock;
++	u32 ifc_port_desired;
++	u32 ct_ifc_port_mask;
+ 
+ 	struct reset_control_bulk_data rsts[AIROHA_MAX_NUM_RSTS];
+ 	struct reset_control_bulk_data *xsi_rsts;
+@@ -866,6 +876,7 @@
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
+ int airoha_ppe_init(struct airoha_eth *eth);
+ void airoha_ppe_deinit(struct airoha_eth *eth);
++int airoha_ifc_scope_ports(struct airoha_eth *eth, u32 scope);
+ void airoha_ppe_ct_shutdown(struct airoha_eth *eth);
+ int airoha_ppe_ct_prepare(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -163,6 +163,49 @@
+ 		      FIELD_PREP(GDM_UCFQ_MASK, val));
+ }
+ 
++static void airoha_ifc_update_ports(struct airoha_eth *eth, u32 mask, bool enable)
++{
++	u32 ports;
++
++	spin_lock_bh(&eth->ifc_port_lock);
++	ports = eth->ct_ifc_port_mask ? eth->ifc_port_desired :
++		airoha_fe_rr(eth, REG_FE_IFC_PORT_EN);
++	ports = enable ? ports | mask : ports & ~mask;
++	if (eth->ct_ifc_port_mask) {
++		eth->ifc_port_desired = ports;
++		ports &= eth->ct_ifc_port_mask;
++	}
++	airoha_fe_wr(eth, REG_FE_IFC_PORT_EN, ports);
++	spin_unlock_bh(&eth->ifc_port_lock);
++}
++
++int airoha_ifc_scope_ports(struct airoha_eth *eth, u32 scope)
++{
++	u32 ports;
++	int err = 0;
++
++	spin_lock_bh(&eth->ifc_port_lock);
++	if (scope) {
++		if (eth->ct_ifc_port_mask) {
++			err = -EBUSY;
++			goto unlock;
++		}
++		eth->ifc_port_desired = airoha_fe_rr(eth, REG_FE_IFC_PORT_EN);
++		eth->ct_ifc_port_mask = scope;
++	} else if (!eth->ct_ifc_port_mask) {
++		goto unlock;
++	}
++	ports = scope ? eth->ifc_port_desired & scope : eth->ifc_port_desired;
++	airoha_fe_wr(eth, REG_FE_IFC_PORT_EN, ports);
++	if (airoha_fe_rr(eth, REG_FE_IFC_PORT_EN) != ports)
++		err = -EIO;
++	else if (!scope)
++		eth->ct_ifc_port_mask = 0;
++unlock:
++	spin_unlock_bh(&eth->ifc_port_lock);
++	return err;
++}
++
+ static int airoha_set_vip_for_gdm_port(struct airoha_gdm_dev *dev, bool enable)
+ {
+ 	struct airoha_gdm_port *port = dev->port;
+@@ -172,10 +215,10 @@
+ 	vip_port = eth->soc->ops.get_vip_port(port, dev->nbq);
+ 	if (enable) {
+ 		airoha_fe_set(eth, REG_FE_VIP_PORT_EN, vip_port);
+-		airoha_fe_set(eth, REG_FE_IFC_PORT_EN, vip_port);
++		airoha_ifc_update_ports(eth, vip_port, true);
+ 	} else {
+ 		airoha_fe_clear(eth, REG_FE_VIP_PORT_EN, vip_port);
+-		airoha_fe_clear(eth, REG_FE_IFC_PORT_EN, vip_port);
++		airoha_ifc_update_ports(eth, vip_port, false);
+ 	}
+ 
+ 	return 0;
+@@ -2532,7 +2575,7 @@
+ 
+ 	/* Disable VIP and IFC for GDM2 */
+ 	airoha_fe_clear(eth, REG_FE_VIP_PORT_EN, BIT(AIROHA_GDM2_IDX));
+-	airoha_fe_clear(eth, REG_FE_IFC_PORT_EN, BIT(AIROHA_GDM2_IDX));
++	airoha_ifc_update_ports(eth, BIT(AIROHA_GDM2_IDX), false);
+ 
+ 	airoha_fe_rmw(eth, REG_FE_WAN_PORT,
+ 		      WAN1_EN_MASK | WAN1_MASK | WAN0_MASK,
+@@ -2591,7 +2634,7 @@
+ 
+ 	/* Enable VIP and IFC for GDM2 */
+ 	airoha_fe_set(eth, REG_FE_VIP_PORT_EN, BIT(AIROHA_GDM2_IDX));
+-	airoha_fe_set(eth, REG_FE_IFC_PORT_EN, BIT(AIROHA_GDM2_IDX));
++	airoha_ifc_update_ports(eth, BIT(AIROHA_GDM2_IDX), true);
+ 
+ 	if (port->id == AIROHA_GDM4_IDX && airoha_is_7581(eth)) {
+ 		u32 mask = FC_ID_OF_SRC_PORT_MASK(dev->nbq);
+@@ -4764,6 +4807,7 @@
+ 		return -EINVAL;
+ 
+ 	eth->dev = &pdev->dev;
++	spin_lock_init(&eth->ifc_port_lock);
+ 
+ 	err = dma_set_mask_and_coherent(eth->dev, DMA_BIT_MASK(32));
+ 	if (err) {
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -22,6 +22,8 @@
+  */
+ DEFINE_MUTEX(flow_offload_mutex);
+ static DEFINE_SPINLOCK(ppe_lock);
++
++#include "airoha_ct_ifc.h"
+ 
+ static const struct rhashtable_params airoha_flow_table_params = {
+ 	.head_offset = offsetof(struct airoha_flow_table_entry, node),
+@@ -1404,6 +1406,9 @@
+ 					   "PON egress has no unambiguous VLAN/P-bit to GEM mapping");
+ 		return err;
+ 	}
++	if (eth->ppe->ct_host_ppe && !egress_dev &&
++	    !airoha_ppe_ct_ifc_covers(eth->ppe, rule, odev))
++		return -EOPNOTSUPP;
+ 	if (eth->ppe->ct_host_ppe && egress_dev &&
+ 	    test_bit(AIROHA_DEV_F_PON, &egress_dev->flags))
+ 		return -EOPNOTSUPP;
+@@ -1964,6 +1969,9 @@
+ 		if (err)
+ 			return err;
+ 	}
++	err = airoha_ppe_ct_ifc_stop(ppe);
++	if (err)
++		return err;
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++)
+ 		airoha_ppe_ct_regs(ppe, bank, true);
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++)
+@@ -2116,6 +2124,7 @@
+ 	airoha_ppe_foe_flow_stats_reset(ppe, npu);
+ 
+ publish:
++	airoha_ppe_ct_ifc_start(ppe);
+ 	rcu_assign_pointer(eth->npu, npu);
+ 	synchronize_rcu();
+ 
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_ifc.h
+@@ -0,0 +1,328 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef AIROHA_CT_IFC_H
++#define AIROHA_CT_IFC_H
++
++#define CT_IFC_CONTROL			0x204
++#define CT_IFC_DONE			BIT(31)
++#define CT_IFC_DATA(_word)		(0x210 + 4 * (_word))
++#define CT_IFC_UDF0			0x220
++#define CT_IFC_UDF0_MASK		GENMASK(15, 0)
++#define CT_IFC_UDF0_IPV4_LENGTH		((2 << 2) | 1)
++#define CT_IFC_TCAM_BANK		0
++#define CT_IFC_LUT1_BANK		1
++#define CT_IFC_ACTION_BANK		2
++#define CT_IFC_RULE_COUNT		64
++#define CT_IFC_LUT1_COUNT		32
++#define CT_IFC_RULE			(CT_IFC_RULE_COUNT - 1)
++#define CT_IFC_ACTION_ENABLE		BIT(31)
++#define CT_IFC_ACTION_STOP		BIT(30)
++#define CT_IFC_ACTION_FORCE_CPU		BIT(28)
++#define CT_IFC_LUT1_ENABLE		BIT(15)
++#define CT_IFC_LUT1_END			BIT(14)
++#define CT_IFC_LUT1_RANGE		(2 << 6)
++#define CT_IFC_LUT1_UDF0		32
++#define CT_IFC_TCAM_TYPE1		0x40
++#define CT_IFC_TCAM_TYPE_MASK		0xc0
++#define CT_IFC_TCAM_IPV4_VALID		BIT(1)
++#define CT_IFC_CPU_RX_RING		1
++#define CT_IFC_IPV4_LEN_MAX		57
++
++static struct net_device *airoha_ppe_ct_ifc_ingress(struct airoha_eth *eth)
++{
++	struct airoha_gdm_port *port = eth->ports[AIROHA_GDM4_IDX - 1];
++	unsigned int index;
++
++	if (!port || port->id != AIROHA_GDM4_IDX || !eth->soc->ops.get_vip_port ||
++	    eth->soc->ops.get_vip_port(port, 0) != XSI_ETH_VIP_PORT_MASK)
++		return NULL;
++	for (index = 0; index < ARRAY_SIZE(port->devs); index++) {
++		struct airoha_gdm_dev *gdm = port->devs[index];
++
++		if (gdm && !gdm->nbq)
++			return netdev_from_priv(gdm);
++	}
++	return NULL;
++}
++
++static bool airoha_ppe_ct_ifc_covers(struct airoha_ppe *ppe, struct flow_rule *rule,
++				     struct net_device *egress)
++{
++	struct airoha_eth *eth = ppe->eth;
++	struct net_device *ingress = airoha_ppe_ct_ifc_ingress(eth);
++	struct flow_match_basic basic;
++	struct flow_match_meta match;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!ppe->ct_ifc.cfg_owned || !ingress || !net_eq(dev_net(ingress), dev_net(egress)) ||
++	    !(airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK) ||
++	    airoha_fe_rr(eth, REG_FE_IFC_PORT_EN) != XSI_ETH_VIP_PORT_MASK ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_CONTROL))
++		return false;
++
++	flow_rule_match_basic(rule, &basic);
++	if (basic.mask->n_proto != htons(U16_MAX) ||
++	    basic.key->n_proto != htons(ETH_P_IP))
++		return false;
++	flow_rule_match_meta(rule, &match);
++	return (u32)match.mask->ingress_ifindex == U32_MAX &&
++	       (u32)match.key->ingress_ifindex == (u32)ingress->ifindex;
++}
++
++static int ct_ifc_access(struct airoha_eth *eth, unsigned int bank,
++			 unsigned int index, unsigned int page, bool write,
++			 u32 *words, unsigned int count)
++{
++	u32 command = (index << 16) | (page << 8) | (bank << 4) | 1;
++	unsigned int word;
++	u32 status;
++	int err;
++
++	if (write) {
++		for (word = 0; word < count; word++)
++			airoha_fe_wr(eth, CT_IFC_DATA(word), words[word]);
++		command |= BIT(1);
++	}
++	airoha_fe_wr(eth, CT_IFC_CONTROL, command);
++	err = read_poll_timeout(airoha_fe_rr, status, status & CT_IFC_DONE,
++				2, 1000, false, eth, CT_IFC_CONTROL);
++	if (err) {
++		dev_warn(eth->dev, "CT IFC command %08x timed out: %08x\n", command, status);
++		return err;
++	}
++	if (!write)
++		for (word = 0; word < count; word++)
++			words[word] = airoha_fe_rr(eth, CT_IFC_DATA(word));
++	return 0;
++}
++
++static int ct_ifc_write_verify(struct airoha_eth *eth, unsigned int bank,
++			       unsigned int index, unsigned int page, u32 *words,
++			       unsigned int count)
++{
++	u32 actual[3];
++	bool match;
++	int err;
++
++	err = ct_ifc_access(eth, bank, index, page, true, words, count);
++	if (!err)
++		err = ct_ifc_access(eth, bank, index, page, false, actual, count);
++	if (err)
++		return err;
++	if (bank == CT_IFC_TCAM_BANK)
++		match = actual[1] == words[1] && !((actual[0] ^ words[0]) & words[1]);
++	else
++		match = !memcmp(actual, words, count * sizeof(*words));
++	if (!match) {
++		dev_warn(eth->dev, "CT IFC bank=%u row=%u page=%u expected=%*phN actual=%*phN\n",
++			 bank, index, page, (int)(count * sizeof(*words)), words,
++			 (int)(count * sizeof(*words)), actual);
++		return -EIO;
++	}
++	return 0;
++}
++
++static const u8 ct_ifc_action_words[] = { 2, 3, 1 };
++
++static int ct_ifc_audit(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	u64 active = 0;
++	u32 used_lut = 0;
++	unsigned int index, page;
++	u32 words[2];
++	int err;
++
++	for (index = 0; index < CT_IFC_RULE_COUNT; index++) {
++		err = ct_ifc_access(eth, CT_IFC_ACTION_BANK, index, 2, false, words, 1);
++		if (err)
++			return err;
++		if (words[0] & CT_IFC_ACTION_ENABLE)
++			active |= BIT_ULL(index);
++		if (index == CT_IFC_RULE)
++			ppe->ct_ifc.action[2][0] = words[0];
++	}
++	for (index = 0; index < CT_IFC_LUT1_COUNT; index++) {
++		err = ct_ifc_access(eth, CT_IFC_LUT1_BANK, index, 0, false, words, 2);
++		if (err)
++			return err;
++		if (words[1] & CT_IFC_LUT1_ENABLE) {
++			used_lut |= BIT(index);
++		} else {
++			ppe->ct_ifc.lut_index = index;
++			memcpy(ppe->ct_ifc.lut, words, sizeof(words));
++		}
++	}
++	if (active || used_lut == U32_MAX)
++		return -EBUSY;
++
++	for (page = 0; page < 2; page++) {
++		err = ct_ifc_access(eth, CT_IFC_ACTION_BANK, CT_IFC_RULE, page, false,
++				    ppe->ct_ifc.action[page], ct_ifc_action_words[page]);
++		if (err)
++			return err;
++	}
++	for (page = 0; page < ARRAY_SIZE(ppe->ct_ifc.tcam); page++) {
++		err = ct_ifc_access(eth, CT_IFC_TCAM_BANK, CT_IFC_RULE, page, false,
++				    ppe->ct_ifc.tcam[page], 2);
++		if (err)
++			return err;
++	}
++	return 0;
++}
++
++static int ct_ifc_write_reg(struct airoha_eth *eth, u32 reg, u32 mask, u32 value)
++{
++	if (!mask)
++		return 0;
++	airoha_fe_rmw(eth, reg, mask, value & mask);
++	return (airoha_fe_rr(eth, reg) & mask) == (value & mask) ? 0 : -EIO;
++}
++
++static int airoha_ppe_ct_ifc_stop(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	unsigned int page;
++	int err = 0;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!ppe->ct_ifc.cfg_owned && !eth->ct_ifc_port_mask && !ppe->ct_ifc.udf_owned &&
++	    !ppe->ct_ifc.lut_dirty && !ppe->ct_ifc.tcam_dirty && !ppe->ct_ifc.action_dirty)
++		return 0;
++	if (ppe->ct_ifc.cfg_owned) {
++		err = ct_ifc_write_reg(eth, REG_FE_CSR_IFC_CFG, FE_IFC_EN_MASK, 0);
++		if (err) {
++			dev_err(eth->dev, "CT IFC could not disable classifier: %d\n", err);
++			return err;
++		}
++		ppe->ct_ifc.cfg_owned = false;
++	}
++	if (airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK) {
++		dev_err(eth->dev, "CT IFC classifier is owned elsewhere; restoration deferred\n");
++		return -EBUSY;
++	}
++	for (page = ARRAY_SIZE(ct_ifc_action_words); page-- > 0;) {
++		if (ppe->ct_ifc.action_dirty & BIT(page)) {
++			int ret = ct_ifc_write_verify(eth, CT_IFC_ACTION_BANK, CT_IFC_RULE,
++						      page, ppe->ct_ifc.action[page],
++						      ct_ifc_action_words[page]);
++
++			if (ret)
++				err = ret;
++			else
++				ppe->ct_ifc.action_dirty &= ~BIT(page);
++		}
++	}
++	for (page = 0; page < ARRAY_SIZE(ppe->ct_ifc.tcam); page++) {
++		if (ppe->ct_ifc.tcam_dirty & BIT(page)) {
++			int ret = ct_ifc_write_verify(eth, CT_IFC_TCAM_BANK, CT_IFC_RULE,
++						      page, ppe->ct_ifc.tcam[page], 2);
++
++			if (ret)
++				err = ret;
++			else
++				ppe->ct_ifc.tcam_dirty &= ~BIT(page);
++		}
++	}
++	if (ppe->ct_ifc.lut_dirty) {
++		int ret = ct_ifc_write_verify(eth, CT_IFC_LUT1_BANK, ppe->ct_ifc.lut_index, 0,
++					      ppe->ct_ifc.lut, ARRAY_SIZE(ppe->ct_ifc.lut));
++
++		if (ret)
++			err = ret;
++		else
++			ppe->ct_ifc.lut_dirty = false;
++	}
++	if (ppe->ct_ifc.udf_owned) {
++		int ret = ct_ifc_write_reg(eth, CT_IFC_UDF0, CT_IFC_UDF0_MASK, ppe->ct_ifc.udf);
++
++		if (ret)
++			err = ret;
++		else
++			ppe->ct_ifc.udf_owned = false;
++	}
++	if (eth->ct_ifc_port_mask && airoha_ifc_scope_ports(eth, 0))
++		err = -EIO;
++	if (err)
++		dev_err(eth->dev, "CT IFC restoration failed: %d\n", err);
++	return err;
++}
++
++static void airoha_ppe_ct_ifc_start(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	u32 range[] = { (CT_IFC_IPV4_LEN_MAX << 16) | sizeof(struct iphdr),
++			CT_IFC_LUT1_ENABLE | CT_IFC_LUT1_END | CT_IFC_LUT1_RANGE | CT_IFC_LUT1_UDF0 };
++	u32 action[][3] = { {}, { 0, 0, CT_IFC_CPU_RX_RING << 10 },
++			    { CT_IFC_ACTION_ENABLE | CT_IFC_ACTION_STOP | CT_IFC_ACTION_FORCE_CPU } };
++	unsigned int page;
++	int err;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!READ_ONCE(ppe->ct_host_ppe))
++		return;
++	if (ppe->ct_ifc.cfg_owned || eth->ct_ifc_port_mask || ppe->ct_ifc.udf_owned ||
++	    ppe->ct_ifc.lut_dirty || ppe->ct_ifc.tcam_dirty || ppe->ct_ifc.action_dirty)
++		return;
++	if (!airoha_ppe_ct_ifc_ingress(eth)) {
++		err = -ENODEV;
++		goto fail;
++	}
++	if (airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK) {
++		err = -EBUSY;
++		goto fail;
++	}
++	err = ct_ifc_audit(ppe);
++	if (err)
++		goto fail;
++	ppe->ct_ifc.udf = airoha_fe_rr(eth, CT_IFC_UDF0);
++	if ((ppe->ct_ifc.udf & CT_IFC_UDF0_MASK) != CT_IFC_UDF0_IPV4_LENGTH) {
++		ppe->ct_ifc.udf_owned = true;
++		err = ct_ifc_write_reg(eth, CT_IFC_UDF0, CT_IFC_UDF0_MASK, CT_IFC_UDF0_IPV4_LENGTH);
++		if (err)
++			goto fail;
++	}
++	ppe->ct_ifc.lut_dirty = true;
++	err = ct_ifc_write_verify(eth, CT_IFC_LUT1_BANK, ppe->ct_ifc.lut_index, 0,
++				  range, ARRAY_SIZE(range));
++	if (err)
++		goto fail;
++	for (page = ARRAY_SIZE(ppe->ct_ifc.tcam); page-- > 0;) {
++		u32 words[2] = {};
++
++		if (page == 8) {
++			words[0] = CT_IFC_TCAM_TYPE1 | CT_IFC_TCAM_IPV4_VALID;
++			words[1] = CT_IFC_TCAM_TYPE_MASK | CT_IFC_TCAM_IPV4_VALID;
++		} else if (page == 4) {
++			words[0] = BIT(ppe->ct_ifc.lut_index);
++			words[1] = words[0];
++		}
++		ppe->ct_ifc.tcam_dirty |= BIT(page);
++		err = ct_ifc_write_verify(eth, CT_IFC_TCAM_BANK, CT_IFC_RULE, page, words, 2);
++		if (err)
++			goto fail;
++	}
++	for (page = 0; page < ARRAY_SIZE(ct_ifc_action_words); page++) {
++		ppe->ct_ifc.action_dirty |= BIT(page);
++		err = ct_ifc_write_verify(eth, CT_IFC_ACTION_BANK, CT_IFC_RULE, page,
++					  action[page], ct_ifc_action_words[page]);
++		if (err)
++			goto fail;
++	}
++	err = airoha_ifc_scope_ports(eth, XSI_ETH_VIP_PORT_MASK);
++	if (err)
++		goto fail;
++	ppe->ct_ifc.cfg_owned = true;
++	err = ct_ifc_write_reg(eth, REG_FE_CSR_IFC_CFG, FE_IFC_EN_MASK, FE_IFC_EN_MASK);
++	if (err)
++		goto fail;
++	return;
++
++fail:
++	airoha_ppe_ct_ifc_stop(ppe);
++	dev_warn(eth->dev, "CT WLAN egress short IPv4 guard unavailable: %d\n", err);
++}
++
++#endif

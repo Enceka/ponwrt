@@ -1,0 +1,75 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mt76: expose CT WED wireless forwarding metadata
+
+Resolve ordinary authorized AP stations through the active CT WED bridge.
+Build the forwarding callback without the native MediaTek WED dependency.
+Pass the radio band, BSS and station WCID to the Airoha PPE while retaining
+the native MediaTek WED path on other platforms.
+
+--- a/mt7915/ct_wed.c
++++ b/mt7915/ct_wed.c
+@@ -467,3 +467,11 @@
++bool mt7915_ct_wed_active(struct mt7915_dev *dev)
++{
++	struct mt7915_ct_wed *bridge = rcu_access_pointer(dev->ct_wed);
++
++	return bridge && READ_ONCE(bridge->owner) == CT_WED &&
++	       READ_ONCE(bridge->ever_exposed);
++}
++
+ bool mt7915_ct_wed_retained(struct mt7915_dev *dev)
+ {
+ 	struct mt7915_ct_wed *bridge = rcu_access_pointer(dev->ct_wed);
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -520,1 +520,2 @@
++bool mt7915_ct_wed_active(struct mt7915_dev *dev);
+ bool mt7915_ct_wed_retained(struct mt7915_dev *dev);
+@@ -550,1 +551,2 @@
++static inline bool mt7915_ct_wed_active(struct mt7915_dev *dev) { return false; }
+ static inline bool mt7915_ct_wed_retained(struct mt7915_dev *dev) { return false; }
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1840,3 +1840,3 @@
+-#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++#if defined(CONFIG_NET_MEDIATEK_SOC_WED) || defined(CONFIG_MT7915_NPU)
+ static int
+ mt7915_net_fill_forward_path(struct ieee80211_hw *hw,
+@@ -1852,5 +1852,25 @@ mt7915_net_fill_forward_path(struct ieee80211_hw *hw,
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
++#endif
+ 
++#ifdef CONFIG_MT7915_NPU
++	if (mt7915_ct_wed_active(dev)) {
++		if (vif->type != NL80211_IFTYPE_AP || !READ_ONCE(msta->ct_authorized) ||
++		    !msta->wcid.idx || msta->wcid.idx > MT7915_WTBL_STA ||
++		    test_bit(MT_WCID_FLAG_4ADDR, &msta->wcid.flags))
++			return -EOPNOTSUPP;
++
++		path->type = DEV_PATH_MTK_WDMA;
++		path->dev = ctx->dev;
++		path->mtk_wdma.wdma_idx = phy->mt76->band_idx;
++		path->mtk_wdma.bss = mvif->mt76.idx;
++		path->mtk_wdma.queue = phy->mt76->band_idx;
++		path->mtk_wdma.wcid = msta->wcid.idx;
++		ctx->dev = NULL;
++		return 0;
++	}
++#endif
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	if (!mtk_wed_device_active(wed))
+ 		return -ENODEV;
+ 
+@@ -1879,3 +1899,6 @@ mt7915_net_fill_forward_path(struct ieee80211_hw *hw,
+ 	return 0;
++#else
++	return -ENODEV;
++#endif
+ }
+ #endif
+@@ -1963,3 +1986,3 @@ const struct ieee80211_ops mt7915_ops = {
+-#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++#if defined(CONFIG_NET_MEDIATEK_SOC_WED) || defined(CONFIG_MT7915_NPU)
+ 	.net_fill_forward_path = mt7915_net_fill_forward_path,
+ #endif

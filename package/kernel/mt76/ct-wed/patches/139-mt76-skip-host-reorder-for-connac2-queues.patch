@@ -1,0 +1,23 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mt76: skip host reorder for connac2 RX queues
+
+Connac2 already reorders packets before forwarding them to either the PPE
+or its host RX queues. CT keeps this NPU in its own path instead of
+mmio.npu, so the existing device-active check misses the CT queues.
+
+Bypass the software BA window for both connac2 queues. Hardware-forwarded
+packets never advance that window; applying it again to host exceptions
+drops control traffic after sequence wrap and stalls TCP completion.
+
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1595,7 +1595,8 @@
+ 	while ((skb = __skb_dequeue(&dev->rx_skb[q])) != NULL) {
+ 		mt76_check_sta(dev, skb);
+ 		if (mtk_wed_device_active(&dev->mmio.wed) ||
+-		    mt76_npu_device_active(dev))
++		    mt76_npu_device_active(dev) ||
++		    q == MT_RXQ_NPU0 || q == MT_RXQ_NPU1)
+ 			__skb_queue_tail(&frames, skb);
+ 		else
+ 			mt76_rx_aggr_reorder(skb, &frames);

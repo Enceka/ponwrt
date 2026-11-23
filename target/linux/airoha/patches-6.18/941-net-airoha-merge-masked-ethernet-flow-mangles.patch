@@ -1,0 +1,30 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: preserve masked Ethernet address bytes
+
+Apply the flow action preserve mask when merging Ethernet address words.
+The source and destination halfword updates share the word at offset four.
+Copying one halfword unconditionally corrupts the other address.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -239,16 +239,13 @@ static void airoha_ppe_flow_mangle_eth(const struct flow_action_entry *act, void *eth)
+ {
+ 	void *dest = eth + act->mangle.offset;
+-	const void *src = &act->mangle.val;
++	u32 word;
+ 
+ 	if (act->mangle.offset > 8)
+ 		return;
+ 
+-	if (act->mangle.mask == 0xffff) {
+-		src += 2;
+-		dest += 2;
+-	}
+-
+-	memcpy(dest, src, act->mangle.mask ? 2 : 4);
++	memcpy(&word, dest, sizeof(word));
++	word = (word & act->mangle.mask) | act->mangle.val;
++	memcpy(dest, &word, sizeof(word));
+ }
+ 
+ static int airoha_ppe_flow_mangle_ports(const struct flow_action_entry *act,

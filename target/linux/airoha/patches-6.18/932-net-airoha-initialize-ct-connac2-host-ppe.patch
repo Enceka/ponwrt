@@ -81,8 +81,8 @@
  					   "PON egress has no unambiguous VLAN/P-bit to GEM mapping");
  		return err;
  	}
-+	if (eth->ppe->ct_host_ppe &&
-+	    (!egress_dev || test_bit(AIROHA_DEV_F_PON, &egress_dev->flags)))
++	if (eth->ppe->ct_host_ppe && egress_dev &&
++	    test_bit(AIROHA_DEV_F_PON, &egress_dev->flags))
 +		return -EOPNOTSUPP;
  
  	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS)) {
@@ -327,7 +327,7 @@
  	u16 now, diff;
  
 +	if (READ_ONCE(ppe->ct_host_ppe) &&
-+	    (!rx_wlan || hash >= airoha_ppe_get_total_sram_num_entries(ppe)))
++	    hash >= airoha_ppe_get_total_sram_num_entries(ppe))
 +		return;
 +
  	if (hash > ppe_hash_mask)

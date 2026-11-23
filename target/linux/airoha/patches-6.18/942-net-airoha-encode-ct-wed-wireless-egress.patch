@@ -1,0 +1,42 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: encode CT wireless egress through WDMA1
+
+Route CT wireless packets to the WDMA1 channels on GDM3. Encode the radio
+ring in NBQ and QDMA channel and the station/BSS special tag used by the
+Connac2 WED engine. Keep the native Airoha wireless encoding unchanged.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -633,11 +633,24 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 					      &info)) {
++			if (READ_ONCE(eth->ppe->ct_host_ppe)) {
++				if (info.idx > 1 || !info.wcid || info.wcid > 150 || info.bss > 63)
++					return -ERANGE;
++				if (type != PPE_PKT_TYPE_IPV4_HNAPT || data->vlan.num ||
++				    data->pppoe.num || is_multicast_ether_addr(data->eth.h_dest))
++					return -EOPNOTSUPP;
++				val |= AIROHA_FOE_IB2_PSE_QOS |
++				       FIELD_PREP(AIROHA_FOE_IB2_NBQ, 2 + info.idx) |
++				       FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT, FE_PSE_PORT_GDM3);
++				qdata |= FIELD_PREP(AIROHA_FOE_CHANNEL, 8 + info.idx);
++				wlan_etype = info.wcid << 6 | info.bss;
++			} else {
+-			val |= FIELD_PREP(AIROHA_FOE_IB2_NBQ, info.idx) |
+-			       FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT,
+-					  FE_PSE_PORT_CDM4);
+-			qdata |= FIELD_PREP(AIROHA_FOE_ACTDP, info.bss);
+-			wlan_etype = FIELD_PREP(AIROHA_FOE_MAC_WDMA_BAND,
+-						info.idx) |
+-				     FIELD_PREP(AIROHA_FOE_MAC_WDMA_WCID,
+-						info.wcid);
++				val |= FIELD_PREP(AIROHA_FOE_IB2_NBQ, info.idx) |
++				       FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT,
++						  FE_PSE_PORT_CDM4);
++				qdata |= FIELD_PREP(AIROHA_FOE_ACTDP, info.bss);
++				wlan_etype = FIELD_PREP(AIROHA_FOE_MAC_WDMA_BAND,
++							info.idx) |
++					     FIELD_PREP(AIROHA_FOE_MAC_WDMA_WCID,
++							info.wcid);
++			}
+ 		} else {
+ 			struct airoha_gdm_dev *dev = netdev_priv(netdev);
