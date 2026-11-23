@@ -203,7 +203,7 @@ define Device/fiberhome_hg5585f-ct
   $(call Device/fiberhome_hg5585f-common)
   DEVICE_MODEL := HG5585F
   DEVICE_VARIANT := CT
-  DEVICE_DTS := an7581-fiberhome-hg5585f-ct$(if $(filter y,$(CONFIG_PACKAGE_hg5585f-ct-npu-firmware)),-connac2)$(if $(filter 1,$(HG5585F_CT_RAM_TRIAL)),-ram)
+  DEVICE_DTS := an7581-fiberhome-hg5585f-ct$(if $(filter y,$(CONFIG_PACKAGE_hg5585f-ct-npu-firmware)),-connac2)$(if $(filter y,$(CONFIG_PACKAGE_kmod-mt7916-ct-wed-prepare)),$(if $(filter 1,$(HG5585F_CT_RAM_TRIAL)),,-wed))$(if $(filter 1,$(HG5585F_CT_RAM_TRIAL)),-ram)
   DEVICE_PACKAGES += kmod-phy-maxlinear $(if $(filter y,$(CONFIG_PACKAGE_hg5585f-ct-npu-firmware)),hg5585f-ct-npu-firmware)
   SUPPORTED_DEVICES += fiberhome,hg5585f-ct-usb-sfp
   $(call Device/fiberhome_hg5585f-images)

@@ -1,0 +1,27 @@
+#include "an7581-fiberhome-hg5585f-ct-connac2.dts"
+
+&{/soc} {
+	ct_wed_slot1: wireless-offload@1fa03000 {
+		compatible = "fiberhome,hg5585f-ct-wed-slot1";
+		reg = <0 0x1fa03000 0 0x1000>, <0 0x1fa06400 0 0x400>;
+		reg-names = "wed", "wdma";
+		interrupts = <GIC_SPI 68 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 73 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "wed", "wdma0", "wdma1", "wdma2";
+	};
+};
+
+&eth {
+	airoha,connac2-host-ppe;
+};
+
+&pcie1 {
+	pcie@0,0 {
+		wifi@0,0 {
+			airoha,connac2-rx;
+			airoha,wed-provider = <&ct_wed_slot1>;
+		};
+	};
+};

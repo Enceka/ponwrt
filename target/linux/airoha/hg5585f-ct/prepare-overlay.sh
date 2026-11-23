@@ -56,7 +56,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   target/linux/airoha/patches-6.18/946-net-airoha-offload-authorized-wireless-bridge-flows.patch \
   target/linux/airoha/patches-6.18/947-net-airoha-guard-ct-npu-wireless-short-frames.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config} \
-  target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts}; do
+  target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed.dts}; do
   mkdir -p "$overlay/tree/$(dirname "$path")"
   install -m 644 "$path" "$overlay/tree/$path"
 done

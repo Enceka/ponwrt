@@ -244,6 +244,9 @@ define KernelPackage/mt7915e
 ifneq ($(CONFIG_TARGET_mediatek_filogic)$(CONFIG_TARGET_mediatek_mt7622),)
   MODPARAMS.mt7915e:=wed_enable=Y
 endif
+ifneq ($(filter y m,$(CONFIG_PACKAGE_kmod-mt7916-ct-wed-prepare)),)
+  MODPARAMS.mt7915e:=ct_wed_activate=1
+endif
 endef
 
 define KernelPackage/mt7915e/config
@@ -262,10 +265,10 @@ endef
 define KernelPackage/mt7916-ct-wed-prepare
   SUBMENU:=Wireless Drivers
   TITLE:=HG5585F-CT MT7916 slot 1 cold ring preparation
-  DEPENDS:=@TARGET_airoha_an7581_DEVICE_fiberhome_hg5585f-ct @MT7915_NPU kmod-mt7915e
+  DEPENDS:=@TARGET_airoha_an7581_DEVICE_fiberhome_hg5585f-ct @MT7915_NPU kmod-mt7915e +hg5585f-ct-npu-firmware
   FILES:=$(PKG_BUILD_DIR)/mt7915/ct_wed_platform.ko $(PKG_BUILD_DIR)/mt7915/ct_wed_guard_v2.ko
   AUTOLOAD:=$(call AutoLoad,19,ct_wed_platform,1)
-  MODPARAMS.ct_wed_platform:=prepare=1
+  MODPARAMS.ct_wed_platform:=prepare=1 prepare_bm=1 inspect=1 start_trace=1 bm_debug=1
 endef
 
 define KernelPackage/mt7916-ct-wed-prepare/install
