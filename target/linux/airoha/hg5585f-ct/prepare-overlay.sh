@@ -34,6 +34,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   package/kernel/mt76/ct-wed/patches/137-mt7915-expose-active-ct-wed-forward-path.patch \
   package/kernel/mt76/ct-wed/patches/138-mt7915-configure-wa-for-ct-wed.patch \
   package/kernel/mt76/ct-wed/patches/139-mt76-skip-host-reorder-for-connac2-queues.patch \
+  package/kernel/mt76/ct-wed/patches/140-mt7915-flush-ct-wlan-flows-on-station-revoke.patch \
   target/linux/airoha/patches-6.18/931-net-airoha-initialize-ct-connac2-packet-pool.patch \
   target/linux/airoha/patches-6.18/932-net-airoha-initialize-ct-connac2-host-ppe.patch \
   target/linux/airoha/patches-6.18/933-net-airoha-quiesce-ct-ppe-on-shutdown.patch \
@@ -47,6 +48,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   target/linux/airoha/patches-6.18/941-net-airoha-merge-masked-ethernet-flow-mangles.patch \
   target/linux/airoha/patches-6.18/942-net-airoha-encode-ct-wed-wireless-egress.patch \
   target/linux/airoha/patches-6.18/943-net-airoha-bypass-short-ipv4-before-ct-wlan-offload.patch \
+  target/linux/airoha/patches-6.18/944-net-airoha-invalidate-ct-wlan-station-flows.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config} \
   target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts}; do
   mkdir -p "$overlay/tree/$(dirname "$path")"

@@ -1,0 +1,173 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: invalidate CT WLAN flows before WCID reuse
+
+Expose a serialized station flush for CT WLAN egress. Remove both pending
+software candidates and bound hardware rows, scoped by band and WCID.
+Check row ownership before invalidation so an aged/reused slot belonging
+to another flow is preserved. Retain failed rows for retry while detaching
+their learning candidates, and propagate SRAM access failures to mt76.
+Use the same checked removal for TC destroy so it cannot discard a failed
+station cleanup record before a later WCID allocation retries it.
+
+Keep the attempted SRAM row on a bind failure and stop the learning pass
+so station teardown can also invalidate writes whose ACK timed out.
+
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -30,6 +30,7 @@
+ struct airoha_ppe_dev *airoha_ppe_get_dev(struct device *dev);
+ void airoha_ppe_put_dev(struct airoha_ppe_dev *dev);
+ int airoha_ppe_ct_prepare_dev(struct airoha_ppe_dev *dev);
++int airoha_ppe_ct_flush_wlan(struct airoha_ppe_dev *dev, u8 band, u16 wcid);
+ 
+ static inline int airoha_ppe_dev_setup_tc_block_cb(struct airoha_ppe_dev *dev,
+ 						   void *type_data)
+@@ -54,6 +55,12 @@
+ }
+ 
+ static inline int airoha_ppe_ct_prepare_dev(struct airoha_ppe_dev *dev)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int airoha_ppe_ct_flush_wlan(struct airoha_ppe_dev *dev,
++					 u8 band, u16 wcid)
+ {
+ 	return -EOPNOTSUPP;
+ }
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1022,6 +1022,103 @@
+ 	}
+ }
+ 
++static bool airoha_ppe_ct_wlan_entry(const struct airoha_foe_entry *hwe,
++				    u8 band, u16 wcid)
++{
++	return FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) ==
++		PPE_PKT_TYPE_IPV4_HNAPT &&
++	       FIELD_GET(AIROHA_FOE_IB2_PSE_PORT, hwe->ipv4.ib2) == FE_PSE_PORT_GDM3 &&
++	       FIELD_GET(AIROHA_FOE_IB2_NBQ, hwe->ipv4.ib2) == 2 + band &&
++	       FIELD_GET(AIROHA_FOE_CHANNEL, hwe->ipv4.data) == 8 + band &&
++	       hwe->ipv4.l2.common.etype >> 6 == wcid;
++}
++
++static int airoha_ppe_ct_remove_wlan_flow(struct airoha_ppe *ppe,
++					 struct airoha_flow_table_entry *e)
++{
++	struct airoha_foe_entry *hwe, invalid;
++	u8 band = FIELD_GET(AIROHA_FOE_IB2_NBQ, e->data.ipv4.ib2) - 2;
++	u16 wcid = e->data.ipv4.l2.common.etype >> 6;
++	int err = 0;
++
++	spin_lock_bh(&ppe_lock);
++	hlist_del_init(&e->list);
++	if (e->hash == 0xffff)
++		goto unlock;
++
++	hwe = airoha_ppe_foe_get_entry_locked(ppe, e->hash);
++	if (!hwe) {
++		err = -ETIMEDOUT;
++	} else if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe->ib1) == AIROHA_FOE_STATE_BIND &&
++		   airoha_ppe_foe_compare_entry(e, hwe) &&
++		   airoha_ppe_ct_wlan_entry(hwe, band, wcid)) {
++		invalid = *hwe;
++		invalid.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
++		err = airoha_ppe_foe_commit_entry(ppe, &invalid, e->hash, false);
++	}
++	if (!err)
++		e->hash = 0xffff;
++unlock:
++	spin_unlock_bh(&ppe_lock);
++	return err;
++}
++
++/* The caller closes station admission before taking flow_offload_mutex.
++ * Remove pending candidates as well as bound entries, so an old WCID cannot
++ * be resurrected by the RX learning path after it is assigned to a new peer.
++ */
++int airoha_ppe_ct_flush_wlan(struct airoha_ppe_dev *dev, u8 band, u16 wcid)
++{
++	struct airoha_ppe *ppe = dev->priv;
++	struct airoha_eth *eth = ppe->eth;
++	struct airoha_flow_table_entry *e, *tmp;
++	struct rhashtable_iter iter;
++	LIST_HEAD(remove_list);
++	int err = 0;
++
++	if (band > 1 || !wcid || wcid > 150)
++		return -EINVAL;
++
++	mutex_lock(&flow_offload_mutex);
++	if (ppe->ct_stopping) {
++		err = -ESHUTDOWN;
++		goto unlock;
++	}
++	if (!ppe->ct_host_ppe)
++		goto unlock;
++
++	rhashtable_walk_enter(&eth->flow_table, &iter);
++	rhashtable_walk_start(&iter);
++	while ((e = rhashtable_walk_next(&iter))) {
++		if (IS_ERR(e))
++			continue;
++		if (list_empty(&e->gc_node) && !e->egress_dev &&
++		    airoha_ppe_ct_wlan_entry(&e->data, band, wcid))
++			list_add_tail(&e->gc_node, &remove_list);
++	}
++	rhashtable_walk_stop(&iter);
++	rhashtable_walk_exit(&iter);
++
++	list_for_each_entry_safe(e, tmp, &remove_list, gc_node) {
++		int ret;
++
++		list_del_init(&e->gc_node);
++		ret = airoha_ppe_ct_remove_wlan_flow(ppe, e);
++		if (ret) {
++			/* Keep the cookie/hash for a retry, but never learn it again. */
++			err = ret;
++			continue;
++		}
++		rhashtable_remove_fast(&eth->flow_table, &e->node,
++				       airoha_flow_table_params);
++		kfree(e);
++	}
++unlock:
++	mutex_unlock(&flow_offload_mutex);
++	return err;
++}
++EXPORT_SYMBOL_GPL(airoha_ppe_ct_flush_wlan);
++
+ static int
+ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+ 				    struct airoha_flow_table_entry *e,
+@@ -1124,9 +1221,11 @@
+ 		if (!airoha_ppe_foe_compare_entry(e, hwe))
+ 			continue;
+ 
+-		airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
++		/* Retain the attempted row for teardown even if its ACK times out. */
++		e->hash = hash;
++		if (airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan))
++			goto unlock;
+ 		commit_done = true;
+-		e->hash = hash;
+ 	}
+ 
+ 	if (commit_done)
+@@ -1515,7 +1614,14 @@
+ 	if (!e)
+ 		return -ENOENT;
+ 
+-	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
++	if (eth->ppe->ct_host_ppe && !e->egress_dev) {
++		int err = airoha_ppe_ct_remove_wlan_flow(eth->ppe, e);
++
++		if (err)
++			return err;
++	} else {
++		airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
++	}
+ 	rhashtable_remove_fast(&eth->flow_table, &e->node,
+ 			       airoha_flow_table_params);
+ 	kfree(e);

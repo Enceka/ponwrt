@@ -1,0 +1,93 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mt76: flush CT WLAN flows on station revocation
+
+Close forwarding admission before synchronously flushing the station's
+PPE entries when authorization is revoked or a peer moves between APs.
+Flush again before clearing/reusing a WCID, including pending software
+candidates that could otherwise reinstall the old wireless destination.
+
+Use the existing CT cleanup recovery path when invalidation fails and
+propagate errors from the allocation-time flush before programming a peer.
+
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -800,6 +800,19 @@
+ 	return 0;
+ }
+ 
++static void mt7915_ct_ba_error(struct mt7915_dev *dev, u16 wcid, int err);
++
++#ifdef CONFIG_MT7915_NPU
++static void mt7915_ct_revoke_sta(struct mt7915_dev *dev, struct mt7915_sta *msta)
++{
++	int err;
++
++	WRITE_ONCE(msta->ct_authorized, false);
++	err = mt7915_ct_flush_sta(dev, msta->vif->phy->mt76->band_idx, msta->wcid.idx);
++	mt7915_ct_ba_error(dev, msta->wcid.idx, err);
++}
++#endif
++
+ struct drop_sta_iter {
+ 	struct mt7915_dev *dev;
+ 	struct ieee80211_hw *hw;
+@@ -823,7 +836,7 @@
+ 
+ 	msta = (struct mt7915_sta *)sta->drv_priv;
+ #ifdef CONFIG_MT7915_NPU
+-	WRITE_ONCE(msta->ct_authorized, false);
++	mt7915_ct_revoke_sta(data->dev, msta);
+ #endif
+ 	mt7915_mcu_add_sta(data->dev, vif, sta, CONN_STATE_DISCONNECT, false);
+ 	msta->wcid.tx_info &= ~MT_WCID_TX_INFO_SET;
+@@ -1917,7 +1930,7 @@
+ 	int err;
+ 
+ 	if (old == IEEE80211_STA_AUTHORIZED)
+-		WRITE_ONCE(msta->ct_authorized, false);
++		mt7915_ct_revoke_sta(mt7915_hw_dev(hw), msta);
+ 	err = mt76_sta_state(hw, vif, sta, old, new);
+ 	if (!err && new == IEEE80211_STA_AUTHORIZED && vif->type == NL80211_IFTYPE_AP)
+ 		WRITE_ONCE(msta->ct_authorized, true);
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -275,9 +275,19 @@
+ 	airoha_ppe_put_dev(data);
+ }
+ 
++int mt7915_ct_flush_sta(struct mt7915_dev *dev, u8 band, u16 wcid)
++{
++	struct mt7915_ct_path *path = dev->ct_path;
++
++	if (!path || !path->ppe)
++		return 0;
++	return airoha_ppe_ct_flush_wlan(path->ppe, band, wcid);
++}
++
+ int mt7915_ct_clear_sta(struct mt7915_dev *dev, u8 band, u16 wcid)
+ {
+ 	struct mt7915_ct_path *path = dev->ct_path;
++	int err;
+ 
+ 	if (!path)
+ 		return 0;
+@@ -285,6 +295,9 @@
+ 		return -ESHUTDOWN;
+ 	if (band > 1 || !wcid || wcid > MT7916_CT_MAX_WCID)
+ 		return -ERANGE;
++	err = mt7915_ct_flush_sta(dev, band, wcid);
++	if (err)
++		return err;
+ 	return mt76_npu_send_msg(path->npu, !band, WLAN_FUNC_SET_WAIT_DEL_STA,
+ 				wcid, GFP_KERNEL);
+ }
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -517,6 +517,7 @@
+ 			 struct sk_buff *skb, u32 info);
+ int mt7915_ct_setup_tc(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		       struct net_device *netdev, enum tc_setup_type type, void *data);
++int mt7915_ct_flush_sta(struct mt7915_dev *dev, u8 band, u16 wcid);
+ int mt7915_ct_clear_sta(struct mt7915_dev *dev, u8 band, u16 wcid);
+ int mt7915_ct_set_ba(struct mt7915_dev *dev, u8 band, u16 wcid,
+ 		     u8 tid, u16 size, u16 ssn);
