@@ -37,7 +37,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   package/kernel/mt76/ct-wed/patches/139-mt76-skip-host-reorder-for-connac2-queues.patch \
   package/kernel/mt76/ct-wed/patches/140-mt7915-flush-ct-wlan-flows-on-station-revoke.patch \
   package/kernel/mt76/ct-wed/patches/141-mt7915-learn-authorized-ct-wireless-bridge-flows.patch \
-  package/kernel/mac80211/patches/subsys/601-mac80211-bridge-ct-ap-unicast-and-isolation-policy.patch \
+  package/kernel/mac80211/{Makefile,patches/subsys/601-mac80211-bridge-ct-ap-unicast-and-isolation-policy.patch} \
   target/linux/airoha/patches-6.18/931-net-airoha-initialize-ct-connac2-packet-pool.patch \
   target/linux/airoha/patches-6.18/932-net-airoha-initialize-ct-connac2-host-ppe.patch \
   target/linux/airoha/patches-6.18/933-net-airoha-quiesce-ct-ppe-on-shutdown.patch \
