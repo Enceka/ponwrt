@@ -1,0 +1,370 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mt76: learn authorized CT wireless bridge flows
+
+Admit wireless redirects only for explicitly marked bridge rules.
+Validate full tuples, identity Ethernet rewrites and both station
+forward paths on the same CT device, including cross-radio paths.
+
+Pass RX source band, BSS, WCID and epoch to PPE learning. Close station
+admission before revocation and refresh epochs after successful AP
+isolation cleanup. Retained destroy cookies reject new replacements
+instead of reporting a new hardware rule as already installed.
+
+Opt CT AP interfaces into Linux bridge unicast decisions. Apply after
+ct-wed 140: the station lifecycle and CT-only main.c sections are
+introduced by that series, after the native mt76 patch directory.
+
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -269,6 +269,9 @@
+ 	    (!mvif->mt76.omac_idx || mvif->mt76.omac_idx > 3))
+ 		vif->offload_flags = 0;
+ 	vif->offload_flags |= IEEE80211_OFFLOAD_ENCAP_4ADDR;
++	vif->offload_flags &= ~IEEE80211_OFFLOAD_BRIDGE_FLOW;
++	if (vif->type == NL80211_IFTYPE_AP && mt7915_ct_wed_active(dev))
++		vif->offload_flags |= IEEE80211_OFFLOAD_BRIDGE_FLOW;
+ 
+ 	mt7915_init_bitrate_mask(vif);
+ 	memset(&mvif->cap, -1, sizeof(mvif->cap));
+@@ -616,6 +619,11 @@
+ 	}
+ }
+ 
++#ifdef CONFIG_MT7915_NPU
++static void mt7915_ct_isolate_changed(struct ieee80211_hw *hw,
++				      struct ieee80211_vif *vif);
++#endif
++
+ static void mt7915_bss_info_changed(struct ieee80211_hw *hw,
+ 				    struct ieee80211_vif *vif,
+ 				    struct ieee80211_bss_conf *info,
+@@ -626,6 +634,11 @@
+ 	int set_bss_info = -1, set_sta = -1;
+ 
+ 	mutex_lock(&dev->mt76.mutex);
++
++#ifdef CONFIG_MT7915_NPU
++	if (changed & BSS_CHANGED_AP_ISOLATE)
++		mt7915_ct_isolate_changed(hw, vif);
++#endif
+ 
+ 	/*
+ 	 * station mode uses BSSID to map the wlan entry to a peer,
+@@ -808,8 +821,40 @@
+ 	int err;
+ 
+ 	WRITE_ONCE(msta->ct_authorized, false);
++	WRITE_ONCE(msta->ct_epoch, 0);
+ 	err = mt7915_ct_flush_sta(dev, msta->vif->phy->mt76->band_idx, msta->wcid.idx);
+ 	mt7915_ct_ba_error(dev, msta->wcid.idx, err);
++}
++
++static void mt7915_ct_isolate_changed(struct ieee80211_hw *hw,
++				      struct ieee80211_vif *vif)
++{
++	struct mt7915_dev *dev = mt7915_hw_dev(hw);
++	struct ieee80211_sta *sta;
++
++	/* The wiphy mutex pins stations. mac80211 blocks bridge forward paths
++	 * across this callback, so no peer can relearn while another is flushed.
++	 */
++	for_each_station(sta, hw) {
++		struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
++		bool authorized;
++		u32 epoch;
++		int err;
++
++		if (msta->vif != (struct mt7915_vif *)vif->drv_priv)
++			continue;
++		authorized = READ_ONCE(msta->ct_authorized);
++		WRITE_ONCE(msta->ct_authorized, false);
++		WRITE_ONCE(msta->ct_epoch, 0);
++		err = mt7915_ct_flush_sta(dev, msta->vif->phy->mt76->band_idx,
++					msta->wcid.idx);
++		mt7915_ct_ba_error(dev, msta->wcid.idx, err);
++		if (err || !authorized)
++			continue;
++		epoch = mt7915_ct_sta_epoch(dev, msta);
++		WRITE_ONCE(msta->ct_epoch, epoch);
++		WRITE_ONCE(msta->ct_authorized, true);
++	}
+ }
+ #endif
+ 
+@@ -1932,8 +1977,12 @@
+ 	if (old == IEEE80211_STA_AUTHORIZED)
+ 		mt7915_ct_revoke_sta(mt7915_hw_dev(hw), msta);
+ 	err = mt76_sta_state(hw, vif, sta, old, new);
+-	if (!err && new == IEEE80211_STA_AUTHORIZED && vif->type == NL80211_IFTYPE_AP)
++	if (!err && new == IEEE80211_STA_AUTHORIZED && vif->type == NL80211_IFTYPE_AP) {
++		u32 epoch = mt7915_ct_sta_epoch(mt7915_hw_dev(hw), msta);
++
++		WRITE_ONCE(msta->ct_epoch, epoch);
+ 		WRITE_ONCE(msta->ct_authorized, true);
++	}
+ 	return err;
+ }
+ #endif
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -148,6 +148,7 @@
+ 	struct mt76_wcid wcid; /* must be first */
+ #ifdef CONFIG_MT7915_NPU
+ 	bool ct_authorized;
++	u32 ct_epoch;
+ #endif
+ 
+ 	struct mt7915_vif *vif;
+@@ -518,6 +519,7 @@
+ int mt7915_ct_setup_tc(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		       struct net_device *netdev, enum tc_setup_type type, void *data);
+ int mt7915_ct_flush_sta(struct mt7915_dev *dev, u8 band, u16 wcid);
++u32 mt7915_ct_sta_epoch(struct mt7915_dev *dev, struct mt7915_sta *msta);
+ int mt7915_ct_clear_sta(struct mt7915_dev *dev, u8 band, u16 wcid);
+ int mt7915_ct_set_ba(struct mt7915_dev *dev, u8 band, u16 wcid,
+ 		     u8 tid, u16 size, u16 ssn);
+--- a/mt7915/npu.c
++++ b/mt7915/npu.c
+@@ -2,6 +2,7 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/pci.h>
+ #include <linux/if_vlan.h>
++#include <linux/if_bridge.h>
+ #include <linux/ip.h>
+ #include <linux/ipv6.h>
+ #include <linux/tcp.h>
+@@ -105,6 +106,7 @@
+ 
+ struct mt7915_ct_block {
+ 	struct mt7915_ct_path *path;
++	struct net_device *netdev;
+ 	struct xarray cookies;
+ 	struct mutex lock;
+ 	int ifindex;
+@@ -126,7 +128,75 @@
+ 	return airoha_ppe_ct_prepare_dev(path->ppe);
+ }
+ 
+-static bool mt7915_ct_flow_ingress(struct flow_rule *rule, int ifindex)
++static bool mt7915_ct_bridge_peer(struct mt7915_dev *dev,
++				 struct net_device *netdev, const u8 *addr,
++				 struct net_device_path *peer)
++{
++	struct mt7915_phy *ext_phy = mt7915_ext_phy(dev);
++	struct net_device_path_ctx ctx = { .dev = netdev, .bridge = true };
++	struct net_device_path_stack stack;
++	struct wireless_dev *wdev = netdev->ieee80211_ptr;
++
++	if (!wdev || wdev->iftype != NL80211_IFTYPE_AP ||
++	    (wdev->wiphy != dev->mphy.hw->wiphy &&
++	     (!ext_phy || wdev->wiphy != ext_phy->mt76->hw->wiphy)) ||
++	    !netif_is_bridge_port(netdev) ||
++	    br_port_get_stp_state(netdev) != BR_STATE_FORWARDING)
++		return false;
++	ether_addr_copy(ctx.daddr, addr);
++	if (dev_fill_forward_path(&ctx, &stack) || stack.num_paths != 1 ||
++	    stack.path[0].type != DEV_PATH_MTK_WDMA || stack.path[0].dev != netdev)
++		return false;
++	*peer = stack.path[0];
++	return peer->mtk_wdma.wdma_idx <= 1 &&
++	       peer->mtk_wdma.queue == peer->mtk_wdma.wdma_idx &&
++	       peer->mtk_wdma.wcid && peer->mtk_wdma.wcid <= MT7916_CT_MAX_WCID;
++}
++
++static bool mt7915_ct_bridge_peers(struct mt7915_ct_block *block,
++				  struct net_device *outdev,
++				  const struct flow_dissector_key_eth_addrs *eth)
++{
++	struct net_device *indev = block->netdev;
++	struct net_device_path source, dest;
++	bool valid = false;
++
++	rcu_read_lock();
++	if (netdev_master_upper_dev_get_rcu(indev) !=
++	    netdev_master_upper_dev_get_rcu(outdev) ||
++	    (indev == outdev && !br_port_flag_is_set(indev, BR_HAIRPIN_MODE)) ||
++	    (br_port_flag_is_set(indev, BR_ISOLATED) &&
++	     br_port_flag_is_set(outdev, BR_ISOLATED)))
++		goto out;
++	if (!mt7915_ct_bridge_peer(block->path->dev, indev, eth->src, &source) ||
++	    !mt7915_ct_bridge_peer(block->path->dev, outdev, eth->dst, &dest))
++		goto out;
++	valid = source.mtk_wdma.wdma_idx != dest.mtk_wdma.wdma_idx ||
++		source.mtk_wdma.wcid != dest.mtk_wdma.wcid;
++out:
++	rcu_read_unlock();
++	return valid;
++}
++
++static bool mt7915_ct_bridge_mangle(const struct flow_action_entry *act,
++				    const struct flow_dissector_key_eth_addrs *eth)
++{
++	u8 addresses[2 * ETH_ALEN];
++	u32 original;
++
++	if (act->mangle.htype != FLOW_ACT_MANGLE_HDR_TYPE_ETH ||
++	    act->mangle.offset > 2 * ETH_ALEN - sizeof(u32) ||
++	    !IS_ALIGNED(act->mangle.offset, sizeof(u32)))
++		return false;
++	ether_addr_copy(addresses, eth->dst);
++	ether_addr_copy(addresses + ETH_ALEN, eth->src);
++	original = get_unaligned((u32 *)(addresses + act->mangle.offset));
++	return ((original & act->mangle.mask) |
++		(act->mangle.val & ~act->mangle.mask)) == original;
++}
++
++static bool mt7915_ct_flow_ingress(struct flow_rule *rule,
++				  struct mt7915_ct_block *block, bool bridge)
+ {
+ 	const u64 common_keys = BIT_ULL(FLOW_DISSECTOR_KEY_META) |
+ 		BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
+@@ -136,7 +206,9 @@
+ 	struct flow_match_basic basic;
+ 	struct flow_match_meta meta;
+ 	struct flow_match_ports ports;
++	struct flow_match_eth_addrs eth;
+ 	const struct flow_action_entry *act;
++	struct net_device *outdev = NULL;
+ 	bool redirect = false, ipv6;
+ 	u64 allowed_keys;
+ 	int index;
+@@ -146,7 +218,7 @@
+ 	flow_rule_match_meta(rule, &meta);
+ 	flow_rule_match_control(rule, &control);
+ 	flow_rule_match_basic(rule, &basic);
+-	if (meta.mask->ingress_ifindex != U32_MAX || meta.key->ingress_ifindex != ifindex ||
++	if (meta.mask->ingress_ifindex != U32_MAX || meta.key->ingress_ifindex != block->ifindex ||
+ 	    meta.mask->ingress_iftype || meta.mask->l2_miss ||
+ 	    control.mask->addr_type != U16_MAX || control.mask->thoff ||
+ 	    control.mask->flags || control.key->flags ||
+@@ -161,6 +233,17 @@
+ 		return false;
+ 	allowed_keys = common_keys | BIT_ULL(control.key->addr_type) |
+ 		BIT_ULL(FLOW_DISSECTOR_KEY_IP) | BIT_ULL(FLOW_DISSECTOR_KEY_TCP);
++	if (bridge) {
++		allowed_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS);
++		if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS))
++			return false;
++		flow_rule_match_eth_addrs(rule, &eth);
++		if (memchr_inv(eth.mask->src, 0xff, ETH_ALEN) ||
++		    memchr_inv(eth.mask->dst, 0xff, ETH_ALEN) ||
++		    !is_valid_ether_addr(eth.key->src) || !is_valid_ether_addr(eth.key->dst) ||
++		    ether_addr_equal(eth.key->src, eth.key->dst))
++			return false;
++	}
+ 	/* Reject VLAN, PPPoE, tunnels and other matches the PPE cannot preserve. */
+ 	if (rule->match.dissector->used_keys & ~allowed_keys ||
+ 	    !flow_rule_match_key(rule, control.key->addr_type))
+@@ -201,11 +284,18 @@
+ 	flow_action_for_each(index, act, &rule->action) {
+ 		switch (act->id) {
+ 		case FLOW_ACTION_REDIRECT:
+-			if (redirect || !act->dev || act->dev->ieee80211_ptr)
++			if (redirect || !act->dev ||
++			    (!!act->dev->ieee80211_ptr != bridge))
+ 				return false;
++			outdev = act->dev;
+ 			redirect = true;
+ 			break;
+ 		case FLOW_ACTION_MANGLE:
++			if (bridge) {
++				if (!mt7915_ct_bridge_mangle(act, eth.key))
++					return false;
++				break;
++			}
+ 			if (act->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_ETH)
+ 				break;
+ 			if (ipv6 || (act->mangle.htype != FLOW_ACT_MANGLE_HDR_TYPE_IP4 &&
+@@ -214,13 +304,16 @@
+ 				return false;
+ 			break;
+ 		case FLOW_ACTION_CSUM:
++			if (bridge)
++				return false;
++			break;
+ 		case FLOW_ACTION_PRIORITY:
+ 			break;
+ 		default:
+ 			return false;
+ 		}
+ 	}
+-	return redirect;
++	return redirect && (!bridge || mt7915_ct_bridge_peers(block, outdev, eth.key));
+ }
+ 
+ static int mt7915_ct_flow_cb(enum tc_setup_type type, void *data, void *priv)
+@@ -235,10 +328,13 @@
+ 	switch (flow->command) {
+ 	case FLOW_CLS_REPLACE:
+ 		if (READ_ONCE(block->path->stopping) ||
+-		    !mt7915_ct_flow_ingress(flow_cls_offload_flow_rule(flow), block->ifindex))
++		    !mt7915_ct_flow_ingress(flow_cls_offload_flow_rule(flow), block, flow->bridge))
+ 			break;
+ 		if (xa_load(&block->cookies, flow->cookie)) {
+-			err = 0;
++			/* A failed destroy can retain this cookie after FT releases its
++			 * owner. Never report a reused cookie as a new hardware rule.
++			 */
++			err = -EEXIST;
+ 			break;
+ 		}
+ 		err = xa_insert(&block->cookies, flow->cookie, xa_mk_value(1), GFP_KERNEL);
+@@ -273,6 +369,7 @@
+ 		airoha_ppe_dev_setup_tc_block_cb(block->path->ppe, &destroy);
+ 	}
+ 	xa_destroy(&block->cookies);
++	dev_put(block->netdev);
+ 	kfree(block);
+ }
+ 
+@@ -303,11 +400,14 @@
+ 			if (!block)
+ 				return -ENOMEM;
+ 			block->path = path;
++			block->netdev = netdev;
++			dev_hold(netdev);
+ 			block->ifindex = netdev->ifindex;
+ 			xa_init(&block->cookies);
+ 			mutex_init(&block->lock);
+ 			cb = flow_block_cb_alloc(mt7915_ct_flow_cb, netdev, block, mt7915_ct_block_release);
+ 			if (IS_ERR(cb)) {
++				dev_put(netdev);
+ 				kfree(block);
+ 				return PTR_ERR(cb);
+ 			}
+@@ -392,12 +492,14 @@
+ 	struct ieee80211_sta *sta;
+ 	struct ethhdr buffer;
+ 	const struct ethhdr *hdr;
++	u32 epoch;
+ 
+ 	if (!mt7915_ct_ppe_enabled(dev) || READ_ONCE(path->stopping) || !msta ||
+ 	    FIELD_GET(NPU_RX_DMA_CRSN_MASK, info) != PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED ||
+ 	    skb->len < ETH_HLEN)
+ 		return;
+ 	sta = wcid_to_sta(&msta->wcid);
++	epoch = READ_ONCE(msta->ct_epoch);
+ 	hdr = skb_header_pointer(skb, 0, sizeof(buffer), &buffer);
+ 	if (!sta || !READ_ONCE(msta->ct_authorized) || !hdr ||
+ 	    is_multicast_ether_addr(hdr->h_dest) ||
+@@ -405,7 +507,19 @@
+ 	    !mt7915_ct_skb_supported(skb, hdr->h_proto))
+ 		return;
+ 	skb_reset_mac_header(skb);
+-	airoha_ppe_dev_check_skb(path->ppe, skb, FIELD_GET(NPU_RX_DMA_FOE_ID_MASK, info), true);
++	airoha_ppe_ct_check_skb(path->ppe, skb, FIELD_GET(NPU_RX_DMA_FOE_ID_MASK, info),
++				msta->vif->phy->mt76->band_idx, msta->vif->mt76.idx,
++				msta->wcid.idx, epoch);
++}
++
++u32 mt7915_ct_sta_epoch(struct mt7915_dev *dev, struct mt7915_sta *msta)
++{
++	struct mt7915_ct_path *path = dev->ct_path;
++
++	if (!path || !path->ppe || READ_ONCE(path->stopping))
++		return 0;
++	return airoha_ppe_ct_wlan_epoch(path->ppe, msta->vif->phy->mt76->band_idx,
++				       msta->wcid.idx);
+ }
+ 
+ static void mt7915_ct_put_ppe(void *data)

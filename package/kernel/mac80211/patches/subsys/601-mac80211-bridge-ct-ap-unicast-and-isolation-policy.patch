@@ -1,0 +1,221 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] wifi: mac80211: bridge CT AP unicast and isolation policy
+
+Let opted-in CT AP interfaces send same-BSS unicast through the Linux
+bridge when hairpin is enabled and client isolation is disabled.
+Apply the decision to both regular and fast RX paths.
+
+Block new bridge forward paths while AP isolation changes, withdraw
+software and hardware rules, and publish the new policy only after
+synchronous cleanup. Preserve the blocked state on a failed begin.
+
+Compile ctx.bridge and bridge-policy APIs only with BR_FLOW_OFFLOAD_API.
+Kernels without that API keep the original AP isolation and forward
+path code. The guarded and unguarded fragments are checked against
+the frozen CT implementation and original mac80211 respectively.
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -374,6 +374,8 @@
+  * @BSS_CHANGED_TPE: transmit power envelope changed
+  * @BSS_CHANGED_NAN_LOCAL_SCHED: NAN local schedule changed (NAN mode only)
+  * @BSS_CHANGED_NPCA: NPCA parameters changed
++ * @BSS_CHANGED_AP_ISOLATE: AP isolation policy is changing; synchronously
++ *	remove hardware forwarding entries before the new policy takes effect.
+  */
+ enum ieee80211_bss_change {
+ 	BSS_CHANGED_ASSOC		= 1<<0,
+@@ -413,6 +415,7 @@
+ 	BSS_CHANGED_TPE			= BIT_ULL(35),
+ 	BSS_CHANGED_NAN_LOCAL_SCHED	= BIT_ULL(36),
+ 	BSS_CHANGED_NPCA		= BIT_ULL(37),
++	BSS_CHANGED_AP_ISOLATE	= BIT_ULL(38),
+ 
+ 	/* when adding here, make sure to change ieee80211_reconfig */
+ };
+@@ -2025,6 +2028,11 @@
+  * @IEEE80211_OFFLOAD_ENCAP_MCAST: tx multicast encapsulation offload is enabled
+  *	The driver supports sending multicast frames passed as 802.3 frames
+  *	by mac80211.
++ * @IEEE80211_OFFLOAD_BRIDGE_FLOW: use the Linux bridge for same-BSS unicast
++ *	when the AP is a bridge hairpin port and client isolation is disabled.
++ *	This lets bridge netfilter authorize hardware flowtable learning.
++ * @IEEE80211_OFFLOAD_BRIDGE_FLOW_BLOCKED: temporary bridge offload admission
++ *	barrier while mac80211 changes the AP isolation policy.
+  */
+ 
+ enum ieee80211_offload_flags {
+@@ -2032,6 +2040,8 @@
+ 	IEEE80211_OFFLOAD_ENCAP_4ADDR		= BIT(1),
+ 	IEEE80211_OFFLOAD_DECAP_ENABLED		= BIT(2),
+ 	IEEE80211_OFFLOAD_ENCAP_MCAST		= BIT(3),
++	IEEE80211_OFFLOAD_BRIDGE_FLOW		= BIT(4),
++	IEEE80211_OFFLOAD_BRIDGE_FLOW_BLOCKED	= BIT(5),
+ };
+ 
+ #define IEEE80211_NAN_AVAIL_BLOB_MAX_LEN	54
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -16,7 +16,11 @@
+ #include <linux/rcupdate.h>
+ #include <linux/fips.h>
+ #include <linux/if_ether.h>
++#include <linux/if_bridge.h>
+ #include <net/cfg80211.h>
++#if defined(BR_FLOW_OFFLOAD_API) && IS_REACHABLE(CONFIG_NF_FLOW_TABLE)
++#include <net/netfilter/nf_flow_table.h>
++#endif
+ #include "ieee80211_i.h"
+ #include "driver-ops.h"
+ #include "rate.h"
+@@ -3370,6 +3374,45 @@
+ }
+ #endif
+ 
++#ifdef BR_FLOW_OFFLOAD_API
++static int ieee80211_change_ap_isolate(struct ieee80211_sub_if_data *sdata,
++					struct ieee80211_link_data *link, bool isolate)
++{
++	bool ct_bridge = sdata->vif.offload_flags & IEEE80211_OFFLOAD_BRIDGE_FLOW;
++	bool old_isolate = sdata->flags & IEEE80211_SDATA_DONT_BRIDGE_PACKETS;
++	bool update = ct_bridge && (old_isolate != isolate ||
++		(sdata->vif.offload_flags & IEEE80211_OFFLOAD_BRIDGE_FLOW_BLOCKED));
++	int err;
++
++	if (update) {
++		/* Keep both software and hardware bridge admission closed until
++		 * all entries authorized by the old policy have been removed.
++		 */
++		WRITE_ONCE(sdata->vif.offload_flags, sdata->vif.offload_flags |
++			   IEEE80211_OFFLOAD_BRIDGE_FLOW_BLOCKED);
++		err = br_flow_offload_begin(sdata->dev);
++		if (err) {
++			br_flow_offload_end(sdata->dev);
++			return err;
++		}
++#if IS_REACHABLE(CONFIG_NF_FLOW_TABLE)
++		nf_flow_table_cleanup(sdata->dev);
++#endif
++		ieee80211_link_info_change_notify(sdata, link, BSS_CHANGED_AP_ISOLATE);
++	}
++	if (isolate)
++		WRITE_ONCE(sdata->flags, sdata->flags | IEEE80211_SDATA_DONT_BRIDGE_PACKETS);
++	else
++		WRITE_ONCE(sdata->flags, sdata->flags & ~IEEE80211_SDATA_DONT_BRIDGE_PACKETS);
++	WRITE_ONCE(sdata->vif.offload_flags, sdata->vif.offload_flags &
++		   ~IEEE80211_OFFLOAD_BRIDGE_FLOW_BLOCKED);
++	if (update)
++		br_flow_offload_end(sdata->dev);
++	ieee80211_check_fast_rx_iface(sdata);
++	return 0;
++}
++#endif
++
+ static int ieee80211_change_bss(struct wiphy *wiphy,
+ 				struct net_device *dev,
+ 				struct bss_parameters *params)
+@@ -3422,11 +3465,18 @@
+ 	}
+ 
+ 	if (params->ap_isolate >= 0) {
++#ifdef BR_FLOW_OFFLOAD_API
++		int err = ieee80211_change_ap_isolate(sdata, link, !!params->ap_isolate);
++
++		if (err)
++			return err;
++#else
+ 		if (params->ap_isolate)
+ 			sdata->flags |= IEEE80211_SDATA_DONT_BRIDGE_PACKETS;
+ 		else
+ 			sdata->flags &= ~IEEE80211_SDATA_DONT_BRIDGE_PACKETS;
+ 		ieee80211_check_fast_rx_iface(sdata);
++#endif
+ 	}
+ 
+ 	if (params->ht_opmode >= 0) {
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -13,6 +13,7 @@
+ #include <linux/slab.h>
+ #include <linux/kernel.h>
+ #include <linux/if_arp.h>
++#include <linux/if_bridge.h>
+ #include <linux/netdevice.h>
+ #include <linux/rtnetlink.h>
+ #include <linux/kcov.h>
+@@ -1018,6 +1019,17 @@
+ 	struct sta_info *sta;
+ 	int ret = -ENOENT;
+ 
++#ifdef BR_FLOW_OFFLOAD_API
++	sdata = IEEE80211_DEV_TO_SUB_IF(ctx->dev);
++	local = sdata->local;
++
++	if (ctx->bridge &&
++	    ((READ_ONCE(sdata->flags) & IEEE80211_SDATA_DONT_BRIDGE_PACKETS) ||
++	     (READ_ONCE(sdata->vif.offload_flags) &
++	      IEEE80211_OFFLOAD_BRIDGE_FLOW_BLOCKED)))
++		return -EOPNOTSUPP;
++#endif
++
+ 	if (ctx->ieee80211) {
+ 		path->type = DEV_PATH_IEEE80211;
+ 		path->dev = ctx->dev;
+@@ -1025,8 +1037,10 @@
+ 		return 0;
+ 	}
+ 
++#ifndef BR_FLOW_OFFLOAD_API
+ 	sdata = IEEE80211_DEV_TO_SUB_IF(ctx->dev);
+ 	local = sdata->local;
++#endif
+ 
+ 	if (!local->ops->net_fill_forward_path)
+ 		return -EOPNOTSUPP;
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -14,6 +14,7 @@
+ #include <linux/kernel.h>
+ #include <linux/skbuff.h>
+ #include <linux/netdevice.h>
++#include <linux/if_bridge.h>
+ #include <linux/etherdevice.h>
+ #include <linux/rcupdate.h>
+ #include <linux/export.h>
+@@ -2796,6 +2797,18 @@
+ 	}
+ }
+ 
++static bool ieee80211_bridge_flow_forward(struct ieee80211_sub_if_data *sdata)
++{
++	/* Read port state for each packet: bridge membership/hairpin can change
++	 * independently of mac80211's cached fast RX configuration.
++	 */
++	return sdata->vif.type == NL80211_IFTYPE_AP &&
++	       (READ_ONCE(sdata->vif.offload_flags) & IEEE80211_OFFLOAD_BRIDGE_FLOW) &&
++	       !(READ_ONCE(sdata->flags) & IEEE80211_SDATA_DONT_BRIDGE_PACKETS) &&
++	       netif_is_bridge_port(sdata->dev) &&
++	       br_port_flag_is_set(sdata->dev, BR_HAIRPIN_MODE);
++}
++
+ /*
+  * requires that rx->skb is a frame with ethernet header
+  */
+@@ -2843,6 +2856,7 @@
+ 				net_info_ratelimited("%s: failed to clone multicast frame\n",
+ 						    dev->name);
+ 		} else if (!is_multicast_ether_addr(ehdr->h_dest) &&
++			   !ieee80211_bridge_flow_forward(sdata) &&
+ 			   !ether_addr_equal(ehdr->h_dest, ehdr->h_source)) {
+ 			dsta = sta_info_get(sdata, ehdr->h_dest);
+ 			if (dsta) {
+@@ -4998,7 +5012,8 @@
+ 		struct sk_buff *xmit_skb = NULL;
+ 		if (is_multicast_ether_addr(da)) {
+ 			xmit_skb = skb_copy(skb, GFP_ATOMIC);
+-		} else if (!ether_addr_equal(da, sa) &&
++		} else if (!ieee80211_bridge_flow_forward(rx->sdata) &&
++			   !ether_addr_equal(da, sa) &&
+ 			   sta_info_get(rx->sdata, da)) {
+ 			xmit_skb = skb;
+ 			skb = NULL;

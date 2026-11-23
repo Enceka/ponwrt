@@ -1,0 +1,1887 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: offload authorized wireless bridge flows
+
+Mark NFPROTO_BRIDGE flow rules explicitly and preserve their Ethernet
+addresses and IPv4 TTL / IPv6 hop limit. Keep route admission separate.
+Require both authorized wireless forward paths, full source/destination
+MAC matches and station epochs before learning an IPv4 or IPv6 row.
+
+Withdraw pending and bound entries for either peer on revocation.
+Synchronize bridge port, VLAN, FDB, STP and isolation policy changes
+with software flow generations and hardware invalidation. Stop both PPE
+engines on an invalidation failure before releasing affected cookies.
+
+Allow same-port paths only with hairpin enabled, support RCU callers of
+the bridge state accessor, and reject stale rules without reporting
+hardware success. Serialize statistics with atomic invalidation.
+Index each bridge cookie before exposing its RX candidate, and remove
+the index if publication fails, so allocation failure cannot leave an
+unowned hardware binding.
+
+Always detach an unregistering bridge port even when hardware quiescence
+fails: NETDEV_UNREGISTER cannot be rejected. Keep the generation blocked
+through nested detach changes, retain uncertain PPE owners, and preserve
+normal user-initiated delif error handling.
+
+The CT route-format FOE entries used for bridging rewrite the complete
+IPv4 DS field or IPv6 traffic class from their output field. Keep that
+field zero and require the companion NPU receive guard before accepting
+or learning a wireless bridge flow. The guard checks every packet before
+TDMA, including packets belonging to an already bound flow: Ethernet
+frames shorter than 72 bytes and packets with any nonzero DSCP or ECN
+bits take the existing host path. Eligible packets with a zero DS field
+can still use hardware, even when the same five-tuple also carries marked
+packets. Software bridge flow forwarding preserves the original DS field,
+TTL / hop limit, addresses and checksums. Wired bridge ingress remains
+unsupported by this hardware path.
+
+Publish BR_FLOW_OFFLOAD_API for guarded mac80211 integration, plus the
+NPU receive-guard readiness contract implemented by the next patch.
+
+---
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -3923,6 +3923,9 @@
+ 			struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+ 			struct flow_match_control control;
+ 
++			if (f->bridge)
++				return -EOPNOTSUPP;
++
+ 			/* The CT IPv6 tuple cannot express arbitrary flower matches. */
+ 			if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL)) {
+ 				flow_rule_match_control(rule, &control);
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -554,6 +554,12 @@
+ 	FLOW_TYPE_L2_SUBFLOW,
+ };
+ 
++struct airoha_ct_bridge_peer {
++	u32 epoch;
++	u16 wcid;
++	u8 band, bss;
++};
++
+ struct airoha_flow_table_entry {
+ 	union {
+ 		struct hlist_node list; /* PPE L3 flow entry */
+@@ -577,6 +583,12 @@
+ 	 */
+ 	struct airoha_gdm_dev *egress_dev;
+ 	struct list_head gc_node;
++	bool ct_bridge, ct_bridge_dead;
++	u64 ct_bridge_generation;
++	struct list_head ct_bridge_node;
++	int ct_ingress_ifindex;
++	struct airoha_ct_bridge_peer ct_src, ct_dest;
++	u8 ct_src_mac[ETH_ALEN], ct_dest_mac[ETH_ALEN];
+ 
+ 	/* Must be last --ends in a flexible-array member. */
+ 	struct airoha_foe_entry data;
+@@ -736,6 +748,11 @@
+ 		bool cfg_owned;
+ 	} ct_ifc;
+ 	bool ct_host_ppe;
++	bool ct_bridge_failed;
++	struct notifier_block ct_bridge_notifier;
++	struct list_head ct_bridge_flows;
++	u32 ct_wlan_epoch[2][151];
++	bool ct_wlan_blocked[2][151];
+ 	struct {
+ 		u8 addr[ETH_ALEN];
+ 		u8 dirty;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -11,6 +11,9 @@
+ #include <linux/platform_device.h>
+ #include <linux/rhashtable.h>
+ #include <net/ipv6.h>
++#include <net/cfg80211.h>
++#include <linux/if_bridge.h>
++#include <net/switchdev.h>
+ #include <net/pkt_cls.h>
+ #include <net/route.h>
+ 
+@@ -295,11 +298,12 @@
+ }
+ 
+ static int airoha_ppe_get_wdma_info(struct net_device *dev, const u8 *addr,
+-				    struct airoha_wdma_info *info)
++				    struct airoha_wdma_info *info, bool bridge)
+ {
+ 	struct net_device_path_stack stack;
+ 	struct net_device_path_ctx ctx = {
+ 		.dev = dev,
++		.bridge = bridge,
+ 	};
+ 	struct net_device_path *path;
+ 	int err;
+@@ -458,7 +462,7 @@
+ 		struct airoha_wdma_info info = {};
+ 
+ 		if (!airoha_ppe_get_wdma_info(netdev, data->eth.h_dest,
+-					      &info)) {
++					      &info, false)) {
+ 			if (READ_ONCE(eth->ppe->ct_host_ppe)) {
+ 				if (info.idx > 1 || !info.wcid || info.wcid > 150 || info.bss > 63)
+ 					return -ERANGE;
+@@ -948,6 +952,8 @@
+ 	lockdep_assert_held(&ppe_lock);
+ 
+ 	hlist_del_init(&e->list);
++	if (e->ct_bridge)
++		list_del_init(&e->ct_bridge_node);
+ 	if (e->hash != 0xffff) {
+ 		e->data.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
+ 		e->data.ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,
+@@ -1067,7 +1073,84 @@
+ 	       band == actual_band && wcid == actual_wcid;
+ }
+ 
+-static int airoha_ppe_ct_remove_wlan_flow(struct airoha_ppe *ppe,
++static u32 airoha_ppe_ct_epoch_locked(struct airoha_ppe *ppe, u8 band, u16 wcid)
++{
++	u32 epoch;
++
++	lockdep_assert_held(&ppe_lock);
++	epoch = ppe->ct_wlan_epoch[band][wcid];
++	/* Exhaustion retires a WCID instead of permitting epoch wrap/reuse. */
++	return epoch == U32_MAX || ppe->ct_wlan_blocked[band][wcid] ? 0 : epoch + 1;
++}
++
++u32 airoha_ppe_ct_wlan_epoch(struct airoha_ppe_dev *dev, u8 band, u16 wcid)
++{
++	struct airoha_ppe *ppe = dev->priv;
++	u32 epoch = 0;
++
++	if (band > 1 || !wcid || wcid > 150)
++		return 0;
++	spin_lock_bh(&ppe_lock);
++	if (ppe->ct_host_ppe && !ppe->ct_stopping)
++		epoch = airoha_ppe_ct_epoch_locked(ppe, band, wcid);
++	spin_unlock_bh(&ppe_lock);
++	return epoch;
++}
++EXPORT_SYMBOL_GPL(airoha_ppe_ct_wlan_epoch);
++
++static bool airoha_ppe_ct_bridge_current(struct airoha_ppe *ppe,
++					struct airoha_flow_table_entry *e,
++					const struct airoha_ct_bridge_peer *peer,
++					struct sk_buff *skb)
++{
++	struct ethhdr buffer;
++	const struct ethhdr *hdr;
++	struct airoha_npu *npu;
++	bool ready;
++
++	lockdep_assert_held(&ppe_lock);
++	rcu_read_lock();
++	npu = rcu_dereference(ppe->eth->npu);
++	ready = npu && npu->ops.wlan_short_guard_ready &&
++		npu->ops.wlan_short_guard_ready(npu);
++	rcu_read_unlock();
++	if (!ready)
++		return false;
++	if (e->ct_bridge_dead || ppe->ct_bridge_failed ||
++	    e->ct_bridge_generation != br_flow_offload_generation() ||
++	    !peer || !peer->epoch || peer->band != e->ct_src.band ||
++	    peer->bss != e->ct_src.bss || peer->wcid != e->ct_src.wcid ||
++	    peer->epoch != e->ct_src.epoch ||
++	    e->ct_src.epoch != airoha_ppe_ct_epoch_locked(ppe, e->ct_src.band,
++							 e->ct_src.wcid) ||
++	    e->ct_dest.epoch != airoha_ppe_ct_epoch_locked(ppe, e->ct_dest.band,
++							  e->ct_dest.wcid))
++		return false;
++	hdr = skb_header_pointer(skb, 0, sizeof(buffer), &buffer);
++	return hdr && ether_addr_equal(hdr->h_source, e->ct_src_mac) &&
++	       ether_addr_equal(hdr->h_dest, e->ct_dest_mac);
++}
++
++static bool airoha_ppe_ct_bridge_row_matches(struct airoha_flow_table_entry *e,
++					    const struct airoha_foe_entry *hwe)
++{
++	int type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1);
++
++	if (!e->ct_bridge)
++		return true;
++	if (hwe->ib1 & AIROHA_FOE_IB1_BIND_TTL)
++		return false;
++	if (type == PPE_PKT_TYPE_IPV6_ROUTE_5T)
++		return !memcmp(&e->data.ipv6.l2, &hwe->ipv6.l2,
++			       sizeof(hwe->ipv6.l2));
++	return !memcmp(&e->data.ipv4.new_tuple, &hwe->ipv4.new_tuple,
++		       sizeof(hwe->ipv4.new_tuple)) &&
++	       !memcmp(&e->data.ipv4.l2.common, &hwe->ipv4.l2.common,
++		       sizeof(hwe->ipv4.l2.common)) &&
++	       e->data.ipv4.l2.src_mac_lo == hwe->ipv4.l2.src_mac_lo;
++}
++
++static int airoha_ppe_ct_remove_wlan_flow_locked(struct airoha_ppe *ppe,
+ 					 struct airoha_flow_table_entry *e)
+ {
+ 	struct airoha_foe_entry *hwe, invalid;
+@@ -1078,7 +1161,7 @@
+ 	if (!airoha_ppe_ct_wlan_dest(&e->data, &band, &wcid))
+ 		return -EINVAL;
+ 
+-	spin_lock_bh(&ppe_lock);
++	lockdep_assert_held(&ppe_lock);
+ 	hlist_del_init(&e->list);
+ 	if (e->hash == 0xffff)
+ 		goto unlock;
+@@ -1088,7 +1171,8 @@
+ 		err = -ETIMEDOUT;
+ 	} else if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe->ib1) == AIROHA_FOE_STATE_BIND &&
+ 		   airoha_ppe_foe_compare_entry(e, hwe) &&
+-		   airoha_ppe_ct_wlan_entry(hwe, band, wcid)) {
++		   airoha_ppe_ct_wlan_entry(hwe, band, wcid) &&
++		   airoha_ppe_ct_bridge_row_matches(e, hwe)) {
+ 		invalid = *hwe;
+ 		invalid.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
+ 		err = airoha_ppe_foe_commit_entry(ppe, &invalid, e->hash, false);
+@@ -1096,8 +1180,95 @@
+ 	if (!err)
+ 		e->hash = 0xffff;
+ unlock:
++	return err;
++}
++
++/* Called under ppe_lock, including atomic bridge policy notifications.
++ * Stop both engines on the first SRAM error; never poll every remaining row.
++ * Software cookies can be released only after both EN and BUSY are clear.
++ */
++static int airoha_ppe_ct_bridge_fail_closed(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	int bank, err;
++	u32 val;
++
++	lockdep_assert_held(&ppe_lock);
++	ppe->ct_bridge_failed = true;
++	ppe->ct_stopping = true;
++	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
++		airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(bank), 0);
++		airoha_fe_clear(eth, REG_PPE_GLO_CFG(bank), PPE_GLO_CFG_EN_MASK);
++	}
++	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
++		err = read_poll_timeout_atomic(airoha_fe_rr, val,
++			!(val & (PPE_GLO_CFG_EN_MASK | PPE_GLO_CFG_BUSY_MASK)),
++			1, 100, false, eth, REG_PPE_GLO_CFG(bank));
++		if (err)
++			return err;
++	}
++	return 0;
++}
++
++static int airoha_ppe_ct_remove_wlan_flow(struct airoha_ppe *ppe,
++					 struct airoha_flow_table_entry *e)
++{
++	int err;
++
++	spin_lock_bh(&ppe_lock);
++	if (e->ct_bridge && ppe->ct_bridge_failed) {
++		err = airoha_ppe_ct_bridge_fail_closed(ppe);
++		hlist_del_init(&e->list);
++	} else {
++		err = airoha_ppe_ct_remove_wlan_flow_locked(ppe, e);
++		if (err && e->ct_bridge)
++			err = airoha_ppe_ct_bridge_fail_closed(ppe);
++	}
++	if (!err && e->ct_bridge) {
++		e->hash = 0xffff;
++		list_del_init(&e->ct_bridge_node);
++	}
+ 	spin_unlock_bh(&ppe_lock);
+ 	return err;
++}
++
++/* Atomic switchdev notification: no mutex, allocation or source-MAC update.
++ * Cookies remain indexed and permanently dead until FT destroys them.
++ */
++static int airoha_ppe_ct_bridge_event(struct notifier_block *nb,
++				     unsigned long event, void *ptr)
++{
++	struct airoha_ppe *ppe = container_of(nb, struct airoha_ppe, ct_bridge_notifier);
++	struct switchdev_notifier_bridge_fwd_info *info = ptr;
++	struct airoha_flow_table_entry *e;
++	int err = 0;
++
++	if (event != SWITCHDEV_BRIDGE_FWD_PRE_CHANGE)
++		return NOTIFY_DONE;
++	spin_lock_bh(&ppe_lock);
++	if (!ppe->ct_host_ppe)
++		goto unlock;
++	if (ppe->ct_bridge_failed) {
++		info->err = airoha_ppe_ct_bridge_fail_closed(ppe);
++		goto unlock;
++	}
++	if (ppe->ct_stopping)
++		goto unlock;
++	list_for_each_entry(e, &ppe->ct_bridge_flows, ct_bridge_node) {
++		e->ct_bridge_dead = true;
++		if (err) {
++			hlist_del_init(&e->list);
++			continue;
++		}
++		err = airoha_ppe_ct_remove_wlan_flow_locked(ppe, e);
++		if (err) {
++			airoha_ppe_ct_bridge_fail_closed(ppe);
++			info->err = err;
++		}
++	}
++unlock:
++	spin_unlock_bh(&ppe_lock);
++	return NOTIFY_DONE;
+ }
+ 
+ /* The caller closes station admission before taking flow_offload_mutex.
+@@ -1124,13 +1295,20 @@
+ 	if (!ppe->ct_host_ppe)
+ 		goto unlock;
+ 
++	spin_lock_bh(&ppe_lock);
++	ppe->ct_wlan_blocked[band][wcid] = true;
++	if (ppe->ct_wlan_epoch[band][wcid] != U32_MAX)
++		ppe->ct_wlan_epoch[band][wcid]++;
++	spin_unlock_bh(&ppe_lock);
++
+ 	rhashtable_walk_enter(&eth->flow_table, &iter);
+ 	rhashtable_walk_start(&iter);
+ 	while ((e = rhashtable_walk_next(&iter))) {
+ 		if (IS_ERR(e))
+ 			continue;
+-		if (list_empty(&e->gc_node) && !e->egress_dev &&
+-		    airoha_ppe_ct_wlan_entry(&e->data, band, wcid))
++		if (list_empty(&e->gc_node) &&
++		    ((!e->egress_dev && airoha_ppe_ct_wlan_entry(&e->data, band, wcid)) ||
++		     (e->ct_bridge && e->ct_src.band == band && e->ct_src.wcid == wcid)))
+ 			list_add_tail(&e->gc_node, &remove_list);
+ 	}
+ 	rhashtable_walk_stop(&iter);
+@@ -1149,6 +1327,11 @@
+ 		rhashtable_remove_fast(&eth->flow_table, &e->node,
+ 				       airoha_flow_table_params);
+ 		kfree(e);
++	}
++	if (!err) {
++		spin_lock_bh(&ppe_lock);
++		ppe->ct_wlan_blocked[band][wcid] = false;
++		spin_unlock_bh(&ppe_lock);
+ 	}
+ unlock:
+ 	mutex_unlock(&flow_offload_mutex);
+@@ -1217,7 +1400,8 @@
+ 
+ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 					struct sk_buff *skb,
+-					u32 hash, bool rx_wlan)
++					u32 hash, bool rx_wlan,
++					const struct airoha_ct_bridge_peer *peer)
+ {
+ 	struct airoha_flow_table_entry *e;
+ 	struct airoha_foe_bridge br = {};
+@@ -1255,6 +1439,9 @@
+ 			continue;
+ 		}
+ 
++		if (e->ct_bridge &&
++		    !airoha_ppe_ct_bridge_current(ppe, e, peer, skb))
++			continue;
+ 		if (!airoha_ppe_foe_compare_entry(e, hwe))
+ 			continue;
+ 
+@@ -1312,10 +1499,52 @@
+ 	e->hash = 0xffff;
+ 
+ 	spin_lock_bh(&ppe_lock);
++	if (ppe->ct_host_ppe) {
++		struct airoha_flow_table_entry *prev;
++
++		/* IP lookup has no ingress-MAC key: keep one action per tuple. */
++		hlist_for_each_entry(prev, &ppe->foe_flow[hash], list) {
++			if ((e->ct_bridge || prev->ct_bridge) &&
++			    airoha_ppe_foe_compare_entry(prev, &e->data)) {
++				spin_unlock_bh(&ppe_lock);
++				return -EEXIST;
++			}
++		}
++	}
++	if (e->ct_bridge) {
++		if (ppe->ct_stopping || ppe->ct_bridge_failed ||
++		    e->ct_bridge_generation != br_flow_offload_generation()) {
++			spin_unlock_bh(&ppe_lock);
++			return -ESTALE;
++		}
++		list_add_tail(&e->ct_bridge_node, &ppe->ct_bridge_flows);
++	}
+ 	hlist_add_head(&e->list, &ppe->foe_flow[hash]);
+ 	spin_unlock_bh(&ppe_lock);
+ 
+ 	return 0;
++}
++
++static int airoha_ppe_ct_bridge_publish(struct airoha_eth *eth,
++				       struct airoha_flow_table_entry *e)
++{
++	int err;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	/* Own the cookie before RX can bind the candidate.  Failed index
++	 * allocation must never require undoing a hardware binding.
++	 */
++	err = rhashtable_insert_fast(&eth->flow_table, &e->node,
++				     airoha_flow_table_params);
++	if (err)
++		return err;
++
++	err = airoha_ppe_foe_flow_commit_entry(eth->ppe, e);
++	if (err)
++		rhashtable_remove_fast(&eth->flow_table, &e->node,
++				       airoha_flow_table_params);
++
++	return err;
+ }
+ 
+ static int airoha_ppe_get_entry_idle_time(struct airoha_ppe *ppe, u32 ib1)
+@@ -1394,7 +1623,8 @@
+ 		goto unlock;
+ 
+ 	memcpy(&hwe, hwe_p, sizeof(*hwe_p));
+-	if (!airoha_ppe_foe_compare_entry(e, &hwe)) {
++	if (!airoha_ppe_foe_compare_entry(e, &hwe) ||
++	    !airoha_ppe_ct_bridge_row_matches(e, &hwe)) {
+ 		e->hash = 0xffff;
+ 		goto unlock;
+ 	}
+@@ -1412,21 +1642,32 @@
+ 	return airoha_ppe_get_entry_idle_time(ppe, e->data.ib1);
+ }
+ 
+-static bool airoha_ppe_ct_ipv6_rule_supported(struct flow_rule *rule)
+-{
+-	const u64 required_keys = BIT_ULL(FLOW_DISSECTOR_KEY_META) |
++static bool airoha_ppe_ct_ip_rule_supported(struct flow_rule *rule, bool bridge)
++{
++	u64 required_keys = BIT_ULL(FLOW_DISSECTOR_KEY_META) |
+ 		BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
+ 		BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
+-		BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS) |
+ 		BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
+-	const u64 allowed_keys = required_keys | BIT_ULL(FLOW_DISSECTOR_KEY_IP) |
+-		BIT_ULL(FLOW_DISSECTOR_KEY_TCP);
+-	struct flow_match_ipv6_addrs addrs;
++	u64 allowed_keys;
+ 	struct flow_match_control control;
+ 	struct flow_match_basic basic;
+ 	struct flow_match_ports ports;
+ 	struct flow_match_meta meta;
+ 	u64 used_keys = rule->match.dissector->used_keys;
++
++	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL))
++		return false;
++	flow_rule_match_control(rule, &control);
++	if (control.key->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS)
++		required_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS);
++	else if (bridge && control.key->addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS)
++		required_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS);
++	else
++		return false;
++	if (bridge)
++		required_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS);
++	allowed_keys = required_keys | BIT_ULL(FLOW_DISSECTOR_KEY_IP) |
++		       BIT_ULL(FLOW_DISSECTOR_KEY_TCP);
+ 
+ 	/* Keep netfilter flowtable's exact five-tuple match contract. */
+ 	if ((used_keys & required_keys) != required_keys || used_keys & ~allowed_keys)
+@@ -1435,17 +1676,40 @@
+ 	flow_rule_match_control(rule, &control);
+ 	flow_rule_match_basic(rule, &basic);
+ 	if (meta.mask->ingress_ifindex != U32_MAX || meta.mask->ingress_iftype ||
+-	    meta.mask->l2_miss || control.key->addr_type != FLOW_DISSECTOR_KEY_IPV6_ADDRS ||
++	    meta.mask->l2_miss ||
+ 	    control.mask->addr_type != U16_MAX || control.mask->thoff ||
+ 	    control.mask->flags || control.key->flags ||
+-	    basic.key->n_proto != htons(ETH_P_IPV6) || basic.mask->n_proto != htons(U16_MAX) ||
++	    basic.key->n_proto != htons(control.key->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS ?
++				       ETH_P_IPV6 : ETH_P_IP) ||
++	    basic.mask->n_proto != htons(U16_MAX) ||
+ 	    basic.mask->ip_proto != U8_MAX ||
+ 	    (basic.key->ip_proto != IPPROTO_TCP && basic.key->ip_proto != IPPROTO_UDP))
+ 		return false;
+-	flow_rule_match_ipv6_addrs(rule, &addrs);
+-	if (memchr_inv(&addrs.mask->src, 0xff, sizeof(addrs.mask->src)) ||
+-	    memchr_inv(&addrs.mask->dst, 0xff, sizeof(addrs.mask->dst)))
+-		return false;
++	if (control.key->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
++		struct flow_match_ipv6_addrs addrs;
++
++		flow_rule_match_ipv6_addrs(rule, &addrs);
++		if (memchr_inv(&addrs.mask->src, 0xff, sizeof(addrs.mask->src)) ||
++		    memchr_inv(&addrs.mask->dst, 0xff, sizeof(addrs.mask->dst)))
++			return false;
++	} else {
++		struct flow_match_ipv4_addrs addrs;
++
++		flow_rule_match_ipv4_addrs(rule, &addrs);
++		if (addrs.mask->src != htonl(U32_MAX) ||
++		    addrs.mask->dst != htonl(U32_MAX))
++			return false;
++	}
++	if (bridge) {
++		struct flow_match_eth_addrs eth;
++
++		flow_rule_match_eth_addrs(rule, &eth);
++		if (memchr_inv(eth.mask, 0xff, sizeof(*eth.mask)) ||
++		    !is_valid_ether_addr(eth.key->src) ||
++		    !is_valid_ether_addr(eth.key->dst) ||
++		    ether_addr_equal(eth.key->src, eth.key->dst))
++			return false;
++	}
+ 	flow_rule_match_ports(rule, &ports);
+ 	if (ports.mask->src != htons(U16_MAX) || ports.mask->dst != htons(U16_MAX))
+ 		return false;
+@@ -1469,6 +1733,62 @@
+ 	return true;
+ }
+ 
++static int airoha_ppe_ct_bridge_paths(struct airoha_eth *eth,
++				      struct flow_rule *rule,
++				      struct net_device *odev,
++				      const struct ethhdr *hdr,
++				      struct airoha_wdma_info *src,
++				      struct airoha_wdma_info *dest)
++{
++	struct airoha_npu *npu;
++	struct flow_match_eth_addrs mac;
++	struct flow_match_meta meta;
++	struct net_device *idev, *master;
++	int err = -EOPNOTSUPP;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	npu = rcu_dereference_protected(eth->npu,
++					lockdep_is_held(&flow_offload_mutex));
++	if (!npu || !npu->ops.wlan_short_guard_ready ||
++	    !npu->ops.wlan_short_guard_ready(npu))
++		return -EOPNOTSUPP;
++	flow_rule_match_eth_addrs(rule, &mac);
++	flow_rule_match_meta(rule, &meta);
++	if (!odev || !odev->ieee80211_ptr ||
++	    !ether_addr_equal(mac.key->src, hdr->h_source) ||
++	    !ether_addr_equal(mac.key->dst, hdr->h_dest))
++		return err;
++	idev = dev_get_by_index(dev_net(odev), meta.key->ingress_ifindex);
++	if (!idev)
++		return -ENODEV;
++	rcu_read_lock();
++	master = netdev_master_upper_dev_get_rcu(idev);
++	if (!master || !netif_is_bridge_master(master) || br_vlan_enabled(master) ||
++	    master != netdev_master_upper_dev_get_rcu(odev) ||
++	    br_port_get_stp_state(idev) != BR_STATE_FORWARDING ||
++	    br_port_get_stp_state(odev) != BR_STATE_FORWARDING ||
++	    br_port_flag_is_set(idev, BR_ISOLATED | BR_PORT_LOCKED) ||
++	    br_port_flag_is_set(odev, BR_ISOLATED | BR_PORT_LOCKED) ||
++	    (idev == odev && !br_port_flag_is_set(idev, BR_HAIRPIN_MODE))) {
++		rcu_read_unlock();
++		goto out;
++	}
++	rcu_read_unlock();
++	if (!idev->ieee80211_ptr ||
++	    wiphy_dev(idev->ieee80211_ptr->wiphy)->parent !=
++	    wiphy_dev(odev->ieee80211_ptr->wiphy)->parent ||
++	    airoha_ppe_get_wdma_info(idev, hdr->h_source, src, true) ||
++	    airoha_ppe_get_wdma_info(odev, hdr->h_dest, dest, true) ||
++	    src->idx > 1 || dest->idx > 1 || src->bss > 63 || dest->bss > 63 ||
++	    !src->wcid || src->wcid > 150 || !dest->wcid || dest->wcid > 150 ||
++	    (src->idx == dest->idx && src->wcid == dest->wcid))
++		goto out;
++	err = 0;
++out:
++	dev_put(idev);
++	return err;
++}
++
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+@@ -1476,6 +1796,8 @@
+ 	struct airoha_flow_table_entry *e;
+ 	struct airoha_gdm_dev *egress_dev;
+ 	struct airoha_flow_data data = {};
++	struct airoha_wdma_info bridge_src = {}, bridge_dest = {};
++	bool bridge = eth->ppe->ct_host_ppe && f->bridge;
+ 	struct net_device *odev = NULL;
+ 	struct flow_action_entry *act;
+ 	u8 dsfield = 0, l4proto = 0;
+@@ -1502,8 +1824,9 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	if (eth->ppe->ct_host_ppe && addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS &&
+-	    !airoha_ppe_ct_ipv6_rule_supported(rule))
++	if (eth->ppe->ct_host_ppe &&
++	    (bridge || addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) &&
++	    !airoha_ppe_ct_ip_rule_supported(rule, bridge))
+ 		return -EOPNOTSUPP;
+ 
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
+@@ -1563,7 +1886,8 @@
+ 			if (offload_type == PPE_PKT_TYPE_BRIDGE)
+ 				return -EOPNOTSUPP;
+ 			/* IPv6 5T hardware routes the original tuple; it cannot do NAT66. */
+-			if (eth->ppe->ct_host_ppe && addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS &&
++			if (eth->ppe->ct_host_ppe &&
++			    (bridge || addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) &&
+ 			    act->mangle.htype != FLOW_ACT_MANGLE_HDR_TYPE_ETH)
+ 				return -EOPNOTSUPP;
+ 
+@@ -1574,7 +1898,12 @@
+ 			odev = act->dev;
+ 			break;
+ 		case FLOW_ACTION_PRIORITY:
++			if (bridge && act->priority)
++				return -EOPNOTSUPP;
++			break;
+ 		case FLOW_ACTION_CSUM:
++			if (bridge)
++				return -EOPNOTSUPP;
+ 			break;
+ 		case FLOW_ACTION_VLAN_PUSH:
+ 			if (data.vlan.num == 2 ||
+@@ -1604,7 +1933,8 @@
+ 		return -EINVAL;
+ 	if (eth->ppe->ct_host_ppe && !odev)
+ 		return -EOPNOTSUPP;
+-	if (eth->ppe->ct_host_ppe && addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS &&
++	if (eth->ppe->ct_host_ppe &&
++	    (bridge || addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) &&
+ 	    (data.vlan.num || data.pppoe.num ||
+ 	     is_multicast_ether_addr(data.eth.h_dest) ||
+ 	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN) ||
+@@ -1612,6 +1942,16 @@
+ 	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE) ||
+ 	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_CONTROL)))
+ 		return -EOPNOTSUPP;
++
++	if (bridge) {
++		if (!f->bridge_generation ||
++		    f->bridge_generation != br_flow_offload_generation())
++			return -ESTALE;
++		err = airoha_ppe_ct_bridge_paths(eth, rule, odev, &data.eth,
++						&bridge_src, &bridge_dest);
++		if (err)
++			return err;
++	}
+ 
+ 	err = airoha_ppe_foe_entry_prepare(eth, &hwe, odev, offload_type,
+ 					   &data, l4proto, dsfield,
+@@ -1623,7 +1963,10 @@
+ 					   "PON egress has no unambiguous VLAN/P-bit to GEM mapping");
+ 		return err;
+ 	}
+-	if (eth->ppe->ct_host_ppe && !egress_dev &&
++	if (bridge && (egress_dev ||
++	    !airoha_ppe_ct_wlan_entry(&hwe, bridge_dest.idx, bridge_dest.wcid)))
++		return -ESTALE;
++	if (eth->ppe->ct_host_ppe && !bridge && !egress_dev &&
+ 	    !airoha_ppe_ct_ifc_covers(eth->ppe, rule, odev))
+ 		return -EOPNOTSUPP;
+ 	if (eth->ppe->ct_host_ppe && egress_dev &&
+@@ -1707,7 +2050,8 @@
+ 		if (err)
+ 			return err;
+ 	}
+-	if (eth->ppe->ct_host_ppe && addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
++	if (eth->ppe->ct_host_ppe && !bridge &&
++	    addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
+ 		u8 smac_id;
+ 
+ 		/* Keep each referenced source MAC immutable until the banks are drained. */
+@@ -1718,6 +2062,10 @@
+ 		hwe.ipv6.l2.src_mac_hi |= FIELD_PREP(AIROHA_FOE_MAC_SMAC_ID, smac_id);
+ 	}
+ 
++	/* IP lookup supplies the key, while the action remains transparent L2. */
++	if (bridge)
++		hwe.ib1 &= ~AIROHA_FOE_IB1_BIND_TTL;
++
+ 	e = kzalloc(sizeof(*e), GFP_KERNEL);
+ 	if (!e)
+ 		return -ENOMEM;
+@@ -1725,7 +2073,39 @@
+ 	INIT_LIST_HEAD(&e->gc_node);
+ 	e->cookie = f->cookie;
+ 	e->egress_dev = egress_dev;
++	e->ct_bridge = bridge;
++	e->ct_bridge_generation = f->bridge_generation;
++	INIT_LIST_HEAD(&e->ct_bridge_node);
++	if (bridge) {
++		struct flow_match_meta meta;
++
++		flow_rule_match_meta(rule, &meta);
++		e->ct_ingress_ifindex = meta.key->ingress_ifindex;
++		e->ct_src.band = bridge_src.idx;
++		e->ct_src.bss = bridge_src.bss;
++		e->ct_src.wcid = bridge_src.wcid;
++		e->ct_src.epoch = airoha_ppe_ct_wlan_epoch(&eth->ppe->dev,
++							 bridge_src.idx, bridge_src.wcid);
++		e->ct_dest.band = bridge_dest.idx;
++		e->ct_dest.bss = bridge_dest.bss;
++		e->ct_dest.wcid = bridge_dest.wcid;
++		e->ct_dest.epoch = airoha_ppe_ct_wlan_epoch(&eth->ppe->dev,
++							  bridge_dest.idx, bridge_dest.wcid);
++		if (!e->ct_src.epoch || !e->ct_dest.epoch) {
++			err = -ESTALE;
++			goto free_entry;
++		}
++		ether_addr_copy(e->ct_src_mac, data.eth.h_source);
++		ether_addr_copy(e->ct_dest_mac, data.eth.h_dest);
++	}
+ 	memcpy(&e->data, &hwe, sizeof(e->data));
++
++	if (bridge) {
++		err = airoha_ppe_ct_bridge_publish(eth, e);
++		if (err)
++			goto free_entry;
++		return 0;
++	}
+ 
+ 	err = airoha_ppe_foe_flow_commit_entry(eth->ppe, e);
+ 	if (err)
+@@ -1780,6 +2160,8 @@
+ 	struct airoha_foe_entry *hwe;
+ 	u32 index;
+ 
++	if (hash >= airoha_ppe_get_total_num_entries(ppe))
++		return;
+ 	hwe = ppe->foe + hash * sizeof(*hwe);
+ 	if (airoha_is_7581(eth) &&
+ 	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, READ_ONCE(hwe->ib1)) ==
+@@ -1827,7 +2209,9 @@
+ 	idle = airoha_ppe_entry_idle_time(eth->ppe, e);
+ 	f->stats.lastused = jiffies - idle * HZ;
+ 
+-	if (e->hash != 0xffff) {
++	spin_lock_bh(&ppe_lock);
++	if (!eth->ppe->ct_stopping &&
++	    e->hash < airoha_ppe_get_total_num_entries(eth->ppe)) {
+ 		struct airoha_foe_stats64 stats = {};
+ 
+ 		airoha_ppe_foe_entry_get_stats(eth->ppe, e->hash, &stats);
+@@ -1835,6 +2219,7 @@
+ 		f->stats.bytes += (stats.bytes - e->stats.bytes);
+ 		e->stats = stats;
+ 	}
++	spin_unlock_bh(&ppe_lock);
+ 
+ 	return 0;
+ }
+@@ -2472,8 +2857,30 @@
+ 		return;
+ 
+ 	ppe->foe_check_time[hash] = now;
+-	airoha_ppe_foe_insert_entry(ppe, skb, hash, rx_wlan);
+-}
++	airoha_ppe_foe_insert_entry(ppe, skb, hash, rx_wlan, NULL);
++}
++
++void airoha_ppe_ct_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
++			   u16 hash, u8 band, u8 bss, u16 wcid, u32 epoch)
++{
++	struct airoha_ct_bridge_peer peer = {
++		.epoch = epoch, .band = band, .bss = bss, .wcid = wcid,
++	};
++	struct airoha_ppe *ppe = dev->priv;
++	u16 now, diff;
++
++	if (!READ_ONCE(ppe->ct_host_ppe) || band > 1 || bss > 63 ||
++	    !wcid || wcid > 150 || !epoch ||
++	    hash >= airoha_ppe_get_total_sram_num_entries(ppe))
++		return;
++	now = (u16)jiffies;
++	diff = now - READ_ONCE(ppe->foe_check_time[hash]);
++	if (diff < HZ / 10)
++		return;
++	WRITE_ONCE(ppe->foe_check_time[hash], now);
++	airoha_ppe_foe_insert_entry(ppe, skb, hash, true, &peer);
++}
++EXPORT_SYMBOL_GPL(airoha_ppe_ct_check_skb);
+ 
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr)
+ {
+@@ -2560,6 +2967,7 @@
+ 	ppe->dev.ops.check_skb = airoha_ppe_check_skb;
+ 	ppe->dev.priv = ppe;
+ 	ppe->eth = eth;
++	INIT_LIST_HEAD(&ppe->ct_bridge_flows);
+ 	eth->ppe = ppe;
+ 
+ 	ppe_num_entries = airoha_ppe_get_total_num_entries(ppe);
+@@ -2609,9 +3017,19 @@
+ 	if (err)
+ 		goto error_flow_table_destroy;
+ 
++	ppe->ct_bridge_notifier.notifier_call = airoha_ppe_ct_bridge_event;
++	if (airoha_ppe_ct_requested(eth)) {
++		err = register_switchdev_notifier(&ppe->ct_bridge_notifier);
++		if (err)
++			goto error_l2_flow_table_destroy;
++	}
++
+ 	err = airoha_ppe_debugfs_init(ppe);
+-	if (err)
++	if (err) {
++		if (airoha_ppe_ct_requested(eth))
++			unregister_switchdev_notifier(&ppe->ct_bridge_notifier);
+ 		goto error_l2_flow_table_destroy;
++	}
+ 
+ 	return 0;
+ 
+@@ -2626,6 +3044,9 @@
+ void airoha_ppe_deinit(struct airoha_eth *eth)
+ {
+ 	struct airoha_npu *npu;
++
++	if (airoha_ppe_ct_requested(eth))
++		unregister_switchdev_notifier(&eth->ppe->ct_bridge_notifier);
+ 
+ 	mutex_lock(&flow_offload_mutex);
+ 
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -186,6 +186,18 @@
+ }
+ #endif
+ 
++#define BR_FLOW_OFFLOAD_API 1
++
++#if IS_REACHABLE(CONFIG_BRIDGE)
++u64 br_flow_offload_generation(void);
++int br_flow_offload_begin(struct net_device *dev);
++void br_flow_offload_end(struct net_device *dev);
++#else
++static inline u64 br_flow_offload_generation(void) { return 0; }
++static inline int br_flow_offload_begin(struct net_device *dev) { return 0; }
++static inline void br_flow_offload_end(struct net_device *dev) {}
++#endif
++
+ #if IS_ENABLED(CONFIG_BRIDGE)
+ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
+ 				    const unsigned char *addr,
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -934,6 +934,7 @@
+ 	} vlan[NET_DEVICE_PATH_VLAN_MAX];
+ 
+ 	bool			ieee80211;
++	bool			bridge;
+ };
+ 
+ enum tc_setup_type {
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -31,6 +31,9 @@
+ void airoha_ppe_put_dev(struct airoha_ppe_dev *dev);
+ int airoha_ppe_ct_prepare_dev(struct airoha_ppe_dev *dev);
+ int airoha_ppe_ct_flush_wlan(struct airoha_ppe_dev *dev, u8 band, u16 wcid);
++u32 airoha_ppe_ct_wlan_epoch(struct airoha_ppe_dev *dev, u8 band, u16 wcid);
++void airoha_ppe_ct_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
++			   u16 hash, u8 band, u8 bss, u16 wcid, u32 epoch);
+ 
+ static inline int airoha_ppe_dev_setup_tc_block_cb(struct airoha_ppe_dev *dev,
+ 						   void *type_data)
+@@ -63,6 +66,18 @@
+ 					 u8 band, u16 wcid)
+ {
+ 	return -EOPNOTSUPP;
++}
++
++static inline u32 airoha_ppe_ct_wlan_epoch(struct airoha_ppe_dev *dev,
++					  u8 band, u16 wcid)
++{
++	return 0;
++}
++
++static inline void airoha_ppe_ct_check_skb(struct airoha_ppe_dev *dev,
++					 struct sk_buff *skb, u16 hash,
++					 u8 band, u8 bss, u16 wcid, u32 epoch)
++{
+ }
+ 
+ static inline int airoha_ppe_dev_setup_tc_block_cb(struct airoha_ppe_dev *dev,
+@@ -194,6 +209,8 @@
+ 	int irqs[NPU_NUM_IRQ];
+ 
+ 	struct airoha_foe_stats __iomem *stats;
++	bool wlan_short_guard_verified;
++	bool wlan_short_guard_started;
+ 
+ 	struct {
+ 		int (*ppe_init)(struct airoha_npu *npu);
+@@ -207,6 +224,7 @@
+ 					    dma_addr_t foe_addr,
+ 					    u32 entry_size, u32 hash,
+ 					    bool ppe2);
++		bool (*wlan_short_guard_ready)(struct airoha_npu *npu);
+ 		int (*wlan_init_reserved_memory)(struct airoha_npu *npu);
+ 		int (*wlan_send_msg)(struct airoha_npu *npu, int ifindex,
+ 				     enum airoha_npu_wlan_set_cmd func_id,
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -695,6 +695,9 @@
+ 	struct flow_cls_common_offload common;
+ 	enum flow_cls_command command;
+ 	bool use_act_stats;
++	/* Set only by the bridge-family netfilter flowtable. */
++	bool bridge;
++	u64 bridge_generation;
+ 	unsigned long cookie;
+ 	struct flow_rule *rule;
+ 	struct flow_stats stats;
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -39,6 +39,7 @@
+ 	};
+ 	struct flow_dissector_key_tcp			tcp;
+ 	struct flow_dissector_key_ports			tp;
++	struct flow_dissector_key_eth_addrs		eth;
+ } __aligned(BITS_PER_LONG / 8); /* Ensure that we can do comparisons as longs. */
+ 
+ struct nf_flow_match {
+@@ -179,6 +180,7 @@
+ 	NF_FLOW_HW_DEAD,
+ 	NF_FLOW_HW_BIDIRECTIONAL,
+ 	NF_FLOW_HW_ESTABLISHED,
++	NF_FLOW_BRIDGE,
+ };
+ 
+ enum flow_offload_type {
+@@ -193,6 +195,7 @@
+ 	u16					type;
+ 	u32					timeout;
+ 	u32					priority;
++	u64					bridge_generation;
+ 	struct rcu_head				rcu_head;
+ };
+ 
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -230,6 +230,8 @@
+ 	SWITCHDEV_BRPORT_OFFLOADED,
+ 	SWITCHDEV_BRPORT_UNOFFLOADED,
+ 	SWITCHDEV_BRPORT_REPLAY,
++	SWITCHDEV_BRIDGE_FWD_PRE_CHANGE,
++	SWITCHDEV_BRIDGE_FWD_POST_CHANGE,
+ };
+ 
+ struct switchdev_notifier_info {
+@@ -241,6 +243,11 @@
+ /* Remember to update br_switchdev_fdb_populate() when adding
+  * new members to this structure
+  */
++struct switchdev_notifier_bridge_fwd_info {
++	struct switchdev_notifier_info info;
++	int err;
++};
++
+ struct switchdev_notifier_fdb_info {
+ 	struct switchdev_notifier_info info; /* must be first */
+ 	const unsigned char *addr;
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@ -19,6 +19,49 @@
+ 
+ #include "br_private.h"
+ 
++static DEFINE_SPINLOCK(br_flow_lock);
++static u64 br_flow_generation = 1;
++static unsigned int br_flow_changes;
++
++u64 br_flow_offload_generation(void)
++{
++	u64 generation;
++
++	spin_lock_bh(&br_flow_lock);
++	generation = br_flow_changes ? 0 : br_flow_generation;
++	spin_unlock_bh(&br_flow_lock);
++	return generation;
++}
++EXPORT_SYMBOL_GPL(br_flow_offload_generation);
++
++int br_flow_offload_begin(struct net_device *dev)
++{
++	struct switchdev_notifier_bridge_fwd_info info = {};
++
++	/* Never hold br_flow_lock across callbacks taking a driver's PPE lock. */
++	spin_lock_bh(&br_flow_lock);
++	br_flow_changes++;
++	br_flow_generation++;
++	spin_unlock_bh(&br_flow_lock);
++	call_switchdev_notifiers(SWITCHDEV_BRIDGE_FWD_PRE_CHANGE, dev,
++				 &info.info, NULL);
++	return info.err;
++}
++EXPORT_SYMBOL_GPL(br_flow_offload_begin);
++
++void br_flow_offload_end(struct net_device *dev)
++{
++	struct switchdev_notifier_bridge_fwd_info info = {};
++
++	call_switchdev_notifiers(SWITCHDEV_BRIDGE_FWD_POST_CHANGE, dev,
++				 &info.info, NULL);
++	spin_lock_bh(&br_flow_lock);
++	br_flow_generation++;
++	br_flow_changes--;
++	spin_unlock_bh(&br_flow_lock);
++}
++EXPORT_SYMBOL_GPL(br_flow_offload_end);
++
+ /*
+  * Handle changes in state of network devices enslaved to a bridge.
+  *
+@@ -124,7 +167,7 @@
+ 		break;
+ 
+ 	case NETDEV_UNREGISTER:
+-		br_del_if(br, dev);
++		br_del_if_unregister(br, dev);
+ 		break;
+ 
+ 	case NETDEV_CHANGENAME:
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -406,11 +406,19 @@
+ 	br_vlan_fill_forward_path_pvid(br, src, ctx, path);
+ 
+ 	f = br_fdb_find_rcu(br, ctx->daddr, path->bridge.vlan_id);
+-	if (!f)
++	if (!f || test_bit(BR_FDB_LOCAL, &f->flags))
+ 		return -1;
+ 
+ 	dst = READ_ONCE(f->dst);
+ 	if (!dst)
++		return -1;
++	if (src == dst && !(dst->flags & BR_HAIRPIN_MODE))
++		return -1;
++	if (ctx->bridge &&
++	    (dst->state != BR_STATE_FORWARDING ||
++	     (src && (src->state != BR_STATE_FORWARDING ||
++		      ((src->flags & BR_ISOLATED) && (dst->flags & BR_ISOLATED)))) ||
++	     test_bit(BR_FDB_LOCKED, &f->flags)))
+ 		return -1;
+ 
+ 	if (br_vlan_fill_forward_path_mode(br, dst, path))
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -312,7 +312,7 @@
+ 	}
+ }
+ 
+-static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f,
++static void __fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f,
+ 		       bool swdev_notify)
+ {
+ 	trace_fdb_delete(br, f);
+@@ -327,6 +327,14 @@
+ 		atomic_dec(&br->fdb_n_learned);
+ 	fdb_notify(br, f, RTM_DELNEIGH, swdev_notify);
+ 	kfree_rcu(f, rcu);
++}
++
++static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f,
++		       bool swdev_notify)
++{
++	br_flow_offload_begin(br->dev);
++	__fdb_delete(br, f, swdev_notify);
++	br_flow_offload_end(br->dev);
+ }
+ 
+ /* Delete a local entry if no other port had the same address.
+@@ -427,7 +435,7 @@
+ 	return fdb;
+ }
+ 
+-static int fdb_add_local(struct net_bridge *br, struct net_bridge_port *source,
++static int __fdb_add_local(struct net_bridge *br, struct net_bridge_port *source,
+ 			 const unsigned char *addr, u16 vid)
+ {
+ 	struct net_bridge_fdb_entry *fdb;
+@@ -455,6 +463,17 @@
+ 	fdb_add_hw_addr(br, addr);
+ 	fdb_notify(br, fdb, RTM_NEWNEIGH, true);
+ 	return 0;
++}
++
++static int fdb_add_local(struct net_bridge *br, struct net_bridge_port *source,
++			 const unsigned char *addr, u16 vid)
++{
++	int err = br_flow_offload_begin(br->dev);
++
++	if (!err)
++		err = __fdb_add_local(br, source, addr, vid);
++	br_flow_offload_end(br->dev);
++	return err;
+ }
+ 
+ void br_fdb_changeaddr(struct net_bridge_port *p, const unsigned char *newaddr)
+@@ -1028,6 +1047,7 @@
+ 			if (unlikely(source != READ_ONCE(fdb->dst) &&
+ 				     !test_bit(BR_FDB_STICKY, &fdb->flags))) {
+ 				br_switchdev_fdb_notify(br, fdb, RTM_DELNEIGH);
++				br_flow_offload_begin(br->dev);
+ 				WRITE_ONCE(fdb->dst, source);
+ 				fdb_modified = true;
+ 				/* Take over HW learned entry */
+@@ -1040,6 +1060,7 @@
+ 				 */
+ 				if (unlikely(test_bit(BR_FDB_LOCKED, &fdb->flags)))
+ 					clear_bit(BR_FDB_LOCKED, &fdb->flags);
++				br_flow_offload_end(br->dev);
+ 			}
+ 
+ 			if (unlikely(test_bit(BR_FDB_ADDED_BY_USER, &flags))) {
+@@ -1174,7 +1195,7 @@
+ }
+ 
+ /* Update (create or replace) forwarding database entry */
+-static int fdb_add_entry(struct net_bridge *br, struct net_bridge_port *source,
++static int __fdb_add_entry(struct net_bridge *br, struct net_bridge_port *source,
+ 			 const u8 *addr, struct ndmsg *ndm, u16 flags, u16 vid,
+ 			 struct nlattr *nfea_tb[])
+ {
+@@ -1271,6 +1292,18 @@
+ 	return 0;
+ }
+ 
++static int fdb_add_entry(struct net_bridge *br, struct net_bridge_port *source,
++			 const u8 *addr, struct ndmsg *ndm, u16 flags, u16 vid,
++			 struct nlattr *nfea_tb[])
++{
++	int err = br_flow_offload_begin(br->dev);
++
++	if (!err)
++		err = __fdb_add_entry(br, source, addr, ndm, flags, vid, nfea_tb);
++	br_flow_offload_end(br->dev);
++	return err;
++}
++
+ static int __br_fdb_add(struct ndmsg *ndm, struct net_bridge *br,
+ 			struct net_bridge_port *p, const unsigned char *addr,
+ 			u16 nlh_flags, u16 vid, struct nlattr *nfea_tb[],
+@@ -1533,7 +1566,7 @@
+ 	rcu_read_unlock();
+ }
+ 
+-int br_fdb_external_learn_add(struct net_bridge *br, struct net_bridge_port *p,
++static int __br_fdb_external_learn_add(struct net_bridge *br, struct net_bridge_port *p,
+ 			      const unsigned char *addr, u16 vid, bool locked,
+ 			      bool swdev_notify)
+ {
+@@ -1614,6 +1647,19 @@
+ 	return err;
+ }
+ 
++int br_fdb_external_learn_add(struct net_bridge *br, struct net_bridge_port *p,
++			      const unsigned char *addr, u16 vid, bool locked,
++			      bool swdev_notify)
++{
++	int err = br_flow_offload_begin(br->dev);
++
++	if (!err)
++		err = __br_fdb_external_learn_add(br, p, addr, vid, locked,
++						 swdev_notify);
++	br_flow_offload_end(br->dev);
++	return err;
++}
++
+ int br_fdb_external_learn_del(struct net_bridge *br, struct net_bridge_port *p,
+ 			      const unsigned char *addr, u16 vid,
+ 			      bool swdev_notify)
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -568,7 +568,7 @@
+ }
+ 
+ /* called with RTNL */
+-int br_add_if(struct net_bridge *br, struct net_device *dev,
++static int __br_add_if(struct net_bridge *br, struct net_device *dev,
+ 	      struct netlink_ext_ack *extack)
+ {
+ 	struct net_bridge_port *p;
+@@ -727,8 +727,19 @@
+ 	return err;
+ }
+ 
++int br_add_if(struct net_bridge *br, struct net_device *dev,
++	      struct netlink_ext_ack *extack)
++{
++	int err = br_flow_offload_begin(br->dev);
++
++	if (!err)
++		err = __br_add_if(br, dev, extack);
++	br_flow_offload_end(br->dev);
++	return err;
++}
++
+ /* called with RTNL */
+-int br_del_if(struct net_bridge *br, struct net_device *dev)
++static int __br_del_if(struct net_bridge *br, struct net_device *dev)
+ {
+ 	struct net_bridge_port *p;
+ 	bool changed_addr;
+@@ -758,6 +769,28 @@
+ 	return 0;
+ }
+ 
++int br_del_if(struct net_bridge *br, struct net_device *dev)
++{
++	int err = br_flow_offload_begin(br->dev);
++
++	if (!err)
++		err = __br_del_if(br, dev);
++	br_flow_offload_end(br->dev);
++	return err;
++}
++
++void br_del_if_unregister(struct net_bridge *br, struct net_device *dev)
++{
++	/* Unregister cannot be rejected: release the port and its device
++	 * reference even if hardware quiescence failed. The driver keeps its
++	 * admission gate closed and retains unconfirmed hardware owners.
++	 * Keep the generation blocked across del_nbp's nested policy changes.
++	 */
++	br_flow_offload_begin(br->dev);
++	__br_del_if(br, dev);
++	br_flow_offload_end(br->dev);
++}
++
+ void br_port_flags_change(struct net_bridge_port *p, unsigned long mask)
+ {
+ 	struct net_bridge *br = p->br;
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -943,7 +943,7 @@
+ }
+ 
+ /* Process bridge protocol info on port */
+-static int br_setport(struct net_bridge_port *p, struct nlattr *tb[],
++static int __br_setport(struct net_bridge_port *p, struct nlattr *tb[],
+ 		      struct netlink_ext_ack *extack)
+ {
+ 	unsigned long old_flags, changed_mask;
+@@ -1089,6 +1089,17 @@
+ 	}
+ 
+ 	return 0;
++}
++
++static int br_setport(struct net_bridge_port *p, struct nlattr *tb[],
++		      struct netlink_ext_ack *extack)
++{
++	int err = br_flow_offload_begin(p->br->dev);
++
++	if (!err)
++		err = __br_setport(p, tb, extack);
++	br_flow_offload_end(p->br->dev);
++	return err;
+ }
+ 
+ /* Change state and parameters on port. */
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -493,6 +493,9 @@
+ 	BROPT_MRP_ENABLED,
+ };
+ 
++int br_flow_offload_begin(struct net_device *dev);
++void br_flow_offload_end(struct net_device *dev);
++
+ struct net_bridge {
+ 	spinlock_t			lock;
+ 	spinlock_t			hash_lock;
+@@ -914,6 +917,7 @@
+ int br_add_if(struct net_bridge *br, struct net_device *dev,
+ 	      struct netlink_ext_ack *extack);
+ int br_del_if(struct net_bridge *br, struct net_device *dev);
++void br_del_if_unregister(struct net_bridge *br, struct net_device *dev);
+ void br_mtu_auto_adjust(struct net_bridge *br);
+ netdev_features_t br_features_recompute(struct net_bridge *br,
+ 					netdev_features_t features);
+--- a/net/bridge/br_stp.c
++++ b/net/bridge/br_stp.c
+@@ -26,7 +26,7 @@
+ 	[BR_STATE_BLOCKING] = "blocking",
+ };
+ 
+-void br_set_state(struct net_bridge_port *p, unsigned int state)
++static void __br_set_state(struct net_bridge_port *p, unsigned int state)
+ {
+ 	struct switchdev_attr attr = {
+ 		.orig_dev = p->dev,
+@@ -70,17 +70,25 @@
+ 	}
+ }
+ 
++void br_set_state(struct net_bridge_port *p, unsigned int state)
++{
++	if (p->state == state || (p->flags & BR_MRP_AWARE))
++		return;
++	br_flow_offload_begin(p->br->dev);
++	__br_set_state(p, state);
++	br_flow_offload_end(p->br->dev);
++}
++
+ u8 br_port_get_stp_state(const struct net_device *dev)
+ {
+ 	struct net_bridge_port *p;
+ 
+-	ASSERT_RTNL();
+-
+-	p = br_port_get_rtnl(dev);
++	/* Callers may hold RTNL or an RCU read-side critical section. */
++	p = br_port_get_rtnl_rcu(dev);
+ 	if (!p)
+ 		return BR_STATE_DISABLED;
+ 
+-	return p->state;
++	return READ_ONCE(p->state);
+ }
+ EXPORT_SYMBOL_GPL(br_port_get_stp_state);
+ 
+--- a/net/bridge/br_sysfs_if.c
++++ b/net/bridge/br_sysfs_if.c
+@@ -56,7 +56,7 @@
+ static BRPORT_ATTR(_name, 0644,					\
+ 		   show_##_name, store_##_name)
+ 
+-static int store_flag(struct net_bridge_port *p, unsigned long v,
++static int __store_flag(struct net_bridge_port *p, unsigned long v,
+ 		      unsigned long mask)
+ {
+ 	struct netlink_ext_ack extack = {0};
+@@ -79,6 +79,17 @@
+ 		br_port_flags_change(p, mask);
+ 	}
+ 	return 0;
++}
++
++static int store_flag(struct net_bridge_port *p, unsigned long v,
++		      unsigned long mask)
++{
++	int err = br_flow_offload_begin(p->dev);
++
++	if (!err)
++		err = __store_flag(p, v, mask);
++	br_flow_offload_end(p->dev);
++	return err;
+ }
+ 
+ static ssize_t show_path_cost(struct net_bridge_port *p, char *buf)
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -771,7 +771,7 @@
+  * Must be called with vid in range from 1 to 4094 inclusive.
+  * changed must be true only if the vlan was created or updated
+  */
+-int br_vlan_add(struct net_bridge *br, u16 vid, u16 flags, bool *changed,
++static int __br_vlan_add(struct net_bridge *br, u16 vid, u16 flags, bool *changed,
+ 		struct netlink_ext_ack *extack)
+ {
+ 	struct net_bridge_vlan_group *vg;
+@@ -813,10 +813,21 @@
+ 	return ret;
+ }
+ 
++int br_vlan_add(struct net_bridge *br, u16 vid, u16 flags, bool *changed,
++		struct netlink_ext_ack *extack)
++{
++	int err = br_flow_offload_begin(br->dev);
++
++	if (!err)
++		err = __br_vlan_add(br, vid, flags, changed, extack);
++	br_flow_offload_end(br->dev);
++	return err;
++}
++
+ /* Must be protected by RTNL.
+  * Must be called with vid in range from 1 to 4094 inclusive.
+  */
+-int br_vlan_delete(struct net_bridge *br, u16 vid)
++static int __br_vlan_delete(struct net_bridge *br, u16 vid)
+ {
+ 	struct net_bridge_vlan_group *vg;
+ 	struct net_bridge_vlan *v;
+@@ -834,6 +845,16 @@
+ 	vlan_tunnel_info_del(vg, v);
+ 
+ 	return __vlan_del(v);
++}
++
++int br_vlan_delete(struct net_bridge *br, u16 vid)
++{
++	int err = br_flow_offload_begin(br->dev);
++
++	if (!err)
++		err = __br_vlan_delete(br, vid);
++	br_flow_offload_end(br->dev);
++	return err;
+ }
+ 
+ void br_vlan_flush(struct net_bridge *br)
+@@ -886,7 +907,7 @@
+ 					      ~(1u << br->group_addr[5]);
+ }
+ 
+-int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val,
++static int __br_vlan_filter_toggle(struct net_bridge *br, unsigned long val,
+ 			  struct netlink_ext_ack *extack)
+ {
+ 	struct switchdev_attr attr = {
+@@ -917,6 +938,17 @@
+ 	}
+ 
+ 	return 0;
++}
++
++int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val,
++			  struct netlink_ext_ack *extack)
++{
++	int err = br_flow_offload_begin(br->dev);
++
++	if (!err)
++		err = __br_vlan_filter_toggle(br, val, extack);
++	br_flow_offload_end(br->dev);
++	return err;
+ }
+ 
+ bool br_vlan_enabled(const struct net_device *dev)
+@@ -1010,13 +1042,24 @@
+ 	return err;
+ }
+ 
++static int br_vlan_set_proto_impl(struct net_bridge *br, unsigned long val,
++		      struct netlink_ext_ack *extack)
++{
++	if (!eth_type_vlan(htons(val)))
++		return -EPROTONOSUPPORT;
++
++	return __br_vlan_set_proto(br, htons(val), extack);
++}
++
+ int br_vlan_set_proto(struct net_bridge *br, unsigned long val,
+ 		      struct netlink_ext_ack *extack)
+ {
+-	if (!eth_type_vlan(htons(val)))
+-		return -EPROTONOSUPPORT;
+-
+-	return __br_vlan_set_proto(br, htons(val), extack);
++	int err = br_flow_offload_begin(br->dev);
++
++	if (!err)
++		err = br_vlan_set_proto_impl(br, val, extack);
++	br_flow_offload_end(br->dev);
++	return err;
+ }
+ 
+ int br_vlan_set_stats(struct net_bridge *br, unsigned long val)
+@@ -1307,7 +1350,7 @@
+  * Must be called with vid in range from 1 to 4094 inclusive.
+  * changed must be true only if the vlan was created or updated
+  */
+-int nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags,
++static int __nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags,
+ 		 bool *changed, struct netlink_ext_ack *extack)
+ {
+ 	struct net_bridge_vlan *vlan;
+@@ -1349,10 +1392,21 @@
+ 	return ret;
+ }
+ 
++int nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags,
++		 bool *changed, struct netlink_ext_ack *extack)
++{
++	int err = br_flow_offload_begin(port->br->dev);
++
++	if (!err)
++		err = __nbp_vlan_add(port, vid, flags, changed, extack);
++	br_flow_offload_end(port->br->dev);
++	return err;
++}
++
+ /* Must be protected by RTNL.
+  * Must be called with vid in range from 1 to 4094 inclusive.
+  */
+-int nbp_vlan_delete(struct net_bridge_port *port, u16 vid)
++static int __nbp_vlan_delete(struct net_bridge_port *port, u16 vid)
+ {
+ 	struct net_bridge_vlan *v;
+ 
+@@ -1365,6 +1419,16 @@
+ 	br_fdb_delete_by_port(port->br, port, vid, 0);
+ 
+ 	return __vlan_del(v);
++}
++
++int nbp_vlan_delete(struct net_bridge_port *port, u16 vid)
++{
++	int err = br_flow_offload_begin(port->br->dev);
++
++	if (!err)
++		err = __nbp_vlan_delete(port, vid);
++	br_flow_offload_end(port->br->dev);
++	return err;
+ }
+ 
+ void nbp_vlan_flush(struct net_bridge_port *port)
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -787,7 +787,7 @@
+ int dev_fill_bridge_path(struct net_device_path_ctx *ctx,
+ 			 struct net_device_path_stack *stack)
+ {
+-	const struct net_device *last_dev, *br_dev;
++	const struct net_device *br_dev;
+ 	struct net_device_path *path;
+ 
+ 	stack->num_paths = 0;
+@@ -799,7 +799,6 @@
+ 	if (!br_dev || !br_dev->netdev_ops->ndo_fill_forward_path)
+ 		return -1;
+ 
+-	last_dev = ctx->dev;
+ 	path = dev_fwd_path(stack);
+ 	if (!path)
+ 		return -1;
+@@ -808,7 +807,7 @@
+ 	if (br_dev->netdev_ops->ndo_fill_forward_path(ctx, path) < 0)
+ 		return -1;
+ 
+-	if (!ctx->dev || last_dev == ctx->dev)
++	if (!ctx->dev)
+ 		return -1;
+ 
+ 	return dev_fill_forward_path_common(ctx, stack);
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include <linux/kernel.h>
++#include <linux/if_bridge.h>
+ #include <linux/init.h>
+ #include <linux/module.h>
+ #include <linux/netfilter.h>
+@@ -394,9 +395,10 @@
+ 
+ void flow_offload_teardown(struct flow_offload *flow)
+ {
+-	clear_bit(IPS_OFFLOAD_BIT, &flow->ct->status);
+-	if (!test_and_set_bit(NF_FLOW_TEARDOWN, &flow->flags))
++	if (!test_and_set_bit(NF_FLOW_TEARDOWN, &flow->flags)) {
++		clear_bit(IPS_OFFLOAD_BIT, &flow->ct->status);
+ 		flow_offload_fixup_ct(flow);
++	}
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_teardown);
+ 
+@@ -417,6 +419,11 @@
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+ 	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags))
+ 		return NULL;
++	if (test_bit(NF_FLOW_BRIDGE, &flow->flags) &&
++	    flow->bridge_generation != br_flow_offload_generation()) {
++		flow_offload_teardown(flow);
++		return NULL;
++	}
+ 
+ 	if (unlikely(nf_ct_is_dying(flow->ct)))
+ 		return NULL;
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -8,6 +8,7 @@
+ #include <linux/ipv6.h>
+ #include <linux/netdevice.h>
+ #include <linux/if_ether.h>
++#include <linux/if_bridge.h>
+ #include <net/gso.h>
+ #include <net/ip.h>
+ #include <net/ipv6.h>
+@@ -172,6 +173,7 @@
+ 	const struct net_device	*in;
+ 	u32			offset;
+ 	u32			hdrsize;
++	bool			bridge;
+ };
+ 
+ static int nf_flow_tuple_ip(struct nf_flowtable_ctx *ctx, struct sk_buff *skb,
+@@ -211,7 +213,7 @@
+ 		return -1;
+ 	}
+ 
+-	if (iph->ttl <= 1)
++	if (!ctx->bridge && iph->ttl <= 1)
+ 		return -1;
+ 
+ 	if (!pskb_may_pull(skb, thoff + ctx->hdrsize))
+@@ -360,6 +362,15 @@
+ 	return NF_STOLEN;
+ }
+ 
++static bool nf_flow_bridge_match(const struct flow_offload_tuple *tuple,
++				 const struct sk_buff *skb)
++{
++	const struct ethhdr *eth = eth_hdr(skb);
++
++	return ether_addr_equal(eth->h_source, tuple->out.h_source) &&
++	       ether_addr_equal(eth->h_dest, tuple->out.h_dest);
++}
++
+ static struct flow_offload_tuple_rhash *
+ nf_flow_offload_lookup(struct nf_flowtable_ctx *ctx,
+ 		       struct nf_flowtable *flow_table, struct sk_buff *skb)
+@@ -389,6 +400,11 @@
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
++	if (test_bit(NF_FLOW_BRIDGE, &flow->flags) &&
++	    flow->bridge_generation != br_flow_offload_generation()) {
++		flow_offload_teardown(flow);
++		return 0;
++	}
+ 
+ 	mtu = flow->tuplehash[dir].tuple.mtu + ctx->offset;
+ 	if (unlikely(nf_flow_exceeds_mtu(skb, mtu)))
+@@ -413,21 +429,24 @@
+ 	thoff -= ctx->offset;
+ 
+ 	iph = ip_hdr(skb);
+-	nf_flow_nat_ip(flow, skb, thoff, dir, iph);
+-
+-	dscp = FIELD_GET(INET_DSCP_MASK, ipv4_get_dsfield(iph));
+-	if (tuplehash->tuple.dscp != dscp)
+-		ipv4_change_dsfield(iph, INET_ECN_MASK,
+-				    FIELD_PREP(INET_DSCP_MASK,
+-					       tuplehash->tuple.dscp));
+-
+-	ip_decrease_ttl(iph);
++	if (!test_bit(NF_FLOW_BRIDGE, &flow->flags)) {
++		nf_flow_nat_ip(flow, skb, thoff, dir, iph);
++
++		dscp = FIELD_GET(INET_DSCP_MASK, ipv4_get_dsfield(iph));
++		if (tuplehash->tuple.dscp != dscp)
++			ipv4_change_dsfield(iph, INET_ECN_MASK,
++					    FIELD_PREP(INET_DSCP_MASK,
++						       tuplehash->tuple.dscp));
++
++		ip_decrease_ttl(iph);
++	}
+ 	skb_clear_tstamp(skb);
+ 
+ 	/* As ip_forward() does for the packets the flow did not take. */
+ 	if (flow->priority)
+ 		skb->priority = flow->priority;
+-	else if (READ_ONCE(dev_net(skb->dev)->ipv4.sysctl_ip_fwd_update_priority))
++	else if (!test_bit(NF_FLOW_BRIDGE, &flow->flags) &&
++		 READ_ONCE(dev_net(skb->dev)->ipv4.sysctl_ip_fwd_update_priority))
+ 		skb->priority = rt_tos2priority(iph->tos);
+ 
+ 	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
+@@ -445,6 +464,7 @@
+ 	enum flow_offload_tuple_dir dir;
+ 	struct nf_flowtable_ctx ctx = {
+ 		.in	= state->in,
++		.bridge	= flow_table->type->family == NFPROTO_BRIDGE,
+ 	};
+ 	struct nf_flow_xmit xmit = {};
+ 	struct flow_offload *flow;
+@@ -453,7 +473,8 @@
+ 	int ret;
+ 
+ 	tuplehash = nf_flow_offload_lookup(&ctx, flow_table, skb);
+-	if (!tuplehash)
++	if (!tuplehash || (ctx.bridge &&
++	    !nf_flow_bridge_match(&tuplehash->tuple, skb)))
+ 		return NF_ACCEPT;
+ 
+ 	ret = nf_flow_offload_forward(&ctx, flow_table, tuplehash, skb);
+@@ -643,7 +664,7 @@
+ 		return -1;
+ 	}
+ 
+-	if (ip6h->hop_limit <= 1)
++	if (!ctx->bridge && ip6h->hop_limit <= 1)
+ 		return -1;
+ 
+ 	if (!pskb_may_pull(skb, thoff + ctx->hdrsize))
+@@ -691,6 +712,11 @@
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
++	if (test_bit(NF_FLOW_BRIDGE, &flow->flags) &&
++	    flow->bridge_generation != br_flow_offload_generation()) {
++		flow_offload_teardown(flow);
++		return 0;
++	}
+ 
+ 	mtu = flow->tuplehash[dir].tuple.mtu + ctx->offset;
+ 	if (unlikely(nf_flow_exceeds_mtu(skb, mtu)))
+@@ -714,15 +740,17 @@
+ 	nf_flow_encap_pop(skb, tuplehash);
+ 
+ 	ip6h = ipv6_hdr(skb);
+-	nf_flow_nat_ipv6(flow, skb, dir, ip6h);
+-
+-	dscp = FIELD_GET(INET_DSCP_MASK, ipv6_get_dsfield(ip6h));
+-	if (tuplehash->tuple.dscp != dscp)
+-		ipv6_change_dsfield(ip6h, INET_ECN_MASK,
+-				    FIELD_PREP(INET_DSCP_MASK,
+-					       tuplehash->tuple.dscp));
+-
+-	ip6h->hop_limit--;
++	if (!test_bit(NF_FLOW_BRIDGE, &flow->flags)) {
++		nf_flow_nat_ipv6(flow, skb, dir, ip6h);
++
++		dscp = FIELD_GET(INET_DSCP_MASK, ipv6_get_dsfield(ip6h));
++		if (tuplehash->tuple.dscp != dscp)
++			ipv6_change_dsfield(ip6h, INET_ECN_MASK,
++					    FIELD_PREP(INET_DSCP_MASK,
++						       tuplehash->tuple.dscp));
++
++		ip6h->hop_limit--;
++	}
+ 	skb_clear_tstamp(skb);
+ 
+ 	if (flow->priority)
+@@ -760,6 +788,7 @@
+ 	enum flow_offload_tuple_dir dir;
+ 	struct nf_flowtable_ctx ctx = {
+ 		.in	= state->in,
++		.bridge	= flow_table->type->family == NFPROTO_BRIDGE,
+ 	};
+ 	struct nf_flow_xmit xmit = {};
+ 	struct flow_offload *flow;
+@@ -768,7 +797,8 @@
+ 	int ret;
+ 
+ 	tuplehash = nf_flow_offload_ipv6_lookup(&ctx, flow_table, skb);
+-	if (tuplehash == NULL)
++	if (!tuplehash || (ctx.bridge &&
++	    !nf_flow_bridge_match(&tuplehash->tuple, skb)))
+ 		return NF_ACCEPT;
+ 
+ 	ret = nf_flow_offload_ipv6_forward(&ctx, flow_table, tuplehash, skb);
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1,4 +1,5 @@
+ #include <linux/kernel.h>
++#include <linux/if_bridge.h>
+ #include <linux/init.h>
+ #include <linux/module.h>
+ #include <linux/netfilter.h>
+@@ -859,6 +860,16 @@
+ 	if (err < 0)
+ 		goto err_flow_match;
+ 
++	if (flowtable->type->family == NFPROTO_BRIDGE) {
++		struct nf_flow_match *match = &flow_rule->match;
++
++		NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_ETH_ADDRS, eth);
++		ether_addr_copy(match->key.eth.src, tuple->out.h_source);
++		ether_addr_copy(match->key.eth.dst, tuple->out.h_dest);
++		memset(&match->mask.eth, 0xff, sizeof(match->mask.eth));
++		match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS);
++	}
++
+ 	flow_rule->rule->action.num_entries = 0;
+ 	if (flowtable->type->action(net, flow, dir, flow_rule) < 0)
+ 		goto err_flow_match;
+@@ -946,6 +957,12 @@
+ 
+ 	nf_flow_offload_init(&cls_flow, proto, priority, cmd,
+ 			     &flow->tuplehash[dir].tuple, &extack);
++	cls_flow.bridge = flowtable->type->family == NFPROTO_BRIDGE;
++	cls_flow.bridge_generation = flow->bridge_generation;
++	if (cmd == FLOW_CLS_REPLACE && cls_flow.bridge &&
++	    (!cls_flow.bridge_generation ||
++	     cls_flow.bridge_generation != br_flow_offload_generation()))
++		return 0;
+ 	if (cmd == FLOW_CLS_REPLACE)
+ 		cls_flow.rule = flow_rule->rule;
+ 
+@@ -1002,6 +1019,14 @@
+ 	return 0;
+ }
+ 
++static bool flow_offload_bridge_stale(struct flow_offload *flow)
++{
++	return test_bit(NF_FLOW_BRIDGE, &flow->flags) &&
++		(!flow->bridge_generation ||
++		 flow->bridge_generation != br_flow_offload_generation() ||
++		 test_bit(NF_FLOW_TEARDOWN, &flow->flags));
++}
++
+ static void flow_offload_work_add(struct flow_offload_work *offload)
+ {
+ 	struct nf_flow_rule *flow_rule[FLOW_OFFLOAD_DIR_MAX];
+@@ -1012,11 +1037,20 @@
+ 		return;
+ 
+ 	err = flow_offload_rule_add(offload, flow_rule);
++	if (flow_offload_bridge_stale(offload->flow))
++		goto stale;
+ 	if (err < 0)
+ 		goto out;
+ 
+ 	set_bit(IPS_HW_OFFLOAD_BIT, &offload->flow->ct->status);
+-
++	if (!flow_offload_bridge_stale(offload->flow))
++		goto out;
++stale:
++	clear_bit(IPS_HW_OFFLOAD_BIT, &offload->flow->ct->status);
++	flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_ORIGINAL);
++	if (test_bit(NF_FLOW_HW_BIDIRECTIONAL, &offload->flow->flags))
++		flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_REPLY);
++	flow_offload_teardown(offload->flow);
+ out:
+ 	nf_flow_offload_destroy(flow_rule);
+ }
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include <linux/kernel.h>
++#include <linux/if_bridge.h>
+ #include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/netlink.h>
+@@ -365,6 +366,7 @@
+ 		ctx.vlan[ctx.num_vlans].proto = th[dir].tuple.encap[i].proto;
+ 		ctx.num_vlans++;
+ 	}
++	ctx.bridge = true;
+ 	ctx.dev = src_dev;
+ 	ether_addr_copy(ctx.daddr, dst_ha);
+ 
+@@ -405,6 +407,10 @@
+ 	struct ethhdr *eth = eth_hdr(pkt->skb);
+ 	struct flow_offload_tuple *tuple;
+ 	int err, i = 0;
++	u64 generation = br_flow_offload_generation();
++
++	if (!generation)
++		return -EAGAIN;
+ 
+ 	in_dev = nft_in(pkt);
+ 	if (!in_dev || !nft_flowtable_find_dev(in_dev, ft))
+@@ -453,6 +459,10 @@
+ 	if (err < 0)
+ 		return err;
+ 
++	if (generation != br_flow_offload_generation())
++		return -EAGAIN;
++	flow->bridge_generation = generation;
++	__set_bit(NF_FLOW_BRIDGE, &flow->flags);
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_bridge_init);

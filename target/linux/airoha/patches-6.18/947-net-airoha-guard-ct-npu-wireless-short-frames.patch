@@ -1,0 +1,356 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: guard CT NPU wireless short frames and marked IP packets
+
+Verify the exact Connac2 1456-50 firmware before patching its RAM image.
+At the common pre-TDMA path, send Ethernet frames shorter than 72 bytes,
+length underflows, non-IP EtherTypes, non-IHL5 IPv4 packets, and any IPv4
+DS byte or IPv6 traffic class with nonzero DSCP/ECN bits to the existing
+host path. Invalid IPv4/IPv6 versions also remain on the host.
+
+Inspect each packet, including an already bound five-tuple, because the
+route-format PPE bridge entry rewrites DS from its fixed output field.
+A marked packet therefore retains its DS byte through software forwarding,
+while subsequent DS=0 packets can reuse the same hardware entry. Keep IPv6
+flow labels intact. Check length before reading Ethernet/IP bytes 12..15,
+using byte loads for unaligned headers and the uncached packet mapping.
+
+Install one branch at 0x5b50 and a 128-byte hook at 0x17f6c..0x17fec.
+The hook replaces unused .eh_frame metadata and extends the stock image
+by 24 bytes. Preserve the preceding __clz_tab, runtime addresses and all
+eight stack slots; the hook ends 20 bytes before the first stack at 0x18000.
+The fixed firmware trap handler does not unwind through .eh_frame.
+
+Verify stock SHA256, original branch-site bytes, generated image SHA256
+and full RAM readback. Publish readiness only after verified NPU startup.
+Reject the previous short-only image by its different combined-image hash.
+Preserve original host queue arguments and TDMA continuation registers;
+leave the on-disk firmware unchanged. Depends on the readiness API in 946.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_npu_guard.h
+@@ -0,0 +1,137 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef AIROHA_CT_NPU_GUARD_H
++#define AIROHA_CT_NPU_GUARD_H
++
++/* Connac2 1456-50 only: SHA256 is checked before modifying the RAM image. */
++#define CT_NPU_GUARD_STOCK_SIZE	0x17fd4
++#define CT_NPU_GUARD_SITE	0x5b50
++#define CT_NPU_GUARD_HOOK	0x17f6c
++#define CT_NPU_GUARD_STACK_BASE	0x18000
++
++static const u8 ct_npu_guard_stock_sha256[SHA256_DIGEST_SIZE] = {
++	0xd7, 0x4a, 0xa2, 0xf8, 0x12, 0x14, 0xfd, 0xa2,
++	0x47, 0x25, 0x52, 0x9a, 0x60, 0x00, 0xbb, 0x05,
++	0xc2, 0x2c, 0x2d, 0xa6, 0xf4, 0x0d, 0xfd, 0x63,
++	0xf0, 0xc2, 0x0e, 0xf0, 0x67, 0xdb, 0x08, 0xaf,
++};
++
++static const u8 ct_npu_guard_patched_sha256[SHA256_DIGEST_SIZE] = {
++	0x7f, 0x03, 0xb0, 0x34, 0x84, 0xca, 0xac, 0x96,
++	0x5e, 0x0d, 0x7e, 0x96, 0x9c, 0xbf, 0x65, 0x5c,
++	0x14, 0x0a, 0x0b, 0xf6, 0xc4, 0x9f, 0xb1, 0xaa,
++	0xa6, 0xcd, 0xa2, 0x6d, 0x35, 0x6b, 0xfd, 0x63,
++};
++
++/* Exact 32-bit branch site and exact stock image SHA pin both code and metadata. */
++static const u8 ct_npu_guard_original[] = {
++	0xb3, 0x05, 0xc8, 0x40,
++};
++static const u8 ct_npu_guard_jump[] = {
++	0x6f, 0x20, 0xc1, 0x41,
++};
++
++/*
++ * Per packet, before the unique TDMA submit caller at 0x5bfa:
++ * - RX length < header offset, or Ethernet length < 72: original host path.
++ * - Non-IPv4/IPv6 EtherType (including VLAN): original host path.
++ * - IPv4 version/IHL != 0x45 or DS byte != 0: original host path.
++ * - IPv6 version != 6 or traffic class != 0: original host path.
++ * - Remaining packets: original TDMA continuation, including DS=0 packets
++ *   after nonzero-DS packets on an already bound five-tuple.
++ *
++ * Ethernet bytes are read through the original uncached packet-buffer mapping;
++ * only bytes 12..15 are read, after the 72-byte minimum was checked. All loads
++ * are byte loads, so unaligned header offsets are valid. IPv6 flow label stays
++ * untouched. a0/a2/a3/a6/s0, SP and RA are preserved; a1/a4/a5 are overwritten
++ * by both original continuations. Host receives original RX length/selector.
++ *
++ * 0x17f6c..0x17fd4 is unused .eh_frame: 2 CIEs and 3 FDEs (startup and libgcc
++ * division helpers). The fixed trap handler saves registers explicitly and
++ * either dispatches IRQ11 or prints the exception and stops; it never unwinds.
++ * The preceding 256-byte __clz_tab ends at 0x17f6c and is preserved. All five
++ * table uses reduce their index to <=255. Original code and runtime data remain
++ * at their exact addresses, except the one 32-bit branch at 0x5b50.
++ *
++ * This 128-byte hook ends at 0x17fec, 20 bytes below the first stack slot
++ * 0x18000..0x1c000. All eight 16-KiB stack slots are unchanged; no stack is used
++ * by the hook. BSS remains 0x3e900b80..0x3e903810 in separate local SRAM.
++ * Readiness means this exact combined short-frame/DS image passed RAM readback
++ * and the NPU boot sequence completed. The former short-only image fails SHA.
++ */
++static const u8 ct_npu_guard_code[] = {
++	0xb3, 0x05, 0xc8, 0x40, 0x63, 0x6c, 0xc8, 0x06,
++	0x93, 0xb7, 0xa5, 0x04, 0xa5, 0xeb, 0xb7, 0x37,
++	0x90, 0x3e, 0x83, 0xa7, 0xc7, 0x66, 0x8a, 0x07,
++	0x89, 0x83, 0x37, 0x07, 0x00, 0x40, 0xd9, 0x8f,
++	0x89, 0x07, 0xb2, 0x97, 0x13, 0x17, 0xb4, 0x00,
++	0xba, 0x97, 0x03, 0xc7, 0xc7, 0x00, 0x83, 0xc5,
++	0xd7, 0x00, 0xa2, 0x05, 0x4d, 0x8f, 0xa1, 0x45,
++	0x63, 0x05, 0xb7, 0x02, 0xb7, 0xe5, 0x00, 0x00,
++	0x93, 0x85, 0x65, 0xd8, 0x63, 0x1c, 0xb7, 0x02,
++	0x03, 0xc7, 0xe7, 0x00, 0x93, 0x05, 0x00, 0x06,
++	0x63, 0x16, 0xb7, 0x02, 0x03, 0xc7, 0xf7, 0x00,
++	0x13, 0x77, 0x07, 0x0f, 0x05, 0xe3, 0x6f, 0x00,
++	0x60, 0x01, 0x03, 0xc7, 0xe7, 0x00, 0x93, 0x05,
++	0x50, 0x04, 0x63, 0x19, 0xb7, 0x00, 0x03, 0xc7,
++	0xf7, 0x00, 0x09, 0xe7, 0xb3, 0x05, 0xc8, 0x40,
++	0x6f, 0xd0, 0x1e, 0xb7, 0x6f, 0xd0, 0x9e, 0xb4,
++};
++
++static int ct_npu_guard_verify_io(void __iomem *addr, size_t size,
++				const u8 *expected_digest)
++{
++	u8 digest[SHA256_DIGEST_SIZE];
++	u8 *copy;
++	int ret = 0;
++
++	copy = kvmalloc(size, GFP_KERNEL);
++	if (!copy)
++		return -ENOMEM;
++	memcpy_fromio(copy, addr, size);
++	sha256(copy, size, digest);
++	if (memcmp(digest, expected_digest, sizeof(digest)))
++		ret = -EIO;
++	kvfree(copy);
++
++	return ret;
++}
++
++static int ct_npu_guard_load(void __iomem *addr, const struct firmware *fw)
++{
++	const size_t size = CT_NPU_GUARD_HOOK + sizeof(ct_npu_guard_code);
++	u8 digest[SHA256_DIGEST_SIZE];
++	u8 *image;
++	int ret;
++
++	BUILD_BUG_ON(CT_NPU_GUARD_HOOK + sizeof(ct_npu_guard_code) >
++		     CT_NPU_GUARD_STACK_BASE);
++	if (fw->size != CT_NPU_GUARD_STOCK_SIZE ||
++	    memcmp(fw->data + CT_NPU_GUARD_SITE, ct_npu_guard_original,
++		   sizeof(ct_npu_guard_original)))
++		return -EBADMSG;
++	sha256(fw->data, fw->size, digest);
++	if (memcmp(digest, ct_npu_guard_stock_sha256, sizeof(digest)))
++		return -EBADMSG;
++
++	image = kvmalloc(size, GFP_KERNEL);
++	if (!image)
++		return -ENOMEM;
++	memcpy(image, fw->data, fw->size);
++	memcpy(image + CT_NPU_GUARD_SITE, ct_npu_guard_jump,
++	       sizeof(ct_npu_guard_jump));
++	memcpy(image + CT_NPU_GUARD_HOOK, ct_npu_guard_code,
++	       sizeof(ct_npu_guard_code));
++	sha256(image, size, digest);
++	if (memcmp(digest, ct_npu_guard_patched_sha256, sizeof(digest))) {
++		ret = -EBADMSG;
++		goto out;
++	}
++	memcpy_toio(addr, image, size);
++	wmb();
++	ret = ct_npu_guard_verify_io(addr, size, ct_npu_guard_patched_sha256);
++out:
++	kvfree(image);
++	return ret;
++}
++
++#endif /* AIROHA_CT_NPU_GUARD_H */
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -13,8 +13,10 @@
+ #include <linux/of_platform.h>
+ #include <linux/of_reserved_mem.h>
+ #include <linux/regmap.h>
++#include <linux/vmalloc.h>
+ 
+ #include "airoha_eth.h"
++#include "airoha_ct_npu_guard.h"
+ 
+ #define NPU_EN7581_FIRMWARE_DATA		"airoha/en7581_npu_data.bin"
+ #define NPU_EN7581_FIRMWARE_RV32		"airoha/en7581_npu_rv32.bin"
+@@ -238,7 +240,7 @@
+ 
+ static int airoha_npu_load_firmware(struct device *dev, void __iomem *addr,
+ 				    const char *fw_name, int fw_max_size,
+-				    const u8 *expected_digest)
++				    const u8 *expected_digest, bool ct_guard)
+ {
+ 	const struct firmware *fw;
+ 	int ret;
+@@ -264,7 +266,18 @@
+ 			goto out;
+ 		}
+ 	}
+-	memcpy_toio(addr, fw->data, fw->size);
++	if (ct_guard) {
++		ret = ct_npu_guard_load(addr, fw);
++	} else {
++		memcpy_toio(addr, fw->data, fw->size);
++		if (expected_digest) {
++			wmb();
++			ret = ct_npu_guard_verify_io(addr, fw->size,
++						    expected_digest);
++		}
++	}
++	if (ret)
++		dev_err(dev, "%s: verified RAM load failed: %d\n", fw_name, ret);
+ out:
+ 	release_firmware(fw);
+ 
+@@ -297,14 +310,14 @@
+ 
+ 	ret = airoha_npu_load_firmware(dev, addr, fw_names[0],
+ 				       NPU_EN7581_FIRMWARE_RV32_MAX_SIZE,
+-				       ct ? ct_fw_sha256[0] : NULL);
++				       ct ? ct_fw_sha256[0] : NULL, ct);
+ 	if (ret)
+ 		return ret;
+ 
+ 	return airoha_npu_load_firmware(dev, base + REG_NPU_LOCAL_SRAM,
+ 					fw_names[1],
+ 					NPU_EN7581_FIRMWARE_DATA_MAX_SIZE,
+-					ct ? ct_fw_sha256[1] : NULL);
++					ct ? ct_fw_sha256[1] : NULL, false);
+ }
+ 
+ static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
+@@ -317,6 +330,11 @@
+ 	soc = of_device_get_match_data(dev);
+ 	if (!soc)
+ 		return -EINVAL;
++
++	if (airoha_npu_is_connac2_ct(dev) &&
++	    (res->start != 0x84000000 ||
++	     resource_size(res) < NPU_EN7581_FIRMWARE_RV32_MAX_SIZE))
++		return dev_err_probe(dev, -EINVAL, "invalid CT firmware memory region\n");
+ 
+ 	addr = devm_ioremap_resource(dev, res);
+ 	if (IS_ERR(addr))
+@@ -330,14 +348,29 @@
+ 
+ 	/* Load rv32 npu firmware */
+ 	ret = airoha_npu_load_firmware(dev, addr, soc->fw_rv32.name,
+-				       soc->fw_rv32.max_size, NULL);
++				       soc->fw_rv32.max_size, NULL, false);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* Load data npu firmware */
+ 	return airoha_npu_load_firmware(dev, base + REG_NPU_LOCAL_SRAM,
+ 					soc->fw_data.name,
+-					soc->fw_data.max_size, NULL);
++					soc->fw_data.max_size, NULL, false);
++}
++
++/* No capability is exposed until verified code, data and boot are complete. */
++static bool airoha_npu_wlan_short_guard_ready(struct airoha_npu *npu)
++{
++	return smp_load_acquire(&npu->wlan_short_guard_started) &&
++	       READ_ONCE(npu->wlan_short_guard_verified);
++}
++
++static void airoha_npu_wlan_short_guard_clear(void *data)
++{
++	struct airoha_npu *npu = data;
++
++	WRITE_ONCE(npu->wlan_short_guard_verified, false);
++	WRITE_ONCE(npu->wlan_short_guard_started, false);
+ }
+ 
+ static irqreturn_t airoha_npu_mbox_handler(int irq, void *npu_instance)
+@@ -385,6 +418,7 @@
+ 	int c = core - &npu->cores[0];
+ 	u32 val;
+ 
++	WRITE_ONCE(npu->wlan_short_guard_verified, false);
+ 	regmap_set_bits(npu->regmap, REG_WDT_TIMER_CTRL(c), WDT_INTR_MASK);
+ 	if (!regmap_read(npu->regmap, REG_WDT_TIMER_CTRL(c), &val) &&
+ 	    FIELD_GET(WDT_EN_MASK, val))
+@@ -812,6 +846,7 @@
+ 	npu->ops.ppe_init_stats = airoha_npu_ppe_stats_setup;
+ 	npu->ops.ppe_flush_sram_entries = airoha_npu_ppe_flush_sram_entries;
+ 	npu->ops.ppe_foe_commit_entry = airoha_npu_foe_commit_entry;
++	npu->ops.wlan_short_guard_ready = airoha_npu_wlan_short_guard_ready;
+ 	npu->ops.wlan_init_reserved_memory = airoha_npu_wlan_init_memory;
+ 	npu->ops.wlan_send_msg = airoha_npu_wlan_msg_send;
+ 	npu->ops.wlan_get_msg = airoha_npu_wlan_msg_get;
+@@ -885,6 +920,11 @@
+ 	if (err)
+ 		return err;
+ 
++	err = devm_add_action_or_reset(dev, airoha_npu_wlan_short_guard_clear, npu);
++	if (err)
++		return err;
++	WRITE_ONCE(npu->wlan_short_guard_verified, airoha_npu_is_connac2_ct(dev));
++
+ 	regmap_write(npu->regmap, REG_CR_NPU_MIB(10),
+ 		     res.start + NPU_EN7581_FIRMWARE_RV32_MAX_SIZE);
+ 	regmap_write(npu->regmap, REG_CR_NPU_MIB(11), 0x40000); /* SRAM 256K */
+@@ -893,13 +933,20 @@
+ 	msleep(100);
+ 
+ 	/* setting booting address */
+-	for (i = 0; i < NPU_NUM_CORES; i++)
+-		regmap_write(npu->regmap, REG_CR_BOOT_BASE(i), res.start);
++	for (i = 0; i < NPU_NUM_CORES; i++) {
++		err = regmap_write(npu->regmap, REG_CR_BOOT_BASE(i), res.start);
++		if (err)
++			return err;
++	}
+ 	usleep_range(1000, 2000);
+ 
+ 	/* enable NPU cores */
+-	regmap_write(npu->regmap, REG_CR_BOOT_CONFIG, 0xff);
+-	regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER, 0x1);
++	err = regmap_write(npu->regmap, REG_CR_BOOT_CONFIG, 0xff);
++	if (err)
++		return err;
++	err = regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER, 0x1);
++	if (err)
++		return err;
+ 	msleep(100);
+ 
+ 	if (airoha_npu_is_connac2_ct(dev)) {
+@@ -907,8 +954,12 @@
+ 		err = airoha_npu_connac2_init_pool(npu);
+ 		if (err)
+ 			dev_warn(dev, "Connac2 packet pool unavailable: %d\n", err);
+-		else
++		else {
+ 			dev_info(dev, "Connac2 packet pool registered\n");
++			smp_store_release(&npu->wlan_short_guard_started, true);
++			if (airoha_npu_wlan_short_guard_ready(npu))
++				dev_info(dev, "CT WLAN short-frame/DS guard ready: Ethernet < 72 or nonzero DS to host\n");
++		}
+ 	} else if (!airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
+ 					    &val, sizeof(val), GFP_KERNEL)) {
+ 		dev_info(dev, "NPU fw version: %0d.%d\n",
+@@ -920,8 +971,17 @@
+ 	return 0;
+ }
+ 
++static void airoha_npu_shutdown(struct platform_device *pdev)
++{
++	struct airoha_npu *npu = platform_get_drvdata(pdev);
++
++	if (npu)
++		airoha_npu_wlan_short_guard_clear(npu);
++}
++
+ static struct platform_driver airoha_npu_driver = {
+ 	.probe = airoha_npu_probe,
++	.shutdown = airoha_npu_shutdown,
+ 	.driver = {
+ 		.name = "airoha-npu",
+ 		.of_match_table = of_airoha_npu_match,
