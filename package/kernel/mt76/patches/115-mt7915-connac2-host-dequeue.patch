@@ -2,12 +2,13 @@ diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
 index 2cd3030..bd400e2 100644
 --- a/mt7915/mt7915.h
 +++ b/mt7915/mt7915.h
-@@ -486,6 +486,8 @@ struct mt7915_npu_host_ct {
+@@ -486,6 +486,9 @@ struct mt7915_npu_host_ct {
  };
  int mt7915_npu_host_init_ct(struct mt7915_dev *dev, struct airoha_npu *npu,
  			    struct mt7915_npu_host_ct rings[2]);
 +int mt7915_npu_host_rx_ct(struct mt7915_npu_host_ct *ring, struct airoha_npu *npu,
 +			  struct napi_struct *napi, struct sk_buff **skb, u32 *info);
++int mt7915_npu_host_rx_flush_ct(struct mt7915_npu_host_ct *ring, struct airoha_npu *npu);
  #endif
  int mt7915_dma_init(struct mt7915_dev *dev, struct mt7915_phy *phy2);
  void mt7915_dma_prefetch(struct mt7915_dev *dev);
@@ -32,12 +33,13 @@ index b705b60..c5a350a 100644
 +			  struct napi_struct *napi, struct sk_buff **skb, u32 *info)
 +{
 +	u16 lengths[7];
-+	struct airoha_npu_rx_dma_desc __iomem *desc = &ring->desc[ring->tail];
++	struct airoha_npu_rx_dma_desc __iomem *desc;
 +	unsigned int total, count, pos, index, copied = 0, consumed = 0;
-+	u32 ctrl = readl(&desc->ctrl);
-+	int err;
++	u32 ctrl;
 +
 +	*skb = NULL;
++	desc = &ring->desc[ring->tail];
++	ctrl = readl(&desc->ctrl);
 +	if (!(ctrl & NPU_RX_DMA_DESC_DONE_MASK))
 +		return 0;
 +	rmb();
@@ -88,15 +90,14 @@ index b705b60..c5a350a 100644
 +		writel(0, &desc->ctrl);
 +		ring->tail = (ring->tail + 1) % MT7916_CT_HOST_COUNT;
 +	}
-+	wmb();
-+	err = regmap_write(npu->regmap, ring->regs + offsetof(struct mt76_queue_regs, dma_idx),
-+			   ring->tail);
-+	if (err) {
-+		dev_kfree_skb_any(*skb);
-+		*skb = NULL;
-+		return err;
-+	}
 +	return 1;
++}
++
++int mt7915_npu_host_rx_flush_ct(struct mt7915_npu_host_ct *ring, struct airoha_npu *npu)
++{
++	wmb();
++	return regmap_write(npu->regmap, ring->regs + offsetof(struct mt76_queue_regs, dma_idx),
++			    ring->tail);
 +}
 +
  static void mt7915_npu_release(void *data)

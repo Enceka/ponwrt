@@ -176,10 +176,11 @@ index bd400e2..b0d555e 100644
  	struct mt7915_reg_desc reg;
  	u8 q_id[MT7915_MAX_QUEUE];
  	u32 q_int_mask[MT7915_MAX_QUEUE];
-@@ -488,8 +489,16 @@ int mt7915_npu_host_init_ct(struct mt7915_dev *dev, struct airoha_npu *npu,
+@@ -488,9 +489,17 @@ int mt7915_npu_host_init_ct(struct mt7915_dev *dev, struct airoha_npu *npu,
  			    struct mt7915_npu_host_ct rings[2]);
  int mt7915_npu_host_rx_ct(struct mt7915_npu_host_ct *ring, struct airoha_npu *npu,
  			  struct napi_struct *napi, struct sk_buff **skb, u32 *info);
+ int mt7915_npu_host_rx_flush_ct(struct mt7915_npu_host_ct *ring, struct airoha_npu *npu);
 +int mt7915_ct_prepare(struct mt7915_dev *dev);
 +int mt7915_ct_bind(struct mt7915_dev *dev);
 +void mt7915_ct_stop(struct mt7915_dev *dev);
@@ -233,7 +234,7 @@ index 6e52e80..654d3de 100644
  static int mt7915_npu_counters_show(struct seq_file *seq, void *unused)
  {
  	struct airoha_npu *npu = seq->private;
-@@ -187,6 +207,98 @@ release:
+@@ -187,6 +207,100 @@ release:
  	return 1;
  }
  
@@ -303,6 +304,8 @@ index 6e52e80..654d3de 100644
 +		*(u32 *)skb->cb = BIT(0) | BIT(2) | BIT(3);
 +		mt7915_queue_rx_skb(mdev, qid, skb, &info);
 +	}
++	if (done && mt7915_npu_host_rx_flush_ct(&path->rings[poll->index], path->npu) && ret >= 0)
++		ret = -EIO;
 +	mt76_rx_poll_complete(mdev, qid, napi);
 +	if (ret < 0)
 +		dev_err_ratelimited(mdev->dev, "Connac2 RX queue %u stopped: %d\n",
