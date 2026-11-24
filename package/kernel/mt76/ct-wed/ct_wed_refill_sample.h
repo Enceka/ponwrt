@@ -51,6 +51,7 @@ static inline int ct_refill_sample_read(const struct ct_live_sample_io *io,
 					struct airoha_ct_wed_refill_sample *sample)
 {
 	struct airoha_ct_wed_refill_sample first = {}, second = {};
+	u32 first_shadow[CT_LIVE_RX_RINGS], second_shadow[CT_LIVE_RX_RINGS];
 	unsigned int index;
 	int err;
 
@@ -64,7 +65,7 @@ static inline int ct_refill_sample_read(const struct ct_live_sample_io *io,
 			return -EINVAL;
 		first.refill[index].index = indices[index];
 	}
-	err = ct_live_read_fields(io, &first.live);
+	err = ct_live_read_fields(io, &first.live, first_shadow);
 	if (!err)
 		err = ct_live_read_desc(io, &first.live);
 	if (!err)
@@ -76,10 +77,11 @@ static inline int ct_refill_sample_read(const struct ct_live_sample_io *io,
 	if (!err)
 		err = ct_refill_read_desc(io, &second);
 	if (!err)
-		err = ct_live_read_fields(io, &second.live);
+		err = ct_live_read_fields(io, &second.live, second_shadow);
 	if (err)
 		return err;
-	if (memcmp(&first, &second, sizeof(first)))
+	if (memcmp(&first, &second, sizeof(first)) ||
+	    memcmp(first_shadow, second_shadow, sizeof(first_shadow)))
 		return -EAGAIN;
 	*sample = first;
 	return 0;
