@@ -1,0 +1,39 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: size coherent mailboxes for WLAN statistics
+
+The Connac2 GET 2 receive-statistics command exchanges 0x1250 bytes,
+including the eight-byte WLAN header. The 256-byte coherent mailbox
+rejects this request before publishing it to the NPU.
+
+Reserve SZ_8K per core at probe, the next power of two covering the
+4688-byte command. Keep the existing bounded sender, per-core lock and
+coherent buffer lifetime; the atomic submission path still reuses its
+buffer. Eight cores reserve 64 KiB total. The 8192-byte limit fits the
+firmware's 16-bit mailbox length and the existing 32-bit coherent DMA
+mask continues to constrain the entire allocation.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -13,6 +13,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/of_reserved_mem.h>
+ #include <linux/regmap.h>
++#include <linux/sizes.h>
+ #include <linux/vmalloc.h>
+ 
+ #include "airoha_eth.h"
+@@ -28,11 +29,10 @@
+ #define NPU_EN7581_FIRMWARE_DATA_MAX_SIZE	0x10000
+ #define NPU_DUMP_SIZE				512
+ /*
+- * Mailbox DMA payload size. Covers sizeof(struct ppe_mbox_data) (28) and
+- * WLAN TLV messages (header + payload); largest in-tree WLAN payload today
+- * is 16 bytes (INODE_TXRX_REG_ADDR). Keep headroom for future commands.
++ * Connac2 WLAN GET 2 statistics uses 0x1250 bytes including its header.
++ * Reserve one coherent buffer per core at probe; submission can be atomic.
+  */
+-#define AIROHA_NPU_MBOX_SIZE			256
++#define AIROHA_NPU_MBOX_SIZE			SZ_8K
+ #define AIROHA_NPU_MBOX_TIMEOUT_US		(100 * USEC_PER_MSEC)
+ 
+ #define REG_NPU_LOCAL_SRAM		0x0
