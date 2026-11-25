@@ -1,0 +1,38 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: publish NPU mailbox status before the sequence trigger
+
+Writing MBQ0_CTRL(2) advances the sequence and immediately raises the
+NPU mailbox interrupt. The current sender writes the function and wait
+status afterwards, allowing the NPU to dispatch the new coherent payload
+using the previous slot status. This affects the shared Wi-Fi, tunnel
+and PPE sender: a completion can acknowledge the previous function while
+the requested function never runs.
+
+Initialize MBQ0_CTRL(3) before advancing the sequence. Order the coherent
+request payload before MMIO publication with dma_wmb(), then keep the
+existing regmap writes ordered so the sequence increment is the final
+request write. Preserve the per-core lock, reply copy and timeout/error
+handling.
+
+Restore the stock host order: parameter, length, status, then read and
+increment the sequence. In the EN7581 firmware, the interrupt dispatcher
+selects its callback from status bits 14:11 immediately after the sequence
+write; it does not wait for the sender to initialize those bits later.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -198,11 +198,12 @@ static int __airoha_npu_send_msg(struct
+ 	memcpy(core->buf, data, len);
+ 
++	dma_wmb();
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, core->addr);
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, len);
+-	regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, &val);
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, val + 1);
+ 	val = FIELD_PREP(MBOX_MSG_FUNC_ID, func_id) | MBOX_MSG_WAIT_RSP;
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, val);
++	regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, &val);
++	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, val + 1);
+ 
+ 	ret = regmap_read_poll_timeout_atomic(npu->regmap,
+ 					      REG_CR_MBQ0_CTRL(3) + offset,
