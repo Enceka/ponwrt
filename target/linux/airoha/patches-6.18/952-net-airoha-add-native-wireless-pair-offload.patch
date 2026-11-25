@@ -165,8 +165,8 @@ legacy NPU operation offsets and existing CT flow-admission diagnostics.
 +	    br_port_flag_is_set(idev, BR_ISOLATED | BR_PORT_LOCKED) ||
 +	    br_port_flag_is_set(odev, BR_ISOLATED | BR_PORT_LOCKED) ||
 +	    (idev == odev && !br_port_flag_is_set(idev, BR_HAIRPIN_MODE)) ||
-+	    br_fdb_find_port(master, hdr->h_source, 0) != idev ||
-+	    br_fdb_find_port(master, hdr->h_dest, 0) != odev ||
++	    br_switchdev_fdb_find_port(master, hdr->h_source, 0) != idev ||
++	    br_switchdev_fdb_find_port(master, hdr->h_dest, 0) != odev ||
 +	    wiphy_dev(idev->ieee80211_ptr->wiphy)->parent !=
 +	    wiphy_dev(odev->ieee80211_ptr->wiphy)->parent ||
 +	    airoha_ppe_get_wdma_info(idev, hdr->h_source, src, true) ||

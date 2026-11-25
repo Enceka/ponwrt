@@ -92,6 +92,11 @@ bridge generation and endpoint epochs. The subsequent learned bank0 L2B row
 becomes BND after those identities match. Up to four row hashes are retained for
 each directed pair.
 
+The frame notifier runs in the bridge's RCU read-side section, including when
+called from NAPI. Both FDB admission passes use `br_switchdev_fdb_find_port()`
+within that section; this helper also excludes entries that the bridge does
+not publish to switchdev. The packet path does not acquire RTNL.
+
 PPE bank0 uses FLOW `0xb200` for native WLAN L2B traffic; bank1 uses `0x3200`
 for route-format flows. Physical GDM ingress selects bank1. Native rows preserve
 DSCP/ECN and IPv6 flow labels. The firmware handles simple IPv4/IPv6 TCP and UDP,
@@ -116,10 +121,12 @@ python3 target/linux/airoha/tests/native_pair/run.py \
 
 Python 3 and Clang with AddressSanitizer/UndefinedBehaviorSanitizer are required.
 The runner extracts the current kernel functions into a separate results
-directory and hashes their source. It runs 700 checks: pair admission/binding
-55, policy serialization 11, bank/revoke lifecycle 223, mailbox wrapper 68,
+directory and hashes their source. It runs 722 checks: pair admission/binding
+77, policy serialization 11, bank/revoke lifecycle 223, mailbox wrapper 68,
 XDP/TCX 16, shutdown ordering 3, FDB movement 6, bridge hook classification 298,
-and nft JSON audit 20. Transport and MMIO are mocked in these host tests.
+and nft JSON audit 20. The pair tests execute the actual bridge FDB helper and
+notifier RCU scope, including source/destination movement between admission
+passes. Transport and MMIO are mocked in these host tests.
 
 The source integration was also compiled as eleven ARM64 kernel objects with
 zero compiler warnings, including the preserved 948 debugfs implementation.
@@ -127,7 +134,8 @@ The RAM bundle uses the same native algorithms with 948 absent from its older
 base. Hardware acceptance captures cold policy state, empty enable/off,
 authorized pair learning, bank0 L2B BND rows in both directions, fresh IPv4 and
 IPv6 traffic, stable host conntrack counters while throughput continues, and
-revoke behavior. Save PHY/radio statistics alongside throughput for comparison.
+revoke behavior. Save PHY/radio statistics alongside throughput for comparison,
+and check the complete boot log for kernel warnings after traffic and revocation.
 
 On 2026-11-25 the matched RAM image passed cold boot, audited enable/off,
 bidirectional IPv4/IPv6 TCP with default ECN, and 16-byte UDP with DS=3/187.
@@ -139,3 +147,10 @@ reauthorization successfully relearned them. Mac WLAN disconnect removed its
 peer rows; reassociation and fresh default ECN traffic relearned both directions
 with host counters fixed. Router mean CPU during these native TCP runs was
 2.48% to 3.88%.
+
+The RCU FDB correction passed a fresh RAM boot, audited enable, bidirectional
+default-ECN IPv4 TCP, live off/nft revocation and relearning. The complete boot
+log remained free of kernel warnings. The two 20-second TCP runs delivered
+580/526 Mbps with native bank0 rows and steady host counters; mean CPU was
+2.97%/4.13%. Evidence is retained in workspace
+`build/private-ram-trials/native-acceptance-prep/fe-rcu-{enable,v4-ecn,lifecycle}`.

@@ -52,6 +52,9 @@ struct net_device {struct wireless_dev*ieee80211_ptr;struct net_device*master;
 struct ethhdr {u8 h_dest[6],h_source[6];u16 h_proto;};
 struct sk_buff {struct net_device*dev;int skb_iif;bool vlan;struct ethhdr hdr;};
 static int ppe_lock,rcu;
+static bool napi;
+static unsigned fdb_reads,fdb_reads_locked,fdb_move;
+static unsigned long fdb_flags[2];
 static u64 ticks,generation;
 static struct net_device*devices[3],*fdbsrc,*fdbdst;
 static struct airoha_foe_entry rows[8192];
@@ -85,11 +88,28 @@ static int dev_net(struct net_device*d){assert(d);return 1;}
 static struct net_device*dev_get_by_index_rcu(int net,int idx){assert(net==1&&rcu);return idx>0&&idx<3?devices[idx]:NULL;}
 static bool netif_is_bridge_port(struct net_device*d){return d->bridge;}
 static struct net_device*netdev_master_upper_dev_get_rcu(struct net_device*d){assert(rcu);return d->master;}
-static bool netif_is_bridge_master(struct net_device*d){return d->master_bridge;}
+static bool netif_is_bridge_master(const struct net_device*d){return d->master_bridge;}
 static bool br_vlan_enabled(struct net_device*d){return d->vlan;}
 static int br_port_get_stp_state(struct net_device*d){return d->state;}
 static bool br_port_flag_is_set(struct net_device*d,u32 f){return d->flags&f;}
-static struct net_device*br_fdb_find_port(struct net_device*d,const u8*a,u16 v){assert(d&&v==0);return a[0]==2?fdbsrc:fdbdst;}
+enum { BR_FDB_LOCAL,BR_FDB_LOCKED,BR_FDB_ADDED_BY_USER,BR_FDB_STATIC,BR_FDB_ADDED_BY_EXT_LEARN };
+struct net_bridge {int unused;};
+struct net_bridge_port {struct net_device*dev;};
+struct net_bridge_fdb_entry {struct net_bridge_port*dst;unsigned long flags;};
+static struct net_bridge br;
+static bool rcu_read_lock_held(void){return rcu>0;}
+#define RCU_LOCKDEP_WARN(condition,message) assert(!(condition))
+static bool test_bit(unsigned bit,const unsigned long*flags){return !!(*flags&(1ul<<bit));}
+static struct net_bridge*netdev_priv(const struct net_device*d){assert(d&&d->master_bridge&&rcu);return &br;}
+static struct net_bridge_fdb_entry*br_fdb_find_rcu(struct net_bridge*b,const u8*a,u16 v){
+ static struct net_bridge_port ports[2];static struct net_bridge_fdb_entry entries[2];
+ assert(b==&br&&v==0&&rcu&&napi);fdb_reads++;fdb_reads_locked+=!!ppe_lock;
+ if(fdb_move==1&&fdb_reads==3)fdbsrc=fdbdst;
+ if(fdb_move==2&&fdb_reads==4)fdbdst=fdbsrc;
+ unsigned i=a[0]!=2;struct net_device*d=i?fdbdst:fdbsrc;if(!d)return NULL;
+ ports[i].dev=d;entries[i]=(struct net_bridge_fdb_entry){.dst=&ports[i],.flags=fdb_flags[i]};return &entries[i];
+}
+#include "bridge_fdb_lookup.inc"
 static struct device*wiphy_dev(struct wiphy*w){return &w->dev;}
 static int airoha_ppe_get_wdma_info(struct net_device*d,const u8*a,struct airoha_wdma_info*w,bool bridge){assert(a&&bridge);*w=d->wdma;return d->wdma_err;}
 static u32 airoha_ppe_ct_epoch_locked(struct airoha_ppe*p,u8 b,u16 w){assert(ppe_lock&&b<2&&w<151);return p->ct_wlan_blocked[b][w]||p->ct_wlan_epoch[b][w]==U32_MAX?0:p->ct_wlan_epoch[b][w]+1;}
@@ -108,12 +128,24 @@ static struct net_device master,src,dst;
 static struct sk_buff skb;
 static void reset(void){
  memset(pairs,0,sizeof pairs);memset(rows,0,sizeof rows);ppe=(struct airoha_ppe){.eth=&eth,.ct_native_pairs=true,.ct_host_ppe=true,.ct_pair_policy_allowed=true,.ct_pairs=pairs};
- ppe_lock=rcu=0;ticks=0;generation=1;writes=reads=failclosed=calls=put_count=retries=0;send_error=read_error=write_error=stop_error=0;barrier_complete=false;
+ ppe_lock=rcu=0;napi=false;fdb_reads=fdb_reads_locked=fdb_move=0;fdb_flags[0]=fdb_flags[1]=0;ticks=0;generation=1;writes=reads=failclosed=calls=put_count=retries=0;send_error=read_error=write_error=stop_error=0;barrier_complete=false;
  master=(struct net_device){.master_bridge=true};src=(struct net_device){.ieee80211_ptr=&wd,.master=&master,.ifindex=1,.state=3,.bridge=true,.wdma={0,2,7}};
  dst=(struct net_device){.ieee80211_ptr=&wd,.master=&master,.ifindex=2,.state=3,.bridge=true,.wdma={1,3,8}};
  devices[1]=fdbsrc=&src;devices[2]=fdbdst=&dst;skb=(struct sk_buff){.dev=&dst,.skb_iif=1,.hdr={.h_source={2},.h_dest={4},.h_proto=htons(ETH_P_IP)}};
 }
-static void frame(void){rcu_read_lock();airoha_ct_native_pair_frame(&ppe,&skb);rcu_read_unlock();assert(!ppe_lock&&!rcu);}
+enum {SWITCHDEV_BRIDGE_NATIVE_PAIR_FRAME=42};
+struct switchdev_notifier_info {int unused;};
+struct switchdev_notifier_native_pair_info {struct switchdev_notifier_info info;struct sk_buff*skb;};
+static bool is_multicast_ether_addr(const u8*a){return !!(a[0]&1);}
+static void call_switchdev_notifiers(unsigned event,struct net_device*d,struct switchdev_notifier_info*info,void*extack){
+ struct switchdev_notifier_native_pair_info*frame=container_of(info,struct switchdev_notifier_native_pair_info,info);
+ assert(event==SWITCHDEV_BRIDGE_NATIVE_PAIR_FRAME&&d==frame->skb->dev&&!extack&&rcu&&napi&&!ppe_lock);
+ airoha_ct_native_pair_frame(&ppe,frame->skb);
+}
+static void frame(void){struct sk_buff*packet=&skb;struct sk_buff*skb=packet;napi=true;
+#include "bridge_frame_notify.inc"
+ napi=false;assert(!ppe_lock&&!rcu);
+}
 static void learned(u32 h){struct airoha_ct_pair_msg*m=&pairs[0].msg;rows[h]=(struct airoha_foe_entry){.ib1=FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,AIROHA_FOE_STATE_UNBIND)|FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE,PPE_PKT_TYPE_BRIDGE)};
  rows[h].l2b.src_mac_hi=get_unaligned_be32(m->smac);rows[h].l2b.src_mac_lo=get_unaligned_be16(m->smac+4);rows[h].l2b.dest_mac_hi=get_unaligned_be32(m->dmac);rows[h].l2b.dest_mac_lo=get_unaligned_be16(m->dmac+4);rows[h].l2b.key=0xa55a1234;}
 static void test_bind(u32 h,struct airoha_ct_bridge_peer*peer){spin_lock_bh(&ppe_lock);airoha_ct_native_pair_bind(&ppe,&skb,h,peer);spin_unlock_bh(&ppe_lock);}
@@ -124,6 +156,16 @@ int main(void){
   reset();switch(mode){case 1:ppe.ct_native_pairs=false;break;case 2:skb.vlan=true;break;case 3:skb.hdr.h_proto=htons(0x0806);break;case 4:generation=0;break;case 5:skb.skb_iif=0;break;case 6:src.wdma_err=-1;break;case 7:dst.wdma_err=-1;break;case 8:master.vlan=true;break;case 9:src.flags=BR_ISOLATED;break;case 10:dst.flags=BR_PORT_LOCKED;break;case 11:src.state=0;break;case 12:fdbsrc=NULL;break;case 13:fdbdst=NULL;break;case 14:src.wdma.wcid=0;break;case 15:dst.wdma.wcid=151;break;case 16:ppe.ct_wlan_blocked[0][7]=true;break;case 17:ppe.ct_wlan_epoch[1][8]=U32_MAX;break;case 18:ppe.ct_pair_failed=true;break;case 19:ppe.ct_stopping=true;break;case 20:ppe.ct_host_ppe=false;break;case 21:skb.hdr.h_source[0]|=1;break;case 22:dst.master=NULL;break;case 23:ppe.ct_pair_policy_allowed=false;break;}
   frame();assert(put_count==(mode==0));cases++;
  }
+ /* Actual switchdev lookup and the actual bridge notifier RCU scope execute
+  * with a simulated NAPI caller; no RTNL primitive is supplied by this harness.
+  * Both admission passes must stay inside that scope, including ppe_lock. */
+ reset();frame();assert(put_count==1&&fdb_reads==4&&fdb_reads_locked==2);cases++;
+ const unsigned long flags[]={0,BIT(BR_FDB_LOCAL),BIT(BR_FDB_LOCKED),BIT(BR_FDB_ADDED_BY_USER),BIT(BR_FDB_ADDED_BY_EXT_LEARN),BIT(BR_FDB_ADDED_BY_USER)|BIT(BR_FDB_STATIC),BIT(BR_FDB_ADDED_BY_USER)|BIT(BR_FDB_ADDED_BY_EXT_LEARN),BIT(BR_FDB_STATIC),BIT(BR_FDB_LOCAL)|BIT(BR_FDB_STATIC)|BIT(BR_FDB_ADDED_BY_USER)};
+ for(unsigned side=0;side<2;side++)for(unsigned mode=0;mode<sizeof(flags)/sizeof(flags[0]);mode++){
+  reset();fdb_flags[side]=flags[mode];frame();assert(put_count==(mode==0||mode==5||mode==6||mode==7));cases++;
+ }
+ for(unsigned side=1;side<=2;side++){reset();fdb_move=side;frame();assert(!put_count&&!pairs[0].used);cases++;}
+ reset();rcu_read_lock();assert(!br_switchdev_fdb_find_port(&src,skb.hdr.h_source,0));rcu_read_unlock();assert(!fdb_reads);cases++;
  reset();frame();frame();assert(put_count==1&&pairs[0].msg.src_selector==1&&pairs[0].msg.dst_selector==0&&pairs[0].msg.src_epoch==1);cases++;
  struct airoha_ct_bridge_peer peer={.epoch=1,.band=0,.bss=2,.wcid=7};
  for(unsigned mode=0;mode<14;mode++){
@@ -147,5 +189,5 @@ int main(void){
  reset();struct airoha_ct_pair_msg cap={.op=AIROHA_CT_PAIR_CAP};retries=5;assert(!airoha_ct_pair_exchange(&npu,&cap)&&calls==6&&!ppe_lock&&!rcu);cases++;
  reset();retries=20000;assert(airoha_ct_pair_exchange(&npu,&cap)==-ETIMEDOUT&&!ppe_lock&&!rcu);cases++;
  reset();send_error=-EPROTO;stop_error=-EBUSY;frame();assert(ppe.ct_pair_failed&&!ppe.ct_pair_hw_stopped);spin_lock_bh(&ppe_lock);assert(airoha_ct_pair_fail(&ppe,-EPROTO)==-EBUSY);spin_unlock_bh(&ppe_lock);cases++;
- printf("PASS %u native host pair admission, bank0 binding, epoch, FDB, revoke barrier, row reuse, timeout and overflow cases\n",cases);
+  printf("PASS %u native host pair admission, bank0 binding, epoch, actual RCU FDB lookup, notifier lock scope, revoke barrier, row reuse, timeout and overflow cases\n",cases);
 }

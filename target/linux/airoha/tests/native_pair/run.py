@@ -43,11 +43,12 @@ paths += ['drivers/net/ethernet/airoha/airoha_eth.h',
           'drivers/net/ethernet/airoha/airoha_regs.h',
           'include/linux/soc/airoha/airoha_offload.h', 'include/linux/netfilter.h',
           'kernel/bpf/tcx.c', 'net/core/dev.c', 'net/netfilter/core.c',
-          'net/bridge/br_fdb.c', 'net/bridge/netfilter/nf_conntrack_bridge.c']
+          'net/bridge/br_fdb.c', 'net/bridge/br_switchdev.c', 'net/bridge/br_forward.c',
+          'net/bridge/netfilter/nf_conntrack_bridge.c']
 report = {
     'passed': True,
-    'cases': 700,
-    'groups': {'pair': 55, 'policy_core': 11, 'bank_lifecycle': 223,
+    'cases': 722,
+    'groups': {'pair': 77, 'policy_core': 11, 'bank_lifecycle': 223,
                'mailbox_wrapper': 68, 'bpf': 16, 'shutdown': 3,
                'fdb_roam': 6, 'bridge_ct_hooks': 298, 'nft_audit': 20},
     'sanitizers': ['address', 'undefined'],
@@ -56,4 +57,4 @@ report = {
                       for name in paths},
 }
 (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
-print('PASS 700 native host cases; report: ' + str(output / 'report.json'))
+print('PASS 722 native host cases; report: ' + str(output / 'report.json'))
