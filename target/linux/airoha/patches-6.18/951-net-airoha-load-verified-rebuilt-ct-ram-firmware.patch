@@ -1,0 +1,49 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: load verified rebuilt Connac2 RAM firmware
+
+Select the source-built native-pair firmware only for the explicit
+airoha,connac2-rebuilt-ram-lab property on a Connac2 device. Verify code
+and data SHA256 plus RAM readback before publishing readiness. Pin the
+native dual-PPE-completion payload built with guard=2, pad=1, bank=2,
+native=1; the existing stock firmware path stays the default.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -299,9 +299,25 @@
+ 		  0xf2, 0x71, 0x3d, 0xa2, 0xf0, 0xeb, 0xdd, 0xe2,
+ 		  0x1f, 0xea, 0xf0, 0x3f, 0xc9, 0x3b, 0x0e, 0x3a },
+ 	};
++	static const u8 lab_sha256[][SHA256_DIGEST_SIZE] = {
++		{ 0x22, 0xc2, 0x66, 0x54, 0x1f, 0xaa, 0x72, 0x35, 0xbe, 0xf1, 0x2a, 0x36, 0xf5, 0xe1, 0xb0, 0x8e, 0x44, 0xd0, 0xbb, 0x11, 0x9b, 0x7a, 0x2d, 0x49, 0x5b, 0x3b, 0x17, 0xec, 0xc5, 0x7d, 0xab, 0xe4 },
++		{ 0xdf, 0x3f, 0x61, 0x98, 0x04, 0xa9, 0x2f, 0xdb, 0x40, 0x57, 0x19, 0x2d, 0xc4, 0x3d, 0xd7, 0x48, 0xea, 0x77, 0x8a, 0xdc, 0x52, 0xbc, 0x49, 0x8c, 0xe8, 0x05, 0x24, 0xc0, 0x14, 0xb8, 0x11, 0x19 },
++	};
+ 	bool ct = airoha_npu_is_connac2_ct(dev);
+ 	const char *fw_names[2];
+ 	int ret;
++
++	if (of_property_read_bool(dev->of_node, "airoha,connac2-rebuilt-ram-lab")) {
++		if (!ct)
++			return -EINVAL;
++		ret = airoha_npu_load_firmware(dev, addr, "airoha/hg5585f-ct/npu_rebuilt_rv32.bin",
++					       0x18000, lab_sha256[0], false);
++		if (ret)
++			return ret;
++		return airoha_npu_load_firmware(dev, base + REG_NPU_LOCAL_SRAM,
++					       "airoha/hg5585f-ct/npu_rebuilt_data.bin",
++					       4, lab_sha256[1], false);
++	}
+ 
+ 	ret = of_property_read_string_array(dev->of_node, "firmware-name",
+ 					    fw_names, ARRAY_SIZE(fw_names));
+@@ -951,7 +967,10 @@
+ 	msleep(100);
+ 
+ 	if (airoha_npu_is_connac2_ct(dev)) {
+-		dev_info(dev, "verified Connac2 firmware 1456-50\n");
++		if (of_property_read_bool(dev->of_node, "airoha,connac2-rebuilt-ram-lab"))
++			dev_info(dev, "verified rebuilt Connac2 RAM firmware\n");
++		else
++			dev_info(dev, "verified Connac2 firmware 1456-50\n");
+ 		err = airoha_npu_connac2_init_pool(npu);
+ 		if (err)
+ 			dev_warn(dev, "Connac2 packet pool unavailable: %d\n", err);

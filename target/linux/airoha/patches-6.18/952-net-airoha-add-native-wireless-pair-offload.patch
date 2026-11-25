@@ -1,0 +1,1480 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: add native wireless MAC-pair offload
+
+Add an explicit default-off, generation-checked policy gate for authorized
+WLAN IPv4/IPv6 peers. Learn directed native L2B rows in PPE bank0 after
+successful software bridge forwarding and reserve bank1 for routed flows.
+Use mailbox pair/endpoint epochs and completion barriers before revoke.
+
+Invalidate authorization before nft, bridge or endpoint changes; reject
+unknown hooks and XDP/TCX installation. Tag and accept only the three native
+bridge conntrack hooks at their exact bridge heads and priorities. Preserve
+legacy NPU operation offsets and existing CT flow-admission diagnostics.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
+@@ -0,0 +1,302 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Included after checked PPE revoke helpers; all state uses ppe_lock. */
++#define CT_PAIR_ROWS 4
++#define CT_PAIR_RETRY_US 100000
++struct airoha_ct_native_pair {
++	struct airoha_ct_pair_msg msg;
++	struct airoha_foe_entry rows[CT_PAIR_ROWS];
++	u16 hashes[CT_PAIR_ROWS];
++	int ingress_ifindex, egress_ifindex;
++	bool used;
++};
++
++static bool airoha_ct_pair_any(struct airoha_ppe *ppe)
++{
++	unsigned int i;
++
++	lockdep_assert_held(&ppe_lock);
++	for (i = 0; i < AIROHA_CT_PAIR_SLOTS; i++)
++		if (ppe->ct_pairs[i].used)
++			return true;
++	return false;
++}
++
++static int airoha_ct_pair_exchange(struct airoha_npu *npu, struct airoha_ct_pair_msg *msg)
++{
++	ktime_t deadline = ktime_add_us(ktime_get(), CT_PAIR_RETRY_US);
++	int err;
++
++	if (!npu || !npu->ops.ct_pair_cmd)
++		return -EOPNOTSUPP;
++	do {
++		err = npu->ops.ct_pair_cmd(npu, msg);
++		if (err != -EAGAIN)
++			break;
++		/* Firmware must return to its done FIFO between revoke probes. */
++		udelay(10);
++	} while (ktime_before(ktime_get(), deadline));
++	return err == -EAGAIN ? -ETIMEDOUT : err;
++}
++
++static int airoha_ct_pair_send(struct airoha_ppe *ppe, struct airoha_ct_pair_msg *msg)
++{
++	struct airoha_npu *npu;
++	int err;
++
++	lockdep_assert_held(&ppe_lock);
++	rcu_read_lock();
++	npu = rcu_dereference(ppe->eth->npu);
++	err = airoha_ct_pair_exchange(npu, msg);
++	rcu_read_unlock();
++	return err;
++}
++
++static int airoha_ct_pair_fail(struct airoha_ppe *ppe, int err)
++{
++	int stop_err;
++
++	ppe->ct_pair_failed = true;
++	stop_err = airoha_ppe_ct_bridge_fail_closed(ppe);
++	ppe->ct_pair_hw_stopped = !stop_err;
++	return stop_err ?: err;
++}
++
++static bool airoha_ct_pair_key(const struct airoha_foe_entry *row,
++			       const struct airoha_ct_pair_msg *msg)
++{
++	return FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, row->ib1) == PPE_PKT_TYPE_BRIDGE &&
++	       row->l2b.src_mac_hi == get_unaligned_be32(msg->smac) &&
++	       row->l2b.src_mac_lo == get_unaligned_be16(msg->smac + 4) &&
++	       row->l2b.dest_mac_hi == get_unaligned_be32(msg->dmac) &&
++	       row->l2b.dest_mac_lo == get_unaligned_be16(msg->dmac + 4) &&
++	       !row->l2b.ingress_vlan;
++}
++
++static bool airoha_ct_pair_row_owned(const struct airoha_foe_entry *row,
++				     const struct airoha_foe_entry *saved)
++{
++	u32 variable = AIROHA_FOE_IB1_BIND_TIMESTAMP;
++
++	return !((row->ib1 ^ saved->ib1) & ~variable) &&
++	       !memcmp(&row->d, &saved->d, sizeof(*row) - sizeof(row->ib1));
++}
++
++static int airoha_ct_native_pair_revoke(struct airoha_ppe *ppe, int band, u16 wcid)
++{
++	struct airoha_ct_pair_msg msg = {};
++	int i, j, err;
++
++	lockdep_assert_held(&ppe_lock);
++	if (!ppe->ct_native_pairs)
++		return 0;
++	msg.op = cpu_to_le16(band < 0 ? AIROHA_CT_PAIR_FLUSH : AIROHA_CT_PAIR_ENDPOINT_REVOKE);
++	if (band >= 0) {
++		if (ppe->ct_wlan_epoch[band][wcid] == U32_MAX)
++			return airoha_ct_pair_fail(ppe, -EOVERFLOW);
++		msg.src_selector = !band;
++		msg.src_wcid = cpu_to_le16(wcid);
++		msg.src_epoch = cpu_to_le32(ppe->ct_wlan_epoch[band][wcid] + 1);
++	}
++	err = airoha_ct_pair_send(ppe, &msg);
++	if (err)
++		return airoha_ct_pair_fail(ppe, err);
++	for (i = 0; i < AIROHA_CT_PAIR_SLOTS; i++) {
++		struct airoha_ct_native_pair *pair = &ppe->ct_pairs[i];
++
++		if (!pair->used || (band >= 0 &&
++		    !(pair->msg.src_selector == !band && le16_to_cpu(pair->msg.src_wcid) == wcid) &&
++		    !(pair->msg.dst_selector == !band && le16_to_cpu(pair->msg.dst_wcid) == wcid)))
++			continue;
++		for (j = 0; j < CT_PAIR_ROWS; j++) {
++			struct airoha_foe_entry *row, invalid;
++
++			if (pair->hashes[j] == U16_MAX)
++				continue;
++			row = airoha_ppe_foe_get_entry_locked(ppe, pair->hashes[j]);
++			if (!row)
++				return airoha_ct_pair_fail(ppe, -ETIMEDOUT);
++			if (airoha_ct_pair_row_owned(row, &pair->rows[j])) {
++				invalid = *row;
++				invalid.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
++				err = airoha_ppe_foe_commit_entry(ppe, &invalid, pair->hashes[j], true);
++				if (err)
++					return airoha_ct_pair_fail(ppe, err);
++			}
++		}
++		pair->used = false;
++	}
++	return 0;
++}
++
++static bool airoha_ct_pair_peers(struct airoha_ppe *ppe, struct net_device *idev,
++				struct net_device *odev, const struct ethhdr *hdr,
++				struct airoha_wdma_info *src,
++				struct airoha_wdma_info *dst)
++{
++	struct net_device *master;
++
++	if (!idev || !odev || !net_eq(dev_net(idev), &init_net) ||
++	    !net_eq(dev_net(odev), &init_net) || !idev->ieee80211_ptr || !odev->ieee80211_ptr ||
++	    !netif_is_bridge_port(idev) || !netif_is_bridge_port(odev) ||
++	    !is_valid_ether_addr(hdr->h_source) || !is_valid_ether_addr(hdr->h_dest) ||
++	    ether_addr_equal(hdr->h_source, hdr->h_dest))
++		return false;
++	master = netdev_master_upper_dev_get_rcu(idev);
++	if (!master || !netif_is_bridge_master(master) || br_vlan_enabled(master) ||
++	    master != netdev_master_upper_dev_get_rcu(odev) ||
++	    br_port_get_stp_state(idev) != BR_STATE_FORWARDING ||
++	    br_port_get_stp_state(odev) != BR_STATE_FORWARDING ||
++	    br_port_flag_is_set(idev, BR_ISOLATED | BR_PORT_LOCKED) ||
++	    br_port_flag_is_set(odev, BR_ISOLATED | BR_PORT_LOCKED) ||
++	    (idev == odev && !br_port_flag_is_set(idev, BR_HAIRPIN_MODE)) ||
++	    br_fdb_find_port(master, hdr->h_source, 0) != idev ||
++	    br_fdb_find_port(master, hdr->h_dest, 0) != odev ||
++	    wiphy_dev(idev->ieee80211_ptr->wiphy)->parent !=
++	    wiphy_dev(odev->ieee80211_ptr->wiphy)->parent ||
++	    airoha_ppe_get_wdma_info(idev, hdr->h_source, src, true) ||
++	    airoha_ppe_get_wdma_info(odev, hdr->h_dest, dst, true) ||
++	    src->idx > 1 || dst->idx > 1 || src->bss > 63 || dst->bss > 63 ||
++	    !src->wcid || !dst->wcid || src->wcid > 150 || dst->wcid > 150 ||
++	    (src->idx == dst->idx && src->wcid == dst->wcid))
++		return false;
++	return true;
++}
++
++static void airoha_ct_native_pair_frame(struct airoha_ppe *ppe, struct sk_buff *skb)
++{
++	struct airoha_wdma_info src = {}, dst = {};
++	struct airoha_ct_pair_msg msg = {};
++	struct airoha_ct_native_pair *pair;
++	struct net_device *idev, *odev = skb->dev;
++	const struct ethhdr *hdr = eth_hdr(skb);
++	u64 generation;
++	int i, free_slot = -1, err;
++
++	if (!READ_ONCE(ppe->ct_native_pairs) || !READ_ONCE(ppe->ct_pair_policy_allowed) ||
++	    skb_vlan_tag_present(skb) ||
++	    (hdr->h_proto != htons(ETH_P_IP) && hdr->h_proto != htons(ETH_P_IPV6)))
++		return;
++	generation = br_flow_offload_generation();
++	if (!generation)
++		return;
++	idev = dev_get_by_index_rcu(dev_net(odev), skb->skb_iif);
++	if (!airoha_ct_pair_peers(ppe, idev, odev, hdr, &src, &dst))
++		return;
++	msg.op = cpu_to_le16(AIROHA_CT_PAIR_PUT);
++	msg.generation = cpu_to_le64(generation);
++	msg.src_selector = !src.idx;
++	msg.dst_selector = !dst.idx;
++	msg.src_wcid = cpu_to_le16(src.wcid);
++	msg.dst_wcid = cpu_to_le16(dst.wcid);
++	msg.src_bss = src.bss;
++	msg.dst_bss = dst.bss;
++	ether_addr_copy(msg.smac, hdr->h_source);
++	ether_addr_copy(msg.dmac, hdr->h_dest);
++	spin_lock_bh(&ppe_lock);
++	if (!ppe->ct_pair_policy_allowed || !ppe->ct_host_ppe || ppe->ct_stopping || ppe->ct_pair_failed ||
++	    generation != br_flow_offload_generation() ||
++	    !airoha_ct_pair_peers(ppe, idev, odev, hdr, &src, &dst) ||
++	    msg.src_selector != !src.idx || msg.dst_selector != !dst.idx ||
++	    le16_to_cpu(msg.src_wcid) != src.wcid || le16_to_cpu(msg.dst_wcid) != dst.wcid ||
++	    msg.src_bss != src.bss || msg.dst_bss != dst.bss)
++		goto out;
++	msg.src_epoch = cpu_to_le32(airoha_ppe_ct_epoch_locked(ppe, src.idx, src.wcid));
++	msg.dst_epoch = cpu_to_le32(airoha_ppe_ct_epoch_locked(ppe, dst.idx, dst.wcid));
++	if (!msg.src_epoch || !msg.dst_epoch)
++		goto out;
++	for (i = 0; i < AIROHA_CT_PAIR_SLOTS; i++) {
++		pair = &ppe->ct_pairs[i];
++		if (!pair->used) {
++			if (free_slot < 0)
++				free_slot = i;
++			continue;
++		}
++		if (!memcmp(&pair->msg.generation, &msg.generation, 40))
++			goto out;
++	}
++	if (free_slot < 0)
++		goto out;
++	if (ppe->ct_pair_token == U32_MAX) {
++		airoha_ct_pair_fail(ppe, -EOVERFLOW);
++		goto out;
++	}
++	msg.slot = cpu_to_le32(free_slot);
++	msg.token = cpu_to_le32(++ppe->ct_pair_token);
++	pair = &ppe->ct_pairs[free_slot];
++	/* Record before PUT: a timeout may mean NPU consumed the request. */
++	pair->msg = msg;
++	pair->ingress_ifindex = idev->ifindex;
++	pair->egress_ifindex = odev->ifindex;
++	memset(pair->hashes, 0xff, sizeof(pair->hashes));
++	pair->used = true;
++	err = airoha_ct_pair_send(ppe, &msg);
++	if (err) {
++		airoha_ct_pair_fail(ppe, err);
++		goto out;
++	}
++	/* PUT ACK publishes admission; RX epoch isolation may delay learning. */
++	pair->msg = msg;
++out:
++	spin_unlock_bh(&ppe_lock);
++}
++
++static void airoha_ct_native_pair_bind(struct airoha_ppe *ppe, struct sk_buff *skb,
++				       u32 hash, const struct airoha_ct_bridge_peer *peer)
++{
++	struct airoha_ct_native_pair *pair;
++	struct airoha_foe_entry *learned, bound;
++	const struct ethhdr *hdr = eth_hdr(skb);
++	u64 generation = br_flow_offload_generation();
++	int i, j, row_slot, err;
++
++	lockdep_assert_held(&ppe_lock);
++	if (!ppe->ct_pair_policy_allowed || ppe->ct_pair_failed || !peer || !generation ||
++	    hash >= PPE_SRAM_NUM_ENTRIES)
++		return;
++	for (i = 0; i < AIROHA_CT_PAIR_SLOTS; i++) {
++		pair = &ppe->ct_pairs[i];
++		if (!pair->used || le64_to_cpu(pair->msg.generation) != generation ||
++		    peer->band != !pair->msg.src_selector || peer->bss != pair->msg.src_bss ||
++		    peer->wcid != le16_to_cpu(pair->msg.src_wcid) ||
++		    peer->epoch != le32_to_cpu(pair->msg.src_epoch) ||
++		    peer->epoch != airoha_ppe_ct_epoch_locked(ppe, peer->band, peer->wcid) ||
++		    le32_to_cpu(pair->msg.dst_epoch) != airoha_ppe_ct_epoch_locked(ppe,
++			!pair->msg.dst_selector, le16_to_cpu(pair->msg.dst_wcid)) ||
++		    !ether_addr_equal(hdr->h_source, pair->msg.smac) ||
++		    !ether_addr_equal(hdr->h_dest, pair->msg.dmac))
++			continue;
++		learned = airoha_ppe_foe_get_entry_locked(ppe, hash);
++		if (!learned) {
++			airoha_ct_pair_fail(ppe, -ETIMEDOUT);
++			return;
++		}
++		if (!airoha_ct_pair_key(learned, &pair->msg) ||
++		    FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, learned->ib1) != AIROHA_FOE_STATE_UNBIND ||
++		    learned->ib1 & AIROHA_FOE_IB1_BIND_STATIC)
++			return;
++		row_slot = -1;
++		for (j = 0; j < CT_PAIR_ROWS; j++)
++			if (pair->hashes[j] == hash || pair->hashes[j] == U16_MAX) {
++				row_slot = j;
++				break;
++			}
++		if (row_slot < 0)
++			return;
++		bound = *learned;
++		bound.ib1 = FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE, PPE_PKT_TYPE_BRIDGE) |
++			    FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND);
++		bound.l2b.data = FIELD_PREP(AIROHA_FOE_SHAPER_ID, 0x7f) |
++			FIELD_PREP(AIROHA_FOE_CHANNEL, 8 + !pair->msg.dst_selector);
++		bound.l2b.ib2 = FIELD_PREP(AIROHA_FOE_IB2_PORT_AG, 0x1f) | AIROHA_FOE_IB2_PSE_QOS |
++			FIELD_PREP(AIROHA_FOE_IB2_NBQ, 2 + !pair->msg.dst_selector) |
++			FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT, FE_PSE_PORT_GDM3);
++		bound.l2b.etype = le16_to_cpu(pair->msg.dst_wcid) << 6 | pair->msg.dst_bss;
++		bound.l2b.vlan1 = bound.l2b.vlan2 = 0;
++		pair->hashes[row_slot] = hash;
++		err = airoha_ppe_foe_commit_entry(ppe, &bound, hash, true);
++		pair->rows[row_slot] = bound;
++		if (err)
++			airoha_ct_pair_fail(ppe, err);
++		return;
++	}
++}
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_pair_banks.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#define CT_NATIVE_FLOW BIT(15)
++
++static u32 airoha_ct_pair_flow_mask(struct airoha_ppe *ppe, int bank)
++{
++	return CT_HOST_IP_FLOWS | (ppe->ct_native_pairs && !bank ? CT_NATIVE_FLOW : 0);
++}
++
++/* Move only PPE1 selectors. GDM2's direct loopback, CPU and DROP are preserved. */
++static u32 airoha_ct_pair_gdm_route(u32 cfg)
++{
++	unsigned int shift;
++
++	for (shift = 0; shift < 16; shift += 4)
++		if (((cfg >> shift) & 0xf) == FE_PSE_PORT_PPE1)
++			cfg = (cfg & ~(0xf << shift)) | (FE_PSE_PORT_PPE2 << shift);
++	return cfg;
++}
++
++static int airoha_ct_pair_gdm_start(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	int i;
++
++	if (!ppe->ct_native_pairs)
++		return 0;
++	/* Save every selector before the first write so partial failure rolls back. */
++	for (i = AIROHA_GDM1_IDX; i <= AIROHA_GDM4_IDX; i++)
++		ppe->ct_pair_gdm_saved[i - 1] = airoha_fe_rr(eth, REG_GDM_FWD_CFG(i));
++	ppe->ct_pair_gdm_owned = true;
++	for (i = AIROHA_GDM1_IDX; i <= AIROHA_GDM4_IDX; i++) {
++		u32 value = airoha_ct_pair_gdm_route(ppe->ct_pair_gdm_saved[i - 1]);
++
++		airoha_fe_wr(eth, REG_GDM_FWD_CFG(i), value);
++		if (airoha_fe_rr(eth, REG_GDM_FWD_CFG(i)) != value)
++			return -EIO;
++	}
++	return 0;
++}
++
++static int airoha_ct_pair_gdm_stop(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	int i;
++
++	if (!ppe->ct_pair_gdm_owned)
++		return 0;
++	for (i = AIROHA_GDM1_IDX; i <= AIROHA_GDM4_IDX; i++) {
++		airoha_fe_wr(eth, REG_GDM_FWD_CFG(i), ppe->ct_pair_gdm_saved[i - 1]);
++		if (airoha_fe_rr(eth, REG_GDM_FWD_CFG(i)) != ppe->ct_pair_gdm_saved[i - 1])
++			return -EIO;
++	}
++	ppe->ct_pair_gdm_owned = false;
++	return 0;
++}
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_pair_policy.h
+@@ -0,0 +1,176 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include <net/netfilter/nf_native_pair.h>
++#include <net/netns/generic.h>
++#include <linux/netfilter.h>
++#include <linux/netfilter_bridge.h>
++#include <linux/netfilter_ipv4.h>
++
++static int airoha_ct_pair_policy_event(struct notifier_block *nb,
++				       unsigned long event, void *unused)
++{
++	struct airoha_ppe *ppe = container_of(nb, struct airoha_ppe, ct_pair_policy_notifier);
++	int err = 0;
++
++	spin_lock_bh(&ppe_lock);
++	ppe->ct_pair_policy_allowed = false;
++	if (event == NF_NATIVE_PAIR_PRE && airoha_ct_pair_any(ppe))
++		err = airoha_ct_native_pair_revoke(ppe, -1, 0);
++	spin_unlock_bh(&ppe_lock);
++	return notifier_from_errno(err);
++}
++
++/* Only the three tagged native bridge conntrack hooks can join nft hooks.
++ * Ingress/egress callers pass -1 and never accept a bridge conntrack tag.
++ */
++static bool airoha_ct_pair_bridge_ct_hook(const struct nf_hook_ops *op,
++					 int bridge_hook)
++{
++	if (bridge_hook < 0 || op->hook_ops_type != NF_HOOK_OP_BRIDGE_CT ||
++	    op->pf != NFPROTO_BRIDGE || op->hooknum != (unsigned int)bridge_hook ||
++	    op->dev || op->priv || !op->hook)
++		return false;
++	if (bridge_hook == NF_BR_PRE_ROUTING)
++		return op->priority == NF_IP_PRI_CONNTRACK;
++	if (bridge_hook == NF_BR_LOCAL_IN || bridge_hook == NF_BR_POST_ROUTING)
++		return op->priority == NF_IP_PRI_CONNTRACK_CONFIRM;
++	return false;
++}
++
++static bool airoha_ct_pair_nft_hooks(struct nf_hook_entries *entries,
++				   int bridge_hook)
++{
++	struct nf_hook_ops **ops;
++	unsigned int i;
++
++	if (!entries)
++		return true;
++	ops = nf_hook_entries_get_hook_ops(entries);
++	for (i = 0; i < entries->num_hook_entries; i++)
++		if (ops[i]->hook_ops_type != NF_HOOK_OP_NF_TABLES &&
++		    ops[i]->hook_ops_type != NF_HOOK_OP_NFT_FT &&
++		    !airoha_ct_pair_bridge_ct_hook(ops[i], bridge_hook))
++			return false;
++	return true;
++}
++
++static bool airoha_ct_pair_policy_hooks(void)
++{
++	struct net_device *dev;
++	bool ok = true;
++	unsigned int h;
++
++	if (IS_ENABLED(CONFIG_BRIDGE_NETFILTER) || IS_ENABLED(CONFIG_NETFILTER_XTABLES) ||
++	    IS_ENABLED(CONFIG_NET_CLS_ACT))
++		return false;
++	rcu_read_lock();
++	for (h = 0; h < ARRAY_SIZE(init_net.nf.hooks_bridge); h++)
++		if (!airoha_ct_pair_nft_hooks(rcu_dereference(init_net.nf.hooks_bridge[h]), h))
++			ok = false;
++	/* INET ingress and NETDEV ingress share each device's hook head. */
++	for_each_netdev_rcu(&init_net, dev) {
++#ifdef CONFIG_NETFILTER_INGRESS
++		if (!airoha_ct_pair_nft_hooks(rcu_dereference(dev->nf_hooks_ingress), -1))
++			ok = false;
++#endif
++#ifdef CONFIG_NETFILTER_EGRESS
++		if (!airoha_ct_pair_nft_hooks(rcu_dereference(dev->nf_hooks_egress), -1))
++			ok = false;
++#endif
++#ifdef CONFIG_NET_XGRESS
++		if (rcu_access_pointer(dev->tcx_ingress) || rcu_access_pointer(dev->tcx_egress))
++			ok = false;
++#endif
++		if (dev_xdp_prog_count(dev))
++			ok = false;
++	}
++	rcu_read_unlock();
++	return ok;
++}
++
++static ssize_t ct_native_pair_policy_show(struct device *dev,
++					 struct device_attribute *attr, char *buf)
++{
++	struct airoha_eth *eth = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "generation=%llu allowed=%u failed=%u\n",
++			  nf_native_pair_policy_generation(),
++			  READ_ONCE(eth->ppe->ct_pair_policy_allowed),
++			  READ_ONCE(eth->ppe->ct_pair_failed));
++}
++
++static ssize_t ct_native_pair_policy_store(struct device *dev,
++					  struct device_attribute *attr,
++					  const char *buf, size_t len)
++{
++	struct airoha_eth *eth = dev_get_drvdata(dev);
++	struct airoha_ppe *ppe = eth->ppe;
++	unsigned long long generation;
++	char trailing;
++	int err;
++
++	if (!ppe->ct_native_pairs)
++		return -EOPNOTSUPP;
++	if (sysfs_streq(buf, "off")) {
++		spin_lock_bh(&ppe_lock);
++		ppe->ct_pair_policy_allowed = false;
++		err = ppe->ct_pair_token ? airoha_ct_native_pair_revoke(ppe, -1, 0) : 0;
++		spin_unlock_bh(&ppe_lock);
++		return err ?: len;
++	}
++	/* The caller has audited that every unicast IPv4/IPv6 packet between
++	 * these authorized WLAN MAC peers is permitted, without per-flow,
++	 * set/map, time, quota or state-dependent filtering.
++	 * Existing TCX/XDP is rejected; RAM sessions block new installation.
++	 */
++	if (sscanf(buf, "whole-mac-ip %llu %c", &generation, &trailing) != 1)
++		return -EINVAL;
++	err = nf_native_pair_policy_lock(generation);
++	if (err)
++		return err;
++	if (!airoha_ct_pair_policy_hooks()) {
++		err = -EOPNOTSUPP;
++		goto unlock;
++	}
++	spin_lock_bh(&ppe_lock);
++	if (!ppe->ct_host_ppe || ppe->ct_stopping || ppe->ct_pair_failed)
++		err = -ESHUTDOWN;
++	else {
++		struct airoha_ct_pair_msg cap = { .op = cpu_to_le16(AIROHA_CT_PAIR_CAP) };
++
++		err = airoha_ct_pair_send(ppe, &cap);
++		if (!err)
++			ppe->ct_pair_policy_allowed = true;
++	}
++	spin_unlock_bh(&ppe_lock);
++unlock:
++	nf_native_pair_policy_unlock();
++	return err ?: len;
++}
++static DEVICE_ATTR_RW(ct_native_pair_policy);
++
++static int airoha_ct_pair_policy_init(struct airoha_ppe *ppe)
++{
++	int err;
++
++	if (!ppe->ct_native_pairs)
++		return 0;
++	ppe->ct_pair_policy_notifier.notifier_call = airoha_ct_pair_policy_event;
++	err = nf_native_pair_register(&ppe->ct_pair_policy_notifier);
++	if (err)
++		return err;
++	err = device_create_file(ppe->eth->dev, &dev_attr_ct_native_pair_policy);
++	if (err)
++		nf_native_pair_unregister(&ppe->ct_pair_policy_notifier);
++	else
++		ppe->ct_pair_policy_registered = true;
++	return err;
++}
++
++static void airoha_ct_pair_policy_deinit(struct airoha_ppe *ppe)
++{
++	if (!ppe->ct_pair_policy_registered)
++		return;
++	device_remove_file(ppe->eth->dev, &dev_attr_ct_native_pair_policy);
++	nf_native_pair_unregister(&ppe->ct_pair_policy_notifier);
++	ppe->ct_pair_policy_registered = false;
++}
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -153,6 +153,8 @@
+ static void airoha_set_gdm_port_fwd_cfg(struct airoha_eth *eth, u32 addr,
+ 					u32 val)
+ {
++	if (val == FE_PSE_PORT_PPE1 && eth->ppe && eth->ppe->ct_native_pairs)
++		val = FE_PSE_PORT_PPE2;
+ 	airoha_fe_rmw(eth, addr, GDM_OCFQ_MASK,
+ 		      FIELD_PREP(GDM_OCFQ_MASK, val));
+ 	airoha_fe_rmw(eth, addr, GDM_MCFQ_MASK,
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -735,6 +735,8 @@
+ #define AIROHA_RXD4_PPE_CPU_REASON	GENMASK(20, 16)
+ #define AIROHA_RXD4_FOE_ENTRY		GENMASK(15, 0)
+ 
++struct airoha_ct_native_pair;
++
+ struct airoha_ppe {
+ 	struct airoha_ppe_dev dev;
+ 	struct airoha_eth *eth;
+@@ -751,6 +753,13 @@
+ 		bool cfg_owned;
+ 	} ct_ifc;
+ 	bool ct_host_ppe;
++	bool ct_native_pairs, ct_pair_failed, ct_pair_hw_stopped;
++	bool ct_pair_policy_allowed, ct_pair_policy_registered;
++	struct notifier_block ct_pair_policy_notifier;
++	u32 ct_pair_token;
++	u32 ct_pair_gdm_saved[4];
++	bool ct_pair_gdm_owned;
++	struct airoha_ct_native_pair *ct_pairs;
+ 	bool ct_bridge_failed;
+ 	struct notifier_block ct_bridge_notifier;
+ 	struct list_head ct_bridge_flows;
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -382,6 +382,47 @@
+ 	       READ_ONCE(npu->wlan_short_guard_verified);
+ }
+ 
++static int airoha_npu_ct_pair_cmd(struct airoha_npu *npu,
++				 struct airoha_ct_pair_msg *msg)
++{
++	struct {
++		__le32 command, function;
++		struct airoha_ct_pair_msg data;
++	} packet = {
++		.command = cpu_to_le32(NPU_OP_SET << 4),
++		.function = cpu_to_le32(AIROHA_CT_PAIR_FUNC),
++		.data = *msg,
++	};
++	struct airoha_ct_pair_msg reply = {};
++	int err;
++
++	if (!airoha_npu_wlan_short_guard_ready(npu) ||
++	    !of_property_read_bool(npu->dev->of_node, "airoha,connac2-rebuilt-ram-lab"))
++		return -EOPNOTSUPP;
++	packet.data.magic = cpu_to_le32(AIROHA_CT_PAIR_MAGIC);
++	packet.data.abi = cpu_to_le16(AIROHA_CT_PAIR_ABI);
++	packet.data.status = cpu_to_le32(-EINPROGRESS);
++	packet.data.caps = 0;
++	err = __airoha_npu_send_msg(npu, NPU_FUNC_WIFI, &packet, sizeof(packet),
++				    &reply, sizeof(reply));
++	if (err)
++		return err;
++	/* A stale/legacy success must never grant an endpoint pair. */
++	if (memcmp(&packet.data, &reply, offsetof(struct airoha_ct_pair_msg, status)))
++		return -EPROTO;
++	err = (s32)le32_to_cpu(reply.status);
++	/* Preparation has no capabilities yet; preserve its bounded retry. */
++	if (err == -EAGAIN && !le32_to_cpu(reply.caps))
++		return err;
++	if ((le32_to_cpu(reply.caps) & AIROHA_CT_PAIR_CAPS) != AIROHA_CT_PAIR_CAPS)
++		return -EPROTO;
++	if (err > 0)
++		return -EPROTO;
++	if (!err)
++		*msg = reply;
++	return err;
++}
++
+ static void airoha_npu_wlan_short_guard_clear(void *data)
+ {
+ 	struct airoha_npu *npu = data;
+@@ -864,6 +905,7 @@
+ 	npu->ops.ppe_flush_sram_entries = airoha_npu_ppe_flush_sram_entries;
+ 	npu->ops.ppe_foe_commit_entry = airoha_npu_foe_commit_entry;
+ 	npu->ops.wlan_short_guard_ready = airoha_npu_wlan_short_guard_ready;
++	npu->ops.ct_pair_cmd = airoha_npu_ct_pair_cmd;
+ 	npu->ops.wlan_init_reserved_memory = airoha_npu_wlan_init_memory;
+ 	npu->ops.wlan_send_msg = airoha_npu_wlan_msg_send;
+ 	npu->ops.wlan_get_msg = airoha_npu_wlan_msg_get;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -135,7 +135,8 @@
+ 	}
+ 	len += VLAN_ETH_HLEN;
+ 
+-	ppe_id = !airoha_is_lan_gdm_dev(dev) && airoha_ppe_is_enabled(eth, 1);
++	ppe_id = (!airoha_is_lan_gdm_dev(dev) || eth->ppe->ct_native_pairs) &&
++		 airoha_ppe_is_enabled(eth, 1);
+ 	index = port->id == AIROHA_GDM4_IDX ? 7 : port->id;
+ 	airoha_fe_rmw(eth, REG_PPE_MTU(ppe_id, index),
+ 		      FP_EGRESS_MTU_MASK(index),
+@@ -232,7 +233,7 @@
+ 			if (!dev)
+ 				continue;
+ 
+-			ppe_id = !airoha_is_lan_gdm_dev(dev) &&
++			ppe_id = (!airoha_is_lan_gdm_dev(dev) || ppe->ct_native_pairs) &&
+ 				 airoha_ppe_is_enabled(eth, 1);
+ 			fport = airoha_get_fe_port(dev);
+ 			airoha_ppe_set_cpu_port(dev, ppe_id, fport);
+@@ -1235,6 +1236,9 @@
+ /* Atomic switchdev notification: no mutex, allocation or source-MAC update.
+  * Cookies remain indexed and permanently dead until FT destroys them.
+  */
++#include "airoha_ct_native_pair.h"
++#include "airoha_ct_pair_policy.h"
++
+ static int airoha_ppe_ct_bridge_event(struct notifier_block *nb,
+ 				     unsigned long event, void *ptr)
+ {
+@@ -1243,6 +1247,12 @@
+ 	struct airoha_flow_table_entry *e;
+ 	int err = 0;
+ 
++	if (event == SWITCHDEV_BRIDGE_NATIVE_PAIR_FRAME) {
++		struct switchdev_notifier_native_pair_info *frame = ptr;
++
++		airoha_ct_native_pair_frame(ppe, frame->skb);
++		return NOTIFY_DONE;
++	}
+ 	if (event != SWITCHDEV_BRIDGE_FWD_PRE_CHANGE)
+ 		return NOTIFY_DONE;
+ 	spin_lock_bh(&ppe_lock);
+@@ -1254,6 +1264,11 @@
+ 	}
+ 	if (ppe->ct_stopping)
+ 		goto unlock;
++	err = airoha_ct_native_pair_revoke(ppe, -1, 0);
++	if (err) {
++		info->err = err;
++		goto unlock;
++	}
+ 	list_for_each_entry(e, &ppe->ct_bridge_flows, ct_bridge_node) {
+ 		e->ct_bridge_dead = true;
+ 		if (err) {
+@@ -1297,6 +1312,11 @@
+ 
+ 	spin_lock_bh(&ppe_lock);
+ 	ppe->ct_wlan_blocked[band][wcid] = true;
++	err = airoha_ct_native_pair_revoke(ppe, band, wcid);
++	if (err) {
++		spin_unlock_bh(&ppe_lock);
++		goto unlock;
++	}
+ 	if (ppe->ct_wlan_epoch[band][wcid] != U32_MAX)
+ 		ppe->ct_wlan_epoch[band][wcid]++;
+ 	spin_unlock_bh(&ppe_lock);
+@@ -1425,8 +1445,13 @@
+ 	/* Native L2B uses its learned key, not an IPv4/L4 software hash bucket. */
+ 	if (airoha_is_7581(ppe->eth) &&
+ 	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) ==
+-	    PPE_PKT_TYPE_BRIDGE)
++	    PPE_PKT_TYPE_BRIDGE) {
++		if (ppe->ct_native_pairs) {
++			airoha_ct_native_pair_bind(ppe, skb, hash, peer);
++			goto unlock;
++		}
+ 		goto l2_lookup;
++	}
+ 
+ 	index = airoha_ppe_foe_get_entry_hash(ppe, hwe);
+ 	hlist_for_each_entry_safe(e, n, &ppe->foe_flow[index], list) {
+@@ -2297,6 +2322,8 @@
+ #define CT_HOST_IP_FLOWS (PPE_FLOW_CFG_IP4_NAPT_MASK | PPE_FLOW_CFG_IP4_NAT_MASK | \
+ 			 PPE_FLOW_CFG_IP6_5T_ROUTE_MASK)
+ 
++#include "airoha_ct_pair_banks.h"
++
+ bool airoha_ppe_ct_requested(struct airoha_eth *eth)
+ {
+ 	return airoha_is_7581(eth) && of_machine_is_compatible("fiberhome,hg5585f-ct") &&
+@@ -2332,9 +2359,13 @@
+ 			err = -EBUSY;
+ 		} else if (entry->ib1 & AIROHA_FOE_IB1_BIND_STATE) {
+ 			u32 type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, entry->ib1);
+-
++			bool native_unb = ppe->ct_native_pairs && !bank && ppe->ct_owns_sram &&
++				type == PPE_PKT_TYPE_BRIDGE &&
++				FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, entry->ib1) == AIROHA_FOE_STATE_UNBIND;
++
++			/* All BIND native rows were exactly revoked before this sweep. */
+ 			if (op == CT_EXPECT_EMPTY ||
+-			    (type != PPE_PKT_TYPE_IPV4_HNAPT && type != PPE_PKT_TYPE_IPV4_ROUTE &&
++			    (!native_unb && type != PPE_PKT_TYPE_IPV4_HNAPT && type != PPE_PKT_TYPE_IPV4_ROUTE &&
+ 			     type != PPE_PKT_TYPE_IPV6_ROUTE_5T)) {
+ 				err = -EBUSY;
+ 			} else if (op == CT_CLEAR_OWNED) {
+@@ -2535,8 +2566,10 @@
+ 	u32 val;
+ 
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+-		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(bank), CT_HOST_IP_FLOWS);
++		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(bank), airoha_ct_pair_flow_mask(ppe, bank));
+ 		airoha_fe_clear(eth, REG_PPE_GLO_CFG(bank), PPE_GLO_CFG_EN_MASK);
++		if (ppe->ct_native_pairs && airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)))
++			return -EIO;
+ 	}
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+ 		err = read_poll_timeout(airoha_fe_rr, val,
+@@ -2559,7 +2592,7 @@
+ 
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+ 		airoha_fe_rmw(eth, REG_PPE_TB_CFG(bank), PPE_TB_CFG_SEARCH_MISS_MASK, no_foe);
+-		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(bank), CT_HOST_IP_FLOWS);
++		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(bank), airoha_ct_pair_flow_mask(ppe, bank));
+ 	}
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+ 		u32 flow = airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank));
+@@ -2585,7 +2618,15 @@
+ 	bool live = ppe->ct_host_ppe && ppe->ct_owns_sram;
+ 	int bank, err;
+ 
++	WRITE_ONCE(ppe->ct_pair_policy_allowed, false);
+ 	WRITE_ONCE(ppe->ct_host_ppe, false);
++	if (ppe->ct_native_pairs && ppe->ct_pair_token) {
++		spin_lock_bh(&ppe_lock);
++		err = airoha_ct_native_pair_revoke(ppe, -1, 0);
++		spin_unlock_bh(&ppe_lock);
++		if (err)
++			return err;
++	}
+ 	err = live ? airoha_ppe_ct_stop_learning(ppe) : airoha_ppe_ct_quiesce(ppe);
+ 	if (err)
+ 		return err;
+@@ -2612,9 +2653,24 @@
+ 		return err;
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++)
+ 		airoha_ppe_ct_regs(ppe, bank, true);
++	for (bank = 0; ppe->ct_native_pairs && bank < eth->soc->num_ppe; bank++) {
++		unsigned int idx;
++
++		for (idx = 0; idx < ARRAY_SIZE(ct_bank0_regs); idx++)
++			if (airoha_fe_rr(eth, ct_bank0_regs[idx] + bank * (PPE2_BASE - PPE1_BASE)) !=
++			    ppe->ct_saved[bank].regs[idx])
++				return -EIO;
++	}
++	err = airoha_ct_pair_gdm_stop(ppe);
++	if (err)
++		return err;
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++)
+ 		airoha_fe_rmw(eth, REG_PPE_GLO_CFG(bank), PPE_GLO_CFG_EN_MASK,
+ 			      ppe->ct_saved[bank].glo & PPE_GLO_CFG_EN_MASK);
++	for (bank = 0; ppe->ct_native_pairs && bank < eth->soc->num_ppe; bank++)
++		if ((airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank)) & PPE_GLO_CFG_EN_MASK) !=
++		    (ppe->ct_saved[bank].glo & PPE_GLO_CFG_EN_MASK))
++			return -EIO;
+ 	ppe->ct_restore_pending = false;
+ 	return 0;
+ }
+@@ -2647,6 +2703,13 @@
+ 	struct airoha_eth *eth = ppe->eth;
+ 	int bank, err;
+ 
++	if (ppe->ct_native_pairs) {
++		struct airoha_ct_pair_msg cap = { .op = cpu_to_le16(AIROHA_CT_PAIR_CAP) };
++
++		err = airoha_ct_pair_exchange(npu, &cap);
++		if (err)
++			return err;
++	}
+ 	if (of_property_read_bool(eth->dev->of_node, "airoha,connac2-ppe-probe-seed") &&
+ 	    (!ppe->ct_probe_seed_attempted || !ppe->ct_probe_seed_verified))
+ 		return -EUCLEAN;
+@@ -2699,10 +2762,13 @@
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++)
+ 		airoha_fe_set(eth, REG_PPE_GLO_CFG(bank), PPE_GLO_CFG_EN_MASK);
+ 	airoha_ppe_hw_init_ports(ppe);
++	err = airoha_ct_pair_gdm_start(ppe);
++	if (err)
++		goto rollback;
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+-		airoha_fe_set(eth, REG_PPE_PPE_FLOW_CFG(bank), CT_HOST_IP_FLOWS);
++		airoha_fe_set(eth, REG_PPE_PPE_FLOW_CFG(bank), airoha_ct_pair_flow_mask(ppe, bank));
+ 		if (!airoha_ppe_is_enabled(eth, bank) ||
+-		    airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)) != CT_HOST_IP_FLOWS)
++		    airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(bank)) != airoha_ct_pair_flow_mask(ppe, bank))
+ 			goto rollback;
+ 	}
+ 	WRITE_ONCE(ppe->ct_host_ppe, true);
+@@ -3057,6 +3123,20 @@
+ 	INIT_LIST_HEAD(&ppe->ct_bridge_flows);
+ 	eth->ppe = ppe;
+ 
++	if (of_property_read_bool(eth->dev->of_node, "airoha,connac2-ram-native-pairs")) {
++		struct device_node *np = of_parse_phandle(eth->dev->of_node, "airoha,npu", 0);
++		bool ram_lab = np && of_property_read_bool(np, "airoha,connac2-rebuilt-ram-lab");
++
++		of_node_put(np);
++		if (!ram_lab || !airoha_ppe_ct_requested(eth))
++			return -EOPNOTSUPP;
++		ppe->ct_pairs = devm_kcalloc(eth->dev, AIROHA_CT_PAIR_SLOTS,
++					    sizeof(*ppe->ct_pairs), GFP_KERNEL);
++		if (!ppe->ct_pairs)
++			return -ENOMEM;
++		ppe->ct_native_pairs = true;
++	}
++
+ 	ppe_num_entries = airoha_ppe_get_total_num_entries(ppe);
+ 	foe_size = ppe_num_entries * sizeof(struct airoha_foe_entry);
+ 	ppe->foe = dmam_alloc_coherent(eth->dev, foe_size, &ppe->foe_dma,
+@@ -3112,6 +3192,8 @@
+ 	}
+ 
+ 	err = airoha_ppe_debugfs_init(ppe);
++	if (!err)
++		err = airoha_ct_pair_policy_init(ppe);
+ 	if (err) {
+ 		if (airoha_ppe_ct_requested(eth))
+ 			unregister_switchdev_notifier(&ppe->ct_bridge_notifier);
+@@ -3132,6 +3214,7 @@
+ {
+ 	struct airoha_npu *npu;
+ 
++
+ 	if (airoha_ppe_ct_requested(eth))
+ 		unregister_switchdev_notifier(&eth->ppe->ct_bridge_notifier);
+ 
+@@ -3143,6 +3226,8 @@
+ 		spin_unlock_bh(&ppe_lock);
+ 	}
+ 
++	if (eth->ppe->ct_restore_pending)
++		airoha_ppe_ct_stop(eth->ppe);
+ 	npu = rcu_replace_pointer(eth->npu, NULL,
+ 				  lockdep_is_held(&flow_offload_mutex));
+ 	if (npu) {
+@@ -3150,12 +3235,11 @@
+ 		if (!eth->ppe->ct_restore_pending && !eth->ppe->ct_stopping)
+ 			npu->ops.ppe_deinit(npu);
+ 	}
+-	if (eth->ppe->ct_restore_pending)
+-		airoha_ppe_ct_stop(eth->ppe);
+ 	if (npu)
+ 		airoha_npu_put(npu);
+ 
+ 	mutex_unlock(&flow_offload_mutex);
++	airoha_ct_pair_policy_deinit(eth->ppe);
+ 
+ 	rhashtable_destroy(&eth->ppe->l2_flows);
+ 	rhashtable_destroy(&eth->flow_table);
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -100,6 +100,7 @@
+ 	NF_HOOK_OP_NF_TABLES,
+ 	NF_HOOK_OP_BPF,
+ 	NF_HOOK_OP_NFT_FT,
++	NF_HOOK_OP_BRIDGE_CT,
+ };
+ 
+ struct nf_hook_ops {
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -191,6 +191,33 @@
+ 	WLAN_FUNC_GET_WAIT_NPU_VERSION,
+ };
+ 
++/* Native WLAN endpoint pair ABI, independent of five-tuple flower cookies.
++ * Fixed little-endian 64-byte payload follows the 8-byte WLAN mailbox header.
++ */
++#define AIROHA_CT_PAIR_MAGIC 0x43545031
++#define AIROHA_CT_PAIR_ABI 1
++#define AIROHA_CT_PAIR_FUNC 34
++#define AIROHA_CT_PAIR_SLOTS 32
++#define AIROHA_CT_PAIR_CAPS 7
++enum airoha_ct_pair_op {
++	AIROHA_CT_PAIR_CAP = 0, AIROHA_CT_PAIR_PUT, AIROHA_CT_PAIR_DEL,
++	AIROHA_CT_PAIR_FLUSH, AIROHA_CT_PAIR_ENDPOINT_REVOKE,
++};
++struct airoha_ct_pair_msg {
++	__le32 magic;
++	__le16 abi, op;
++	__le32 slot, token;
++	__le64 generation;
++	__le32 src_epoch, dst_epoch;
++	__le16 src_wcid, dst_wcid;
++	u8 src_selector, dst_selector, src_bss, dst_bss;
++	u8 smac[6], dmac[6];
++	__le32 flags, status, caps;
++};
++static_assert(sizeof(struct airoha_ct_pair_msg) == 64);
++static_assert(offsetof(struct airoha_ct_pair_msg, smac) == 40);
++static_assert(offsetof(struct airoha_ct_pair_msg, status) == 56);
++
+ struct airoha_npu {
+ #if (IS_BUILTIN(CONFIG_NET_AIROHA_NPU) || IS_MODULE(CONFIG_NET_AIROHA_NPU))
+ 	struct device *dev;
+@@ -238,6 +265,7 @@
+ 		u32 (*wlan_get_irq_status)(struct airoha_npu *npu, int q);
+ 		void (*wlan_enable_irq)(struct airoha_npu *npu, int q);
+ 		void (*wlan_disable_irq)(struct airoha_npu *npu, int q);
++		int (*ct_pair_cmd)(struct airoha_npu *npu, struct airoha_ct_pair_msg *msg);
+ 	} ops;
+ #endif
+ };
+--- /dev/null
++++ b/include/net/netfilter/nf_native_pair.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _NET_NF_NATIVE_PAIR_H
++#define _NET_NF_NATIVE_PAIR_H
++#include <linux/notifier.h>
++#include <linux/types.h>
++/* Whole-MAC-pair RAM authorization is revoked before policy changes publish. */
++enum { NF_NATIVE_PAIR_PRE = 1, NF_NATIVE_PAIR_POST };
++int nf_native_pair_policy_begin(void);
++int nf_native_pair_bpf_begin(void);
++void nf_native_pair_bpf_end(void);
++void nf_native_pair_policy_end(void);
++u64 nf_native_pair_policy_generation(void);
++int nf_native_pair_policy_lock(u64 generation);
++void nf_native_pair_policy_unlock(void);
++int nf_native_pair_register(struct notifier_block *nb);
++void nf_native_pair_unregister(struct notifier_block *nb);
++#endif
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -232,6 +232,7 @@
+ 	SWITCHDEV_BRPORT_REPLAY,
+ 	SWITCHDEV_BRIDGE_FWD_PRE_CHANGE,
+ 	SWITCHDEV_BRIDGE_FWD_POST_CHANGE,
++	SWITCHDEV_BRIDGE_NATIVE_PAIR_FRAME,
+ };
+ 
+ struct switchdev_notifier_info {
+@@ -247,6 +248,13 @@
+ 	struct switchdev_notifier_info info;
+ 	int err;
+ };
++
++/* Successful software bridge egress; consumers validate current FDB/ports. */
++struct switchdev_notifier_native_pair_info {
++	struct switchdev_notifier_info info;
++	struct sk_buff *skb;
++};
++
+ 
+ struct switchdev_notifier_fdb_info {
+ 	struct switchdev_notifier_info info; /* must be first */
+--- a/kernel/bpf/tcx.c
++++ b/kernel/bpf/tcx.c
+@@ -1,3 +1,6 @@
++#include <net/netfilter/nf_native_pair.h>
++#include <net/netfilter/nf_native_pair.h>
++#include <net/netfilter/nf_native_pair.h>
+ // SPDX-License-Identifier: GPL-2.0
+ /* Copyright (c) 2023 Isovalent */
+ 
+@@ -7,7 +10,7 @@
+ 
+ #include <net/tcx.h>
+ 
+-int tcx_prog_attach(const union bpf_attr *attr, struct bpf_prog *prog)
++static int __native_tcx_prog_attach(const union bpf_attr *attr, struct bpf_prog *prog)
+ {
+ 	bool created, ingress = attr->attach_type == BPF_TCX_INGRESS;
+ 	struct net *net = current->nsproxy->net_ns;
+@@ -54,6 +57,18 @@
+ 		bpf_prog_put(replace_prog);
+ 	rtnl_unlock();
+ 	return ret;
++}
++
++int tcx_prog_attach(const union bpf_attr *attr, struct bpf_prog *prog)
++{
++	int err;
++
++	err = nf_native_pair_bpf_begin();
++	if (err)
++		return err;
++	err = __native_tcx_prog_attach(attr, prog);
++	nf_native_pair_bpf_end();
++	return err;
+ }
+ 
+ int tcx_prog_detach(const union bpf_attr *attr, struct bpf_prog *prog)
+@@ -200,7 +215,7 @@
+ 	rtnl_unlock();
+ }
+ 
+-static int tcx_link_update(struct bpf_link *link, struct bpf_prog *nprog,
++static int __native_tcx_link_update(struct bpf_link *link, struct bpf_prog *nprog,
+ 			   struct bpf_prog *oprog)
+ {
+ 	struct tcx_link *tcx = tcx_link(link);
+@@ -241,6 +256,19 @@
+ out:
+ 	rtnl_unlock();
+ 	return ret;
++}
++
++static int tcx_link_update(struct bpf_link *link, struct bpf_prog *nprog,
++			   struct bpf_prog *oprog)
++{
++	int err;
++
++	err = nf_native_pair_bpf_begin();
++	if (err)
++		return err;
++	err = __native_tcx_link_update(link, nprog, oprog);
++	nf_native_pair_bpf_end();
++	return err;
+ }
+ 
+ static void tcx_link_dealloc(struct bpf_link *link)
+@@ -307,7 +335,7 @@
+ 	return bpf_link_prime(&tcx->link, link_primer);
+ }
+ 
+-int tcx_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
++static int __native_tcx_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
+ {
+ 	struct net *net = current->nsproxy->net_ns;
+ 	struct bpf_link_primer link_primer;
+@@ -344,3 +372,15 @@
+ 	rtnl_unlock();
+ 	return ret;
+ }
++
++int tcx_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
++{
++	int err;
++
++	err = nf_native_pair_bpf_begin();
++	if (err)
++		return err;
++	err = __native_tcx_link_attach(attr, prog);
++	nf_native_pair_bpf_end();
++	return err;
++}
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -1037,17 +1037,24 @@
+ 		} else {
+ 			unsigned long now = jiffies;
+ 			bool fdb_modified = false;
+-
++			bool roaming = source != READ_ONCE(fdb->dst) &&
++				       !test_bit(BR_FDB_STICKY, &fdb->flags);
++
++			/* A learned move is cancellable. Keep the old destination,
++			 * activity state and notifications intact if revoke fails.
++			 */
++			if (roaming && br_flow_offload_begin(br->dev)) {
++				br_flow_offload_end(br->dev);
++				return;
++			}
+ 			if (now != READ_ONCE(fdb->updated)) {
+ 				WRITE_ONCE(fdb->updated, now);
+ 				fdb_modified = __fdb_mark_active(fdb);
+ 			}
+ 
+ 			/* fastpath: update of existing entry */
+-			if (unlikely(source != READ_ONCE(fdb->dst) &&
+-				     !test_bit(BR_FDB_STICKY, &fdb->flags))) {
++			if (unlikely(roaming)) {
+ 				br_switchdev_fdb_notify(br, fdb, RTM_DELNEIGH);
+-				br_flow_offload_begin(br->dev);
+ 				WRITE_ONCE(fdb->dst, source);
+ 				fdb_modified = true;
+ 				/* Take over HW learned entry */
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -15,6 +15,7 @@
+ #include <linux/skbuff.h>
+ #include <linux/if_vlan.h>
+ #include <linux/netfilter_bridge.h>
++#include <net/switchdev.h>
+ #include "br_private.h"
+ 
+ /* Don't forward packets to originating port or forwarding disabled */
+@@ -50,6 +51,16 @@
+ 
+ 	br_switchdev_frame_set_offload_fwd_mark(skb);
+ 
++	if (netif_is_bridge_port(skb->dev) && skb->skb_iif &&
++	    !is_multicast_ether_addr(eth_hdr(skb)->h_dest)) {
++		struct switchdev_notifier_native_pair_info info = { .skb = skb };
++
++		/* After both bridge netfilter hooks and final forwarding checks. */
++		rcu_read_lock();
++		call_switchdev_notifiers(SWITCHDEV_BRIDGE_NATIVE_PAIR_FRAME,
++					 skb->dev, &info.info, NULL);
++		rcu_read_unlock();
++	}
+ 	dev_queue_xmit(skb);
+ 
+ 	return 0;
+--- a/net/bridge/netfilter/nf_conntrack_bridge.c
++++ b/net/bridge/netfilter/nf_conntrack_bridge.c
+@@ -566,18 +566,21 @@
+ 	{
+ 		.hook		= nf_ct_bridge_pre,
+ 		.pf		= NFPROTO_BRIDGE,
++		.hook_ops_type	= NF_HOOK_OP_BRIDGE_CT,
+ 		.hooknum	= NF_BR_PRE_ROUTING,
+ 		.priority	= NF_IP_PRI_CONNTRACK,
+ 	},
+ 	{
+ 		.hook		= nf_ct_bridge_in,
+ 		.pf		= NFPROTO_BRIDGE,
++		.hook_ops_type	= NF_HOOK_OP_BRIDGE_CT,
+ 		.hooknum	= NF_BR_LOCAL_IN,
+ 		.priority	= NF_IP_PRI_CONNTRACK_CONFIRM,
+ 	},
+ 	{
+ 		.hook		= nf_ct_bridge_post,
+ 		.pf		= NFPROTO_BRIDGE,
++		.hook_ops_type	= NF_HOOK_OP_BRIDGE_CT,
+ 		.hooknum	= NF_BR_POST_ROUTING,
+ 		.priority	= NF_IP_PRI_CONNTRACK_CONFIRM,
+ 	},
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -1,3 +1,5 @@
++#include <net/netfilter/nf_native_pair.h>
++#include <net/netfilter/nf_native_pair.h>
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ /*
+  *      NET3    Protocol independent device support routines.
+@@ -10415,7 +10417,7 @@
+ 	}
+ }
+ 
+-static int dev_xdp_attach(struct net_device *dev, struct netlink_ext_ack *extack,
++static int __native_dev_xdp_attach(struct net_device *dev, struct netlink_ext_ack *extack,
+ 			  struct bpf_xdp_link *link, struct bpf_prog *new_prog,
+ 			  struct bpf_prog *old_prog, u32 flags)
+ {
+@@ -10512,6 +10514,22 @@
+ 		bpf_prog_put(cur_prog);
+ 
+ 	return 0;
++}
++
++static int dev_xdp_attach(struct net_device *dev, struct netlink_ext_ack *extack,
++			  struct bpf_xdp_link *link, struct bpf_prog *new_prog,
++			  struct bpf_prog *old_prog, u32 flags)
++{
++	int err;
++
++	if (!(link || new_prog))
++		return __native_dev_xdp_attach(dev, extack, link, new_prog, old_prog, flags);
++	err = nf_native_pair_bpf_begin();
++	if (err)
++		return err;
++	err = __native_dev_xdp_attach(dev, extack, link, new_prog, old_prog, flags);
++	nf_native_pair_bpf_end();
++	return err;
+ }
+ 
+ static int dev_xdp_attach_link(struct net_device *dev,
+@@ -10601,7 +10619,7 @@
+ 	return 0;
+ }
+ 
+-static int bpf_xdp_link_update(struct bpf_link *link, struct bpf_prog *new_prog,
++static int __native_bpf_xdp_link_update(struct bpf_link *link, struct bpf_prog *new_prog,
+ 			       struct bpf_prog *old_prog)
+ {
+ 	struct bpf_xdp_link *xdp_link = container_of(link, struct bpf_xdp_link, link);
+@@ -10649,6 +10667,19 @@
+ 
+ out_unlock:
+ 	rtnl_unlock();
++	return err;
++}
++
++static int bpf_xdp_link_update(struct bpf_link *link, struct bpf_prog *new_prog,
++			       struct bpf_prog *old_prog)
++{
++	int err;
++
++	err = nf_native_pair_bpf_begin();
++	if (err)
++		return err;
++	err = __native_bpf_xdp_link_update(link, new_prog, old_prog);
++	nf_native_pair_bpf_end();
+ 	return err;
+ }
+ 
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -27,6 +27,116 @@
+ #include <net/sock.h>
+ 
+ #include "nf_internals.h"
++#include <net/netfilter/nf_native_pair.h>
++
++/* Serialize explicit authorizations against every nft transaction. */
++static DEFINE_MUTEX(nf_native_pair_mutex);
++static BLOCKING_NOTIFIER_HEAD(nf_native_pair_chain);
++static u64 nf_native_pair_generation = 1;
++static unsigned int nf_native_pair_users;
++static atomic_t nf_native_pair_bpf_active = ATOMIC_INIT(0);
++
++u64 nf_native_pair_policy_generation(void)
++{
++	return READ_ONCE(nf_native_pair_generation);
++}
++EXPORT_SYMBOL_GPL(nf_native_pair_policy_generation);
++
++int nf_native_pair_policy_begin(void)
++{
++	int err;
++
++	mutex_lock(&nf_native_pair_mutex);
++	if (nf_native_pair_generation >= U64_MAX - 1) {
++		mutex_unlock(&nf_native_pair_mutex);
++		return -EOVERFLOW;
++	}
++	nf_native_pair_generation++;
++	err = notifier_to_errno(blocking_notifier_call_chain(&nf_native_pair_chain,
++						NF_NATIVE_PAIR_PRE, NULL));
++	if (err) {
++		blocking_notifier_call_chain(&nf_native_pair_chain, NF_NATIVE_PAIR_POST, NULL);
++		nf_native_pair_generation++;
++		mutex_unlock(&nf_native_pair_mutex);
++	}
++	return err;
++}
++EXPORT_SYMBOL_GPL(nf_native_pair_policy_begin);
++
++void nf_native_pair_policy_end(void)
++{
++	lockdep_assert_held(&nf_native_pair_mutex);
++	nf_native_pair_generation++;
++	blocking_notifier_call_chain(&nf_native_pair_chain, NF_NATIVE_PAIR_POST, NULL);
++	mutex_unlock(&nf_native_pair_mutex);
++}
++EXPORT_SYMBOL_GPL(nf_native_pair_policy_end);
++
++int nf_native_pair_policy_lock(u64 generation)
++{
++	mutex_lock(&nf_native_pair_mutex);
++	if (!generation || generation != nf_native_pair_generation) {
++		mutex_unlock(&nf_native_pair_mutex);
++		return -ESTALE;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nf_native_pair_policy_lock);
++
++void nf_native_pair_policy_unlock(void)
++{
++	mutex_unlock(&nf_native_pair_mutex);
++}
++EXPORT_SYMBOL_GPL(nf_native_pair_policy_unlock);
++
++int nf_native_pair_register(struct notifier_block *nb)
++{
++	int err;
++
++	mutex_lock(&nf_native_pair_mutex);
++	if (atomic_read(&nf_native_pair_bpf_active))
++		err = -EBUSY;
++	else
++		err = blocking_notifier_chain_register(&nf_native_pair_chain, nb);
++	if (!err)
++		nf_native_pair_users++;
++	mutex_unlock(&nf_native_pair_mutex);
++	return err;
++}
++EXPORT_SYMBOL_GPL(nf_native_pair_register);
++
++void nf_native_pair_unregister(struct notifier_block *nb)
++{
++	mutex_lock(&nf_native_pair_mutex);
++	blocking_notifier_chain_unregister(&nf_native_pair_chain, nb);
++	nf_native_pair_users--;
++	mutex_unlock(&nf_native_pair_mutex);
++}
++EXPORT_SYMBOL_GPL(nf_native_pair_unregister);
++
++/* Native RAM sessions exclude dynamic XDP/TCX installation. Some callers
++ * hold RTNL: never wait here on a policy transaction that can take RTNL.
++ */
++int nf_native_pair_bpf_begin(void)
++{
++	if (!mutex_trylock(&nf_native_pair_mutex))
++		return -EBUSY;
++	if (nf_native_pair_users) {
++		mutex_unlock(&nf_native_pair_mutex);
++		return -EOPNOTSUPP;
++	}
++	atomic_inc(&nf_native_pair_bpf_active);
++	mutex_unlock(&nf_native_pair_mutex);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nf_native_pair_bpf_begin);
++
++void nf_native_pair_bpf_end(void)
++{
++	atomic_dec(&nf_native_pair_bpf_active);
++}
++EXPORT_SYMBOL_GPL(nf_native_pair_bpf_end);
++
+ 
+ const struct nf_ipv6_ops __rcu *nf_ipv6_ops __read_mostly;
+ EXPORT_SYMBOL_GPL(nf_ipv6_ops);
+@@ -426,6 +536,15 @@
+ 	if (!pp)
+ 		return -EINVAL;
+ 
++	/* Non-nft bridge/ingress policies invalidate the explicit pair contract. */
++	if ((pf == NFPROTO_BRIDGE || pf == NFPROTO_NETDEV ||
++	     (pf == NFPROTO_INET && reg->hooknum == NF_INET_INGRESS)) &&
++	    reg->hook_ops_type != NF_HOOK_OP_NF_TABLES &&
++	    reg->hook_ops_type != NF_HOOK_OP_NFT_FT) {
++		err = nf_native_pair_policy_begin();
++		if (err)
++			return err;
++	}
+ 	mutex_lock(&nf_hook_mutex);
+ 
+ 	p = nf_entry_dereference(*pp);
+@@ -437,6 +556,11 @@
+ 	}
+ 
+ 	mutex_unlock(&nf_hook_mutex);
++	if ((pf == NFPROTO_BRIDGE || pf == NFPROTO_NETDEV ||
++	     (pf == NFPROTO_INET && reg->hooknum == NF_INET_INGRESS)) &&
++	    reg->hook_ops_type != NF_HOOK_OP_NF_TABLES &&
++	    reg->hook_ops_type != NF_HOOK_OP_NFT_FT)
++		nf_native_pair_policy_end();
+ 	if (IS_ERR(new_hooks))
+ 		return PTR_ERR(new_hooks);
+ 
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -14,6 +14,7 @@
+ #include <linux/rhashtable.h>
+ #include <linux/audit.h>
+ #include <linux/netfilter.h>
++#include <net/netfilter/nf_native_pair.h>
+ #include <linux/netfilter/nfnetlink.h>
+ #include <linux/netfilter/nf_tables.h>
+ #include <net/netfilter/nf_flow_table.h>
+@@ -10936,8 +10937,15 @@
+ 	/* must be last, so audit and chain blob set up does not leave hardware
+ 	 * in consistent state.
+ 	 */
++	err = nf_native_pair_policy_begin();
++	if (err) {
++		nf_tables_commit_chain_prepare_cancel(net);
++		nf_tables_commit_audit_free(&adl);
++		return err;
++	}
+ 	err = nft_flow_rule_offload_commit(net);
+ 	if (err < 0) {
++		nf_native_pair_policy_end();
+ 		nf_tables_commit_chain_prepare_cancel(net);
+ 		nf_tables_commit_audit_free(&adl);
+ 		return err;
+@@ -11172,6 +11180,7 @@
+ 
+ 	nft_gc_seq_end(nft_net, gc_seq);
+ 	nft_net->validate_state = NFT_VALIDATE_SKIP;
++	nf_native_pair_policy_end();
+ 	nf_tables_commit_release(net);
+ 
+ 	return 0;
+@@ -12067,7 +12076,8 @@
+ 	struct netlink_notify *n = ptr;
+ 	struct net *net = n->net;
+ 	unsigned int deleted;
+-	bool restart = false;
++	bool restart = false, pair_policy = false;
++	int err;
+ 	unsigned int gc_seq;
+ 
+ 	if (event != NETLINK_URELEASE || n->protocol != NETLINK_NETFILTER)
+@@ -12076,6 +12086,29 @@
+ 	nft_net = nft_pernet(net);
+ 	deleted = 0;
+ 	mutex_lock(&nft_net->commit_mutex);
++	list_for_each_entry(table, &nft_net->tables, list) {
++		if (nft_table_has_owner(table) && n->portid == table->nlpid &&
++		    !(table->flags & NFT_TABLE_F_PERSIST)) {
++			err = nf_native_pair_policy_begin();
++			if (err) {
++				/* Socket release has no retry. Retain policy, detach the
++				 * dead owner so reuse of its portid cannot inherit it.
++				 */
++				list_for_each_entry(table, &nft_net->tables, list) {
++					if (nft_table_has_owner(table) && n->portid == table->nlpid) {
++						table->flags &= ~NFT_TABLE_F_OWNER;
++						table->flags |= NFT_TABLE_F_PERSIST;
++						table->nlpid = 0;
++					}
++				}
++				pr_warn_ratelimited("native pair revoke failed: nft tables retained without owner (%d)\n", err);
++				mutex_unlock(&nft_net->commit_mutex);
++				return notifier_from_errno(err);
++			}
++			pair_policy = true;
++			break;
++		}
++	}
+ 
+ 	gc_seq = nft_gc_seq_begin(nft_net);
+ 
+@@ -12105,6 +12138,8 @@
+ 			goto again;
+ 	}
+ 	nft_gc_seq_end(nft_net, gc_seq);
++	if (pair_policy)
++		nf_native_pair_policy_end();
+ 
+ 	mutex_unlock(&nft_net->commit_mutex);
+ 
