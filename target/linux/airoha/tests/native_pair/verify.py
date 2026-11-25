@@ -4,13 +4,15 @@ r=Path(__file__).resolve().parent;b=r/'build';b.mkdir(exist_ok=True)
 policy=(r/'airoha_ct_pair_policy.h').read_text();a=policy.index('static int airoha_ct_pair_policy_event(');z=policy.index('static bool airoha_ct_pair_bridge_ct_hook',a);(b/'pair_policy_event.inc').write_text(policy[a:z])
 h=(r/'candidate/drivers/net/ethernet/airoha/airoha_eth.h').read_text()
 a=h.index('enum {\n\tAIROHA_FOE_STATE_INVALID,');z=h.index('struct airoha_foe_stats {',a);(b/'foe_layout.inc').write_text(h[a:z])
-h=(r/'candidate/include/linux/soc/airoha/airoha_offload.h').read_text();a=h.index('/* Native WLAN endpoint pair ABI');z=h.index('struct airoha_npu {',a);(b/'pair_abi.inc').write_text(h[a:z])
+h=(r/'candidate/include/linux/soc/airoha/airoha_offload.h').read_text();a=h.index('/* Native endpoint pair ABI');z=h.index('struct airoha_npu {',a);(b/'pair_abi.inc').write_text(h[a:z])
 def function(text, signature):
  a=text.index(signature);brace=text.index('{',a);depth=0
  for z in range(brace,len(text)):
   depth+=(text[z]=='{')-(text[z]=='}')
   if depth==0:return text[a:z+1]
  raise AssertionError(signature)
+cfg=(r/'candidate/include/net/cfg80211.h').read_text()
+(b/'wiphy_dev.inc').write_text(function(cfg,'static inline struct device *wiphy_dev(')+'\n')
 bridge=(r/'candidate/net/bridge/br_switchdev.c').read_text()
 (b/'bridge_fdb_lookup.inc').write_text(function(bridge,'static bool br_switchdev_fdb_notifies(')+'\n'+function(bridge,'struct net_device *br_switchdev_fdb_find_port(')+'\n')
 forward=(r/'candidate/net/bridge/br_forward.c').read_text();a=forward.index('\tif (netif_is_bridge_port(skb->dev) && skb->skb_iif &&');z=forward.index('\tdev_queue_xmit(skb);',a)

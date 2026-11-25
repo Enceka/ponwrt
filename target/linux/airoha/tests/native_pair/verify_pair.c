@@ -25,6 +25,11 @@ typedef int32_t s32;typedef u16 __le16;typedef u32 __le32;typedef u64 __le64;
 #undef static_assert
 #define static_assert(x) _Static_assert(x,#x)
 #define FE_PSE_PORT_GDM3 3
+#define FE_PSE_PORT_GDM4 9
+#define AIROHA_GDM4_IDX 4
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
+#define NOTIFY_DONE 0
+enum {NETDEV_GOING_DOWN=1,NETDEV_DOWN,NETDEV_UNREGISTER,NETDEV_CHANGE,NETDEV_PRE_CHANGEADDR,NETDEV_PRECHANGEMTU,NETDEV_PRECHANGEUPPER,NETDEV_UP,NETDEV_CHANGEADDR,NETDEV_CHANGEMTU,NETDEV_CHANGEUPPER};
 #define PPE_SRAM_NUM_ENTRIES 8192
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86dd
@@ -40,15 +45,27 @@ struct notifier_block {int unused;};
 #define notifier_from_errno(e) (e)
 enum{NF_NATIVE_PAIR_PRE=1,NF_NATIVE_PAIR_POST};
 struct airoha_npu {struct {int(*ct_pair_cmd)(struct airoha_npu*,struct airoha_ct_pair_msg*);}ops;};
-struct airoha_eth {struct airoha_npu*npu;};
+struct airoha_gdm_port; struct device;
+struct airoha_eth {struct airoha_npu*npu;struct airoha_gdm_port*ports[4];struct device*dev;};
 struct airoha_ppe {struct airoha_eth*eth;bool ct_native_pairs,ct_pair_failed,ct_host_ppe,ct_stopping,ct_pair_policy_allowed,ct_pair_hw_stopped;
- struct notifier_block ct_pair_policy_notifier;
+ struct notifier_block ct_pair_policy_notifier,ct_pair_wired_notifier;u32 ct_pair_wired_epoch;bool ct_pair_wired_blocked;
  u32 ct_pair_token,ct_wlan_epoch[2][151];bool ct_wlan_blocked[2][151];struct airoha_ct_native_pair*ct_pairs;};
 struct airoha_wdma_info {u8 idx,bss;u16 wcid;};
 struct airoha_ct_bridge_peer {u32 epoch;u16 wcid;u8 band,bss;};
-struct device {void*parent;};struct wiphy {struct device dev;};struct wireless_dev {struct wiphy*wiphy;};
+struct device_node {int id;};
+struct device {struct device*parent;struct device_node*of_node;};struct wiphy {struct device dev;};struct wireless_dev {struct wiphy*wiphy;};
 struct net_device {struct wireless_dev*ieee80211_ptr;struct net_device*master;
- int ifindex,state;u32 flags;bool bridge,master_bridge,vlan;struct airoha_wdma_info wdma;int wdma_err;};
+ int ifindex,state;u32 flags;bool bridge,master_bridge,vlan,running,carrier;struct airoha_wdma_info wdma;int wdma_err;};
+struct airoha_gdm_dev {int nbq;struct net_device*netdev;};
+struct airoha_gdm_port {int id;struct airoha_gdm_dev*devs[2];};
+static bool airoha_is_7581(struct airoha_eth*eth){return !!eth;}
+static struct net_device*netdev_from_priv(struct airoha_gdm_dev*d){return d->netdev;}
+static bool netif_running(struct net_device*d){return d->running;}
+static bool netif_carrier_ok(struct net_device*d){return d->carrier;}
+static struct net_device*netdev_notifier_info_to_dev(void*p){return p;}
+static struct device_node*phandle,*phandle_input;
+static struct device_node*of_parse_phandle(struct device_node*n,const char*key,int i){assert(!strcmp(key,"airoha,eth")&&!i);return n&&n==phandle_input?phandle:NULL;}
+static void of_node_put(struct device_node*n){(void)n;}
 struct ethhdr {u8 h_dest[6],h_source[6];u16 h_proto;};
 struct sk_buff {struct net_device*dev;int skb_iif;bool vlan;struct ethhdr hdr;};
 static int ppe_lock,rcu;
@@ -110,7 +127,7 @@ static struct net_bridge_fdb_entry*br_fdb_find_rcu(struct net_bridge*b,const u8*
  ports[i].dev=d;entries[i]=(struct net_bridge_fdb_entry){.dst=&ports[i],.flags=fdb_flags[i]};return &entries[i];
 }
 #include "bridge_fdb_lookup.inc"
-static struct device*wiphy_dev(struct wiphy*w){return &w->dev;}
+#include "wiphy_dev.inc"
 static int airoha_ppe_get_wdma_info(struct net_device*d,const u8*a,struct airoha_wdma_info*w,bool bridge){assert(a&&bridge);*w=d->wdma;return d->wdma_err;}
 static u32 airoha_ppe_ct_epoch_locked(struct airoha_ppe*p,u8 b,u16 w){assert(ppe_lock&&b<2&&w<151);return p->ct_wlan_blocked[b][w]||p->ct_wlan_epoch[b][w]==U32_MAX?0:p->ct_wlan_epoch[b][w]+1;}
 static int airoha_ppe_ct_bridge_fail_closed(struct airoha_ppe*p){assert(ppe_lock);p->ct_stopping=true;failclosed++;return stop_error;}
@@ -121,9 +138,13 @@ static int mock_send(struct airoha_npu*n,struct airoha_ct_pair_msg*m){assert(n&&
 #include "pair_policy_event.inc"
 static struct airoha_ct_native_pair pairs[32];
 static struct airoha_npu npu={.ops.ct_pair_cmd=mock_send};
-static struct airoha_eth eth={.npu=&npu};
+static struct device_node eth_node={1},wifi_node={2};
+static struct device pci_bridge;
+static struct device eth_dev={.of_node=&eth_node},wifi_dev={.parent=&pci_bridge,.of_node=&wifi_node};
+static struct airoha_eth eth={.npu=&npu,.dev=&eth_dev};
+static struct airoha_gdm_dev wired;static struct airoha_gdm_port gdm4;
 static struct airoha_ppe ppe;
-static struct wiphy phy={.dev.parent=(void*)1};static struct wireless_dev wd={.wiphy=&phy};
+static struct wiphy phy={.dev.parent=&wifi_dev};static struct wireless_dev wd={.wiphy=&phy};
 static struct net_device master,src,dst;
 static struct sk_buff skb;
 static void reset(void){
@@ -131,6 +152,7 @@ static void reset(void){
  ppe_lock=rcu=0;napi=false;fdb_reads=fdb_reads_locked=fdb_move=0;fdb_flags[0]=fdb_flags[1]=0;ticks=0;generation=1;writes=reads=failclosed=calls=put_count=retries=0;send_error=read_error=write_error=stop_error=0;barrier_complete=false;
  master=(struct net_device){.master_bridge=true};src=(struct net_device){.ieee80211_ptr=&wd,.master=&master,.ifindex=1,.state=3,.bridge=true,.wdma={0,2,7}};
  dst=(struct net_device){.ieee80211_ptr=&wd,.master=&master,.ifindex=2,.state=3,.bridge=true,.wdma={1,3,8}};
+ wired=(struct airoha_gdm_dev){.nbq=0,.netdev=&dst};gdm4=(struct airoha_gdm_port){.id=4,.devs={&wired}};eth.ports[3]=&gdm4;phandle=&eth_node;phandle_input=&wifi_node;wifi_dev.of_node=&wifi_node;phy.dev.parent=&wifi_dev;
  devices[1]=fdbsrc=&src;devices[2]=fdbdst=&dst;skb=(struct sk_buff){.dev=&dst,.skb_iif=1,.hdr={.h_source={2},.h_dest={4},.h_proto=htons(ETH_P_IP)}};
 }
 enum {SWITCHDEV_BRIDGE_NATIVE_PAIR_FRAME=42};
@@ -150,6 +172,8 @@ static void learned(u32 h){struct airoha_ct_pair_msg*m=&pairs[0].msg;rows[h]=(st
  rows[h].l2b.src_mac_hi=get_unaligned_be32(m->smac);rows[h].l2b.src_mac_lo=get_unaligned_be16(m->smac+4);rows[h].l2b.dest_mac_hi=get_unaligned_be32(m->dmac);rows[h].l2b.dest_mac_lo=get_unaligned_be16(m->dmac+4);rows[h].l2b.key=0xa55a1234;}
 static void test_bind(u32 h,struct airoha_ct_bridge_peer*peer){spin_lock_bh(&ppe_lock);airoha_ct_native_pair_bind(&ppe,&skb,h,peer);spin_unlock_bh(&ppe_lock);}
 static int revoke(int band,u16 wcid){int e;spin_lock_bh(&ppe_lock);e=airoha_ct_native_pair_revoke(&ppe,band,wcid);spin_unlock_bh(&ppe_lock);return e;}
+static void wired_reset(void){reset();dst.ieee80211_ptr=NULL;dst.running=dst.carrier=true;}
+static int wired_event(unsigned long event){return airoha_ct_pair_wired_event(&ppe.ct_pair_wired_notifier,event,&dst);}
 int main(void){
  unsigned cases=0;
  for(unsigned mode=0;mode<24;mode++){
@@ -189,5 +213,41 @@ int main(void){
  reset();struct airoha_ct_pair_msg cap={.op=AIROHA_CT_PAIR_CAP};retries=5;assert(!airoha_ct_pair_exchange(&npu,&cap)&&calls==6&&!ppe_lock&&!rcu);cases++;
  reset();retries=20000;assert(airoha_ct_pair_exchange(&npu,&cap)==-ETIMEDOUT&&!ppe_lock&&!rcu);cases++;
  reset();send_error=-EPROTO;stop_error=-EBUSY;frame();assert(ppe.ct_pair_failed&&!ppe.ct_pair_hw_stopped);spin_lock_bh(&ppe_lock);assert(airoha_ct_pair_fail(&ppe,-EPROTO)==-EBUSY);spin_unlock_bh(&ppe_lock);cases++;
-  printf("PASS %u native host pair admission, bank0 binding, epoch, actual RCU FDB lookup, notifier lock scope, revoke barrier, row reuse, timeout and overflow cases\n",cases);
+ /* All existing WLAN pair cases above remain live. The wired cases execute
+  * the same compiled functions with real ABI and FOE layout declarations. */
+ for(unsigned mode=0;mode<17;mode++){
+  wired_reset();switch(mode){case 1:dst.running=false;break;case 2:dst.carrier=false;break;case 3:ppe.ct_pair_wired_blocked=true;break;case 4:ppe.ct_pair_wired_epoch=U32_MAX;break;case 5:eth.ports[3]=NULL;break;case 6:gdm4.id=3;break;case 7:wired.nbq=1;break;case 8:phandle=NULL;break;case 9:phandle=&wifi_node;break;case 10:fdbdst=&src;break;case 11:dst.state=0;break;case 12:dst.flags=BR_ISOLATED;break;case 13:master.vlan=true;break;case 14:src.ieee80211_ptr=NULL;break;case 15:src.wdma.wcid=151;break;case 16:ppe.ct_pair_policy_allowed=false;break;}
+  frame();assert(put_count==(mode==0));
+  if(!mode){assert(pairs[0].msg.src_selector==1&&pairs[0].msg.dst_selector==2&&pairs[0].msg.dst_wcid==24&&pairs[0].msg.dst_bss==0&&pairs[0].msg.dst_epoch==1);learned(0x912);test_bind(0x912,&peer);assert(writes==1);assert(FIELD_GET(AIROHA_FOE_IB2_PSE_PORT,rows[0x912].l2b.ib2)==9);assert(!FIELD_GET(AIROHA_FOE_IB2_NBQ,rows[0x912].l2b.ib2));assert(rows[0x912].l2b.ib2&AIROHA_FOE_IB2_FAST_PATH);assert(FIELD_GET(AIROHA_FOE_CHANNEL,rows[0x912].l2b.data)==4);assert(!rows[0x912].l2b.etype&&!(rows[0x912].ib1&AIROHA_FOE_IB1_BIND_TTL));assert(rows[0x912].l2b.key==0xa55a1234);}
+  cases++;
+ }
+ for(unsigned mode=0;mode<7;mode++){
+  wired_reset();frame();learned(0x912);switch(mode){case 1:dst.carrier=false;break;case 2:dst.running=false;break;case 3:ppe.ct_pair_wired_blocked=true;break;case 4:ppe.ct_pair_wired_epoch++;break;case 5:dst.ifindex++;break;case 6:eth.ports[3]=NULL;break;}test_bind(0x912,&peer);assert(writes==(mode==0));cases++;
+ }
+ const unsigned events[]={NETDEV_GOING_DOWN,NETDEV_DOWN,NETDEV_UNREGISTER,NETDEV_CHANGE,NETDEV_PRE_CHANGEADDR,NETDEV_PRECHANGEMTU,NETDEV_PRECHANGEUPPER};
+ for(unsigned i=0;i<ARRAY_SIZE(events);i++){
+  wired_reset();frame();learned(0x912);test_bind(0x912,&peer);retries=3;assert(!wired_event(events[i]));assert(lastmsg.op==AIROHA_CT_PAIR_ENDPOINT_REVOKE&&lastmsg.src_selector==2&&lastmsg.src_wcid==24&&lastmsg.src_epoch==1);assert(!pairs[0].used&&writes==2&&ppe.ct_pair_wired_epoch==1);assert(ppe.ct_pair_wired_blocked==(events[i]!=NETDEV_CHANGE));if(events[i]!=NETDEV_CHANGE){frame();assert(put_count==1);}assert(!wired_event(NETDEV_UP));frame();assert(put_count==2&&pairs[0].msg.dst_epoch==2);cases++;
+ }
+ wired_reset();assert(!wired_event(NETDEV_CHANGE)&&!calls&&ppe.ct_pair_wired_epoch==1&&!ppe.ct_pair_wired_blocked);cases++;
+ wired_reset();frame();learned(0x912);test_bind(0x912,&peer);dst.carrier=false;assert(!wired_event(NETDEV_CHANGE));assert(ppe.ct_pair_wired_blocked&&!pairs[0].used);assert(!wired_event(NETDEV_UP)&&ppe.ct_pair_wired_blocked);dst.carrier=true;assert(!wired_event(NETDEV_CHANGE)&&!ppe.ct_pair_wired_blocked);frame();assert(pairs[0].msg.dst_epoch==3);cases++;
+ wired_reset();frame();send_error=-ETIMEDOUT;assert(wired_event(NETDEV_GOING_DOWN)==-ETIMEDOUT&&ppe.ct_pair_failed&&ppe.ct_pair_wired_blocked&&ppe.ct_stopping&&ppe.ct_pair_wired_epoch==0);cases++;
+ wired_reset();ppe.ct_pair_wired_epoch=U32_MAX;assert(wired_event(NETDEV_CHANGE)==-EOVERFLOW&&ppe.ct_pair_failed&&ppe.ct_pair_wired_blocked&&!calls);cases++;
+ wired_reset();frame();learned(0x912);test_bind(0x912,&peer);assert(!airoha_ct_pair_policy_event(&ppe.ct_pair_policy_notifier,NF_NATIVE_PAIR_PRE,NULL));assert(!pairs[0].used&&!ppe.ct_pair_policy_allowed&&writes==2);cases++;
+ wired_reset();frame();learned(0x912);test_bind(0x912,&peer);assert(!revoke(-1,0)&&!pairs[0].used&&writes==2);generation++;frame();assert(put_count==2&&pairs[0].msg.generation==2);cases++;
+ wired_reset();frame();learned(0x912);test_bind(0x912,&peer);rows[0x912].l2b.ib2^=1;assert(!wired_event(NETDEV_DOWN)&&writes==1&&!pairs[0].used);cases++;
+ wired_reset();frame();assert(!airoha_ct_pair_wired_event(&ppe.ct_pair_wired_notifier,NETDEV_CHANGE,&src)&&put_count==1&&calls==1);cases++;
+ reset();frame();assert(!wired_event(NETDEV_CHANGE)&&pairs[0].used&&put_count==1&&calls==1);cases++;
+ /* Kernel wiphy_dev() returns the physical radio, not &wiphy->dev.
+  * Sharing a PCI bridge must never make different radios the same owner. */
+ struct wiphy phy2={.dev.parent=&wifi_dev};struct wireless_dev wd2={.wiphy=&phy2};
+ struct device_node wrong_node={3};
+ struct device radio2={.parent=&pci_bridge,.of_node=&wrong_node};
+ reset();dst.ieee80211_ptr=&wd2;frame();assert(put_count==1);cases++;
+ reset();phy2.dev.parent=&radio2;dst.ieee80211_ptr=&wd2;frame();assert(!put_count);cases++;
+ wired_reset();wifi_dev.of_node=NULL;frame();assert(!put_count);cases++;
+ wired_reset();phy.dev.parent=NULL;frame();assert(!put_count);cases++;
+ wired_reset();phy2.dev.parent=&radio2;src.ieee80211_ptr=&wd2;frame();assert(!put_count);cases++;
+ wired_reset();phandle_input=&wrong_node;pci_bridge.of_node=&wrong_node;frame();assert(!put_count);cases++;
+ reset();pci_bridge.of_node=NULL;
+ printf("PASS %u actual host native pair admission/binding/FDB/policy and wired endpoint/link epoch/revoke cases\n",cases);
 }

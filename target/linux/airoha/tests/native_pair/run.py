@@ -10,7 +10,7 @@ import sys
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--kernel-tree', required=True, type=Path,
-                    help='Linux source after the Airoha 951 and 952 patches')
+                    help='Linux source after the Airoha native-pair patches through 953')
 parser.add_argument('--output', required=True, type=Path,
                     help='New directory for extracted source, executables and reports')
 args = parser.parse_args()
@@ -33,7 +33,8 @@ end = core.index('EXPORT_SYMBOL_GPL(nf_native_pair_bpf_end);', start)
 end += len('EXPORT_SYMBOL_GPL(nf_native_pair_bpf_end);')
 (output / 'nf_native_pair_core.inc').write_text(core[start:end] + '\n')
 scripts = ['verify.py', 'verify_lifecycle.py', 'verify_wrapper.py', 'verify_bpf.py',
-           'verify_shutdown.py', 'verify_fdb.py', 'verify_bridge_ct.py', 'verify_audit.py']
+           'verify_shutdown.py', 'verify_fdb.py', 'verify_bridge_ct.py', 'verify_audit.py',
+           'verify_wired_mtu.py', 'verify_wired_notifier.py', 'verify_owner.py']
 for script in scripts:
     subprocess.run([sys.executable, str(output / script)], check=True)
 paths = ['drivers/net/ethernet/airoha/' + name for name in headers]
@@ -42,19 +43,19 @@ paths += ['drivers/net/ethernet/airoha/airoha_eth.h',
           'drivers/net/ethernet/airoha/airoha_ppe.c',
           'drivers/net/ethernet/airoha/airoha_regs.h',
           'include/linux/soc/airoha/airoha_offload.h', 'include/linux/netfilter.h',
-          'kernel/bpf/tcx.c', 'net/core/dev.c', 'net/netfilter/core.c',
+          'include/net/cfg80211.h', 'kernel/bpf/tcx.c', 'net/core/dev.c', 'net/netfilter/core.c',
           'net/bridge/br_fdb.c', 'net/bridge/br_switchdev.c', 'net/bridge/br_forward.c',
           'net/bridge/netfilter/nf_conntrack_bridge.c']
 report = {
     'passed': True,
-    'cases': 722,
-    'groups': {'pair': 77, 'policy_core': 11, 'bank_lifecycle': 223,
-               'mailbox_wrapper': 68, 'bpf': 16, 'shutdown': 3,
-               'fdb_roam': 6, 'bridge_ct_hooks': 298, 'nft_audit': 20},
+    'cases': 911,
+    'groups': {'pair': 123, 'policy_core': 11, 'bank_lifecycle': 223,
+               'mailbox_wrapper': 69, 'bpf': 16, 'shutdown': 3,
+               'fdb_roam': 6, 'bridge_ct_hooks': 298, 'nft_audit': 20, 'wired_mtu': 130, 'wired_notifier': 8, 'radio_owner': 4},
     'sanitizers': ['address', 'undefined'],
     'kernel_tree': str(source),
     'source_sha256': {name: hashlib.sha256((source / name).read_bytes()).hexdigest()
                       for name in paths},
 }
 (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
-print('PASS 722 native host cases; report: ' + str(output / 'report.json'))
+print('PASS 911 native host cases; report: ' + str(output / 'report.json'))

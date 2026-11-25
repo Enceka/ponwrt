@@ -1,0 +1,382 @@
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -756,6 +756,9 @@
+ 	bool ct_native_pairs, ct_pair_failed, ct_pair_hw_stopped;
+ 	bool ct_pair_policy_allowed, ct_pair_policy_registered;
+ 	struct notifier_block ct_pair_policy_notifier;
++	struct notifier_block ct_pair_wired_notifier;
++	bool ct_pair_wired_registered, ct_pair_wired_blocked;
++	u32 ct_pair_wired_epoch;
+ 	u32 ct_pair_token;
+ 	u32 ct_pair_gdm_saved[4];
+ 	bool ct_pair_gdm_owned;
+--- a/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
+@@ -84,6 +84,8 @@
+ static int airoha_ct_native_pair_revoke(struct airoha_ppe *ppe, int band, u16 wcid)
+ {
+ 	struct airoha_ct_pair_msg msg = {};
++	u32 *epoch = NULL;
++	u8 selector = 0;
+ 	int i, j, err;
+ 
+ 	lockdep_assert_held(&ppe_lock);
+@@ -91,11 +93,20 @@
+ 		return 0;
+ 	msg.op = cpu_to_le16(band < 0 ? AIROHA_CT_PAIR_FLUSH : AIROHA_CT_PAIR_ENDPOINT_REVOKE);
+ 	if (band >= 0) {
+-		if (ppe->ct_wlan_epoch[band][wcid] == U32_MAX)
++		if (band == AIROHA_CT_PAIR_LAN1_SELECTOR && wcid == AIROHA_CT_PAIR_LAN1_ID) {
++			selector = AIROHA_CT_PAIR_LAN1_SELECTOR;
++			epoch = &ppe->ct_pair_wired_epoch;
++		} else if (band <= 1 && wcid && wcid <= 150) {
++			selector = !band;
++			epoch = &ppe->ct_wlan_epoch[band][wcid];
++		} else {
++			return -EINVAL;
++		}
++		if (*epoch == U32_MAX)
+ 			return airoha_ct_pair_fail(ppe, -EOVERFLOW);
+-		msg.src_selector = !band;
++		msg.src_selector = selector;
+ 		msg.src_wcid = cpu_to_le16(wcid);
+-		msg.src_epoch = cpu_to_le32(ppe->ct_wlan_epoch[band][wcid] + 1);
++		msg.src_epoch = cpu_to_le32(*epoch + 1);
+ 	}
+ 	err = airoha_ct_pair_send(ppe, &msg);
+ 	if (err)
+@@ -104,8 +115,8 @@
+ 		struct airoha_ct_native_pair *pair = &ppe->ct_pairs[i];
+ 
+ 		if (!pair->used || (band >= 0 &&
+-		    !(pair->msg.src_selector == !band && le16_to_cpu(pair->msg.src_wcid) == wcid) &&
+-		    !(pair->msg.dst_selector == !band && le16_to_cpu(pair->msg.dst_wcid) == wcid)))
++		    !(pair->msg.src_selector == selector && le16_to_cpu(pair->msg.src_wcid) == wcid) &&
++		    !(pair->msg.dst_selector == selector && le16_to_cpu(pair->msg.dst_wcid) == wcid)))
+ 			continue;
+ 		for (j = 0; j < CT_PAIR_ROWS; j++) {
+ 			struct airoha_foe_entry *row, invalid;
+@@ -128,6 +139,54 @@
+ 	return 0;
+ }
+ 
++static struct net_device *airoha_ct_pair_lan1(struct airoha_ppe *ppe)
++{
++	struct airoha_gdm_port *port = ppe->eth->ports[AIROHA_GDM4_IDX - 1];
++	unsigned int i;
++
++	if (!airoha_is_7581(ppe->eth) || !port || port->id != AIROHA_GDM4_IDX)
++		return NULL;
++	for (i = 0; i < ARRAY_SIZE(port->devs); i++)
++		if (port->devs[i] && !port->devs[i]->nbq)
++			return netdev_from_priv(port->devs[i]);
++	return NULL;
++}
++
++static bool airoha_ct_pair_lan1_ready(struct airoha_ppe *ppe, struct net_device *dev)
++{
++	return !READ_ONCE(ppe->ct_pair_wired_blocked) && dev && dev == airoha_ct_pair_lan1(ppe) &&
++	       !dev->ieee80211_ptr && netif_running(dev) && netif_carrier_ok(dev);
++}
++
++static bool airoha_ct_pair_wlan_owner(struct airoha_ppe *ppe, struct net_device *dev)
++{
++	struct device *radio = wiphy_dev(dev->ieee80211_ptr->wiphy);
++	struct device_node *node;
++	bool same;
++
++	if (!radio)
++		return false;
++	node = of_parse_phandle(radio->of_node, "airoha,eth", 0);
++	same = node && node == ppe->eth->dev->of_node;
++	of_node_put(node);
++	return same;
++}
++
++static u8 airoha_ct_pair_dst_selector(const struct airoha_wdma_info *dst)
++{
++	return dst->idx == AIROHA_CT_PAIR_LAN1_SELECTOR ? dst->idx : !dst->idx;
++}
++
++static u32 airoha_ct_pair_dst_epoch(struct airoha_ppe *ppe, u8 selector, u16 id)
++{
++	lockdep_assert_held(&ppe_lock);
++	if (selector == AIROHA_CT_PAIR_LAN1_SELECTOR)
++		return id == AIROHA_CT_PAIR_LAN1_ID && ppe->ct_pair_wired_epoch != U32_MAX ?
++		       ppe->ct_pair_wired_epoch + 1 : 0;
++	return selector <= 1 && id && id <= 150 ?
++	       airoha_ppe_ct_epoch_locked(ppe, !selector, id) : 0;
++}
++
+ static bool airoha_ct_pair_peers(struct airoha_ppe *ppe, struct net_device *idev,
+ 				struct net_device *odev, const struct ethhdr *hdr,
+ 				struct airoha_wdma_info *src,
+@@ -136,7 +195,7 @@
+ 	struct net_device *master;
+ 
+ 	if (!idev || !odev || !net_eq(dev_net(idev), &init_net) ||
+-	    !net_eq(dev_net(odev), &init_net) || !idev->ieee80211_ptr || !odev->ieee80211_ptr ||
++	    !net_eq(dev_net(odev), &init_net) || !idev->ieee80211_ptr ||
+ 	    !netif_is_bridge_port(idev) || !netif_is_bridge_port(odev) ||
+ 	    !is_valid_ether_addr(hdr->h_source) || !is_valid_ether_addr(hdr->h_dest) ||
+ 	    ether_addr_equal(hdr->h_source, hdr->h_dest))
+@@ -151,15 +210,23 @@
+ 	    (idev == odev && !br_port_flag_is_set(idev, BR_HAIRPIN_MODE)) ||
+ 	    br_switchdev_fdb_find_port(master, hdr->h_source, 0) != idev ||
+ 	    br_switchdev_fdb_find_port(master, hdr->h_dest, 0) != odev ||
+-	    wiphy_dev(idev->ieee80211_ptr->wiphy) !=
+-	    wiphy_dev(odev->ieee80211_ptr->wiphy) ||
+ 	    airoha_ppe_get_wdma_info(idev, hdr->h_source, src, true) ||
+-	    airoha_ppe_get_wdma_info(odev, hdr->h_dest, dst, true) ||
+-	    src->idx > 1 || dst->idx > 1 || src->bss > 63 || dst->bss > 63 ||
+-	    !src->wcid || !dst->wcid || src->wcid > 150 || dst->wcid > 150 ||
+-	    (src->idx == dst->idx && src->wcid == dst->wcid))
++	    src->idx > 1 || src->bss > 63 || !src->wcid || src->wcid > 150)
+ 		return false;
+-	return true;
++	if (!odev->ieee80211_ptr) {
++		if (!airoha_ct_pair_lan1_ready(ppe, odev) ||
++		    !airoha_ct_pair_wlan_owner(ppe, idev))
++			return false;
++		*dst = (struct airoha_wdma_info) {
++			.idx = AIROHA_CT_PAIR_LAN1_SELECTOR, .wcid = AIROHA_CT_PAIR_LAN1_ID,
++		};
++		return true;
++	}
++	return wiphy_dev(idev->ieee80211_ptr->wiphy) ==
++	       wiphy_dev(odev->ieee80211_ptr->wiphy) &&
++	       !airoha_ppe_get_wdma_info(odev, hdr->h_dest, dst, true) &&
++	       dst->idx <= 1 && dst->bss <= 63 && dst->wcid && dst->wcid <= 150 &&
++	       (src->idx != dst->idx || src->wcid != dst->wcid);
+ }
+ 
+ static void airoha_ct_native_pair_frame(struct airoha_ppe *ppe, struct sk_buff *skb)
+@@ -185,7 +252,7 @@
+ 	msg.op = cpu_to_le16(AIROHA_CT_PAIR_PUT);
+ 	msg.generation = cpu_to_le64(generation);
+ 	msg.src_selector = !src.idx;
+-	msg.dst_selector = !dst.idx;
++	msg.dst_selector = airoha_ct_pair_dst_selector(&dst);
+ 	msg.src_wcid = cpu_to_le16(src.wcid);
+ 	msg.dst_wcid = cpu_to_le16(dst.wcid);
+ 	msg.src_bss = src.bss;
+@@ -196,12 +263,12 @@
+ 	if (!ppe->ct_pair_policy_allowed || !ppe->ct_host_ppe || ppe->ct_stopping || ppe->ct_pair_failed ||
+ 	    generation != br_flow_offload_generation() ||
+ 	    !airoha_ct_pair_peers(ppe, idev, odev, hdr, &src, &dst) ||
+-	    msg.src_selector != !src.idx || msg.dst_selector != !dst.idx ||
++	    msg.src_selector != !src.idx || msg.dst_selector != airoha_ct_pair_dst_selector(&dst) ||
+ 	    le16_to_cpu(msg.src_wcid) != src.wcid || le16_to_cpu(msg.dst_wcid) != dst.wcid ||
+ 	    msg.src_bss != src.bss || msg.dst_bss != dst.bss)
+ 		goto out;
+ 	msg.src_epoch = cpu_to_le32(airoha_ppe_ct_epoch_locked(ppe, src.idx, src.wcid));
+-	msg.dst_epoch = cpu_to_le32(airoha_ppe_ct_epoch_locked(ppe, dst.idx, dst.wcid));
++	msg.dst_epoch = cpu_to_le32(airoha_ct_pair_dst_epoch(ppe, msg.dst_selector, dst.wcid));
+ 	if (!msg.src_epoch || !msg.dst_epoch)
+ 		goto out;
+ 	for (i = 0; i < AIROHA_CT_PAIR_SLOTS; i++) {
+@@ -260,8 +327,11 @@
+ 		    peer->wcid != le16_to_cpu(pair->msg.src_wcid) ||
+ 		    peer->epoch != le32_to_cpu(pair->msg.src_epoch) ||
+ 		    peer->epoch != airoha_ppe_ct_epoch_locked(ppe, peer->band, peer->wcid) ||
+-		    le32_to_cpu(pair->msg.dst_epoch) != airoha_ppe_ct_epoch_locked(ppe,
+-			!pair->msg.dst_selector, le16_to_cpu(pair->msg.dst_wcid)) ||
++		    le32_to_cpu(pair->msg.dst_epoch) != airoha_ct_pair_dst_epoch(ppe,
++			pair->msg.dst_selector, le16_to_cpu(pair->msg.dst_wcid)) ||
++		    (pair->msg.dst_selector == AIROHA_CT_PAIR_LAN1_SELECTOR &&
++		     (!airoha_ct_pair_lan1_ready(ppe, airoha_ct_pair_lan1(ppe)) ||
++		      airoha_ct_pair_lan1(ppe)->ifindex != pair->egress_ifindex)) ||
+ 		    !ether_addr_equal(hdr->h_source, pair->msg.smac) ||
+ 		    !ether_addr_equal(hdr->h_dest, pair->msg.dmac))
+ 			continue;
+@@ -285,12 +355,21 @@
+ 		bound = *learned;
+ 		bound.ib1 = FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE, PPE_PKT_TYPE_BRIDGE) |
+ 			    FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND);
+-		bound.l2b.data = FIELD_PREP(AIROHA_FOE_SHAPER_ID, 0x7f) |
+-			FIELD_PREP(AIROHA_FOE_CHANNEL, 8 + !pair->msg.dst_selector);
+-		bound.l2b.ib2 = FIELD_PREP(AIROHA_FOE_IB2_PORT_AG, 0x1f) | AIROHA_FOE_IB2_PSE_QOS |
+-			FIELD_PREP(AIROHA_FOE_IB2_NBQ, 2 + !pair->msg.dst_selector) |
+-			FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT, FE_PSE_PORT_GDM3);
+-		bound.l2b.etype = le16_to_cpu(pair->msg.dst_wcid) << 6 | pair->msg.dst_bss;
++		bound.l2b.data = FIELD_PREP(AIROHA_FOE_SHAPER_ID, 0x7f);
++		bound.l2b.ib2 = FIELD_PREP(AIROHA_FOE_IB2_PORT_AG, 0x1f) | AIROHA_FOE_IB2_PSE_QOS;
++		if (pair->msg.dst_selector == AIROHA_CT_PAIR_LAN1_SELECTOR) {
++			/* Native L2 keeps each packet's IP fields and EtherType. The
++			 * ordinary LAN1 action uses channel4, GDM4/PSE9 and NBQ0. */
++			bound.l2b.data |= FIELD_PREP(AIROHA_FOE_CHANNEL, AIROHA_GDM4_IDX);
++			bound.l2b.ib2 |= AIROHA_FOE_IB2_FAST_PATH |
++				FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT, FE_PSE_PORT_GDM4);
++			bound.l2b.etype = 0;
++		} else {
++			bound.l2b.data |= FIELD_PREP(AIROHA_FOE_CHANNEL, 8 + !pair->msg.dst_selector);
++			bound.l2b.ib2 |= FIELD_PREP(AIROHA_FOE_IB2_NBQ, 2 + !pair->msg.dst_selector) |
++				FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT, FE_PSE_PORT_GDM3);
++			bound.l2b.etype = le16_to_cpu(pair->msg.dst_wcid) << 6 | pair->msg.dst_bss;
++		}
+ 		bound.l2b.vlan1 = bound.l2b.vlan2 = 0;
+ 		pair->hashes[row_slot] = hash;
+ 		err = airoha_ppe_foe_commit_entry(ppe, &bound, hash, true);
+@@ -300,3 +379,60 @@
+ 		return;
+ 	}
+ }
++
++/* Link/device changes retire the wired epoch before it can admit new packets.
++ * FDB and bridge policy changes continue through the existing global barrier. */
++static int airoha_ct_pair_wired_event(struct notifier_block *nb,
++				    unsigned long event, void *ptr)
++{
++	struct airoha_ppe *ppe = container_of(nb, struct airoha_ppe, ct_pair_wired_notifier);
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++	bool revoke = true, resume = false, used = false;
++	int i, err = 0;
++
++	if (dev != airoha_ct_pair_lan1(ppe))
++		return NOTIFY_DONE;
++	switch (event) {
++	case NETDEV_GOING_DOWN:
++	case NETDEV_DOWN:
++	case NETDEV_UNREGISTER:
++	case NETDEV_PRE_CHANGEADDR:
++	case NETDEV_PRECHANGEMTU:
++	case NETDEV_PRECHANGEUPPER:
++		break;
++	case NETDEV_CHANGE:
++		resume = true;
++		break;
++	case NETDEV_UP:
++	case NETDEV_CHANGEADDR:
++	case NETDEV_CHANGEMTU:
++	case NETDEV_CHANGEUPPER:
++		revoke = false;
++		resume = true;
++		break;
++	default:
++		return NOTIFY_DONE;
++	}
++	spin_lock_bh(&ppe_lock);
++	if (!ppe->ct_native_pairs || ppe->ct_stopping)
++		goto out;
++	if (revoke) {
++		ppe->ct_pair_wired_blocked = true;
++		for (i = 0; i < AIROHA_CT_PAIR_SLOTS; i++)
++			if (ppe->ct_pairs[i].used &&
++			    ppe->ct_pairs[i].msg.dst_selector == AIROHA_CT_PAIR_LAN1_SELECTOR)
++				used = true;
++		if (ppe->ct_pair_wired_epoch == U32_MAX)
++			err = airoha_ct_pair_fail(ppe, -EOVERFLOW);
++		else if (used)
++			err = airoha_ct_native_pair_revoke(ppe, AIROHA_CT_PAIR_LAN1_SELECTOR,
++							 AIROHA_CT_PAIR_LAN1_ID);
++		if (!err)
++			ppe->ct_pair_wired_epoch++;
++	}
++	if (!err && resume && netif_running(dev) && netif_carrier_ok(dev))
++		ppe->ct_pair_wired_blocked = false;
++out:
++	spin_unlock_bh(&ppe_lock);
++	return notifier_from_errno(err);
++}
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -141,6 +141,17 @@
+ 	airoha_fe_rmw(eth, REG_PPE_MTU(ppe_id, index),
+ 		      FP_EGRESS_MTU_MASK(index),
+ 		      __field_prep(FP_EGRESS_MTU_MASK(index), len));
++	/* Native WLAN pairs use bank0 for LAN1 egress as well as WLAN egress.
++	 * Keep its GDM4 limit current across open, stop and MTU changes. */
++	if (eth->ppe->ct_native_pairs && ppe_id &&
++	    port->id == AIROHA_GDM4_IDX && !dev->nbq) {
++		struct net_device *netdev = netdev_from_priv(dev);
++
++		len = VLAN_ETH_HLEN + (netif_running(netdev) ? netdev->mtu : 0);
++		airoha_fe_rmw(eth, REG_PPE_MTU(0, index),
++			      FP_EGRESS_MTU_MASK(index),
++			      __field_prep(FP_EGRESS_MTU_MASK(index), len));
++	}
+ }
+ 
+ static void airoha_ppe_hw_init(struct airoha_ppe *ppe, bool sram_only)
+--- a/drivers/net/ethernet/airoha/airoha_ct_pair_policy.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_pair_policy.h
+@@ -118,7 +118,7 @@
+ 		return err ?: len;
+ 	}
+ 	/* The caller has audited that every unicast IPv4/IPv6 packet between
+-	 * these authorized WLAN MAC peers is permitted, without per-flow,
++	 * these authorized MAC peers is permitted, without per-flow,
+ 	 * set/map, time, quota or state-dependent filtering.
+ 	 * Existing TCX/XDP is rejected; RAM sessions block new installation.
+ 	 */
+@@ -154,20 +154,34 @@
+ 
+ 	if (!ppe->ct_native_pairs)
+ 		return 0;
++	ppe->ct_pair_wired_notifier.notifier_call = airoha_ct_pair_wired_event;
++	err = register_netdevice_notifier(&ppe->ct_pair_wired_notifier);
++	if (err)
++		return err;
++	ppe->ct_pair_wired_registered = true;
+ 	ppe->ct_pair_policy_notifier.notifier_call = airoha_ct_pair_policy_event;
+ 	err = nf_native_pair_register(&ppe->ct_pair_policy_notifier);
+ 	if (err)
+-		return err;
++		goto unregister_wired;
+ 	err = device_create_file(ppe->eth->dev, &dev_attr_ct_native_pair_policy);
+ 	if (err)
+ 		nf_native_pair_unregister(&ppe->ct_pair_policy_notifier);
+ 	else
+ 		ppe->ct_pair_policy_registered = true;
++	if (!err)
++		return 0;
++unregister_wired:
++	unregister_netdevice_notifier(&ppe->ct_pair_wired_notifier);
++	ppe->ct_pair_wired_registered = false;
+ 	return err;
+ }
+ 
+ static void airoha_ct_pair_policy_deinit(struct airoha_ppe *ppe)
+ {
++	if (ppe->ct_pair_wired_registered) {
++		unregister_netdevice_notifier(&ppe->ct_pair_wired_notifier);
++		ppe->ct_pair_wired_registered = false;
++	}
+ 	if (!ppe->ct_pair_policy_registered)
+ 		return;
+ 	device_remove_file(ppe->eth->dev, &dev_attr_ct_native_pair_policy);
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -191,14 +191,18 @@
+ 	WLAN_FUNC_GET_WAIT_NPU_VERSION,
+ };
+ 
+-/* Native WLAN endpoint pair ABI, independent of five-tuple flower cookies.
++/* Native endpoint pair ABI, independent of five-tuple flower cookies.
+  * Fixed little-endian 64-byte payload follows the 8-byte WLAN mailbox header.
+  */
+ #define AIROHA_CT_PAIR_MAGIC 0x43545031
+-#define AIROHA_CT_PAIR_ABI 1
++#define AIROHA_CT_PAIR_ABI 2
+ #define AIROHA_CT_PAIR_FUNC 34
+ #define AIROHA_CT_PAIR_SLOTS 32
+-#define AIROHA_CT_PAIR_CAPS 7
++#define AIROHA_CT_PAIR_CAPS 15
++/* selector 0/1: WLAN ring + WCID; selector 2: wired LAN1 + source-port ID.
++ * ABI2 admits LAN1 only as destination; FE receive admission is separate. */
++#define AIROHA_CT_PAIR_LAN1_SELECTOR 2
++#define AIROHA_CT_PAIR_LAN1_ID 24
+ enum airoha_ct_pair_op {
+ 	AIROHA_CT_PAIR_CAP = 0, AIROHA_CT_PAIR_PUT, AIROHA_CT_PAIR_DEL,
+ 	AIROHA_CT_PAIR_FLUSH, AIROHA_CT_PAIR_ENDPOINT_REVOKE,
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -300,7 +300,7 @@
+ 		  0x1f, 0xea, 0xf0, 0x3f, 0xc9, 0x3b, 0x0e, 0x3a },
+ 	};
+ 	static const u8 lab_sha256[][SHA256_DIGEST_SIZE] = {
+-		{ 0x22, 0xc2, 0x66, 0x54, 0x1f, 0xaa, 0x72, 0x35, 0xbe, 0xf1, 0x2a, 0x36, 0xf5, 0xe1, 0xb0, 0x8e, 0x44, 0xd0, 0xbb, 0x11, 0x9b, 0x7a, 0x2d, 0x49, 0x5b, 0x3b, 0x17, 0xec, 0xc5, 0x7d, 0xab, 0xe4 },
++		{ 0x59, 0xac, 0x23, 0x9f, 0x39, 0xb9, 0xf1, 0x32, 0x04, 0x97, 0x0e, 0x49, 0x75, 0x44, 0xa0, 0x34, 0x6d, 0x53, 0xb0, 0x8a, 0xb3, 0x5f, 0xc5, 0xba, 0xf1, 0x54, 0x53, 0xf8, 0x34, 0x1e, 0x52, 0xf6 },
+ 		{ 0xdf, 0x3f, 0x61, 0x98, 0x04, 0xa9, 0x2f, 0xdb, 0x40, 0x57, 0x19, 0x2d, 0xc4, 0x3d, 0xd7, 0x48, 0xea, 0x77, 0x8a, 0xdc, 0x52, 0xbc, 0x49, 0x8c, 0xe8, 0x05, 0x24, 0xc0, 0x14, 0xb8, 0x11, 0x19 },
+ 	};
+ 	bool ct = airoha_npu_is_connac2_ct(dev);
