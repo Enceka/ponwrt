@@ -1,0 +1,282 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: expose read-only CT flow admission results
+
+Record the original hardware flow callback result and software-flow presence
+for CT IPv4/IPv6 TCP/UDP requests, without changing return values or hardware
+accesses. Aggregate repeated cookie/tuple/error observations in 64 bounded
+LRU buckets. Export a locked snapshot through a read-only debugfs file.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_flow_admission.h
+@@ -0,0 +1,79 @@
++#ifndef AIROHA_CT_FLOW_ADMISSION_H
++#define AIROHA_CT_FLOW_ADMISSION_H
++
++#define CT_FLOW_ADMISSION_BUCKETS 64
++
++struct ct_flow_admission_key {
++	unsigned long cookie;
++	u32 src[4], dest[4];
++	int ingress, egress;
++	int error;
++	u16 sport, dport;
++	u8 smac[6], dmac[6];
++	u8 protocol;
++	bool ipv6;
++};
++
++struct ct_flow_admission_bucket {
++	struct ct_flow_admission_key key;
++	u64 count, sequence;
++	u32 hash;
++	bool present, valid;
++};
++
++struct ct_flow_admission_table {
++	struct ct_flow_admission_bucket bucket[CT_FLOW_ADMISSION_BUCKETS];
++	u64 total, replaced;
++};
++
++static inline bool ct_flow_admission_equal(const struct ct_flow_admission_key *first,
++					  const struct ct_flow_admission_key *second)
++{
++	return first->cookie == second->cookie && first->ingress == second->ingress &&
++		first->egress == second->egress && first->error == second->error &&
++		first->sport == second->sport && first->dport == second->dport &&
++		first->protocol == second->protocol && first->ipv6 == second->ipv6 &&
++		!memcmp(first->src, second->src, sizeof(first->src)) &&
++		!memcmp(first->dest, second->dest, sizeof(first->dest)) &&
++		!memcmp(first->smac, second->smac, sizeof(first->smac)) &&
++		!memcmp(first->dmac, second->dmac, sizeof(first->dmac));
++}
++
++static inline void ct_flow_admission_record(struct ct_flow_admission_table *table,
++					    const struct ct_flow_admission_key *key,
++					    bool present, u32 hash)
++{
++	struct ct_flow_admission_bucket *chosen = NULL;
++	unsigned int index;
++
++	for (index = 0; index < CT_FLOW_ADMISSION_BUCKETS; index++) {
++		struct ct_flow_admission_bucket *bucket = &table->bucket[index];
++
++		if (bucket->valid && ct_flow_admission_equal(&bucket->key, key)) {
++			chosen = bucket;
++			break;
++		}
++	}
++	if (!chosen) {
++		chosen = &table->bucket[0];
++		for (index = 0; index < CT_FLOW_ADMISSION_BUCKETS; index++) {
++			struct ct_flow_admission_bucket *bucket = &table->bucket[index];
++
++			if (!bucket->valid) {
++				chosen = bucket;
++				break;
++			}
++			if (bucket->sequence < chosen->sequence)
++				chosen = bucket;
++		}
++		if (chosen->valid)
++			table->replaced++;
++		*chosen = (struct ct_flow_admission_bucket) { .key = *key, .valid = true };
++	}
++	chosen->count++;
++	chosen->sequence = ++table->total;
++	chosen->present = present;
++	chosen->hash = hash;
++}
++
++#endif
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -16,6 +16,7 @@
+ #include <linux/reset.h>
+ #include <linux/soc/airoha/airoha_offload.h>
+ #include <net/dsa.h>
++#include "airoha_ct_flow_admission.h"
+ 
+ #define AIROHA_MAX_NUM_GDM_PORTS	4
+ #define AIROHA_MAX_NUM_GDM_DEVS		2
+@@ -737,6 +738,8 @@
+ struct airoha_ppe {
+ 	struct airoha_ppe_dev dev;
+ 	struct airoha_eth *eth;
++	spinlock_t ct_admission_lock;
++	struct ct_flow_admission_table ct_admission;
+ 	struct {
+ 		u32 udf, udf_owned;
+ 		struct {
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -2810,6 +2810,80 @@
+ }
+ EXPORT_SYMBOL_GPL(airoha_ppe_ct_prepare_dev);
+ 
++static void airoha_ppe_ct_record_admission(struct airoha_ppe *ppe,
++					 struct flow_cls_offload *request,
++					 int error, bool present, u32 hash)
++{
++	struct ct_flow_admission_key key = {};
++	struct flow_rule *rule;
++	struct flow_match_control control;
++	struct flow_match_basic basic;
++	struct flow_match_ports ports;
++	struct flow_match_meta meta;
++	struct flow_action_entry *action;
++	struct ethhdr ethernet = {};
++	unsigned long flags;
++	int index;
++
++	if (!READ_ONCE(ppe->ct_host_ppe) || request->command != FLOW_CLS_REPLACE)
++		return;
++	rule = flow_cls_offload_flow_rule(request);
++	if (!rule || !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS) ||
++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
++		return;
++	flow_rule_match_control(rule, &control);
++	flow_rule_match_basic(rule, &basic);
++	if (basic.key->ip_proto != IPPROTO_TCP && basic.key->ip_proto != IPPROTO_UDP)
++		return;
++	if (control.key->addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS &&
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS)) {
++		struct flow_match_ipv4_addrs addrs;
++
++		flow_rule_match_ipv4_addrs(rule, &addrs);
++		memcpy(key.src, &addrs.key->src, sizeof(addrs.key->src));
++		memcpy(key.dest, &addrs.key->dst, sizeof(addrs.key->dst));
++	} else if (control.key->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS &&
++		   flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV6_ADDRS)) {
++		struct flow_match_ipv6_addrs addrs;
++
++		flow_rule_match_ipv6_addrs(rule, &addrs);
++		memcpy(key.src, &addrs.key->src, sizeof(key.src));
++		memcpy(key.dest, &addrs.key->dst, sizeof(key.dest));
++		key.ipv6 = true;
++	} else {
++		return;
++	}
++	flow_rule_match_ports(rule, &ports);
++	flow_rule_match_meta(rule, &meta);
++	key.cookie = request->cookie;
++	key.protocol = basic.key->ip_proto;
++	key.sport = ports.key->src;
++	key.dport = ports.key->dst;
++	key.ingress = meta.key->ingress_ifindex;
++	key.error = error;
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
++		struct flow_match_eth_addrs eth;
++
++		flow_rule_match_eth_addrs(rule, &eth);
++		ether_addr_copy(ethernet.h_source, eth.key->src);
++		ether_addr_copy(ethernet.h_dest, eth.key->dst);
++	}
++	flow_action_for_each(index, action, &rule->action) {
++		if (action->id == FLOW_ACTION_REDIRECT && action->dev)
++			key.egress = action->dev->ifindex;
++		if (action->id == FLOW_ACTION_MANGLE &&
++		    action->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_ETH)
++			airoha_ppe_flow_mangle_eth(action, &ethernet);
++	}
++	ether_addr_copy(key.smac, ethernet.h_source);
++	ether_addr_copy(key.dmac, ethernet.h_dest);
++	spin_lock_irqsave(&ppe->ct_admission_lock, flags);
++	ct_flow_admission_record(&ppe->ct_admission, &key, present, hash);
++	spin_unlock_irqrestore(&ppe->ct_admission_lock, flags);
++}
++
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data)
+ {
+ 	struct airoha_ppe *ppe = dev->priv;
+@@ -2820,8 +2894,10 @@
+ 	 * the net_devices are registered or initialized. Delay offloading
+ 	 * until all net_devices are registered in the system.
+ 	 */
+-	if (!test_bit(DEV_STATE_REGISTERED, &eth->state))
++	if (!test_bit(DEV_STATE_REGISTERED, &eth->state)) {
++		airoha_ppe_ct_record_admission(ppe, type_data, -EBUSY, false, 0xffff);
+ 		return -EBUSY;
++	}
+ 
+ 	mutex_lock(&flow_offload_mutex);
+ 
+@@ -2831,6 +2907,16 @@
+ 		err = airoha_ppe_offload_setup(eth, true);
+ 	if (!err)
+ 		err = airoha_ppe_flow_offload_cmd(eth, type_data);
++	if (READ_ONCE(ppe->ct_host_ppe)) {
++		struct flow_cls_offload *request = type_data;
++		struct airoha_flow_table_entry *entry = NULL;
++
++		if (request->command == FLOW_CLS_REPLACE)
++			entry = rhashtable_lookup_fast(&eth->flow_table, &request->cookie,
++						      airoha_flow_table_params);
++		airoha_ppe_ct_record_admission(ppe, request, err, !!entry,
++					     entry ? READ_ONCE(entry->hash) : 0xffff);
++	}
+ 
+ 	mutex_unlock(&flow_offload_mutex);
+ 
+@@ -2962,6 +3048,7 @@
+ 	ppe = devm_kzalloc(eth->dev, sizeof(*ppe), GFP_KERNEL);
+ 	if (!ppe)
+ 		return -ENOMEM;
++	spin_lock_init(&ppe->ct_admission_lock);
+ 
+ 	ppe->dev.ops.setup_tc_block_cb = airoha_ppe_setup_tc_block_cb;
+ 	ppe->dev.ops.check_skb = airoha_ppe_check_skb;
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -288,9 +288,50 @@
+ 	.write = airoha_ppe_debugfs_bind_rate_write,
+ };
+ 
++static int airoha_ppe_debugfs_admission_show(struct seq_file *stream, void *private)
++{
++	struct airoha_ppe *ppe = stream->private;
++	struct ct_flow_admission_table *snapshot;
++	unsigned long flags;
++	unsigned int index;
++
++	snapshot = kmalloc(sizeof(*snapshot), GFP_KERNEL);
++	if (!snapshot)
++		return -ENOMEM;
++	spin_lock_irqsave(&ppe->ct_admission_lock, flags);
++	*snapshot = ppe->ct_admission;
++	spin_unlock_irqrestore(&ppe->ct_admission_lock, flags);
++	seq_printf(stream, "capacity=%u total=%llu replaced=%llu\n",
++		   CT_FLOW_ADMISSION_BUCKETS, snapshot->total, snapshot->replaced);
++	for (index = 0; index < CT_FLOW_ADMISSION_BUCKETS; index++) {
++		const struct ct_flow_admission_bucket *bucket = &snapshot->bucket[index];
++		const struct ct_flow_admission_key *key = &bucket->key;
++
++		if (!bucket->valid)
++			continue;
++		seq_printf(stream, "bucket=%u cookie=%lx count=%llu sequence=%llu family=%u protocol=%u ",
++			   index, key->cookie, bucket->count, bucket->sequence,
++			   key->ipv6 ? 6 : 4, key->protocol);
++		if (key->ipv6)
++			seq_printf(stream, "src=%pI6c:%u dest=%pI6c:%u ",
++				   key->src, ntohs(key->sport), key->dest, ntohs(key->dport));
++		else
++			seq_printf(stream, "src=%pI4:%u dest=%pI4:%u ",
++				   key->src, ntohs(key->sport), key->dest, ntohs(key->dport));
++		seq_printf(stream, "ingress=%d egress=%d errno=%d present=%u hash=%04x smac=%pM dmac=%pM\n",
++			   key->ingress, key->egress, key->error, bucket->present, bucket->hash,
++			   key->smac, key->dmac);
++	}
++	kfree(snapshot);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_admission);
++
+ int airoha_ppe_debugfs_init(struct airoha_ppe *ppe)
+ {
+ 	ppe->debugfs_dir = debugfs_create_dir("ppe", NULL);
++	debugfs_create_file("flow_admission", 0444, ppe->debugfs_dir, ppe,
++			    &airoha_ppe_debugfs_admission_fops);
+ 	debugfs_create_file("config", 0444, ppe->debugfs_dir, ppe,
+ 			    &airoha_ppe_debugfs_config_fops);
+ 	debugfs_create_file("bind_rate", 0644, ppe->debugfs_dir, ppe,
