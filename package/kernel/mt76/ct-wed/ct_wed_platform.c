@@ -13,6 +13,7 @@
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/sysfs.h>
+#include <linux/unaligned.h>
 
 #include "../ct-wed-provider-abi.h"
 #include "ct_wdma_rx.h"
@@ -22,6 +23,7 @@
 #include "ct_wed_bm.h"
 #include "ct_wed_bm_snapshot.h"
 #include "ct_wed_rx_snapshot.h"
+#include "ct_wed_tx_snapshot.h"
 #include "ct_wed_cold.h"
 #include "ct_wed_start.h"
 
@@ -1339,10 +1341,135 @@ static ssize_t rx_snapshot_show(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR_RO(rx_snapshot);
 
+struct ct_tx_snapshot_entry {
+	u32 descriptor[4], token;
+	u8 header[CT_TX_SNAPSHOT_HEADER_BYTES];
+	u8 payload[CT_TX_SNAPSHOT_PAYLOAD_BYTES];
+	int error;
+};
+
+static void ct_tx_snapshot_read(struct airoha_ct_wed *wed, unsigned int ring,
+			       unsigned int slot, struct ct_tx_snapshot_entry *entry)
+{
+	const struct ct_txd *descriptor = &wed->mid[ring].desc[slot];
+	unsigned int chunk, index;
+	const __le32 *words = (const __le32 *)descriptor;
+	size_t offset;
+
+	*entry = (struct ct_tx_snapshot_entry) {};
+	dma_rmb();
+	for (index = 0; index < ARRAY_SIZE(entry->descriptor); index++)
+		entry->descriptor[index] = le32_to_cpu(READ_ONCE(words[index]));
+	entry->error = ct_tx_snapshot_token(wed->bm[1].dma, wed->bm[1].bytes,
+					    entry->descriptor[0], &entry->token);
+	if (entry->error)
+		return;
+	chunk = 2 + entry->token / CT_BM_CHUNK_TOKENS;
+	entry->error = ct_tx_snapshot_payload(wed->bm[chunk].dma, wed->bm[chunk].bytes,
+					      entry->token, entry->descriptor[2], &offset);
+	if (entry->error)
+		return;
+	dma_rmb();
+	for (index = 0; index < sizeof(entry->header); index++)
+		entry->header[index] = READ_ONCE(*(u8 *)(wed->bm[1].cpu +
+						entry->token * CT_BM_HEADER_SIZE + index));
+	for (index = 0; index < sizeof(entry->payload); index++)
+		entry->payload[index] = READ_ONCE(*(u8 *)(wed->bm[chunk].cpu + offset + index));
+}
+
+static ssize_t tx_snapshot_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ct_tx_snapshot_entry first[2][CT_TX_SNAPSHOT_PER_RING];
+	struct ct_tx_snapshot_entry second[2][CT_TX_SNAPSHOT_PER_RING];
+	struct airoha_ct_wed *wed;
+	u32 before[2], after[2], issued[2], returned[2];
+	unsigned int ring, position;
+	bool stable = true;
+	ssize_t length;
+	int err;
+
+	mutex_lock(&ct_lock);
+	wed = dev_get_drvdata(dev);
+	err = ct_rx_debug_current(wed);
+	if (err)
+		goto fail;
+	for (ring = 0; ring < ARRAY_SIZE(wed->mid); ring++) {
+		if (!wed->mid[ring].desc) {
+			err = -EAGAIN;
+			goto fail;
+		}
+		before[ring] = readl(wed->wed + 0x60c + ring * 0x10);
+		if (before[ring] >= CT_TX_COUNT) {
+			err = -EIO;
+			goto fail;
+		}
+	}
+	issued[0] = readl(wed->wed + 0x1c4);
+	returned[0] = readl(wed->wed + 0x1c0);
+	for (ring = 0; ring < ARRAY_SIZE(wed->mid); ring++)
+		for (position = 0; position < CT_TX_SNAPSHOT_PER_RING; position++) {
+			unsigned int slot = (before[ring] + CT_TX_COUNT -
+					     CT_TX_SNAPSHOT_PER_RING + position) % CT_TX_COUNT;
+
+			ct_tx_snapshot_read(wed, ring, slot, &first[ring][position]);
+		}
+	dma_rmb();
+	for (ring = 0; ring < ARRAY_SIZE(wed->mid); ring++)
+		for (position = 0; position < CT_TX_SNAPSHOT_PER_RING; position++) {
+			unsigned int slot = (before[ring] + CT_TX_COUNT -
+					     CT_TX_SNAPSHOT_PER_RING + position) % CT_TX_COUNT;
+
+			ct_tx_snapshot_read(wed, ring, slot, &second[ring][position]);
+		}
+	for (ring = 0; ring < ARRAY_SIZE(wed->mid); ring++) {
+		after[ring] = readl(wed->wed + 0x60c + ring * 0x10);
+		stable &= before[ring] == after[ring];
+	}
+	issued[1] = readl(wed->wed + 0x1c4);
+	returned[1] = readl(wed->wed + 0x1c0);
+	stable &= issued[0] == issued[1] && returned[0] == returned[1] &&
+		  !memcmp(first, second, sizeof(first));
+	length = sysfs_emit(buf,
+		"error=0 stable=%u didx=%u,%u/%u,%u issued=%u/%u returned=%u/%u\n",
+		stable, before[0], before[1], after[0], after[1],
+		issued[0], issued[1], returned[0], returned[1]);
+	for (ring = 0; ring < ARRAY_SIZE(wed->mid); ring++)
+		for (position = 0; position < CT_TX_SNAPSHOT_PER_RING; position++) {
+			const struct ct_tx_snapshot_entry *entry = &first[ring][position];
+			unsigned int slot = (before[ring] + CT_TX_COUNT -
+					     CT_TX_SNAPSHOT_PER_RING + position) % CT_TX_COUNT;
+			u32 control = entry->descriptor[1];
+
+			length += sysfs_emit_at(buf, length,
+				"mid%u[%u] error=%d raw=%08x,%08x,%08x,%08x len0=%u len1=%u last0=%u last1=%u done=%u\n",
+				ring, slot, entry->error, entry->descriptor[0], control,
+				entry->descriptor[2], entry->descriptor[3],
+				(control >> 16) & 0x3fff, control & 0x3fff,
+				!!(control & BIT(30)), !!(control & BIT(14)), !!(control & BIT(31)));
+			if (entry->error)
+				continue;
+			length += sysfs_emit_at(buf, length,
+				"token=%u txp_token=%u nbuf=%u txp_len0=%u txp_buf0=%08x txd=%*phN txp=%*phN payload=%*phN tail=%*phN\n",
+				entry->token, get_unaligned_le16(entry->header + 34),
+				entry->header[39], get_unaligned_le16(entry->header + 64),
+				get_unaligned_le32(entry->header + 40),
+				32, entry->header, 44, entry->header + 32,
+				64, entry->payload, 8, entry->payload + 64);
+		}
+	goto out;
+fail:
+	length = sysfs_emit(buf, "error=%d stable=0\n", err);
+out:
+	mutex_unlock(&ct_lock);
+	return length;
+}
+static DEVICE_ATTR_RO(tx_snapshot);
+
 static struct attribute *ct_wed_attrs[] = {
 	&dev_attr_status.attr,
 	&dev_attr_bm_snapshot.attr,
 	&dev_attr_rx_snapshot.attr,
+	&dev_attr_tx_snapshot.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(ct_wed);
