@@ -2,7 +2,12 @@
 
 ```sh
 python3 verify_stock_fe.py --stock-dir /path/to/stock/lib/modules --output /tmp/stock-fe.json
+python3 verify_board_hir.py --image /path/to/stock/Image --hw-nat /path/to/stock/lib/modules/hw_nat.ko
 ```
+
+HG5585F-CT 在 RAM 启动 `3bc04188-e242-4374-a29c-be72056bf053` 上读到 `SCU+0x64 = 0x000e0000`。可在相同 regmap 布局用 `dd if=/sys/kernel/debug/regmap/dummy-clock-controller@0x000000001fb00000/registers bs=14 skip=25 count=1` 单行复测，确认行标签是 `064:`。`verify_board_hir.py` 从原厂内核导出表定位并执行 `GET_HIR`，将 DT 的第二个 clock-controller 窗口接入夹具，检查实际的 32 位读地址及返回值。实板值对应 HIR `0xe`。
+
+在此 HIR 上调用原厂 `PpeSetTunnel_Info`，已选中的 GRE 动作将槽位和有效位写入 FOE `+0x28` 低七位；类型 0/1/2 的动作字段在 `+0x22`，类型 4/5 在 `+0x3e`。96 个逐字节对照覆盖动态槽两端、有效位开关、八种类型、低半字变化和 HIR `0xc`。这里核对的是 80 字节原厂 FOE 的编码；发布、撤销和硬件收包在集成板测中验收。
 
 测试通过 Unicorn 执行 SHA 固定的 `fe_core.ko`、`hw_nat.ko` 和 `qdma_lan.ko`。寄存器访问、延时、日志和 ECNT 跨模块传递由夹具提供。初始化和 QDMA 分派使用下面注明的指令区间；表的写入、清除及 FE 分派函数从入口执行到返回。
 
