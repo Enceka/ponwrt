@@ -1,0 +1,274 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] mt7915: refresh CT station RX activity
+
+Sample valid WTBL RX airtime changes once per second for authorized CT
+stations. Reset samples across station epochs and radio resets, and
+serialize the shared WTBL bank selector across all callers.
+
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -81,6 +81,7 @@
+ 
+ u32 mt7915_mac_wtbl_lmac_addr(struct mt7915_dev *dev, u16 wcid, u8 dw)
+ {
++	lockdep_assert_held(&dev->mt76.sta_poll_lock);
+ 	mt76_wr(dev, MT_WTBLON_TOP_WDUCR,
+ 		FIELD_PREP(MT_WTBLON_TOP_WDUCR_GROUP, (wcid >> 7)));
+ 
+@@ -127,6 +128,8 @@
+ 
+ 		idx = msta->wcid.idx;
+ 
++		/* Serialize the shared WTBL bank selector with the activity sampler. */
++		spin_lock_bh(&dev->mt76.sta_poll_lock);
+ 		/* refresh peer's airtime reporting */
+ 		addr = mt7915_mac_wtbl_lmac_addr(dev, idx, 20);
+ 
+@@ -152,6 +155,7 @@
+ 
+ 			addr += 8;
+ 		}
++		spin_unlock_bh(&dev->mt76.sta_poll_lock);
+ 
+ 		if (clear) {
+ 			mt7915_mac_wtbl_update(dev, idx,
+@@ -184,8 +188,10 @@
+ 		 * from per-sta counters directly.
+ 		 */
+ 		rate = &msta->wcid.rate;
++		spin_lock_bh(&dev->mt76.sta_poll_lock);
+ 		addr = mt7915_mac_wtbl_lmac_addr(dev, idx, 7);
+ 		val = mt76_rr(dev, addr);
++		spin_unlock_bh(&dev->mt76.sta_poll_lock);
+ 
+ 		switch (rate->bw) {
+ 		case RATE_INFO_BW_160:
+@@ -215,8 +221,10 @@
+ 		}
+ 
+ 		/* get signal strength of resp frames (CTS/BA/ACK) */
++		spin_lock_bh(&dev->mt76.sta_poll_lock);
+ 		addr = mt7915_mac_wtbl_lmac_addr(dev, idx, 30);
+ 		val = mt76_rr(dev, addr);
++		spin_unlock_bh(&dev->mt76.sta_poll_lock);
+ 
+ 		rssi[0] = to_rssi(GENMASK(7, 0), val);
+ 		rssi[1] = to_rssi(GENMASK(15, 8), val);
+@@ -2041,6 +2049,93 @@
+ 	spin_unlock_bh(&dev->mt76.sta_poll_lock);
+ }
+ 
++#ifdef CONFIG_MT7915_NPU
++/* Caller holds sta_poll_lock. Each sample only observes RX airtime; the
++ * ordinary TX-free poll remains the owner of airtime accounting and clears.
++ */
++static bool mt7915_ct_rx_activity_sample(struct mt7915_sta *msta, u32 epoch,
++				       const u32 airtime[IEEE80211_NUM_ACS])
++{
++	bool active = false;
++	int i;
++
++	for (i = 0; i < IEEE80211_NUM_ACS; i++)
++		if (airtime[i] == U32_MAX) {
++			msta->ct_rx_activity_epoch = 0;
++			return false;
++		}
++
++	if (msta->ct_rx_activity_epoch == epoch)
++		for (i = 0; i < IEEE80211_NUM_ACS; i++)
++			/* A clear to zero is not RX. A new nonzero value after
++			 * a clear or wrap represents newly accumulated airtime.
++			 */
++			if (airtime[i] && airtime[i] != msta->ct_rx_airtime[i])
++				active = true;
++
++	memcpy(msta->ct_rx_airtime, airtime, sizeof(msta->ct_rx_airtime));
++	msta->ct_rx_activity_epoch = epoch;
++	return active;
++}
++
++static void mt7915_ct_rx_activity_poll(struct mt7915_phy *phy)
++{
++	struct mt7915_dev *dev = phy->dev;
++	unsigned long now = jiffies;
++	bool enabled, fresh = !phy->ct_rx_activity_next;
++	int idx;
++
++	lockdep_assert_held(&dev->mt76.mutex);
++	enabled = mt7915_ct_wed_active(dev) &&
++		  test_bit(MT76_STATE_RUNNING, &phy->mt76->state) &&
++		  !test_bit(MT76_RESET, &phy->mt76->state) &&
++		  !test_bit(MT76_REMOVED, &dev->mphy.state);
++	if (!enabled && fresh)
++		return;
++	if (enabled && time_before(now, phy->ct_rx_activity_next))
++		return;
++	phy->ct_rx_activity_next = enabled ? now + HZ : 0;
++
++	rcu_read_lock();
++	for (idx = 1; idx <= MT7916_CT_MAX_WCID; idx++) {
++		struct mt76_wcid *wcid = mt76_wcid_ptr(dev, idx);
++		struct mt7915_sta *msta;
++		struct ieee80211_sta *sta;
++		u32 airtime[IEEE80211_NUM_ACS], addr, epoch;
++		int i;
++
++		if (!wcid || wcid->phy_idx != phy->mt76->band_idx)
++			continue;
++		sta = wcid_to_sta(wcid);
++		if (!sta)
++			continue;
++		msta = container_of(wcid, struct mt7915_sta, wcid);
++
++		spin_lock_bh(&dev->mt76.sta_poll_lock);
++		epoch = READ_ONCE(msta->ct_epoch);
++		if (fresh)
++			msta->ct_rx_activity_epoch = 0;
++		if (!enabled || !epoch || !READ_ONCE(msta->ct_authorized)) {
++			msta->ct_rx_activity_epoch = 0;
++			spin_unlock_bh(&dev->mt76.sta_poll_lock);
++			continue;
++		}
++
++		addr = mt7915_mac_wtbl_lmac_addr(dev, idx, 21);
++		for (i = 0; i < IEEE80211_NUM_ACS; i++)
++			airtime[i] = mt76_rr(dev, addr + 8 * i);
++		if (mt7915_ct_rx_activity_sample(msta, epoch, airtime))
++			ieee80211_sta_register_rx_activity(sta, -1);
++		spin_unlock_bh(&dev->mt76.sta_poll_lock);
++	}
++	rcu_read_unlock();
++}
++#else
++static void mt7915_ct_rx_activity_poll(struct mt7915_phy *phy)
++{
++}
++#endif
++
+ void mt7915_mac_work(struct work_struct *work)
+ {
+ 	struct mt7915_phy *phy;
+@@ -2052,6 +2147,7 @@
+ 
+ 	mutex_lock(&mphy->dev->mutex);
+ 
++	mt7915_ct_rx_activity_poll(phy);
+ 	mt76_update_survey(mphy);
+ 	if (++mphy->mac_work_count == 5) {
+ 		mphy->mac_work_count = 0;
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -82,6 +82,9 @@
+ 		goto out;
+ 
+ 	set_bit(MT76_STATE_RUNNING, &phy->mt76->state);
++#ifdef CONFIG_MT7915_NPU
++	phy->ct_rx_activity_next = 0;
++#endif
+ 
+ 	if (!mt76_testmode_enabled(phy->mt76))
+ 		ieee80211_queue_delayed_work(hw, &phy->mt76->mac_work,
+@@ -816,12 +819,21 @@
+ static void mt7915_ct_ba_error(struct mt7915_dev *dev, u16 wcid, int err);
+ 
+ #ifdef CONFIG_MT7915_NPU
++static void mt7915_ct_publish_sta(struct mt7915_dev *dev, struct mt7915_sta *msta,
++				  bool authorized, u32 epoch)
++{
++	spin_lock_bh(&dev->mt76.sta_poll_lock);
++	WRITE_ONCE(msta->ct_authorized, authorized);
++	WRITE_ONCE(msta->ct_epoch, epoch);
++	msta->ct_rx_activity_epoch = 0;
++	spin_unlock_bh(&dev->mt76.sta_poll_lock);
++}
++
+ static void mt7915_ct_revoke_sta(struct mt7915_dev *dev, struct mt7915_sta *msta)
+ {
+ 	int err;
+ 
+-	WRITE_ONCE(msta->ct_authorized, false);
+-	WRITE_ONCE(msta->ct_epoch, 0);
++	mt7915_ct_publish_sta(dev, msta, false, 0);
+ 	err = mt7915_ct_flush_sta(dev, msta->vif->phy->mt76->band_idx, msta->wcid.idx);
+ 	mt7915_ct_ba_error(dev, msta->wcid.idx, err);
+ }
+@@ -844,16 +856,14 @@
+ 		if (msta->vif != (struct mt7915_vif *)vif->drv_priv)
+ 			continue;
+ 		authorized = READ_ONCE(msta->ct_authorized);
+-		WRITE_ONCE(msta->ct_authorized, false);
+-		WRITE_ONCE(msta->ct_epoch, 0);
++		mt7915_ct_publish_sta(dev, msta, false, 0);
+ 		err = mt7915_ct_flush_sta(dev, msta->vif->phy->mt76->band_idx,
+ 					msta->wcid.idx);
+ 		mt7915_ct_ba_error(dev, msta->wcid.idx, err);
+ 		if (err || !authorized)
+ 			continue;
+ 		epoch = mt7915_ct_sta_epoch(dev, msta);
+-		WRITE_ONCE(msta->ct_epoch, epoch);
+-		WRITE_ONCE(msta->ct_authorized, true);
++		mt7915_ct_publish_sta(mt7915_hw_dev(hw), msta, true, epoch);
+ 	}
+ }
+ #endif
+@@ -927,8 +937,13 @@
+ 		if (ret)
+ 			return ret;
+ 
++		spin_lock_bh(&dev->mt76.sta_poll_lock);
++#ifdef CONFIG_MT7915_NPU
++		msta->ct_rx_activity_epoch = 0;
++#endif
+ 		addr = mt7915_mac_wtbl_lmac_addr(dev, msta->wcid.idx, 30);
+ 		mt76_rmw_field(dev, addr, GENMASK(7, 0), 0xa0);
++		spin_unlock_bh(&dev->mt76.sta_poll_lock);
+ 
+ 		ret = mt7915_mcu_add_rate_ctrl(dev, vif, sta, &msta->wcid, false);
+ 		if (ret)
+@@ -1980,8 +1995,7 @@
+ 	if (!err && new == IEEE80211_STA_AUTHORIZED && vif->type == NL80211_IFTYPE_AP) {
+ 		u32 epoch = mt7915_ct_sta_epoch(mt7915_hw_dev(hw), msta);
+ 
+-		WRITE_ONCE(msta->ct_epoch, epoch);
+-		WRITE_ONCE(msta->ct_authorized, true);
++		mt7915_ct_publish_sta(mt7915_hw_dev(hw), msta, true, epoch);
+ 	}
+ 	return err;
+ }
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -1550,11 +1550,13 @@
+ 		 * account, so driver should update here to reflect the
+ 		 * actual txrate hardware sends out.
+ 		 */
++		spin_lock_bh(&dev->mt76.sta_poll_lock);
+ 		addr = mt7915_mac_wtbl_lmac_addr(dev, msta->wcid.idx, 7);
+ 		if (sta->deflink.he_cap.has_he)
+ 			mt76_rmw_field(dev, addr, GENMASK(31, 24), phy.sgi);
+ 		else
+ 			mt76_rmw_field(dev, addr, GENMASK(15, 12), phy.sgi);
++		spin_unlock_bh(&dev->mt76.sta_poll_lock);
+ 
+ 		ret = mt7915_mcu_set_fixed_rate_ctrl(dev, vif, sta, wcid, &phy,
+ 						     RATE_PARAM_FIXED_GI);
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -149,6 +149,8 @@
+ #ifdef CONFIG_MT7915_NPU
+ 	bool ct_authorized;
+ 	u32 ct_epoch;
++	u32 ct_rx_activity_epoch;
++	u32 ct_rx_airtime[IEEE80211_NUM_ACS];
+ #endif
+ 
+ 	struct mt7915_vif *vif;
+@@ -214,6 +216,9 @@
+ struct mt7915_phy {
+ 	struct mt76_phy *mt76;
+ 	struct mt7915_dev *dev;
++#ifdef CONFIG_MT7915_NPU
++	unsigned long ct_rx_activity_next;
++#endif
+ 
+ 	struct ieee80211_sband_iftype_data iftype[NUM_NL80211_BANDS][NUM_NL80211_IFTYPES];
+ 

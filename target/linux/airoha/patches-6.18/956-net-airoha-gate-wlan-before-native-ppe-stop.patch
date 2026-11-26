@@ -1,0 +1,425 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: gate WLAN before native PPE stop
+
+Require the sticky firmware WLAN gate ACK before stopping native PPE banks,
+retain NPU owners on failed teardown, and close fixed-DT provider unbind.
+Publish native state after all netdevs register and pin the matching firmware.
+
+--- a/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
+@@ -103,6 +103,29 @@
+ static void airoha_ct_fe_health_work(struct work_struct *work);
+ #include "airoha_ct_fe_native.h"
+ 
++/* The fault gate ACK covers descriptor publication, not frame retirement. */
++static int airoha_ct_pair_wlan_gate(struct airoha_ppe *ppe)
++{
++	struct airoha_ct_pair_msg msg = {
++		.op = cpu_to_le16(AIROHA_CT_PAIR_FLUSH),
++		.flags = cpu_to_le32(AIROHA_CT_PAIR_F_CPU_FALLBACK),
++	};
++	struct airoha_npu *npu;
++	int err = -EOPNOTSUPP;
++
++	lockdep_assert_held(&ppe_lock);
++	if (READ_ONCE(ppe->eth->ct_cpu_wlan_gated))
++		return 0;
++	rcu_read_lock();
++	npu = rcu_dereference(ppe->eth->npu);
++	if (npu && npu->ops.ct_pair_cmd)
++		err = npu->ops.ct_pair_cmd(npu, &msg);
++	rcu_read_unlock();
++	if (!err)
++		WRITE_ONCE(ppe->eth->ct_cpu_wlan_gated, true);
++	return err;
++}
++
+ /* FLUSH closes every admission before reporting outstanding references.
+  * A fault can keep those references busy indefinitely. Send one command now,
+  * then retry in the worker without waiting for a completion ACK to stop PPE.
+@@ -122,14 +145,19 @@
+ 	ppe->ct_pair_close_pending = !!err;
+ }
+ 
+-static void airoha_ct_pair_fault_close(struct airoha_ppe *ppe)
+-{
+-	lockdep_assert_held(&ppe_lock);
+-	airoha_ct_pair_close_once(ppe);
++static int airoha_ct_pair_fault_close(struct airoha_ppe *ppe)
++{
++	int err;
++
++	lockdep_assert_held(&ppe_lock);
++	err = airoha_ct_pair_wlan_gate(ppe);
++	if (!err)
++		airoha_ct_pair_close_once(ppe);
+ 	if (READ_ONCE(ppe->eth->ct_cpu_ifc_disabled))
+ 		ppe->ct_fe.active = false;
+ 	if (!ppe->ct_fe.health_stopping)
+ 		schedule_delayed_work(&ppe->ct_fe.health_work, msecs_to_jiffies(100));
++	return err;
+ }
+ 
+ static int airoha_ct_pair_fail_from(struct airoha_ppe *ppe, int err,
+@@ -161,7 +189,9 @@
+ 	    (!READ_ONCE(ppe->eth->ct_cpu_ifc_disabled) ||
+ 	     !READ_ONCE(ppe->eth->ct_cpu_routes_ready)))
+ 		airoha_ct_cpu_fallback(ppe->eth);
+-	if (!ppe->ct_fe.health_stopping && ppe->ct_pair_failed && ppe->ct_pair_close_pending)
++	if (!ppe->ct_fe.health_stopping && ppe->ct_pair_failed && !ppe->ct_pair_hw_stopped)
++		airoha_ppe_ct_bridge_fail_closed(ppe);
++	else if (!ppe->ct_fe.health_stopping && ppe->ct_pair_failed && ppe->ct_pair_close_pending)
+ 		airoha_ct_pair_close_once(ppe);
+ 	if (!ppe->ct_fe.health_stopping && ppe->ct_pair_failed &&
+ 	    (ppe->ct_fe.armed || ppe->ct_fe.pending || ppe->ct_fe.arm_pending))
+@@ -177,7 +207,8 @@
+ 		airoha_ct_pair_fail(ppe, err);
+ out:
+ 	again = !ppe->ct_fe.health_stopping && (ppe->ct_pair_close_pending ||
+-		(ppe->ct_pair_failed && (!READ_ONCE(ppe->eth->ct_cpu_ifc_disabled) ||
++		(ppe->ct_pair_failed && (!ppe->ct_pair_hw_stopped ||
++		 !READ_ONCE(ppe->eth->ct_cpu_ifc_disabled) ||
+ 		 !READ_ONCE(ppe->eth->ct_cpu_routes_ready))) ||
+ 		(!READ_ONCE(ppe->eth->ct_cpu_fallback) && ppe->ct_fe.touched) ||
+ 		(ppe->ct_pair_failed && (ppe->ct_fe.armed || ppe->ct_fe.pending || ppe->ct_fe.arm_pending)) ||
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2107,13 +2107,16 @@
+ 	return err;
+ }
+ 
+-static void airoha_hw_cleanup(struct airoha_eth *eth)
+-{
+-	int i;
+-
++static int airoha_hw_cleanup(struct airoha_eth *eth)
++{
++	int i, err;
++
++	err = airoha_ppe_deinit(eth);
++	if (err)
++		return err;
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+ 		airoha_qdma_cleanup(eth, &eth->qdma[i]);
+-	airoha_ppe_deinit(eth);
++	return 0;
+ }
+ 
+ static void airoha_qdma_start_napi(struct airoha_qdma *qdma)
+@@ -4919,14 +4922,15 @@
+ 		}
+ 	}
+ 
++	err = airoha_register_gdm_devices(eth);
++	if (err)
++		goto error_napi_stop;
++
++	/* No probe failure path follows native producer publication. */
+ 	err = airoha_ppe_ct_prepare(eth);
+ 	if (err && err != -EOPNOTSUPP)
+ 		dev_info(eth->dev, "CT PPE eager preparation: %d; native Ethernet retained\n",
+ 			 err);
+-
+-	err = airoha_register_gdm_devices(eth);
+-	if (err)
+-		goto error_napi_stop;
+ 
+ 	return 0;
+ 
+@@ -4959,7 +4963,8 @@
+ 		}
+ 		airoha_metadata_dst_free(port);
+ 	}
+-	airoha_hw_cleanup(eth);
++	/* This unwind runs before native producer publication. */
++	WARN_ON(airoha_hw_cleanup(eth));
+ error_netdev_free:
+ 	free_netdev(eth->napi_dev);
+ 	platform_set_drvdata(pdev, NULL);
+@@ -4970,16 +4975,26 @@
+ static void airoha_shutdown(struct platform_device *pdev)
+ {
+ 	struct airoha_eth *eth = platform_get_drvdata(pdev);
+-
+-	if (eth && test_bit(DEV_STATE_INITIALIZED, &eth->state))
+-		airoha_ppe_ct_shutdown(eth);
++	int err;
++
++	if (!eth || !test_bit(DEV_STATE_INITIALIZED, &eth->state))
++		return;
++	err = airoha_ppe_ct_shutdown(eth);
++	if (err)
++		dev_err(eth->dev, "CT shutdown retained native resources: %d\n", err);
+ }
+ 
+ static void airoha_remove(struct platform_device *pdev)
+ {
+ 	struct airoha_eth *eth = platform_get_drvdata(pdev);
+-	int i;
+-
++	int i, err;
++
++	/* Built-in fixed-DT providers have no sysfs unbind entry. */
++	err = airoha_ppe_ct_shutdown(eth);
++	if (err) {
++		dev_err(eth->dev, "CT remove retained native resources: %d\n", err);
++		return;
++	}
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
+ 		airoha_qdma_stop_napi(&eth->qdma[i]);
+ 		airoha_qdma_tx_cleanup(&eth->qdma[i]);
+@@ -5007,7 +5022,9 @@
+ 		}
+ 		airoha_metadata_dst_free(port);
+ 	}
+-	airoha_hw_cleanup(eth);
++	err = airoha_hw_cleanup(eth);
++	if (WARN_ON(err))
++		return;
+ 
+ 	free_netdev(eth->napi_dev);
+ 	platform_set_drvdata(pdev, NULL);
+@@ -5214,6 +5231,7 @@
+ 	.shutdown = airoha_shutdown,
+ 	.driver = {
+ 		.name = KBUILD_MODNAME,
++		.suppress_bind_attrs = true,
+ 		.of_match_table = of_airoha_match,
+ 	},
+ };
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -837,6 +837,7 @@
+ 	bool ct_cpu_fallback;
+ 	bool ct_cpu_ifc_disabled;
+ 	bool ct_cpu_routes_ready;
++	bool ct_cpu_wlan_gated;
+ 	spinlock_t ifc_port_lock;
+ 	u32 ifc_port_desired;
+ 	u32 ct_ifc_port_mask;
+@@ -935,12 +936,12 @@
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
+ bool airoha_ppe_ct_requested(struct airoha_eth *eth);
+ int airoha_ppe_init(struct airoha_eth *eth);
+-void airoha_ppe_deinit(struct airoha_eth *eth);
++int airoha_ppe_deinit(struct airoha_eth *eth);
+ int airoha_ifc_scope_ports(struct airoha_eth *eth, u32 scope);
+ int airoha_gdm_fwd_cfg_update(struct airoha_eth *eth, unsigned int id,
+ 			     u32 mask, u32 value);
+ int airoha_ct_cpu_fallback(struct airoha_eth *eth);
+-void airoha_ppe_ct_shutdown(struct airoha_eth *eth);
++int airoha_ppe_ct_shutdown(struct airoha_eth *eth);
+ int airoha_ppe_ct_prepare(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+ u32 airoha_ppe_get_total_num_entries(struct airoha_ppe *ppe);
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -300,7 +300,7 @@
+ 		  0x1f, 0xea, 0xf0, 0x3f, 0xc9, 0x3b, 0x0e, 0x3a },
+ 	};
+ 	static const u8 lab_sha256[][SHA256_DIGEST_SIZE] = {
+-		{ 0x90, 0xca, 0x5d, 0xf9, 0xa9, 0xbc, 0x68, 0x49, 0x86, 0x9a, 0xf0, 0x8a, 0x66, 0xc9, 0xf8, 0x14, 0x64, 0xdc, 0xe1, 0x67, 0x7a, 0xf2, 0x5e, 0x67, 0xce, 0x7d, 0x36, 0x20, 0x5c, 0xf5, 0x81, 0xc3 },
++		{ 0x0c, 0x22, 0xad, 0xc3, 0xcd, 0xb8, 0x1c, 0x9f, 0xc2, 0x88, 0x31, 0xdf, 0xe5, 0x5f, 0x5d, 0xcb, 0x10, 0xbb, 0xac, 0x8e, 0x53, 0x90, 0xe6, 0x48, 0x02, 0x23, 0x53, 0x23, 0x7a, 0xbe, 0xdb, 0x11 },
+ 		{ 0xdf, 0x3f, 0x61, 0x98, 0x04, 0xa9, 0x2f, 0xdb, 0x40, 0x57, 0x19, 0x2d, 0xc4, 0x3d, 0xd7, 0x48, 0xea, 0x77, 0x8a, 0xdc, 0x52, 0xbc, 0x49, 0x8c, 0xe8, 0x05, 0x24, 0xc0, 0x14, 0xb8, 0x11, 0x19 },
+ 	};
+ 	bool ct = airoha_npu_is_connac2_ct(dev);
+@@ -1046,6 +1046,7 @@
+ 	.shutdown = airoha_npu_shutdown,
+ 	.driver = {
+ 		.name = "airoha-npu",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = of_airoha_npu_match,
+ 	},
+ };
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1195,7 +1195,7 @@
+ 	return err;
+ }
+ 
+-static void airoha_ct_pair_fault_close(struct airoha_ppe *ppe);
++static int airoha_ct_pair_fault_close(struct airoha_ppe *ppe);
+ 
+ /* Called under ppe_lock, including atomic bridge policy notifications.
+  * Stop both engines on the first SRAM error; never poll every remaining row.
+@@ -1228,8 +1228,12 @@
+ 		ppe->ct_pair_failed = true;
+ 	/* Publish the software route before stopping its hardware consumers. */
+ 	route_err = airoha_ct_cpu_fallback(eth);
+-	if (ppe->ct_native_pairs)
+-		airoha_ct_pair_fault_close(ppe);
++	if (ppe->ct_native_pairs) {
++		err = airoha_ct_pair_fault_close(ppe);
++		/* Never stop the consumer before the WLAN producer gate ACK. */
++		if (err)
++			return err;
++	}
+ 	ppe->ct_pair_hw_stopped = false;
+ 	for (bank = 0; bank < eth->soc->num_ppe; bank++) {
+ 		airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(bank), 0);
+@@ -2653,7 +2657,7 @@
+ static int airoha_ppe_ct_stop(struct airoha_ppe *ppe)
+ {
+ 	struct airoha_eth *eth = ppe->eth;
+-	bool live = ppe->ct_host_ppe && ppe->ct_owns_sram;
++	bool live = rcu_access_pointer(eth->npu) && ppe->ct_owns_sram;
+ 	int bank, err;
+ 
+ 	WRITE_ONCE(ppe->ct_pair_policy_allowed, false);
+@@ -2662,6 +2666,15 @@
+ 	    ppe->ct_fe.touched || ppe->ct_fe.pending || ppe->ct_fe.arm_pending)) {
+ 		spin_lock_bh(&ppe_lock);
+ 		err = airoha_ct_native_pair_revoke(ppe, -1, 0);
++		spin_unlock_bh(&ppe_lock);
++		if (err)
++			return err;
++	}
++	/* The published native runtime must close gateway TDMA as well as pairs.
++	 * Cold-start rollback has no published NPU and uses the firmware EN guard. */
++	if (ppe->ct_native_pairs && rcu_access_pointer(eth->npu)) {
++		spin_lock_bh(&ppe_lock);
++		err = airoha_ct_pair_wlan_gate(ppe);
+ 		spin_unlock_bh(&ppe_lock);
+ 		if (err)
+ 			return err;
+@@ -2714,13 +2727,13 @@
+ 	return 0;
+ }
+ 
+-void airoha_ppe_ct_shutdown(struct airoha_eth *eth)
++int airoha_ppe_ct_shutdown(struct airoha_eth *eth)
+ {
+ 	struct airoha_ppe *ppe = eth->ppe;
+-	int err;
++	int err = 0;
+ 
+ 	if (!airoha_ppe_ct_requested(eth))
+-		return;
++		return 0;
+ 
+ 	mutex_lock(&flow_offload_mutex);
+ 	spin_lock_bh(&ppe_lock);
+@@ -2734,6 +2747,7 @@
+ 			dev_info(eth->dev, "CT PPE shutdown: banks restored\n");
+ 	}
+ 	mutex_unlock(&flow_offload_mutex);
++	return err;
+ }
+ 
+ static int airoha_ppe_ct_start(struct airoha_ppe *ppe, struct airoha_npu *npu)
+@@ -2820,11 +2834,13 @@
+ 
+ static int airoha_ppe_offload_setup(struct airoha_eth *eth, bool load_module)
+ {
+-	struct airoha_npu *npu = load_module ? airoha_ppe_npu_get(eth) :
+-					    airoha_npu_get(eth->dev);
++	struct airoha_npu *npu;
+ 	struct airoha_ppe *ppe = eth->ppe;
+ 	int err, ppe_num_stats_entries;
+ 
++	if (!test_bit(DEV_STATE_REGISTERED, &eth->state))
++		return -EPROBE_DEFER;
++	npu = load_module ? airoha_ppe_npu_get(eth) : airoha_npu_get(eth->dev);
+ 	if (IS_ERR(npu))
+ 		return PTR_ERR(npu);
+ 	if (!npu)
+@@ -3094,6 +3110,7 @@
+ 	struct platform_device *pdev;
+ 	struct device_node *np;
+ 	struct airoha_eth *eth;
++	int err = -ENODEV;
+ 
+ 	np = of_parse_phandle(dev->of_node, "airoha,eth", 0);
+ 	if (!np)
+@@ -3113,8 +3130,11 @@
+ 	}
+ 
+ 	eth = platform_get_drvdata(pdev);
+-	if (!eth)
++	/* Keep the provider private until every GDM netdev is registered. */
++	if (!eth || !test_bit(DEV_STATE_REGISTERED, &eth->state)) {
++		err = -EPROBE_DEFER;
+ 		goto error_module_put;
++	}
+ 
+ 	if (!device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_SUPPLIER)) {
+ 		dev_err(&pdev->dev,
+@@ -3130,7 +3150,7 @@
+ error_pdev_put:
+ 	platform_device_put(pdev);
+ 
+-	return ERR_PTR(-ENODEV);
++	return ERR_PTR(err);
+ }
+ EXPORT_SYMBOL_GPL(airoha_ppe_get_dev);
+ 
+@@ -3249,13 +3269,11 @@
+ 	return err;
+ }
+ 
+-void airoha_ppe_deinit(struct airoha_eth *eth)
++int airoha_ppe_deinit(struct airoha_eth *eth)
+ {
+ 	struct airoha_npu *npu;
+-
+-
+-	if (airoha_ppe_ct_requested(eth))
+-		unregister_switchdev_notifier(&eth->ppe->ct_bridge_notifier);
++	int err;
++
+ 
+ 	mutex_lock(&flow_offload_mutex);
+ 
+@@ -3265,8 +3283,13 @@
+ 		spin_unlock_bh(&ppe_lock);
+ 	}
+ 
+-	if (eth->ppe->ct_restore_pending)
+-		airoha_ppe_ct_stop(eth->ppe);
++	if (eth->ppe->ct_restore_pending) {
++		err = airoha_ppe_ct_stop(eth->ppe);
++		if (err) {
++			mutex_unlock(&flow_offload_mutex);
++			return err;
++		}
++	}
+ 	npu = rcu_replace_pointer(eth->npu, NULL,
+ 				  lockdep_is_held(&flow_offload_mutex));
+ 	if (npu) {
+@@ -3278,9 +3301,12 @@
+ 		airoha_npu_put(npu);
+ 
+ 	mutex_unlock(&flow_offload_mutex);
++	if (airoha_ppe_ct_requested(eth))
++		unregister_switchdev_notifier(&eth->ppe->ct_bridge_notifier);
+ 	airoha_ct_pair_policy_deinit(eth->ppe);
+ 
+ 	rhashtable_destroy(&eth->ppe->l2_flows);
+ 	rhashtable_destroy(&eth->flow_table);
+ 	debugfs_remove(eth->ppe->debugfs_dir);
+-}
++	return 0;
++}
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -195,6 +195,7 @@
+ 	seq_printf(m, "ct_cpu_fallback: %u routes_ready: %u ifc_disabled: %u\n",
+ 		   READ_ONCE(eth->ct_cpu_fallback), READ_ONCE(eth->ct_cpu_routes_ready),
+ 		   READ_ONCE(eth->ct_cpu_ifc_disabled));
++	seq_printf(m, "ct_cpu_wlan_gated: %u\n", READ_ONCE(eth->ct_cpu_wlan_gated));
+ 	for (i = AIROHA_GDM1_IDX; i <= AIROHA_GDM4_IDX; i++)
+ 		seq_printf(m, "gdm%u_fwd_cfg: %08x fallback_mask: %04x\n", i,
+ 			   airoha_fe_rr(eth, REG_GDM_FWD_CFG(i)),
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -198,7 +198,9 @@
+ #define AIROHA_CT_PAIR_ABI 3
+ #define AIROHA_CT_PAIR_FUNC 34
+ #define AIROHA_CT_PAIR_SLOTS 32
+-#define AIROHA_CT_PAIR_CAPS 31
++#define AIROHA_CT_PAIR_CAPS 63
++/* Fault-only FLUSH: ACK closes WLAN producers; inflight owners are retained. */
++#define AIROHA_CT_PAIR_F_CPU_FALLBACK BIT(0)
+ /* selector 0/1: WLAN ring + WCID; selector 2: wired LAN1 + source-port ID.
+  * ABI3 admits LAN1 source only within an acknowledged FE ARM lifetime. */
+ #define AIROHA_CT_PAIR_LAN1_SELECTOR 2

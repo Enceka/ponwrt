@@ -12,8 +12,14 @@ pre = r'''
 #include <errno.h>
 struct notifier_block {int(*notifier_call)(struct notifier_block*,unsigned long,void*);};
 struct airoha_eth {void*dev;};
-struct airoha_ppe {struct airoha_eth*eth;bool ct_native_pairs,ct_pair_wired_registered,ct_pair_policy_registered;struct notifier_block ct_pair_wired_notifier,ct_pair_policy_notifier;};
+struct airoha_ppe {struct {int health_work;bool health_stopping;}ct_fe;struct airoha_eth*eth;bool ct_native_pairs,ct_pair_wired_registered,ct_pair_policy_registered;struct notifier_block ct_pair_wired_notifier,ct_pair_policy_notifier;};
 static unsigned active_net,active_policy,active_file,step;
+static int ppe_lock;
+#define spin_lock_bh(p) (*(p)=1)
+#define spin_unlock_bh(p) (*(p)=0)
+#define INIT_DELAYED_WORK(w,f) (*(w)=1)
+static void cancel_delayed_work_sync(int*w){assert(*w==1&&!ppe_lock);}
+
 static int fail_stage,dev_attr_ct_native_pair_policy;
 static int airoha_ct_pair_wired_event(struct notifier_block*n,unsigned long e,void*p){(void)n;(void)e;(void)p;return 0;}
 static int airoha_ct_pair_policy_event(struct notifier_block*n,unsigned long e,void*p){(void)n;(void)e;(void)p;return 0;}

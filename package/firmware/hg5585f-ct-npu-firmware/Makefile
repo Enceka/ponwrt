@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=hg5585f-ct-npu-firmware
 PKG_VERSION:=6.6.23
-PKG_RELEASE:=1
+PKG_RELEASE:=3
 PKGARCH:=all
 PKG_LICENSE:=Proprietary
 
@@ -15,6 +15,13 @@ define Package/hg5585f-ct-npu-firmware
   DEPENDS:=@TARGET_airoha_an7581
 endef
 
+define Package/hg5585f-ct-npu-rebuilt-firmware
+  SECTION:=firmware
+  CATEGORY:=Firmware
+  TITLE:=FiberHome HG5585F rebuilt native NPU firmware
+  DEPENDS:=@TARGET_airoha_an7581 +hg5585f-ct-npu-firmware
+endef
+
 define Build/Compile
 endef
 
@@ -24,4 +31,11 @@ define Package/hg5585f-ct-npu-firmware/install
 	$(INSTALL_DATA) $(CURDIR)/files/npu_rv32.bin $(CURDIR)/files/npu_data.bin $(1)/lib/firmware/airoha/hg5585f-ct/
 endef
 
+define Package/hg5585f-ct-npu-rebuilt-firmware/install
+	cd $(CURDIR)/files && sha256sum -c ../SHA256SUMS.rebuilt
+	$(INSTALL_DIR) $(1)/lib/firmware/airoha/hg5585f-ct
+	$(INSTALL_DATA) $(CURDIR)/files/npu_rebuilt_rv32.bin $(CURDIR)/files/npu_rebuilt_data.bin $(1)/lib/firmware/airoha/hg5585f-ct/
+endef
+
 $(eval $(call BuildPackage,hg5585f-ct-npu-firmware))
+$(eval $(call BuildPackage,hg5585f-ct-npu-rebuilt-firmware))

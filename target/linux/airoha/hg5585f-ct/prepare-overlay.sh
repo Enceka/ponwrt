@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# != 2 ]]; then
-  echo "usage: bash $0 STOCK_USERFS NEW_OVERLAY_DIRECTORY" >&2
+if [[ $# != 2 && $# != 3 ]]; then
+  echo "usage: bash $0 STOCK_USERFS NEW_OVERLAY_DIRECTORY [REBUILT_PAYLOAD_DIRECTORY]" >&2
   exit 2
 fi
 source_dir=$(cd "$1" && pwd)
-repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+repo=$(cd "$(dirname "$0")/../../../.." && pwd)
+rebuilt_dir=
+if [[ $# == 3 ]]; then
+  rebuilt_dir=$(cd "$3" && pwd)
+fi
 package=package/firmware/hg5585f-ct-npu-firmware
 firmware=(npu_rv32.bin npu_data.bin)
 (cd "$source_dir" && sha256sum -c "$repo/$package/SHA256SUMS")
 mkdir -- "$2"
 overlay=$(cd "$2" && pwd)
 cd "$repo"
-for path in "$package/Makefile" "$package/SHA256SUMS" \
+for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebuilt" \
   package/kernel/mt76/{Makefile,patches/111-mt7915-connac2-mailbox.patch,patches/112-mt7915-connac2-counters.patch,patches/113-mt7915-connac2-rx-rings.patch} \
   package/kernel/mt76/patches/{114-mt7915-connac2-host-rx.patch,115-mt7915-connac2-host-dequeue.patch,116-mt7915-connac2-packet-count.patch} \
   package/kernel/mt76/patches/{117-mt7915-connac2-pcie-windows.patch,118-mt7915-connac2-completion-counts.patch} \
@@ -37,7 +41,9 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   package/kernel/mt76/ct-wed/patches/139-mt76-skip-host-reorder-for-connac2-queues.patch \
   package/kernel/mt76/ct-wed/patches/140-mt7915-flush-ct-wlan-flows-on-station-revoke.patch \
   package/kernel/mt76/ct-wed/patches/141-mt7915-learn-authorized-ct-wireless-bridge-flows.patch \
+  package/kernel/mt76/ct-wed/patches/142-mt7915-refresh-ct-native-rx-activity.patch \
   package/kernel/mac80211/{Makefile,patches/subsys/601-mac80211-bridge-ct-ap-unicast-and-isolation-policy.patch} \
+  package/kernel/mac80211/patches/subsys/602-mac80211-track-driver-reported-rx-activity.patch \
   target/linux/airoha/patches-6.18/931-net-airoha-initialize-ct-connac2-packet-pool.patch \
   target/linux/airoha/patches-6.18/932-net-airoha-initialize-ct-connac2-host-ppe.patch \
   target/linux/airoha/patches-6.18/933-net-airoha-quiesce-ct-ppe-on-shutdown.patch \
@@ -55,7 +61,20 @@ for path in "$package/Makefile" "$package/SHA256SUMS" \
   target/linux/airoha/patches-6.18/945-net-airoha-offload-ct-wireless-ipv6.patch \
   target/linux/airoha/patches-6.18/946-net-airoha-offload-authorized-wireless-bridge-flows.patch \
   target/linux/airoha/patches-6.18/947-net-airoha-guard-ct-npu-wireless-short-frames.patch \
-  target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config} \
+  target/linux/airoha/patches-6.18/948-net-airoha-report-ct-flow-admission.patch \
+  target/linux/airoha/patches-6.18/949-net-airoha-publish-npu-mailbox-status-before-trigger.patch \
+  target/linux/airoha/patches-6.18/950-net-airoha-size-coherent-mailboxes-for-wlan-statistics.patch \
+  target/linux/airoha/patches-6.18/951-net-airoha-load-verified-rebuilt-ct-ram-firmware.patch \
+  target/linux/airoha/patches-6.18/952-net-airoha-add-native-wireless-pair-offload.patch \
+  target/linux/airoha/patches-6.18/953-net-airoha-add-native-wlan-lan1-destination.patch \
+  target/linux/airoha/patches-6.18/954-net-airoha-add-native-lan1-source-offload.patch \
+  target/linux/airoha/patches-6.18/955-net-airoha-preserve-cpu-forwarding-after-native-faults.patch \
+  target/linux/airoha/patches-6.18/956-net-airoha-gate-wlan-before-native-ppe-stop.patch \
+  target/linux/airoha/patches-6.18/957-net-airoha-allow-station-reconnect-after-native-fault.patch \
+  target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config,NATIVE_PAIRS.md} \
+  target/linux/airoha/tests/native_pair/*.{py,c} \
+  target/linux/airoha/tests/native_pair/fixtures/*.inc \
+  target/linux/airoha/tests/station_activity/*.py \
   target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed.dts}; do
   mkdir -p "$overlay/tree/$(dirname "$path")"
   install -m 644 "$path" "$overlay/tree/$path"
@@ -65,5 +84,25 @@ for name in "${firmware[@]}"; do
   install -m 644 "$source_dir/$name" "$overlay/tree/$package/files/$name"
 done
 (cd "$overlay/tree/$package/files" && sha256sum -c ../SHA256SUMS)
+if [[ -n "$rebuilt_dir" ]]; then
+  for kind in rv32 data; do
+    install -m 644 "$rebuilt_dir/ram-npu_$kind.bin" "$overlay/tree/$package/files/npu_rebuilt_$kind.bin"
+  done
+  (cd "$overlay/tree/$package/files" && sha256sum -c ../SHA256SUMS.rebuilt)
+fi
 printf '%s\n' CONFIG_MT7915_NPU=y CONFIG_PACKAGE_hg5585f-ct-npu-firmware=y \
   CONFIG_PACKAGE_kmod-mt7916-ct-wed-prepare=y > "$overlay/local.config"
+if [[ -n "$rebuilt_dir" ]]; then
+  printf '%s\n' CONFIG_PACKAGE_hg5585f-ct-npu-rebuilt-firmware=y \
+    CONFIG_PACKAGE_kmod-nft-core=y CONFIG_PACKAGE_kmod-nft-bridge=y >> "$overlay/local.config"
+fi
+python3 - "$overlay" <<'PY_MANIFEST'
+from pathlib import Path
+import hashlib
+import sys
+root = Path(sys.argv[1])
+files = sorted(path for path in root.rglob('*') if path.is_file())
+(root / 'SHA256SUMS').write_text(''.join(
+    f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(root)}\n'
+    for path in files))
+PY_MANIFEST

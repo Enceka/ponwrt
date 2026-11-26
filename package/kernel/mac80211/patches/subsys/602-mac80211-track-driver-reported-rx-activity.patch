@@ -1,0 +1,94 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] mac80211: track driver-reported RX activity
+
+Keep a separate driver RX timestamp and merge it with software RX and
+successful TX ACK activity for station inactivity reporting.
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -7017,6 +7017,18 @@
+ 			       struct ieee80211_sta *pubsta, bool block);
+ 
+ /**
++ * ieee80211_sta_register_rx_activity - report RX activity from an offload engine
++ * @pubsta: station that received traffic
++ * @link_id: link ID, or -1 for a non-MLO station's default link
++ *
++ * Report only newly observed, valid RX activity. Counter reads and failed TX
++ * attempts are not activity. The caller must keep the station alive with RCU
++ * or the wiphy mutex, and serialize calls for the same station/link. This does
++ * not change packet, byte, rate, signal, or TX ACK statistics.
++ */
++void ieee80211_sta_register_rx_activity(struct ieee80211_sta *pubsta, int link_id);
++
++/**
+  * ieee80211_sta_eosp - notify mac80211 about end of SP
+  * @pubsta: the station
+  *
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -3426,10 +3426,27 @@
+ 	return thr;
+ }
+ 
++void ieee80211_sta_register_rx_activity(struct ieee80211_sta *pubsta, int link_id)
++{
++	struct sta_info *sta = container_of(pubsta, struct sta_info, sta);
++	struct link_sta_info *link;
++
++	if (WARN_ON_ONCE(link_id < -1 || link_id >= IEEE80211_MLD_MAX_NUM_LINKS))
++		return;
++
++	rcu_read_lock();
++	link = link_id < 0 ? &sta->deflink : rcu_dereference(sta->link[link_id]);
++	if (link)
++		WRITE_ONCE(link->last_rx_hw, jiffies);
++	rcu_read_unlock();
++}
++EXPORT_SYMBOL_GPL(ieee80211_sta_register_rx_activity);
++
+ unsigned long ieee80211_sta_last_active(struct sta_info *sta, int link_id)
+ {
+ 	struct ieee80211_sta_rx_stats *stats;
+ 	struct link_sta_info *link_sta_info;
++	unsigned long last_rx, last_ack, last_rx_hw;
+ 
+ 	stats = sta_get_last_rx_stats(sta, link_id);
+ 
+@@ -3439,11 +3456,13 @@
+ 		link_sta_info = wiphy_dereference(sta->local->hw.wiphy,
+ 						  sta->link[link_id]);
+ 
+-	if (!link_sta_info->status_stats.last_ack ||
+-	    time_after(stats->last_rx, link_sta_info->status_stats.last_ack))
+-		return stats->last_rx;
+-
+-	return link_sta_info->status_stats.last_ack;
++	last_rx = READ_ONCE(stats->last_rx);
++	last_ack = READ_ONCE(link_sta_info->status_stats.last_ack);
++	last_rx_hw = READ_ONCE(link_sta_info->last_rx_hw);
++	if (last_rx_hw && time_after(last_rx_hw, last_rx))
++		last_rx = last_rx_hw;
++
++	return !last_ack || time_after(last_rx, last_ack) ? last_rx : last_ack;
+ }
+ 
+ int ieee80211_sta_allocate_link(struct sta_info *sta, unsigned int link_id)
+--- a/net/mac80211/sta_info.h
++++ b/net/mac80211/sta_info.h
+@@ -491,6 +491,7 @@
+  * @tx_stats.last_rate: last TX rate
+  * @tx_stats.msdu: # of transmitted MSDUs per TID
+  * @rx_stats: RX statistics
++ * @last_rx_hw: last driver-reported RX activity (jiffies)
+  * @rx_stats_avg: averaged RX statistics
+  * @rx_stats_avg.signal: averaged signal
+  * @rx_stats_avg.chain_signal: averaged per-chain signal
+@@ -539,6 +540,7 @@
+ 
+ 	/* Updated from RX path only, no locking requirements */
+ 	struct ieee80211_sta_rx_stats rx_stats;
++	unsigned long last_rx_hw;
+ 	struct {
+ 		struct ewma_signal signal;
+ 		struct ewma_signal chain_signal[IEEE80211_MAX_CHAINS];

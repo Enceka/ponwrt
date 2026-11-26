@@ -1,0 +1,722 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: admit native LAN1 source traffic through FE
+
+Admit LAN1 source MAC pairs through the ABI3 FE owner lifetime and bind
+native bank0 bridge rows after checking current FDB and station ownership.
+Retire the FE producer and all native submitters, drain PPE1, then remove
+owned rows before restoring the bank. Keep failed IFC rollback work alive
+until the pending QUIESCE completes. Before a failure hard-stops the banks,
+issue global native FLUSH and retain retries independently of FE ownership
+flags until all native references drain. Pin the FE fence/watchdog firmware.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
+@@ -0,0 +1,258 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* ABI3 LAN1 producer ownership. All entry points hold ppe_lock; notifier
++ * callers are atomic, so table completion never sleeps. */
++#define CT_FE_NATIVE_ROW 54
++
++static int airoha_ct_fe_table(struct airoha_ppe *ppe, unsigned int bank,
++			      unsigned int index, unsigned int page, bool write,
++			      u32 *words, unsigned int count)
++{
++	struct airoha_eth *eth = ppe->eth;
++	u32 command = (index << 16) | (page << 8) | (bank << 4) | (write ? 3 : 1);
++	u32 status;
++	unsigned int i;
++	int err;
++
++	lockdep_assert_held(&ppe_lock);
++	if (write)
++		for (i = 0; i < count; i++)
++			airoha_fe_wr(eth, CT_IFC_DATA(i), words[i]);
++	airoha_fe_wr(eth, CT_IFC_CONTROL, command);
++	err = read_poll_timeout_atomic(airoha_fe_rr, status, status & CT_IFC_DONE,
++				       2, 1000, false, eth, CT_IFC_CONTROL);
++	if (!err && !write)
++		for (i = 0; i < count; i++)
++			words[i] = airoha_fe_rr(eth, CT_IFC_DATA(i));
++	return err;
++}
++
++static int airoha_ct_fe_put(struct airoha_ppe *ppe, unsigned int bank,
++			    unsigned int index, unsigned int page,
++			    u32 *words, unsigned int count)
++{
++	u32 actual[3] = {};
++	int err;
++
++	err = airoha_ct_fe_table(ppe, bank, index, page, true, words, count);
++	if (!err)
++		err = airoha_ct_fe_table(ppe, bank, index, page, false, actual, count);
++	if (err)
++		return err;
++	if (bank == CT_IFC_TCAM_BANK)
++		return actual[1] == words[1] && !((actual[0] ^ words[0]) & words[1]) ? 0 : -EIO;
++	return memcmp(actual, words, count * sizeof(*words)) ? -EIO : 0;
++}
++
++static int airoha_ct_fe_snapshot(struct airoha_ppe *ppe)
++{
++	unsigned int r, page;
++	int err;
++
++	if (!ppe->ct_ifc.cfg_owned ||
++	    !(airoha_fe_rr(ppe->eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK) ||
++	    airoha_fe_rr(ppe->eth, REG_FE_IFC_PORT_EN) != XSI_ETH_VIP_PORT_MASK)
++		return -EINVAL;
++	if (ppe->ct_fe.touched)
++		return -EBUSY;
++	for (r = 0; r < 2; r++) {
++		for (page = 0; page < 3; page++) {
++			err = airoha_ct_fe_table(ppe, CT_IFC_ACTION_BANK, CT_FE_NATIVE_ROW + r,
++						 page, false, ppe->ct_fe.action[r][page],
++						 ct_ifc_action_words[page]);
++			if (err)
++				return err;
++		}
++		if (ppe->ct_fe.action[r][2][0] & CT_IFC_ACTION_ENABLE)
++			return -EBUSY;
++		for (page = 0; page < 9; page++) {
++			err = airoha_ct_fe_table(ppe, CT_IFC_TCAM_BANK, CT_FE_NATIVE_ROW + r,
++						 page, false, ppe->ct_fe.tcam[r][page], 2);
++			if (err)
++				return err;
++		}
++	}
++	ppe->ct_fe.saved = true;
++	return 0;
++}
++
++static int airoha_ct_fe_restore(struct airoha_ppe *ppe)
++{
++	u32 disabled = 0;
++	unsigned int r, page;
++	int err, first = 0;
++
++	if (!ppe->ct_fe.touched)
++		return 0;
++	if (!ppe->ct_fe.saved)
++		return -EUCLEAN;
++	/* Both producers must stop before either key or action dependency changes. */
++	for (r = 0; r < 2; r++) {
++		err = airoha_ct_fe_put(ppe, CT_IFC_ACTION_BANK, CT_FE_NATIVE_ROW + r,
++				       2, &disabled, 1);
++		if (err && !first)
++			first = err;
++	}
++	if (first)
++		return first;
++	ppe->ct_fe.active = false;
++	for (r = 0; r < 2; r++) {
++		for (page = 0; page < 9; page++) {
++			err = airoha_ct_fe_put(ppe, CT_IFC_TCAM_BANK, CT_FE_NATIVE_ROW + r,
++					       page, ppe->ct_fe.tcam[r][page], 2);
++			if (err && !first)
++				first = err;
++		}
++		for (page = 0; page < 3; page++) {
++			err = airoha_ct_fe_put(ppe, CT_IFC_ACTION_BANK, CT_FE_NATIVE_ROW + r,
++					       page, ppe->ct_fe.action[r][page],
++					       ct_ifc_action_words[page]);
++			if (err && !first)
++				first = err;
++		}
++	}
++	if (!first) {
++		ppe->ct_fe.touched = false;
++		ppe->ct_fe.saved = false;
++	}
++	return first;
++}
++
++static int airoha_ct_fe_control(struct airoha_ppe *ppe, u16 op, u64 generation,
++				u32 epoch)
++{
++	struct airoha_ct_pair_msg msg = {
++		.op = cpu_to_le16(op), .generation = cpu_to_le64(generation),
++		.src_epoch = cpu_to_le32(epoch),
++		.src_selector = AIROHA_CT_PAIR_LAN1_SELECTOR,
++		.src_wcid = cpu_to_le16(AIROHA_CT_PAIR_LAN1_ID),
++	};
++
++	return airoha_ct_pair_send(ppe, &msg);
++}
++
++static int airoha_ct_fe_quiesce(struct airoha_ppe *ppe, u64 generation)
++{
++	u32 epoch;
++	int err;
++
++	lockdep_assert_held(&ppe_lock);
++	err = airoha_ct_fe_restore(ppe);
++	if (!err)
++		err = airoha_ct_fe_snapshot(ppe);
++	if (err)
++		return err;
++	if (!generation || ppe->ct_fe.epoch == U32_MAX ||
++	    ppe->ct_pair_wired_epoch == U32_MAX)
++		return -EOVERFLOW;
++	/* Preserve the exact attempted epoch for an ambiguous mailbox timeout. */
++	if (!ppe->ct_fe.pending) {
++		epoch = max(ppe->ct_fe.epoch + 1, ppe->ct_pair_wired_epoch + 1);
++		ppe->ct_fe.pending_epoch = epoch;
++		ppe->ct_fe.pending_generation = generation;
++		ppe->ct_fe.pending = true;
++	}
++	ppe->ct_fe.armed = false;
++	err = airoha_ct_fe_control(ppe, AIROHA_CT_PAIR_FE_QUIESCE,
++				   ppe->ct_fe.pending_generation, ppe->ct_fe.pending_epoch);
++	if (err)
++		return err;
++	ppe->ct_fe.epoch = ppe->ct_fe.pending_epoch;
++	ppe->ct_fe.generation = ppe->ct_fe.pending_generation;
++	ppe->ct_pair_wired_epoch = ppe->ct_fe.epoch - 1;
++	ppe->ct_fe.pending = false;
++	ppe->ct_fe.arm_pending = false;
++	return 0;
++}
++
++static int airoha_ct_fe_arm(struct airoha_ppe *ppe, u64 generation)
++{
++	u32 tcam[9][2] = {}, action[][3] = {
++		{ 6 << 8, 0 }, { 0, BIT(28), 7 << 10 },
++		{ CT_IFC_ACTION_ENABLE | CT_IFC_ACTION_STOP },
++	};
++	unsigned int r, page;
++	int err;
++
++	lockdep_assert_held(&ppe_lock);
++	if (!ppe->ct_fe.epoch || ppe->ct_fe.pending || ppe->ct_fe.drain_pending ||
++	    ppe->ct_pair_failed || ppe->ct_stopping || ppe->ct_fe.generation != generation)
++		return -ESTALE;
++	if (ppe->ct_fe.armed && ppe->ct_fe.active)
++		return 0;
++	err = airoha_ct_fe_snapshot(ppe);
++	if (err)
++		return err;
++	ppe->ct_fe.arm_pending = true;
++	err = airoha_ct_fe_control(ppe, AIROHA_CT_PAIR_FE_ARM, generation, ppe->ct_fe.epoch);
++	if (err)
++		return err;
++	ppe->ct_fe.arm_pending = false;
++	ppe->ct_fe.armed = true;
++	ppe->ct_fe.touched = true;
++	for (r = 0; r < 2; r++) {
++		tcam[8][0] = r ? 0x41 : 0x42;
++		tcam[8][1] = 0xc3;
++		for (page = 0; page < 9; page++) {
++			err = airoha_ct_fe_put(ppe, CT_IFC_TCAM_BANK, CT_FE_NATIVE_ROW + r,
++					       page, tcam[page], 2);
++			if (err)
++				return err;
++		}
++		for (page = 0; page < 2; page++) {
++			err = airoha_ct_fe_put(ppe, CT_IFC_ACTION_BANK, CT_FE_NATIVE_ROW + r,
++					       page, action[page], ct_ifc_action_words[page]);
++			if (err)
++				return err;
++		}
++	}
++	for (r = 0; r < 2; r++) {
++		err = airoha_ct_fe_put(ppe, CT_IFC_ACTION_BANK, CT_FE_NATIVE_ROW + r,
++				       2, action[2], 1);
++		if (err)
++			return err;
++	}
++	ppe->ct_fe.active = true;
++	if (!ppe->ct_fe.health_stopping)
++		schedule_delayed_work(&ppe->ct_fe.health_work, msecs_to_jiffies(100));
++	return 0;
++}
++
++/* FE RXMBI completes the PSE assembly. PPE BUSY establishes the next queue
++ * boundary after FLUSH has stopped all native producers and TDMA references. */
++static int airoha_ct_fe_ppe_drain(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	u32 status, no_foe = FIELD_PREP(PPE_TB_CFG_SEARCH_MISS_MASK, 2);
++	int err;
++
++	lockdep_assert_held(&ppe_lock);
++	if (!ppe->ct_fe.drain_pending) {
++		ppe->ct_fe.drain_flow = airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0));
++		ppe->ct_fe.drain_tb = airoha_fe_rr(eth, REG_PPE_TB_CFG(0));
++		ppe->ct_fe.drain_pending = true;
++	}
++	airoha_fe_rmw(eth, REG_PPE_TB_CFG(0), PPE_TB_CFG_SEARCH_MISS_MASK, no_foe);
++	airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(0), 0);
++	if (airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) ||
++	    (airoha_fe_rr(eth, REG_PPE_TB_CFG(0)) & PPE_TB_CFG_SEARCH_MISS_MASK) != no_foe)
++		return -EIO;
++	err = read_poll_timeout_atomic(airoha_fe_rr, status, !(status & PPE_GLO_CFG_BUSY_MASK),
++				       10, 100000, false, eth, REG_PPE_GLO_CFG(0));
++	return err ?: (status & PPE_GLO_CFG_EN_MASK ? 0 : -EIO);
++}
++
++static int airoha_ct_fe_ppe_resume(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++
++	lockdep_assert_held(&ppe_lock);
++	if (!ppe->ct_fe.drain_pending)
++		return 0;
++	airoha_fe_wr(eth, REG_PPE_TB_CFG(0), ppe->ct_fe.drain_tb);
++	airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(0), ppe->ct_fe.drain_flow);
++	if (airoha_fe_rr(eth, REG_PPE_TB_CFG(0)) != ppe->ct_fe.drain_tb ||
++	    airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) != ppe->ct_fe.drain_flow)
++		return -EIO;
++	ppe->ct_fe.drain_pending = false;
++	return 0;
++}
+--- a/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
+@@ -51,14 +51,81 @@
+ 	return err;
+ }
+ 
++static void airoha_ct_fe_health_work(struct work_struct *work);
++#include "airoha_ct_fe_native.h"
++
++/* FLUSH closes every admission before reporting outstanding references.
++ * A fault can keep those references busy indefinitely. Send one command now,
++ * then retry in the worker without waiting for a completion ACK to stop PPE.
++ * EAGAIN also covers a busy firmware lock, so it always retains the retry. */
++static void airoha_ct_pair_close_once(struct airoha_ppe *ppe)
++{
++	struct airoha_ct_pair_msg msg = { .op = cpu_to_le16(AIROHA_CT_PAIR_FLUSH) };
++	struct airoha_npu *npu;
++	int err = -EOPNOTSUPP;
++
++	lockdep_assert_held(&ppe_lock);
++	rcu_read_lock();
++	npu = rcu_dereference(ppe->eth->npu);
++	if (npu && npu->ops.ct_pair_cmd)
++		err = npu->ops.ct_pair_cmd(npu, &msg);
++	rcu_read_unlock();
++	ppe->ct_pair_close_pending = !!err;
++}
++
+ static int airoha_ct_pair_fail(struct airoha_ppe *ppe, int err)
+ {
+ 	int stop_err;
+ 
++	ppe->ct_pair_policy_allowed = false;
+ 	ppe->ct_pair_failed = true;
++	/* Close WLAN pairs too: FE QUIESCE retires only wired endpoints. */
++	airoha_ct_pair_close_once(ppe);
++	/* Close the FE producer before bank fail-closed stops the consumer. */
++	if (!airoha_ct_fe_restore(ppe) &&
++	    (ppe->ct_fe.armed || ppe->ct_fe.pending || ppe->ct_fe.arm_pending))
++		airoha_ct_fe_quiesce(ppe, max(ppe->ct_fe.generation,
++					     br_flow_offload_generation()));
+ 	stop_err = airoha_ppe_ct_bridge_fail_closed(ppe);
+ 	ppe->ct_pair_hw_stopped = !stop_err;
++	if ((ppe->ct_pair_close_pending || ppe->ct_fe.touched || ppe->ct_fe.armed || ppe->ct_fe.pending ||
++	     ppe->ct_fe.arm_pending) && !ppe->ct_fe.health_stopping)
++		schedule_delayed_work(&ppe->ct_fe.health_work, msecs_to_jiffies(100));
+ 	return stop_err ?: err;
++}
++
++
++static void airoha_ct_fe_health_work(struct work_struct *work)
++{
++	struct airoha_ppe *ppe = container_of(to_delayed_work(work), struct airoha_ppe,
++					     ct_fe.health_work);
++	bool again;
++	int err;
++
++	spin_lock_bh(&ppe_lock);
++	if (!ppe->ct_fe.health_stopping && ppe->ct_pair_failed && ppe->ct_pair_close_pending)
++		airoha_ct_pair_close_once(ppe);
++	if (!ppe->ct_fe.health_stopping && ppe->ct_pair_failed &&
++	    (ppe->ct_fe.touched || ppe->ct_fe.armed || ppe->ct_fe.pending || ppe->ct_fe.arm_pending)) {
++		if (!airoha_ct_fe_restore(ppe))
++			airoha_ct_fe_quiesce(ppe, max(ppe->ct_fe.generation,
++						     br_flow_offload_generation()));
++	}
++	if (ppe->ct_fe.health_stopping || !ppe->ct_fe.armed || !ppe->ct_fe.active ||
++	    ppe->ct_stopping || ppe->ct_pair_failed)
++		goto out;
++	/* Idempotent ARM performs the firmware fault/stop checks first. */
++	err = airoha_ct_fe_control(ppe, AIROHA_CT_PAIR_FE_ARM,
++				   ppe->ct_fe.generation, ppe->ct_fe.epoch);
++	if (err)
++		airoha_ct_pair_fail(ppe, err);
++out:
++	again = !ppe->ct_fe.health_stopping && (ppe->ct_pair_close_pending || ppe->ct_fe.touched ||
++		(ppe->ct_pair_failed && (ppe->ct_fe.armed || ppe->ct_fe.pending || ppe->ct_fe.arm_pending)) ||
++		(ppe->ct_fe.armed && ppe->ct_fe.active && !ppe->ct_pair_failed && !ppe->ct_stopping));
++	if (again)
++		schedule_delayed_work(&ppe->ct_fe.health_work, msecs_to_jiffies(100));
++	spin_unlock_bh(&ppe_lock);
+ }
+ 
+ static bool airoha_ct_pair_key(const struct airoha_foe_entry *row,
+@@ -86,11 +153,21 @@
+ 	struct airoha_ct_pair_msg msg = {};
+ 	u32 *epoch = NULL;
+ 	u8 selector = 0;
++	bool retired_wired = false, drain_all;
+ 	int i, j, err;
+ 
+ 	lockdep_assert_held(&ppe_lock);
+ 	if (!ppe->ct_native_pairs)
+ 		return 0;
++	if (ppe->ct_fe.armed || ppe->ct_fe.touched || ppe->ct_fe.pending || ppe->ct_fe.arm_pending) {
++		/* Bridge PRE notifications deliberately expose generation zero.
++		 * Retire the last armed generation, then rearm after POST. */
++		err = airoha_ct_fe_quiesce(ppe, max(ppe->ct_fe.generation,
++						 br_flow_offload_generation()));
++		if (err)
++			return airoha_ct_pair_fail(ppe, err);
++		retired_wired = true;
++	}
+ 	msg.op = cpu_to_le16(band < 0 ? AIROHA_CT_PAIR_FLUSH : AIROHA_CT_PAIR_ENDPOINT_REVOKE);
+ 	if (band >= 0) {
+ 		if (band == AIROHA_CT_PAIR_LAN1_SELECTOR && wcid == AIROHA_CT_PAIR_LAN1_ID) {
+@@ -108,13 +185,25 @@
+ 		msg.src_wcid = cpu_to_le16(wcid);
+ 		msg.src_epoch = cpu_to_le32(*epoch + 1);
+ 	}
+-	err = airoha_ct_pair_send(ppe, &msg);
++	drain_all = retired_wired || ppe->ct_fe.epoch;
++	if (drain_all) {
++		struct airoha_ct_pair_msg flush = { .op = cpu_to_le16(AIROHA_CT_PAIR_FLUSH) };
++
++		/* Drain every native TDMA producer before the shared bank0 boundary. */
++		err = airoha_ct_pair_send(ppe, &flush);
++		if (!err)
++			err = airoha_ct_fe_ppe_drain(ppe);
++	} else {
++		err = airoha_ct_pair_send(ppe, &msg);
++	}
+ 	if (err)
+ 		return airoha_ct_pair_fail(ppe, err);
+ 	for (i = 0; i < AIROHA_CT_PAIR_SLOTS; i++) {
+ 		struct airoha_ct_native_pair *pair = &ppe->ct_pairs[i];
+ 
+-		if (!pair->used || (band >= 0 &&
++		if (!pair->used || (!drain_all && band >= 0 &&
++		    !(retired_wired && (pair->msg.src_selector == AIROHA_CT_PAIR_LAN1_SELECTOR ||
++		      pair->msg.dst_selector == AIROHA_CT_PAIR_LAN1_SELECTOR)) &&
+ 		    !(pair->msg.src_selector == selector && le16_to_cpu(pair->msg.src_wcid) == wcid) &&
+ 		    !(pair->msg.dst_selector == selector && le16_to_cpu(pair->msg.dst_wcid) == wcid)))
+ 			continue;
+@@ -136,6 +225,16 @@
+ 		}
+ 		pair->used = false;
+ 	}
++	if (drain_all) {
++		if (band >= 0 && band != AIROHA_CT_PAIR_LAN1_SELECTOR) {
++			err = airoha_ct_pair_send(ppe, &msg);
++			if (err)
++				return airoha_ct_pair_fail(ppe, err);
++		}
++		err = airoha_ct_fe_ppe_resume(ppe);
++		if (err)
++			return airoha_ct_pair_fail(ppe, err);
++	}
+ 	return 0;
+ }
+ 
+@@ -195,7 +294,8 @@
+ 	struct net_device *master;
+ 
+ 	if (!idev || !odev || !net_eq(dev_net(idev), &init_net) ||
+-	    !net_eq(dev_net(odev), &init_net) || !idev->ieee80211_ptr ||
++	    !net_eq(dev_net(odev), &init_net) ||
++	    (!idev->ieee80211_ptr && !odev->ieee80211_ptr) ||
+ 	    !netif_is_bridge_port(idev) || !netif_is_bridge_port(odev) ||
+ 	    !is_valid_ether_addr(hdr->h_source) || !is_valid_ether_addr(hdr->h_dest) ||
+ 	    ether_addr_equal(hdr->h_source, hdr->h_dest))
+@@ -209,8 +309,20 @@
+ 	    br_port_flag_is_set(odev, BR_ISOLATED | BR_PORT_LOCKED) ||
+ 	    (idev == odev && !br_port_flag_is_set(idev, BR_HAIRPIN_MODE)) ||
+ 	    br_switchdev_fdb_find_port(master, hdr->h_source, 0) != idev ||
+-	    br_switchdev_fdb_find_port(master, hdr->h_dest, 0) != odev ||
+-	    airoha_ppe_get_wdma_info(idev, hdr->h_source, src, true) ||
++	    br_switchdev_fdb_find_port(master, hdr->h_dest, 0) != odev)
++		return false;
++	if (!idev->ieee80211_ptr) {
++		if (!airoha_ct_pair_lan1_ready(ppe, idev) ||
++		    !airoha_ct_pair_wlan_owner(ppe, odev) ||
++		    airoha_ppe_get_wdma_info(odev, hdr->h_dest, dst, true) ||
++		    dst->idx > 1 || dst->bss > 63 || !dst->wcid || dst->wcid > 150)
++			return false;
++		*src = (struct airoha_wdma_info) {
++			.idx = AIROHA_CT_PAIR_LAN1_SELECTOR, .wcid = AIROHA_CT_PAIR_LAN1_ID,
++		};
++		return true;
++	}
++	if (airoha_ppe_get_wdma_info(idev, hdr->h_source, src, true) ||
+ 	    src->idx > 1 || src->bss > 63 || !src->wcid || src->wcid > 150)
+ 		return false;
+ 	if (!odev->ieee80211_ptr) {
+@@ -251,7 +363,7 @@
+ 		return;
+ 	msg.op = cpu_to_le16(AIROHA_CT_PAIR_PUT);
+ 	msg.generation = cpu_to_le64(generation);
+-	msg.src_selector = !src.idx;
++	msg.src_selector = airoha_ct_pair_dst_selector(&src);
+ 	msg.dst_selector = airoha_ct_pair_dst_selector(&dst);
+ 	msg.src_wcid = cpu_to_le16(src.wcid);
+ 	msg.dst_wcid = cpu_to_le16(dst.wcid);
+@@ -263,11 +375,30 @@
+ 	if (!ppe->ct_pair_policy_allowed || !ppe->ct_host_ppe || ppe->ct_stopping || ppe->ct_pair_failed ||
+ 	    generation != br_flow_offload_generation() ||
+ 	    !airoha_ct_pair_peers(ppe, idev, odev, hdr, &src, &dst) ||
+-	    msg.src_selector != !src.idx || msg.dst_selector != airoha_ct_pair_dst_selector(&dst) ||
++	    msg.src_selector != airoha_ct_pair_dst_selector(&src) || msg.dst_selector != airoha_ct_pair_dst_selector(&dst) ||
+ 	    le16_to_cpu(msg.src_wcid) != src.wcid || le16_to_cpu(msg.dst_wcid) != dst.wcid ||
+ 	    msg.src_bss != src.bss || msg.dst_bss != dst.bss)
+ 		goto out;
+-	msg.src_epoch = cpu_to_le32(airoha_ppe_ct_epoch_locked(ppe, src.idx, src.wcid));
++	if (!ppe->ct_fe.armed || !ppe->ct_fe.active || ppe->ct_fe.generation != generation) {
++		/* Every previous revoke retired and invalidated wired owned rows. */
++		if (!ppe->ct_fe.epoch || ppe->ct_fe.generation != generation ||
++		    ppe->ct_pair_wired_epoch == U32_MAX ||
++		    ppe->ct_fe.epoch != ppe->ct_pair_wired_epoch + 1) {
++			err = airoha_ct_native_pair_revoke(ppe, -1, 0);
++			if (!err)
++				err = airoha_ct_fe_quiesce(ppe, generation);
++			if (err) {
++				airoha_ct_pair_fail(ppe, err);
++				goto out;
++			}
++		}
++		err = airoha_ct_fe_arm(ppe, generation);
++		if (err) {
++			airoha_ct_pair_fail(ppe, err);
++			goto out;
++		}
++	}
++	msg.src_epoch = cpu_to_le32(airoha_ct_pair_dst_epoch(ppe, msg.src_selector, src.wcid));
+ 	msg.dst_epoch = cpu_to_le32(airoha_ct_pair_dst_epoch(ppe, msg.dst_selector, dst.wcid));
+ 	if (!msg.src_epoch || !msg.dst_epoch)
+ 		goto out;
+@@ -317,16 +448,24 @@
+ 	int i, j, row_slot, err;
+ 
+ 	lockdep_assert_held(&ppe_lock);
+-	if (!ppe->ct_pair_policy_allowed || ppe->ct_pair_failed || !peer || !generation ||
++	if (!ppe->ct_pair_policy_allowed || ppe->ct_pair_failed || !generation ||
++	    skb_vlan_tag_present(skb) ||
++	    (hdr->h_proto != htons(ETH_P_IP) && hdr->h_proto != htons(ETH_P_IPV6)) ||
+ 	    hash >= PPE_SRAM_NUM_ENTRIES)
+ 		return;
+ 	for (i = 0; i < AIROHA_CT_PAIR_SLOTS; i++) {
+ 		pair = &ppe->ct_pairs[i];
+ 		if (!pair->used || le64_to_cpu(pair->msg.generation) != generation ||
+-		    peer->band != !pair->msg.src_selector || peer->bss != pair->msg.src_bss ||
+-		    peer->wcid != le16_to_cpu(pair->msg.src_wcid) ||
+-		    peer->epoch != le32_to_cpu(pair->msg.src_epoch) ||
+-		    peer->epoch != airoha_ppe_ct_epoch_locked(ppe, peer->band, peer->wcid) ||
++		    (pair->msg.src_selector == AIROHA_CT_PAIR_LAN1_SELECTOR ?
++		     (peer || !ppe->ct_fe.armed || !ppe->ct_fe.active ||
++		      ppe->ct_fe.generation != generation ||
++		      ppe->ct_fe.epoch != le32_to_cpu(pair->msg.src_epoch) ||
++		      !airoha_ct_pair_lan1_ready(ppe, skb->dev) ||
++		      skb->dev->ifindex != pair->ingress_ifindex) :
++		     (!peer || peer->band != !pair->msg.src_selector || peer->bss != pair->msg.src_bss ||
++		      peer->wcid != le16_to_cpu(pair->msg.src_wcid) ||
++		      peer->epoch != le32_to_cpu(pair->msg.src_epoch) ||
++		      peer->epoch != airoha_ppe_ct_epoch_locked(ppe, peer->band, peer->wcid))) ||
+ 		    le32_to_cpu(pair->msg.dst_epoch) != airoha_ct_pair_dst_epoch(ppe,
+ 			pair->msg.dst_selector, le16_to_cpu(pair->msg.dst_wcid)) ||
+ 		    (pair->msg.dst_selector == AIROHA_CT_PAIR_LAN1_SELECTOR &&
+@@ -335,6 +474,20 @@
+ 		    !ether_addr_equal(hdr->h_source, pair->msg.smac) ||
+ 		    !ether_addr_equal(hdr->h_dest, pair->msg.dmac))
+ 			continue;
++		if (pair->msg.src_selector == AIROHA_CT_PAIR_LAN1_SELECTOR) {
++			struct net_device *egress;
++			struct airoha_wdma_info src = {}, dst = {};
++			bool peer_current;
++
++			rcu_read_lock();
++			egress = dev_get_by_index_rcu(dev_net(skb->dev), pair->egress_ifindex);
++			peer_current = airoha_ct_pair_peers(ppe, skb->dev, egress, hdr, &src, &dst) &&
++				airoha_ct_pair_dst_selector(&dst) == pair->msg.dst_selector &&
++				dst.wcid == le16_to_cpu(pair->msg.dst_wcid) && dst.bss == pair->msg.dst_bss;
++			rcu_read_unlock();
++			if (!peer_current)
++				continue;
++		}
+ 		learned = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 		if (!learned) {
+ 			airoha_ct_pair_fail(ppe, -ETIMEDOUT);
+@@ -387,7 +540,7 @@
+ {
+ 	struct airoha_ppe *ppe = container_of(nb, struct airoha_ppe, ct_pair_wired_notifier);
+ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+-	bool revoke = true, resume = false, used = false;
++	bool revoke = true, resume = false, used = false, fe_live;
+ 	int i, err = 0;
+ 
+ 	if (dev != airoha_ct_pair_lan1(ppe))
+@@ -418,16 +571,18 @@
+ 		goto out;
+ 	if (revoke) {
+ 		ppe->ct_pair_wired_blocked = true;
++		fe_live = ppe->ct_fe.armed || ppe->ct_fe.touched || ppe->ct_fe.pending || ppe->ct_fe.arm_pending;
+ 		for (i = 0; i < AIROHA_CT_PAIR_SLOTS; i++)
+ 			if (ppe->ct_pairs[i].used &&
+-			    ppe->ct_pairs[i].msg.dst_selector == AIROHA_CT_PAIR_LAN1_SELECTOR)
++			    (ppe->ct_pairs[i].msg.dst_selector == AIROHA_CT_PAIR_LAN1_SELECTOR ||
++			     ppe->ct_pairs[i].msg.src_selector == AIROHA_CT_PAIR_LAN1_SELECTOR))
+ 				used = true;
+ 		if (ppe->ct_pair_wired_epoch == U32_MAX)
+ 			err = airoha_ct_pair_fail(ppe, -EOVERFLOW);
+-		else if (used)
++		else if (used || fe_live)
+ 			err = airoha_ct_native_pair_revoke(ppe, AIROHA_CT_PAIR_LAN1_SELECTOR,
+ 							 AIROHA_CT_PAIR_LAN1_ID);
+-		if (!err)
++		if (!err && !fe_live)
+ 			ppe->ct_pair_wired_epoch++;
+ 	}
+ 	if (!err && resume && netif_running(dev) && netif_carrier_ok(dev))
+--- a/drivers/net/ethernet/airoha/airoha_ct_pair_policy.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_pair_policy.h
+@@ -13,7 +13,8 @@
+ 
+ 	spin_lock_bh(&ppe_lock);
+ 	ppe->ct_pair_policy_allowed = false;
+-	if (event == NF_NATIVE_PAIR_PRE && airoha_ct_pair_any(ppe))
++	if (event == NF_NATIVE_PAIR_PRE && (airoha_ct_pair_any(ppe) ||
++	    ppe->ct_fe.armed || ppe->ct_fe.touched || ppe->ct_fe.pending || ppe->ct_fe.arm_pending))
+ 		err = airoha_ct_native_pair_revoke(ppe, -1, 0);
+ 	spin_unlock_bh(&ppe_lock);
+ 	return notifier_from_errno(err);
+@@ -113,7 +114,7 @@
+ 	if (sysfs_streq(buf, "off")) {
+ 		spin_lock_bh(&ppe_lock);
+ 		ppe->ct_pair_policy_allowed = false;
+-		err = ppe->ct_pair_token ? airoha_ct_native_pair_revoke(ppe, -1, 0) : 0;
++		err = airoha_ct_native_pair_revoke(ppe, -1, 0);
+ 		spin_unlock_bh(&ppe_lock);
+ 		return err ?: len;
+ 	}
+@@ -136,10 +137,19 @@
+ 		err = -ESHUTDOWN;
+ 	else {
+ 		struct airoha_ct_pair_msg cap = { .op = cpu_to_le16(AIROHA_CT_PAIR_CAP) };
+-
+-		err = airoha_ct_pair_send(ppe, &cap);
++		u64 bridge_generation = br_flow_offload_generation();
++
++		err = bridge_generation ? airoha_ct_pair_send(ppe, &cap) : -EAGAIN;
++		if (!err)
++			err = airoha_ct_native_pair_revoke(ppe, -1, 0);
++		if (!err)
++			err = airoha_ct_fe_quiesce(ppe, bridge_generation);
++		if (!err)
++			err = airoha_ct_fe_arm(ppe, bridge_generation);
+ 		if (!err)
+ 			ppe->ct_pair_policy_allowed = true;
++		else
++			airoha_ct_pair_fail(ppe, err);
+ 	}
+ 	spin_unlock_bh(&ppe_lock);
+ unlock:
+@@ -154,6 +164,7 @@
+ 
+ 	if (!ppe->ct_native_pairs)
+ 		return 0;
++	INIT_DELAYED_WORK(&ppe->ct_fe.health_work, airoha_ct_fe_health_work);
+ 	ppe->ct_pair_wired_notifier.notifier_call = airoha_ct_pair_wired_event;
+ 	err = register_netdevice_notifier(&ppe->ct_pair_wired_notifier);
+ 	if (err)
+@@ -178,6 +189,12 @@
+ 
+ static void airoha_ct_pair_policy_deinit(struct airoha_ppe *ppe)
+ {
++	if (ppe->ct_native_pairs) {
++		spin_lock_bh(&ppe_lock);
++		ppe->ct_fe.health_stopping = true;
++		spin_unlock_bh(&ppe_lock);
++		cancel_delayed_work_sync(&ppe->ct_fe.health_work);
++	}
+ 	if (ppe->ct_pair_wired_registered) {
+ 		unregister_netdevice_notifier(&ppe->ct_pair_wired_notifier);
+ 		ppe->ct_pair_wired_registered = false;
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -14,6 +14,7 @@
+ #include <linux/kernel.h>
+ #include <linux/netdevice.h>
+ #include <linux/reset.h>
++#include <linux/workqueue.h>
+ #include <linux/soc/airoha/airoha_offload.h>
+ #include <net/dsa.h>
+ #include "airoha_ct_flow_admission.h"
+@@ -753,12 +754,19 @@
+ 		bool cfg_owned;
+ 	} ct_ifc;
+ 	bool ct_host_ppe;
+-	bool ct_native_pairs, ct_pair_failed, ct_pair_hw_stopped;
++	bool ct_native_pairs, ct_pair_failed, ct_pair_hw_stopped, ct_pair_close_pending;
+ 	bool ct_pair_policy_allowed, ct_pair_policy_registered;
+ 	struct notifier_block ct_pair_policy_notifier;
+ 	struct notifier_block ct_pair_wired_notifier;
+ 	bool ct_pair_wired_registered, ct_pair_wired_blocked;
+ 	u32 ct_pair_wired_epoch;
++	struct {
++		u32 tcam[2][9][2], action[2][3][3];
++		u32 epoch, pending_epoch, drain_flow, drain_tb;
++		u64 generation, pending_generation;
++		bool saved, touched, active, armed, pending, arm_pending, health_stopping, drain_pending;
++		struct delayed_work health_work;
++	} ct_fe;
+ 	u32 ct_pair_token;
+ 	u32 ct_pair_gdm_saved[4];
+ 	bool ct_pair_gdm_owned;
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -300,7 +300,7 @@
+ 		  0x1f, 0xea, 0xf0, 0x3f, 0xc9, 0x3b, 0x0e, 0x3a },
+ 	};
+ 	static const u8 lab_sha256[][SHA256_DIGEST_SIZE] = {
+-		{ 0x59, 0xac, 0x23, 0x9f, 0x39, 0xb9, 0xf1, 0x32, 0x04, 0x97, 0x0e, 0x49, 0x75, 0x44, 0xa0, 0x34, 0x6d, 0x53, 0xb0, 0x8a, 0xb3, 0x5f, 0xc5, 0xba, 0xf1, 0x54, 0x53, 0xf8, 0x34, 0x1e, 0x52, 0xf6 },
++		{ 0x90, 0xca, 0x5d, 0xf9, 0xa9, 0xbc, 0x68, 0x49, 0x86, 0x9a, 0xf0, 0x8a, 0x66, 0xc9, 0xf8, 0x14, 0x64, 0xdc, 0xe1, 0x67, 0x7a, 0xf2, 0x5e, 0x67, 0xce, 0x7d, 0x36, 0x20, 0x5c, 0xf5, 0x81, 0xc3 },
+ 		{ 0xdf, 0x3f, 0x61, 0x98, 0x04, 0xa9, 0x2f, 0xdb, 0x40, 0x57, 0x19, 0x2d, 0xc4, 0x3d, 0xd7, 0x48, 0xea, 0x77, 0x8a, 0xdc, 0x52, 0xbc, 0x49, 0x8c, 0xe8, 0x05, 0x24, 0xc0, 0x14, 0xb8, 0x11, 0x19 },
+ 	};
+ 	bool ct = airoha_npu_is_connac2_ct(dev);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -2631,7 +2631,8 @@
+ 
+ 	WRITE_ONCE(ppe->ct_pair_policy_allowed, false);
+ 	WRITE_ONCE(ppe->ct_host_ppe, false);
+-	if (ppe->ct_native_pairs && ppe->ct_pair_token) {
++	if (ppe->ct_native_pairs && (ppe->ct_pair_token || ppe->ct_fe.armed ||
++	    ppe->ct_fe.touched || ppe->ct_fe.pending || ppe->ct_fe.arm_pending)) {
+ 		spin_lock_bh(&ppe_lock);
+ 		err = airoha_ct_native_pair_revoke(ppe, -1, 0);
+ 		spin_unlock_bh(&ppe_lock);
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -195,17 +195,18 @@
+  * Fixed little-endian 64-byte payload follows the 8-byte WLAN mailbox header.
+  */
+ #define AIROHA_CT_PAIR_MAGIC 0x43545031
+-#define AIROHA_CT_PAIR_ABI 2
++#define AIROHA_CT_PAIR_ABI 3
+ #define AIROHA_CT_PAIR_FUNC 34
+ #define AIROHA_CT_PAIR_SLOTS 32
+-#define AIROHA_CT_PAIR_CAPS 15
++#define AIROHA_CT_PAIR_CAPS 31
+ /* selector 0/1: WLAN ring + WCID; selector 2: wired LAN1 + source-port ID.
+- * ABI2 admits LAN1 only as destination; FE receive admission is separate. */
++ * ABI3 admits LAN1 source only within an acknowledged FE ARM lifetime. */
+ #define AIROHA_CT_PAIR_LAN1_SELECTOR 2
+ #define AIROHA_CT_PAIR_LAN1_ID 24
+ enum airoha_ct_pair_op {
+ 	AIROHA_CT_PAIR_CAP = 0, AIROHA_CT_PAIR_PUT, AIROHA_CT_PAIR_DEL,
+ 	AIROHA_CT_PAIR_FLUSH, AIROHA_CT_PAIR_ENDPOINT_REVOKE,
++	AIROHA_CT_PAIR_FE_QUIESCE, AIROHA_CT_PAIR_FE_ARM,
+ };
+ struct airoha_ct_pair_msg {
+ 	__le32 magic;

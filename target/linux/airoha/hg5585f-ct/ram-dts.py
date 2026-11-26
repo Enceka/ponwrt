@@ -18,7 +18,15 @@ def main():
     parser.add_argument("--wed-bm-debug", action="store_true",
                         help="Reserve the full slot 1 register block for owned BM selector snapshots")
     parser.add_argument("--firmware-dir", type=Path, help="Directory containing the two packaged NPU binaries")
+    parser.add_argument("--native-pairs", action="store_true",
+                        help="Enable the native ABI3 RAM path (requires WED slot 1 and rebuilt firmware)")
+    parser.add_argument("--rebuilt-firmware-dir", type=Path,
+                        help="Directory containing the two installed npu_rebuilt_*.bin files")
     args = parser.parse_args()
+    if args.native_pairs and not args.wed_slot1:
+        parser.error("--native-pairs requires --wed-slot1")
+    if args.native_pairs != bool(args.rebuilt_firmware_dir):
+        parser.error("--native-pairs and --rebuilt-firmware-dir must be used together")
     if args.connac2_rx and not args.connac2:
         parser.error("--connac2-rx requires --connac2")
     if args.connac2_host_ppe and not args.connac2_rx:
@@ -40,6 +48,17 @@ def main():
             for name, digest in hashes.items():
                 if hashlib.sha256((args.firmware_dir / name).read_bytes()).hexdigest() != digest:
                     parser.error(f"Connac2 firmware digest mismatch: {name}")
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+    if args.native_pairs:
+        manifest = (Path(__file__).resolve().parents[4] / "package/firmware/hg5585f-ct-npu-firmware/SHA256SUMS.rebuilt")
+        try:
+            hashes = dict(line.split()[::-1] for line in manifest.read_text().splitlines())
+            if set(hashes) != {"npu_rebuilt_rv32.bin", "npu_rebuilt_data.bin"}:
+                parser.error("incomplete rebuilt native firmware identity")
+            for name, digest in hashes.items():
+                if hashlib.sha256((args.rebuilt_firmware_dir / name).read_bytes()).hexdigest() != digest:
+                    parser.error(f"rebuilt native firmware digest mismatch: {name}")
         except (OSError, ValueError) as error:
             parser.error(str(error))
     data = args.factory.read_bytes()
@@ -69,6 +88,9 @@ def main():
         print('&pcie1 { pcie@0,0 { wifi@0,0 { airoha,connac2-rx; }; }; };')
     if args.connac2_host_ppe:
         print('&eth { airoha,connac2-host-ppe; };')
+    if args.native_pairs:
+        print('&npu { airoha,connac2-rebuilt-ram-lab; };')
+        print('&eth { airoha,connac2-ram-native-pairs; };')
     if args.ct_ppe_probe_seed:
         print('&eth { airoha,connac2-ppe-probe-seed; };')
     if args.wed_slot1:

@@ -1,0 +1,73 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: allow station reconnect after native faults
+
+Allow CPU station registration after all fault gates and PPE stops complete,
+while retaining native epochs and owners. Keep actual teardown rejected and
+continue the existing mt76 station/BA cleanup before reusing a WCID.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1345,20 +1345,28 @@
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&flow_offload_mutex);
++	spin_lock_bh(&ppe_lock);
+ 	if (ppe->ct_stopping) {
+-		err = -ESHUTDOWN;
+-		goto unlock;
++		/* A completed fault cutover permits CPU station reuse. Keep the
++		 * native owners and epochs pinned; mt76 still clears RX BA state.
++		 * Driver teardown clears ct_host_ppe before reaching this path.
++		 */
++		if (!ppe->ct_host_ppe || !ppe->ct_native_pairs ||
++		    !ppe->ct_pair_failed || ppe->ct_fe.health_stopping ||
++		    !ppe->ct_pair_hw_stopped || !READ_ONCE(eth->ct_cpu_fallback) ||
++		    !READ_ONCE(eth->ct_cpu_routes_ready) ||
++		    !READ_ONCE(eth->ct_cpu_ifc_disabled) ||
++		    !READ_ONCE(eth->ct_cpu_wlan_gated))
++			err = -ESHUTDOWN;
++		goto unlock_spin;
+ 	}
+ 	if (!ppe->ct_host_ppe)
+-		goto unlock;
+-
+-	spin_lock_bh(&ppe_lock);
++		goto unlock_spin;
++
+ 	ppe->ct_wlan_blocked[band][wcid] = true;
+ 	err = airoha_ct_native_pair_revoke(ppe, band, wcid);
+-	if (err) {
+-		spin_unlock_bh(&ppe_lock);
+-		goto unlock;
+-	}
++	if (err)
++		goto unlock_spin;
+ 	if (ppe->ct_wlan_epoch[band][wcid] != U32_MAX)
+ 		ppe->ct_wlan_epoch[band][wcid]++;
+ 	spin_unlock_bh(&ppe_lock);
+@@ -1395,6 +1403,9 @@
+ 		ppe->ct_wlan_blocked[band][wcid] = false;
+ 		spin_unlock_bh(&ppe_lock);
+ 	}
++	goto unlock;
++unlock_spin:
++	spin_unlock_bh(&ppe_lock);
+ unlock:
+ 	mutex_unlock(&flow_offload_mutex);
+ 	return err;
+@@ -2738,6 +2749,7 @@
+ 	mutex_lock(&flow_offload_mutex);
+ 	spin_lock_bh(&ppe_lock);
+ 	ppe->ct_stopping = true;
++	ppe->ct_host_ppe = false;
+ 	spin_unlock_bh(&ppe_lock);
+ 	if (ppe->ct_restore_pending) {
+ 		err = airoha_ppe_ct_stop(ppe);
+@@ -3280,6 +3292,7 @@
+ 	if (airoha_ppe_ct_requested(eth)) {
+ 		spin_lock_bh(&ppe_lock);
+ 		eth->ppe->ct_stopping = true;
++		eth->ppe->ct_host_ppe = false;
+ 		spin_unlock_bh(&ppe_lock);
+ 	}
+ 
