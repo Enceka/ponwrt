@@ -41,3 +41,44 @@ byte patterns (256 complete 80-byte entries). Negative cases cover truncation,
 GRE flags and inner protocol, outer IPv4 options and fragments, tagging,
 direction, FOE types, and slot bounds. A rejected call must preserve its
 entire output buffer.
+
+## Dynamic row ownership (patch 968)
+
+The pool starts with no available slots. Its owner supplies an immutable mask of
+clean rows it controls; bit 0 is slot 32. One pool must cover every user of the FE
+command port, including operations targeting different slots. Acquire a reference
+before publishing a learnable flow. Identical 17-word rows share a slot. Keep each
+reference, including that of a pending flow, in its owning cookie until `put`
+succeeds. A timed-out FE write blocks new acquisitions; recovery drains the old
+command, then clears its row. After a failed last release, retry `put` on the
+original reference; an acknowledged flow retirement is performed only once.
+
+The production path still needs an exclusive MMIO owner and hardware completion
+and drain callbacks. For PPE integration:
+
+- Under `flow_offload_mutex`, acquire and link the row, index its cookie, then
+  publish the candidate using the cookie-first order in `airoha_ppe_ct_bridge_publish`.
+- In `airoha_ppe_foe_insert_entry`, qualify the current underlay and serialize
+  bind attempts under `ppe_lock`. Preserve every attempted hash until its FOE
+  retirement is acknowledged, including after a timeout or an intervening stats
+  update. The ordinary path can overwrite `e->hash` on a later learn event.
+- On cookie destroy, device removal or route withdrawal, unlink the learner under
+  `ppe_lock`, verify the binding's identity including its GRE action and slot, and
+  confirm invalidation and completion of in-flight reads before acknowledging
+  retirement. The generic `airoha_ppe_foe_remove_flow` drops SRAM commit errors.
+  Keep a failed withdrawal indexed and retryable.
+
+Run the pool tests against the compiled driver helpers on ARM64 Linux, using
+the same kernel tree and toolchain as the encoder test:
+
+```sh
+cp "$TEST_DIR/gre4_lifetime_vectors.c" drivers/net/ethernet/airoha/
+make ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" drivers/net/ethernet/airoha/gre4_lifetime_vectors.o
+gcc -shared -o /tmp/gre4_lifetime.so drivers/net/ethernet/airoha/gre4_lifetime_vectors.o
+python3 -c 'import ctypes; r = ctypes.CDLL("/tmp/gre4_lifetime.so").gre4_lifetime_test(); assert not r, r'
+```
+
+The FE model delivers a late write during drain. Cases include both ends of the
+dynamic range, sparse ownership, pool exhaustion, a one-word difference at each
+of the 17 positions, a shared row after an earlier hole, a failed FOE retirement,
+and repeated recovery failures during both row creation and final release.

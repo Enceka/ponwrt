@@ -1,0 +1,140 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: manage shared GRE egress row lifetime
+
+Hold a dynamic FE row from candidate creation through confirmed FOE retirement.
+After an ambiguous write, drain the common command port and clear its row before
+accepting another transaction. Leave ingress policy and MMIO to the caller.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_gre4_lifetime.h
+@@ -0,0 +1,130 @@
++#ifndef AIROHA_CT_GRE4_LIFETIME_H
++#define AIROHA_CT_GRE4_LIFETIME_H
++
++#include "airoha_ct_gre4.h"
++
++/* One zero-initialized pool per exclusive FE command-port owner. The caller
++ * serializes all operations, including callbacks. owned is immutable and
++ * contains only independently established clean, exclusive rows 32..63.
++ */
++struct airoha_ct_gre4_pool {
++	struct airoha_ct_gre4_slot {
++		struct airoha_ct_gre4_row row;
++		u32 refs;
++		bool present;
++	} slots[32];
++	u32 owned;
++	u8 fault;
++};
++
++/* Embed one zeroed, non-copyable reference in each pending/bound cookie. */
++struct airoha_ct_gre4_ref {
++	struct airoha_ct_gre4_pool *pool;
++	u8 slot;
++	bool retired;
++};
++
++struct airoha_ct_gre4_io {
++	/* On success all five banks have completed; NULL means write zeroes. */
++	int (*write)(void *ctx, u8 slot, const struct airoha_ct_gre4_row *row);
++	/* On success no earlier command may touch the table or staging port. */
++	int (*drain)(void *ctx);
++	void *ctx;
++};
++
++static inline int
++airoha_ct_gre4_get(struct airoha_ct_gre4_pool *p, struct airoha_ct_gre4_ref *ref,
++		   const struct airoha_ct_gre4_row *row, const struct airoha_ct_gre4_io *io)
++{
++	struct airoha_ct_gre4_slot *s;
++	int i, free = -1, err;
++
++	if (ref->pool)
++		return -EALREADY;
++	if (p->fault)
++		return -EAGAIN;
++	for (i = 0; i < ARRAY_SIZE(p->slots); i++) {
++		s = &p->slots[i];
++		if (!(p->owned & BIT(i)))
++			continue;
++		if (s->present && !memcmp(&s->row, row, sizeof(*row))) {
++			if (s->refs == U32_MAX)
++				return -EOVERFLOW;
++			goto attach;
++		}
++		if (!s->refs && free < 0)
++			free = i;
++	}
++	if (free < 0)
++		return -ENOSPC;
++	i = free;
++	s = &p->slots[i];
++	err = io->write(io->ctx, i + 32, row);
++	if (err) {
++		p->fault = i + 32;
++		return err;
++	}
++	s->row = *row;
++	s->present = true;
++attach:
++	s->refs++;
++	ref->pool = p;
++	ref->slot = i + 32;
++	return 0;
++}
++
++/* retire must unpublish the learning candidate, then acknowledge retirement
++ * of any hardware binding and in-flight consumer of this row. On failure
++ * the reference remains pinned and withdrawal may be retried.
++ */
++static inline int
++airoha_ct_gre4_put(struct airoha_ct_gre4_ref *ref, const struct airoha_ct_gre4_io *io,
++		   int (*retire)(void *flow), void *flow)
++{
++	struct airoha_ct_gre4_pool *p = ref->pool;
++	struct airoha_ct_gre4_slot *s;
++	int err;
++
++	if (!p)
++		return -ENOENT;
++	s = &p->slots[ref->slot - 32];
++	if (!ref->retired) {
++		err = retire(flow);
++		if (err)
++			return err;
++		ref->retired = true;
++	}
++	if (s->refs == 1 && s->present) {
++		if (p->fault)
++			return -EAGAIN;
++		err = io->write(io->ctx, ref->slot, NULL);
++		if (err) {
++			p->fault = ref->slot;
++			return err;
++		}
++		s->present = false;
++	}
++	s->refs--;
++	*ref = (struct airoha_ct_gre4_ref) {};
++	return 0;
++}
++
++static inline int
++airoha_ct_gre4_recover(struct airoha_ct_gre4_pool *p, const struct airoha_ct_gre4_io *io)
++{
++	int err;
++
++	if (!p->fault)
++		return 0;
++	err = io->drain(io->ctx);
++	if (err)
++		return err;
++	err = io->write(io->ctx, p->fault, NULL);
++	if (err)
++		return err;
++	p->slots[p->fault - 32].present = false;
++	p->fault = 0;
++	return 0;
++}
++
++#endif
