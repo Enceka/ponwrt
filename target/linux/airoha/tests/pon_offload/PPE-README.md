@@ -80,7 +80,9 @@ families, including a synthetic PON-ingress candidate at the actual bind step.
   omits those selectors. Patch 965 exports an exact PPPoE ingress key with
   session ID, session EtherType and inner PPP protocol. Airoha rejects this
   key before installing a cookie in either PPE mode, including IPv4 to a
-  physical Ethernet output. PON still rejects VLAN/CVLAN/tunnel keys at
+  physical Ethernet output. Patch 966 rejects outer tunnel metadata and
+  addresses, GRE keys, L2TPv3 sessions and IPsec selectors in both PPE modes
+  before FOE preparation. PON still rejects VLAN/CVLAN keys at
   admission and rechecks packet framing at bind. The production PON gate
   remains closed for all candidates.
 - NAT66, non-TCP/UDP traffic, native bridge PON flows,

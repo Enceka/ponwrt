@@ -58,12 +58,15 @@ struct airoha_pon_flow_table { unsigned count; struct airoha_pon_flow_entry entr
 struct airoha_gdm_dev { u32 pon_qdma_tag; struct airoha_pon_flow_table *pon_flow_table; unsigned long flags; };
 struct airoha_ppe { bool ct_host_ppe; };
 struct airoha_eth { struct airoha_ppe *ppe; struct airoha_gdm_dev *registered; };
-struct flow_rule { struct nf_flow_rule action; unsigned keys; };
+struct flow_rule { struct nf_flow_rule action; uint64_t keys; };
 enum { FLOW_DISSECTOR_KEY_VLAN, FLOW_DISSECTOR_KEY_CVLAN, FLOW_DISSECTOR_KEY_PPPOE,
        FLOW_DISSECTOR_KEY_ENC_CONTROL, FLOW_DISSECTOR_KEY_IPV6_ADDRS,
        FLOW_DISSECTOR_KEY_IPV4_ADDRS, FLOW_DISSECTOR_KEY_META, FLOW_DISSECTOR_KEY_CONTROL,
        FLOW_DISSECTOR_KEY_BASIC, FLOW_DISSECTOR_KEY_IP, FLOW_DISSECTOR_KEY_TCP,
-       FLOW_DISSECTOR_KEY_PORTS };
+       FLOW_DISSECTOR_KEY_PORTS, FLOW_DISSECTOR_KEY_ENC_KEYID, FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS,
+       FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS, FLOW_DISSECTOR_KEY_ENC_PORTS, FLOW_DISSECTOR_KEY_ENC_IP,
+       FLOW_DISSECTOR_KEY_ENC_OPTS, FLOW_DISSECTOR_KEY_GRE_KEYID, FLOW_DISSECTOR_KEY_L2TPV3,
+       FLOW_DISSECTOR_KEY_IPSEC = 32 };
 #define FLOW_OFFLOAD_XMIT_TC 4
 #define PPP_IP 0x21
 #define PPP_IPV6 0x57
@@ -100,7 +103,7 @@ struct ip_tunnel_info;
 #define VLAN_VID_MASK 4095
 #define netdev_priv(n) ((n)->priv)
 #define test_bit(b, p) (!!(*(p) & BIT(b)))
-#define flow_rule_match_key(r, k) (!!((r)->keys & BIT(k)))
+#define flow_rule_match_key(r, k) (!!((r)->keys & BIT_ULL(k)))
 #define is_multicast_ether_addr(a) ((a)[0] & 1)
 #define flow_action_for_each(i, act, a) for ((i)=0; (unsigned)(i)<(a)->count && ((act)=&(a)->actions[i]); (i)++)
 #define airoha_is_valid_gdm_dev(e, d) ((d) == (e)->registered)

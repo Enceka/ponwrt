@@ -5,6 +5,36 @@
 static unsigned cases;
 static unsigned ingress_cases;
 
+static unsigned check_tunnel_matches(void)
+{
+    const int keys[] = {FLOW_DISSECTOR_KEY_ENC_CONTROL, FLOW_DISSECTOR_KEY_ENC_KEYID,
+        FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS, FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS,
+        FLOW_DISSECTOR_KEY_ENC_PORTS, FLOW_DISSECTOR_KEY_ENC_IP, FLOW_DISSECTOR_KEY_ENC_OPTS,
+        FLOW_DISSECTOR_KEY_GRE_KEYID, FLOW_DISSECTOR_KEY_L2TPV3, FLOW_DISSECTOR_KEY_IPSEC};
+    const int families[] = {FLOW_DISSECTOR_KEY_IPV4_ADDRS, FLOW_DISSECTOR_KEY_IPV6_ADDRS};
+    struct airoha_gdm_dev dev = {};
+    struct net_device physical = {.priv = &dev};
+    struct airoha_ppe ppe = {};
+    struct airoha_eth eth = {.ppe = &ppe, .registered = &dev};
+    struct airoha_flow_data data = {};
+    unsigned count = 0;
+
+    for (unsigned ct = 0; ct < 2; ct++)
+        for (unsigned bridge = 0; bridge < 2; bridge++)
+            for (unsigned family = 0; family < ARRAY_SIZE(families); family++) {
+                ppe.ct_host_ppe = ct;
+                struct flow_rule rule = {.keys = BIT_ULL(families[family]) | BIT_ULL(FLOW_DISSECTOR_KEY_PORTS)};
+                assert(!project_output_gate(&eth, &physical, bridge, families[family], &rule, data));
+                for (unsigned index = 0; index < ARRAY_SIZE(keys); index++) {
+                    rule.keys |= BIT_ULL(keys[index]);
+                    assert(project_output_gate(&eth, &physical, bridge, families[family], &rule, data) == -EOPNOTSUPP);
+                    rule.keys &= ~BIT_ULL(keys[index]);
+                    count++;
+                }
+            }
+    return count;
+}
+
 static void check_ingress(struct flow_offload_tuple *tuple, unsigned vlans, bool ppp)
 {
     struct nf_flow_match match = {0};
@@ -193,6 +223,6 @@ int main(void)
           run_case(family?AF_INET6:AF_INET,direction,vlans,ppp,swap?200:100,swap?100:200,split);
     check_invalid_stacks(AF_INET);
     check_invalid_stacks(AF_INET6);
-    printf("PASS: %u production path-to-selector and %u ingress-match scenarios\n", cases, ingress_cases);
+    printf("PASS: %u production path-to-selector, %u ingress-match and %u tunnel-key checks\n", cases, ingress_cases, check_tunnel_matches());
     return 0;
 }

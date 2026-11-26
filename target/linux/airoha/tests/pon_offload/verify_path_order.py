@@ -51,7 +51,8 @@ def main():
                 ('inner-select','data->vlan.hdr[0].id : AIROHA_PON_VID_ANY;','data->vlan.hdr[data->vlan.num - 1].id : AIROHA_PON_VID_ANY;'),
                 ('omit-reverse','i = route->tuple[dir].in.num_encaps - 1; i >= 0; i--','i = 0; i < route->tuple[dir].in.num_encaps; i++'),
                 ('truncate-session','key->pppoe.session_id = htons(sid);','key->pppoe.session_id = htons(sid & 0xff);'),
-                ('allow-pppoe-foe','if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE))','if (false)')]:
+                ('allow-pppoe-foe','if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE))','if (false)'),
+                ('ignore-gre-key','flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_GRE_KEYID)','false')]:
             assert old in code
             path.write_text(code.replace(old,new));r=run(name)
             assert r.returncode == -signal.SIGABRT,name

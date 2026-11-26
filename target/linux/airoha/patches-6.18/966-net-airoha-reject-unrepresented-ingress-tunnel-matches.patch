@@ -1,0 +1,37 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: reject unrepresented ingress tunnel matches
+
+An inner IP tuple does not encode the outer addresses, protocol metadata
+or tunnel ID. Reject these matches on both PPE paths before preparing
+a FOE, including routed IPv4 traffic with a physical Ethernet output.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -2317,6 +2317,17 @@
+ 		return -EOPNOTSUPP;
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE))
+ 		return -EOPNOTSUPP;
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_CONTROL) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_KEYID) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_PORTS) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_IP) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_OPTS) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_GRE_KEYID) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_L2TPV3) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPSEC))
++		return -EOPNOTSUPP;
+ 	if (eth->ppe->ct_host_ppe &&
+ 	    (bridge || addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) &&
+ 	    (((data.vlan.num || data.pppoe.num) &&
+@@ -2323,8 +2334,7 @@
+ 	      (bridge || !airoha_ppe_ct_pon_encap_output(eth, odev, rule, &data))) ||
+ 	     is_multicast_ether_addr(data.eth.h_dest) ||
+ 	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN) ||
+-	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN) ||
+-	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_CONTROL)))
++	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN)))
+ 		return -EOPNOTSUPP;
+ 
+ 	if (bridge) {
