@@ -1,5 +1,7 @@
 # 原厂 FE 隧道路由与写表
 
+软件收发对照：在支持网络命名空间、veth 和 IPv4 GRE 的 Linux 上执行 `sudo python3 verify_gre_wire.py`，需要 iproute2 和 Python 3。工具创建两个临时网络命名空间，两条内层主机路由共用一条无密钥 GRE 隧道；逐包检查两端方向、GRE 头、内层 UDP 端口和载荷。撤销其中一条路由后，该目的地址返回 `ENETUNREACH`，另一条仍交付；重建路由后恢复。工具退出时删除命名空间。此对照使用内核软件路径，实板还需核对硬件流表及隧道行。
+
 ```sh
 python3 verify_stock_fe.py --stock-dir /path/to/stock/lib/modules --output /tmp/stock-fe.json
 python3 verify_board_hir.py --image /path/to/stock/Image --hw-nat /path/to/stock/lib/modules/hw_nat.ko
