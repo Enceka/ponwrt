@@ -36,6 +36,13 @@ python3 verify_retirement.py --source /path/to/linux-after-959 \
 
 ## 原厂元数据对照
 
+`verify_rx_service.py` 对照原厂 `qdma_wan.ko` 与 host 接收路径。1,058 个描述符覆盖所有 32×32 组来源端口和 CPU reason，以及 GEM/LLID 的每一位和边界。`msg0[29:14]` 保存完整 16 位服务号。原厂 `qdma_api_get_rxmsg_eth` 输出偏移 `+6` 是 CPU reason（`msg1[20:16]`），`+7` 是来源端口（`msg1[25:21]`）。早期 v6 向量报告将这两个偏移的名称对调；本测试额外执行原厂 INT-2 错误日志的取参指令，核对 `crsn=%X` 实参。GDM2 来源端口 2 位于 `msg1[25:21]`。
+
+```sh
+python3 verify_rx_service.py --source /path/to/patched/linux \
+  --stock-dir /path/to/stock/lib/modules --output /path/to/results/rx-service
+```
+
 `verify_path_order.py` 从真实 netfilter 路径生成、tuple 反转、action 生成和 Airoha action 解析一路执行到 PON GEM 选择。96 个场景覆盖两个方向、IPv4/IPv6、单/双 VLAN、PPPoE+单 VLAN，以及 PPPoE+双 VLAN 的现有两层容量拒绝，另有两个运行期负控制。
 
 ```sh
