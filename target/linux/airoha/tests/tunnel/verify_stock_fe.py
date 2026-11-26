@@ -62,8 +62,9 @@ class TunnelHost(Module):
         self.instructions += 1
         self.stub_calls[name] += 1
         if name == 'memset':
-            assert (x1, x2) == (0, 252)
+            assert x1 == 0 and x2 in (88, 252)
             cpu.mem_write(x0, bytes(x2))
+            cpu.reg_write(R.UC_ARM64_REG_X0, x0)
         else:
             assert (x0, x1, self.get(x2, '<I')[0]) == (0x13, 0, 0x89)
             self.fe.cpu.mem_write(self.fe.DATA, bytes(cpu.mem_read(x2, 256)))
@@ -128,6 +129,96 @@ def check_tables(host, fe):
     return cases
 
 
+class SessionHost(TunnelHost):
+    def __init__(self, path, fe):
+        super().__init__(path, fe)
+        self.bound = set()
+        self.checked = []
+        self.allocated = []
+        self.freed = []
+        self.fail_alloc = False
+        self.local_stubs[self.names['hwnat_check_entry_is_bind']] = (
+            'hwnat_check_entry_is_bind', self.check_bind)
+
+    def check_bind(self, module):
+        flow = module.cpu.reg_read(R.UC_ARM64_REG_W0)
+        self.checked.append(flow)
+        module.cpu.reg_write(R.UC_ARM64_REG_W0, int(flow in self.bound))
+
+    def _hook(self, cpu, pc, size, data):
+        name, tail = self.calls.get(pc, (None, False))
+        if name not in ('kmalloc_trace', 'kfree'):
+            return super()._hook(cpu, pc, size, data)
+        self.instructions += 1
+        self.stub_calls[name] += 1
+        if name == 'kmalloc_trace':
+            assert cpu.reg_read(R.UC_ARM64_REG_X2) == 24
+            addr = 0
+            if not self.fail_alloc:
+                addr = self.DATA + 0x2000 + 32 * len(self.allocated)
+                self.allocated.append(addr)
+            cpu.reg_write(R.UC_ARM64_REG_X0, addr)
+        else:
+            addr = cpu.reg_read(R.UC_ARM64_REG_X0)
+            assert addr in self.allocated and addr not in self.freed
+            self.freed.append(addr)
+        cpu.reg_write(R.UC_ARM64_REG_PC, cpu.reg_read(R.UC_ARM64_REG_LR) if tail else pc + size)
+
+
+def check_sessions(host, fe):
+    base = host.names['TUNNEL_SWTABLE']
+    flows = (0x137, 0x241)
+    count = 0
+    for slot in (31, 32, 63):
+        for flags in (0, 1, 2, 4):
+            for mask in range(4):
+                for timeout in (False, True):
+                    host.cpu.mem_write(base, bytes(88 * 64))
+                    row = base + 88 * slot
+                    head = row + 72
+                    host.put(row, '<I', 0xcafe5510)
+                    host.put(row + 68, '<IQQ', flags, head, head)
+                    host.freed.clear()
+                    host.checked.clear()
+                    host.allocated.clear()
+                    host.bound = {flow for idx, flow in enumerate(flows) if mask & 1 << idx}
+                    for flow in flows:
+                        assert host.call('ppe_add_session_to_tunnel_list', slot, flow) == 0
+                        assert host.call('ppe_add_session_to_tunnel_list', slot, flow) == -1
+                    assert len(host.allocated) == 2
+                    fe.writes.clear()
+                    fe.ready_after = 4 if timeout else 1
+                    logs = fe.stub_calls['_printk']
+                    assert host.call('ppe_update_tunnel_session_list') == 0
+                    scanned = slot >= 32 and bool(flags & 3)
+                    assert host.checked == (list(flows) if scanned else [])
+                    live = [addr for addr, flow in zip(host.allocated, flows)
+                            if not scanned or flow in host.bound]
+                    assert host.freed == [addr for addr in host.allocated if addr not in live]
+                    chain = [head, *live]
+                    for idx, node in enumerate(chain):
+                        assert host.get(node, '<QQ') == (chain[(idx + 1) % len(chain)], chain[idx - 1])
+                    cleared = scanned and not live
+                    assert host.get(row, '<I') == (0 if cleared else 0xcafe5510,)
+                    assert host.get(row + 68, '<I') == (0 if cleared else flags,)
+                    expected = []
+                    if cleared:
+                        for bank in (4, 0, 1, 2, 3):
+                            expected.extend((CTRL + off, 0) for off in (16, 12, 8, 4))
+                            expected.append((CTRL, (bank << 16) | (slot << 8) | 0x11))
+                    assert fe.writes == expected
+                    assert fe.stub_calls['_printk'] - logs == (5 if cleared and timeout else 0)
+                    count += 1
+
+    head = base + 32 * 88 + 72
+    host.put(head, '<QQ', head, head)
+    host.fail_alloc = True
+    logs = host.stub_calls['_printk']
+    assert host.call('ppe_add_session_to_tunnel_list', 32, flows[0]) == 0
+    assert host.stub_calls['_printk'] == logs + 1 and host.get(head, '<QQ') == (head, head)
+    return count + 1
+
+
 def check_rx_dispatch(qdma):
     # Stop at the first instruction of each destination. This fixture tests
     # selection only; skb allocation, reassembly and delivery follow it.
@@ -165,6 +256,7 @@ def main():
     host = TunnelHost(args.stock_dir / 'hw_nat.ko', fe)
     qdma = Module(args.stock_dir / 'qdma_lan.ko')
     result = dict(route_init_cases=route_setup(fe), table_cases=check_tables(host, fe),
+                  session_lifetime_cases=check_sessions(SessionHost(host.path, fe), fe),
                   qdma_rx_dispatch_cases=check_rx_dispatch(qdma),
                   hashes={m.path.name: m.sha256 for m in (fe, host, qdma)})
     args.output.parent.mkdir(exist_ok=True, parents=True)
