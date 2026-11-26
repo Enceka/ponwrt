@@ -24,6 +24,11 @@ def main():
     end=ppe.index('\t\tdefault:',start)
     # Retain the exact three production action cases, changing only the wrapper.
     code+='\nstatic int project_production_actions(struct nf_flow_rule *r,struct airoha_flow_data *out) { struct airoha_flow_data data={}; for(unsigned i=0;i<r->count;i++){ const struct flow_action_entry *act=&r->actions[i]; switch(act->id) {\n'+ppe[start:end]+'default:return -EOPNOTSUPP;}}*out=data;return 0;}\n'
+    if 'static bool airoha_ppe_ct_pon_encap_output(' in ppe:
+        code+=function(ppe,'airoha_ppe_ct_pon_encap_output')
+    start=ppe.index('\tif (eth->ppe->ct_host_ppe && !odev)', end)
+    end=ppe.index('\n\tif (bridge) {', start)
+    code+='\nstatic int project_output_gate(struct airoha_eth *eth, struct net_device *odev, bool bridge, int addr_type, struct flow_rule *rule, struct airoha_flow_data data) {\n'+ppe[start:end]+'return 0; }\n'
     path=out/'path_functions.inc';path.write_text(code)
     for name in ['path_stubs.h','path_runner.c']:shutil.copyfile(ROOT/name,out/name)
     results=[]

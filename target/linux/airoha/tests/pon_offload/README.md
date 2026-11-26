@@ -9,15 +9,15 @@ Host 使用 `flow_offload_mutex` → `pon_config_lock` 锁序。控制器须在�
 ```sh
 python3 verify_transaction.py --source /path/to/linux-after-959 --output /path/to/results/transaction
 python3 verify_tx_gate.py --source /path/to/linux-after-959 --output /path/to/results/tx
-python3 verify_admission.py --source /path/to/linux-after-959 --output /path/to/results/admission
+python3 verify_admission.py --source /path/to/linux-after-962 --output /path/to/results/admission
 python3 verify_pon_flows.py --source /path/to/linux-after-959 --output /path/to/results/flows
 python3 verify_retirement.py --source /path/to/linux-after-959 \
   --stock-dir /path/to/stock/lib/modules --output /path/to/results/retirement
 ```
 
-生产函数测试包括 73 个 host 事务场景（含 27 个 MMIO 写故障位置）、18 个 TX 分片/回收场景及非 PON 回归、597 个准入/绑定场景、62 个双向撤销场景，共 34 个运行期负控制。原厂退役差分执行 288 个场景，并加测 64 个过期/占用命令和 64 个写故障恢复场景。控制器仓库另有 41 个事务场景和 35 个恢复场景。
+生产函数测试包括 73 个 host 事务场景（含 27 个 MMIO 写故障位置）、18 个 TX 分片/回收场景及非 PON 回归、617 个准入/绑定场景、62 个双向撤销场景，共 35 个运行期负控制。原厂退役差分执行 288 个场景，并加测 64 个过期/占用命令和 64 个写故障恢复场景。控制器仓库另有 41 个事务场景和 35 个恢复场景。
 
-当前已实现 routed IPv4/IPv6 TCP/UDP 的 PON 与有线双向准入、WLAN→PON，以及 IPv4 出口 VLAN/PPPoE 编码。PON 硬件准入默认关闭，等待前置硬件分类器隔离来源、VID 和 PPPoE 会话；现阶段 PON 继续软件转发。HQoS 开启模式、PON→WLAN、PON bridge、入方向封装、IPv6 出口封装继续补齐。范围见 `PPE-README.md`。
+当前已实现 routed IPv4/IPv6 TCP/UDP 的 PON 与有线双向准入、WLAN→PON，以及物理 PON 出口的 VLAN/PPPoE 编码。PON 硬件准入默认关闭，等待前置硬件分类器隔离来源、VID 和 PPPoE 会话；现阶段 PON 继续软件转发。HQoS 开启模式、PON→WLAN、PON bridge、入方向封装继续补齐。范围见 `PPE-README.md`。
 
 ### RAM 共用路径回归（2026-11-26）
 
@@ -54,11 +54,11 @@ python3 verify_gwan_ingress.py --stock-dir /path/to/stock/lib/modules \
 
 在同一个 FOE 槽位、两个 VLAN 输入和两个 channel 下，`PpeGemportCheck` 读取生成的 skb `+0xba` 与 `foe_ext[entry]+0x5c` 比较。36 次匹配均保留，36 次仅翻转 GEM 高字节一位的错配均清空服务并请求删除该槽。此验证覆盖原厂 CPU 收包及 FOE 复核；NPU 快路径仍需定位 GDM2 写入 FE32 服务字和类型有效位的硬件来源。
 
-`verify_path_order.py` 从真实 netfilter 路径生成、tuple 反转、action 生成和 Airoha action 解析一路执行到 PON GEM 选择。96 个场景覆盖两个方向、IPv4/IPv6、单/双 VLAN、PPPoE+单 VLAN，以及 PPPoE+双 VLAN 的现有两层容量拒绝，另有两个运行期负控制。
+`verify_path_order.py` 从真实 netfilter 路径生成、tuple 反转、action 生成和 Airoha action 解析一路执行到 PON GEM 选择。96 个场景覆盖两个方向、IPv4/IPv6、单/双 VLAN、PPPoE+单 VLAN，以及 PPPoE+双 VLAN 的现有两层容量拒绝，另有两个运行期负控制。IPv6 测试执行驱动的出口准入判断，并检查物理端口、桥接、输入封装键、VLAN 剥离、优先级、保留 VID 和 PPPoE 会话号。
 
 ```sh
-python3 verify_path_order.py --kernel /path/to/linux-after-959 \
-  --ppe /path/to/linux-after-959/drivers/net/ethernet/airoha/airoha_ppe.c \
+python3 verify_path_order.py --kernel /path/to/linux-after-963 \
+  --ppe /path/to/linux-after-963/drivers/net/ethernet/airoha/airoha_ppe.c \
   --output /path/to/results/path-order
 ```
 

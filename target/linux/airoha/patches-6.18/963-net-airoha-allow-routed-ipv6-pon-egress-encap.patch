@@ -1,0 +1,50 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: allow routed IPv6 VLAN and PPPoE on PON egress
+
+The IPv6 FOE has two VLAN slots and separate source MAC index and PPPoE
+session fields. Permit the output actions for a physical PON device;
+keep input matches and the PON qualification and bind checks in place.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -2122,6 +2122,30 @@
+ }
+ 
++static bool airoha_ppe_ct_pon_encap_output(struct airoha_eth *eth,
++					  struct net_device *odev,
++					  struct flow_rule *rule,
++					  struct airoha_flow_data *data)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(odev);
++	struct flow_action_entry *act;
++	int i;
++
++	if (!airoha_is_valid_gdm_dev(eth, dev) ||
++	    !test_bit(AIROHA_DEV_F_PON, &dev->flags) ||
++	    data->vlan.num + data->pppoe.num > 2 ||
++	    (data->pppoe.num && (!data->pppoe.sid || data->pppoe.sid == U16_MAX)))
++		return false;
++
++	/* Input must be plain IP; the output encoder writes the VID only. */
++	flow_action_for_each(i, act, &rule->action)
++		if (act->id == FLOW_ACTION_VLAN_POP ||
++		    (act->id == FLOW_ACTION_VLAN_PUSH &&
++		     (act->vlan.prio || act->vlan.vid >= VLAN_VID_MASK)))
++			return false;
++	return true;
++}
++
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+ 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+@@ -2266,7 +2290,8 @@
+ 		return -EOPNOTSUPP;
+ 	if (eth->ppe->ct_host_ppe &&
+ 	    (bridge || addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) &&
+-	    (data.vlan.num || data.pppoe.num ||
++	    (((data.vlan.num || data.pppoe.num) &&
++	      (bridge || !airoha_ppe_ct_pon_encap_output(eth, odev, rule, &data))) ||
+ 	     is_multicast_ether_addr(data.eth.h_dest) ||
+ 	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN) ||
+ 	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN) ||

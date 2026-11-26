@@ -40,6 +40,43 @@ static void run_case(int family, int direction, unsigned vlans, bool ppp,
     assert(rule.count==vlans+ppp);
     assert(project_production_actions(&rule,&data)==0);
     assert(data.vlan.num==vlans && data.pppoe.num==ppp);
+    if (family == AF_INET6 && (vlans || ppp)) {
+        struct flow_rule parsed = {.action=rule};
+        struct airoha_ppe ppe = {.ct_host_ppe=true};
+        struct airoha_eth eth = {.ppe=&ppe, .registered=&dev};
+        physical.priv = &dev;
+        dev.flags = BIT(AIROHA_DEV_F_PON);
+#define GATE(out, bridge) project_output_gate(&eth, out, bridge, FLOW_DISSECTOR_KEY_IPV6_ADDRS, &parsed, data)
+        assert(GATE(&physical, false) == 0);
+        parsed.action.actions[parsed.action.count++].id = FLOW_ACTION_VLAN_POP;
+        assert(GATE(&physical, false) == -EOPNOTSUPP);
+        parsed.action.count--;
+        assert(GATE(&physical, true) == -EOPNOTSUPP);
+        assert(GATE(&upper, false) == -EOPNOTSUPP);
+        dev.flags = 0;
+        assert(GATE(&physical, false) == -EOPNOTSUPP);
+        dev.flags = BIT(AIROHA_DEV_F_PON);
+        for (int key=FLOW_DISSECTOR_KEY_VLAN; key<=FLOW_DISSECTOR_KEY_ENC_CONTROL; key++) {
+            parsed.keys = BIT(key);
+            assert(GATE(&physical, false) == -EOPNOTSUPP);
+        }
+        parsed.keys = 0;
+        if (vlans) {
+            struct flow_action_entry *tag = &parsed.action.actions[0];
+            assert(tag->id == FLOW_ACTION_VLAN_PUSH);
+            tag->vlan.prio = 5;
+            assert(GATE(&physical, false) == -EOPNOTSUPP);
+            tag->vlan.prio = 0; tag->vlan.vid = VLAN_VID_MASK;
+            assert(GATE(&physical, false) == -EOPNOTSUPP);
+            tag->vlan.vid = outer;
+        }
+        if (ppp) {
+            data.pppoe.sid = 0; assert(GATE(&physical, false) == -EOPNOTSUPP);
+            data.pppoe.sid = U16_MAX; assert(GATE(&physical, false) == -EOPNOTSUPP);
+            data.pppoe.sid = 0x4321;
+        }
+#undef GATE
+    }
     if(vlans) assert(data.vlan.hdr[0].id==outer);
     if(vlans==2) assert(data.vlan.hdr[1].id==inner);
     if(ppp) assert(data.pppoe.sid==0x4321);

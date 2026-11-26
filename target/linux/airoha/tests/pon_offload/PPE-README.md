@@ -42,7 +42,7 @@ hits need the separate ingress classifier.
 
 ## Paths exercised with the test qualifier enabled
 
-- Routed IPv4 TCP/UDP (including NAT44) and unencapsulated routed IPv6 TCP/UDP.
+- Routed IPv4 TCP/UDP (including NAT44) and routed IPv6 TCP/UDP with plain IP input.
 - Upstream physical wired or DSA LAN to PON. WLAN to PON uses its physical
   wireless ingress ifindex and the existing NPU-to-PPE learning path.
 - Downstream PON to physical wired or DSA LAN, with an unencapsulated ingress
@@ -50,11 +50,14 @@ hits need the separate ingress classifier.
   At binding, the actual Ethernet protocol must match the IPv4/IPv6 FOE type
   and no hardware VLAN tag may be present. The gate checks input framing, so
   plain IPv4 input with VLAN/PPPoE output actions remains valid.
-- Upstream IPv4 egress VLAN/PPPoE uses the existing action encoder and requires
+- Upstream IPv4/IPv6 egress VLAN/PPPoE uses the existing action encoder and requires
   one unambiguous GEM/T-CONT mapping. Both admission and binding check that
   the egress selects WAN QDMA and reads HQoS disabled at offset `0x90`, bit 31.
   Enabling WAN HQoS or changing the QDMA between admission and learning skips
   the hardware bind. Restoring the direct encoding allows the next learn to bind.
+- IPv6 on physical PON egress accepts up to two 802.1Q tags or one PPPoE
+  session with at most one tag. Nonzero VLAN push priority, reserved VID,
+  VLAN pop in the encapsulation rule and session IDs 0/65535 are rejected.
 - DSA learning checks the physical conduit and the RX `METADATA_HW_PORT_MUX`
   port number. Missing metadata, another metadata type, another port and a
   different conduit are rejected. A bare DSA conduit META is rejected.
@@ -73,7 +76,7 @@ hits need the separate ingress classifier.
   PPPoE input is rejected at bind by its Ethernet protocol. With the test
   qualifier enabled, a PPPoE candidate can exist in the software cookie table without a hardware bind. The production
   default rejects PON candidates before publication.
-- IPv6 VLAN/PPPoE output, NAT66, non-TCP/UDP traffic, native bridge PON flows,
+- NAT66, non-TCP/UDP traffic, native bridge PON flows,
   PON-to-PON flows and per-P-bit split GEM mappings.
 - WAN HQoS enabled mode (T-CONT/channel remapping).
 
