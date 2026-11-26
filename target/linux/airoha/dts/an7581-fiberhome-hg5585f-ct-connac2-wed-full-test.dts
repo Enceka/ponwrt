@@ -1,0 +1,9 @@
+#include "an7581-fiberhome-hg5585f-ct-connac2-wed.dts"
+
+&npu {
+	airoha,connac2-ordinary-full-test;
+};
+
+&eth {
+	airoha,connac2-ordinary-full-test;
+};
