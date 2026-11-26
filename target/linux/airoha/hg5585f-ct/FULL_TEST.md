@@ -15,6 +15,12 @@ capabilities `0x3f`; the ordinary native IFC selector uses GDM4 port 24
 (`0x01000000`). Native forwarding policy starts off. Use the stock WED
 profile without the full-test package for a comparison.
 
+On a fresh overlay, LAN1 (2.5 GbE), LAN2 and LAN3 belong to the management
+bridge; LAN4 provides DHCP WAN and DHCPv6 WAN. The optical `pon0` is available
+for a separate line test. `prepare-overlay.sh --full-test` replaces the old
+SDK's LAN1-WAN network seed with an empty file so first boot generates these
+defaults. An upgrade that retains `/etc/config/network` retains its port roles.
+
 Use this image to test the optical controller and software bearer path.
 The rebuilt payload has no optical FE service. The driver routes GDM2 PPE
 destinations to the WAN QDMA1 CPU receiver (CDM2), including during bank

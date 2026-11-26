@@ -107,6 +107,11 @@ if [[ -n "$rebuilt_dir" ]]; then
     CONFIG_PACKAGE_kmod-nft-core=y CONFIG_PACKAGE_kmod-nft-bridge=y >> "$overlay/local.config"
 fi
 if [[ -n "$full_dir" ]]; then
+  board_network=target/linux/airoha/an7581/base-files/etc/board.d/02_network
+  mkdir -p "$overlay/tree/$(dirname "$board_network")" "$overlay/tree/files/etc/config"
+  install -m 755 "$board_network" "$overlay/tree/$board_network"
+  # config_generate skips nonempty network files, including the old LAN1-WAN seed.
+  : > "$overlay/tree/files/etc/config/network"
   for kind in rv32 data; do
     install -m 644 "$full_dir/ram-npu_$kind.bin" "$overlay/tree/$package/files/npu_full_test_$kind.bin"
   done

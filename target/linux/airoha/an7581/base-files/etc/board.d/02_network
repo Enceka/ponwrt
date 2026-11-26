@@ -33,6 +33,9 @@ an7581_setup_interfaces()
 	fiberhome,hg5382a|\
 	fiberhome,hg5585f-ct)
 		case "$VARIANT" in
+			ordinary-full-test)
+				ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "lan4"
+				;;
 			usb-sfp)
 				# lan1 uses external GPY211; lan2 through lan4 use the integrated switch; lan5 uses usb.
 				ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4 lan5" "pon0"
