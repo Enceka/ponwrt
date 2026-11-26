@@ -2,6 +2,7 @@
 import argparse
 import json
 from pathlib import Path
+import struct
 import sys
 
 from unicorn import UC_HOOK_CODE
@@ -219,6 +220,57 @@ def check_sessions(host, fe):
     return count + 1
 
 
+def check_gre_ipv4(host, fe):
+    base = host.names['TUNNEL_SWTABLE']
+    parsed = host.names['PpeParseResult']
+    skb, packet = host.DATA + 0x400, host.DATA + 0x1000
+    for slot in range(64):
+        head = base + slot * 88 + 72
+        host.put(head, '<QQ', head, head)
+    fe.ready_after = 1
+    source = 0xc0000201
+    macs = bytes.fromhex('020000abcdef020000654321')
+    inner = bytes.fromhex('4500001c0033000040110000c0000202c63364031f40232800080000')
+    for flow, destination, gre_type, slot, fresh in (
+            (0x135, 0xc6336402, 0x0800, 32, True),
+            (0x136, 0xc6336402, 0x0800, 32, False),
+            (0x137, 0xc6336403, 0x0800, 33, True),
+            (0x138, 0xc6336404, 0x1234, None, False)):
+        host.cpu.mem_write(parsed, bytes(0x124))
+        host.cpu.mem_write(parsed, macs)
+        host.cpu.mem_write(parsed + 0x24, struct.pack('!BBHHHBBHII', 0x45, 0x18, 52,
+                           0x102, 0x4000, 63, 47, 0, source, destination))
+        host.put(skb + 0x180, '<QQ', packet, packet)
+        host.put(skb + 0x12f, '<H', flow)
+        host.cpu.mem_write(packet, struct.pack('!HH', 0, gre_type) + inner)
+        fe.writes.clear()
+        allocations = len(host.allocated)
+        result = host.call('PpeParseGreTunnelInfo', skb, 0, 0)
+        if slot is None:
+            assert result == 1 and not fe.writes and len(host.allocated) == allocations
+            continue
+        assert result == 0 and len(host.allocated) == allocations + 1
+        assert host.get(parsed + 0x120, '<I') == (0x10062 | slot << 17,)
+        assert host.get(base + slot * 88 + 80, '<Q') == (host.allocated[-1],)
+        assert host.get(host.allocated[-1] + 16, '<I') == (flow,)
+        host.bound.add(flow)
+        precheck = sum((source >> 16, source & 65535, destination >> 16, destination & 65535))
+        while precheck >> 16:
+            precheck = (precheck & 65535) + (precheck >> 16)
+        words = [0x02002600, *struct.unpack('!3I', macs), 0,
+                 63 << 24 | 0x18 << 16 | precheck, 0x102 << 16,
+                 source, destination, *([0] * 8)]
+        assert host.get(base + slot * 88, '<17I') == tuple(words)
+        expected = []
+        if fresh:
+            for bank, group in [(4, [0, 0, 0, words[0]])] + [
+                    (bank, words[1 + 4*bank:5 + 4*bank]) for bank in range(4)]:
+                expected.extend(zip((CTRL+16, CTRL+12, CTRL+8, CTRL+4), group))
+                expected.append((CTRL, bank << 16 | slot << 8 | 0x11))
+        assert fe.writes == expected
+    return 4
+
+
 def check_rx_dispatch(qdma):
     # Stop at the first instruction of each destination. This fixture tests
     # selection only; skb allocation, reassembly and delivery follow it.
@@ -257,6 +309,7 @@ def main():
     qdma = Module(args.stock_dir / 'qdma_lan.ko')
     result = dict(route_init_cases=route_setup(fe), table_cases=check_tables(host, fe),
                   session_lifetime_cases=check_sessions(SessionHost(host.path, fe), fe),
+                  gre_ipv4_cases=check_gre_ipv4(SessionHost(host.path, fe), fe),
                   qdma_rx_dispatch_cases=check_rx_dispatch(qdma),
                   hashes={m.path.name: m.sha256 for m in (fe, host, qdma)})
     args.output.parent.mkdir(exist_ok=True, parents=True)
