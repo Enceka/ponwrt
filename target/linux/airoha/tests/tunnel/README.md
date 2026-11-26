@@ -4,6 +4,8 @@ RAM 系统无需 Python。用 Linux AArch64 工具链构建 `aarch64-linux-gnu-g
 
 软件收发对照：在支持网络命名空间、veth 和 IPv4 GRE 的 Linux 上执行 `sudo python3 verify_gre_wire.py`，需要 iproute2 和 Python 3。工具创建两个临时网络命名空间，两条内层主机路由共用一条无密钥 GRE 隧道；逐包检查两端方向、GRE 头、内层 UDP 端口和载荷。撤销其中一条路由后，该目的地址返回 `ENETUNREACH`，另一条仍交付；重建路由后恢复。工具退出时删除命名空间。此对照使用内核软件路径，实板还需核对硬件流表及隧道行。
 
+2026-11-27 HG5585F-CT 实板软件对照通过。禁用 NAND 的 RAM FIT SHA256 为 `96f3059e6ef54f69f69c506a188208203be71b877189712753ed222202d7ca34`；板上 `/sys/kernel/notes` 的 Build ID `378b510bd429c4b05cedad835fb32c72c7a8f9c6` 与构建产物一致。六次 UDP 交付均匹配对应的 GRE 帧；撤路返回 `ENETUNREACH`，另一条共享隧道的路由仍可双向收发，恢复后原路由再次交付。前后命名空间列表及默认路由一致，Mac 经 Wi-Fi 访问外网返回 HTTP 200。复测记录：板测工作区 `build/gre-board.S2d31l/ct243-host-rx-boot-1795733312054371000/{gre-software.log,gre-software.json,wan-verified/result.json}`。此项验收使用 veth 和内核 GRE；FE 行及 FOE 命中另行验收。
+
 ```sh
 python3 verify_stock_fe.py --stock-dir /path/to/stock/lib/modules --output /tmp/stock-fe.json
 python3 verify_board_hir.py --image /path/to/stock/Image --hw-nat /path/to/stock/lib/modules/hw_nat.ko
