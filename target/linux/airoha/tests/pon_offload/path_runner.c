@@ -3,6 +3,105 @@
 #include "path_functions.inc"
 
 static unsigned cases;
+static unsigned ingress_cases;
+
+static void check_ingress(struct flow_offload_tuple *tuple, unsigned vlans, bool ppp)
+{
+    struct nf_flow_match match = {0};
+    struct airoha_gdm_dev dev = {0};
+    struct net_device physical = {.priv = &dev};
+    struct airoha_ppe ppe = {0};
+    struct airoha_eth eth = {.ppe = &ppe, .registered = &dev};
+    struct airoha_flow_data data = {0};
+    struct flow_rule rule = {0};
+
+    if (tuple->l3proto == AF_INET6) {
+        tuple->src_v6.s6_addr[15] = 1;
+        tuple->dst_v6.s6_addr[15] = 2;
+    } else {
+        tuple->src_v4.s_addr = htonl(0xc0000201);
+        tuple->dst_v4.s_addr = htonl(0xc0000202);
+    }
+    tuple->src_port = htons(53001);
+    tuple->dst_port = htons(443);
+    for (unsigned proto = 0; proto < 2; proto++) {
+        tuple->l4proto = proto ? IPPROTO_TCP : IPPROTO_UDP;
+        memset(&match, 0, sizeof(match));
+        assert(!nf_flow_rule_match(&match, tuple, NULL));
+        bool ipv6 = tuple->l3proto == AF_INET6;
+        assert(match.key.basic.n_proto == htons(ipv6 ? ETH_P_IPV6 : ETH_P_IP));
+        assert(match.key.basic.ip_proto == tuple->l4proto);
+        assert(match.key.tp.src == tuple->src_port && match.key.tp.dst == tuple->dst_port);
+        assert(!!(match.dissector.used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_VLAN)) == !!vlans);
+        assert(!!(match.dissector.used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN)) == (vlans == 2));
+        assert(!!(match.dissector.used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_PPPOE)) == ppp);
+        if (vlans) assert(match.key.vlan.vlan_id == tuple->encap[0].id);
+        if (vlans == 2) assert(match.key.cvlan.vlan_id == tuple->encap[1].id);
+        if (ppp) {
+            struct flow_offload_tuple second = *tuple;
+            struct nf_flow_match other = {0};
+            assert(match.dissector.offset[FLOW_DISSECTOR_KEY_PPPOE] == offsetof(struct nf_flow_key, pppoe));
+            assert(match.key.pppoe.session_id == htons(tuple->encap[vlans].id));
+            assert(match.key.pppoe.type == htons(ETH_P_PPP_SES));
+            assert(match.key.pppoe.ppp_proto == htons(ipv6 ? PPP_IPV6 : PPP_IP));
+            assert(match.mask.pppoe.session_id == htons(U16_MAX));
+            assert(match.mask.pppoe.type == htons(U16_MAX) && match.mask.pppoe.ppp_proto == htons(U16_MAX));
+            second.encap[vlans].id ^= 0x8000;
+            assert(!nf_flow_rule_match(&other, &second, NULL));
+            assert(other.key.pppoe.session_id == htons(second.encap[vlans].id));
+            assert((other.key.pppoe.session_id ^ match.key.pppoe.session_id) & match.mask.pppoe.session_id);
+            other.key.pppoe.session_id = match.key.pppoe.session_id;
+            assert(!memcmp(&other, &match, sizeof(match)));
+        }
+        rule.keys = match.dissector.used_keys;
+        for (unsigned ct = 0; ct < 2; ct++) {
+            ppe.ct_host_ppe = ct;
+            int rc = project_output_gate(&eth, &physical, false, match.key.control.addr_type, &rule, data);
+            assert(rc == (ppp || (ct && ipv6 && vlans) ? -EOPNOTSUPP : 0));
+        }
+        ingress_cases++;
+    }
+}
+
+static void check_invalid_stacks(int family)
+{
+    struct flow_offload_tuple tuple = {.l3proto = family, .l4proto = IPPROTO_TCP};
+    struct nf_flow_match match;
+    const u16 session = htons(ETH_P_PPP_SES), vlan = htons(ETH_P_8021Q);
+    const struct { unsigned count; u16 proto[2], id[2]; unsigned flags; } stacks[] = {
+        {1, {session}, {0}, 0}, {1, {session}, {U16_MAX}, 0},
+        {2, {vlan, session}, {100, 0}, 0}, {2, {vlan, session}, {100, U16_MAX}, 0},
+        {2, {session, vlan}, {7, 100}, 0}, {2, {session, session}, {7, 8}, 0},
+        {2, {htons(0x88a8), session}, {100, 7}, 0}, {1, {session}, {7}, BIT(0)},
+        {2, {vlan, session}, {100, 7}, BIT(1)}, {3, {vlan, session}, {100, 7}, 0},
+    };
+    for (unsigned index = 0; index < ARRAY_SIZE(stacks); index++) {
+        tuple.encap_num = stacks[index].count;
+        tuple.in_vlan_ingress = stacks[index].flags;
+        for (unsigned layer = 0; layer < ARRAY_SIZE(tuple.encap); layer++) {
+            tuple.encap[layer].proto = stacks[index].proto[layer];
+            tuple.encap[layer].id = stacks[index].id[layer];
+        }
+        memset(&match, 0, sizeof(match));
+        assert(nf_flow_rule_match(&match, &tuple, NULL) == -EOPNOTSUPP);
+        ingress_cases++;
+    }
+    tuple.encap_num = 2;
+    tuple.in_vlan_ingress = BIT(0);
+    tuple.encap[0].proto = vlan;
+    tuple.encap[0].id = 100;
+    tuple.encap[1].proto = session;
+    for (unsigned bound = 0; bound < 2; bound++) {
+        tuple.encap[1].id = bound ? U16_MAX - 1 : 1;
+        memset(&match, 0, sizeof(match));
+        assert(!nf_flow_rule_match(&match, &tuple, NULL));
+        assert(match.dissector.used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_PPPOE));
+        assert(!(match.dissector.used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_VLAN)));
+        assert(match.key.pppoe.session_id == htons(tuple.encap[1].id));
+        ingress_cases++;
+    }
+}
+
 static void run_case(int family, int direction, unsigned vlans, bool ppp,
                      u16 outer, u16 inner, bool split_outer)
 {
@@ -36,6 +135,7 @@ static void run_case(int family, int direction, unsigned vlans, bool ppp,
     if(vlans) assert(tuple->encap[0].id==outer);
     if(vlans==2) assert(tuple->encap[1].id==inner);
     if(ppp) assert(tuple->encap[vlans].id==0x4321);
+    check_ingress(tuple, vlans, ppp);
     assert(nf_flow_rule_route_common(&net,&flow,direction,&rule)==0);
     assert(rule.count==vlans+ppp);
     assert(project_production_actions(&rule,&data)==0);
@@ -91,6 +191,8 @@ int main(void)
       for(unsigned vlans=0;vlans<=2;vlans++) for(unsigned ppp=0;ppp<2;ppp++)
         for(unsigned swap=0;swap<2;swap++) for(unsigned split=0;split<2;split++)
           run_case(family?AF_INET6:AF_INET,direction,vlans,ppp,swap?200:100,swap?100:200,split);
-    printf("PASS: %u production path-to-selector scenarios\n",cases);
+    check_invalid_stacks(AF_INET);
+    check_invalid_stacks(AF_INET6);
+    printf("PASS: %u production path-to-selector and %u ingress-match scenarios\n", cases, ingress_cases);
     return 0;
 }

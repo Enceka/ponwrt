@@ -77,11 +77,12 @@ families, including a synthetic PON-ingress candidate at the actual bind step.
   enters through GDM2. The PON admission gate also requires a physical egress
   GDM, whereas the WLAN action returns a WDMA destination and no egress GDM.
 - PON ingress VLAN, CVLAN, PPPoE and tunnel keys: the current FOE tuple match
-  does not retain those selectors. VLAN/CVLAN/tunnel keys are rejected at
-  admission. This kernel does not emit a PPPoE ingress dissector key; actual
-  PPPoE input is rejected at bind by its Ethernet protocol. With the test
-  qualifier enabled, a PPPoE candidate can exist in the software cookie table without a hardware bind. The production
-  default rejects PON candidates before publication.
+  omits those selectors. Patch 965 exports an exact PPPoE ingress key with
+  session ID, session EtherType and inner PPP protocol. Airoha rejects this
+  key before installing a cookie in either PPE mode, including IPv4 to a
+  physical Ethernet output. PON still rejects VLAN/CVLAN/tunnel keys at
+  admission and rechecks packet framing at bind. The production PON gate
+  remains closed for all candidates.
 - NAT66, non-TCP/UDP traffic, native bridge PON flows,
   PON-to-PON flows and per-P-bit split GEM mappings.
 - WAN HQoS enabled mode (T-CONT/channel remapping).

@@ -13,6 +13,7 @@ typedef uint32_t u32;
 #define ETH_P_8021Q 0x8100
 #define ETH_P_PPP_SES 0x8864
 #define BIT(n) (1u << (n))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define NFPROTO_IPV4 AF_INET
 #define NFPROTO_IPV6 AF_INET6
 #undef EOPNOTSUPP
@@ -40,9 +41,14 @@ struct nft_flowtable { struct nf_flowtable data; };
 struct net { int unused; };
 struct nf_conn { int unused; };
 enum ip_conntrack_dir { IP_CT_DIR_ORIGINAL, IP_CT_DIR_REPLY };
-struct dst_entry { int unused; };
+struct dst_entry { void *lwtstate; };
 struct nf_flow_route { struct { struct dst_entry *dst; struct { int ifindex, num_encaps, ingress_vlans; struct { u16 id, proto; } encap[NF_FLOW_TABLE_ENCAP_MAX]; } in; struct { int ifindex, hw_ifindex, bridge_path, bridge_vlan, port_vlans; u8 h_source[6], h_dest[6]; } out; int xmit_type; } tuple[2]; };
-struct flow_offload_tuple { int l3proto, mtu, iifidx, ifidx, dst_cookie, bridge_path, bridge_vlan, port_vlans, encap_num, in_vlan_ingress, xmit_type; struct dst_entry *dst_cache; struct { u16 id, proto; } encap[NF_FLOW_TABLE_ENCAP_MAX]; struct { int ifidx, hw_ifidx; u8 h_dest[6], h_source[6]; } out; };
+struct flow_offload_tuple { int l3proto, mtu, iifidx, ifidx, dst_cookie, bridge_path, bridge_vlan, port_vlans, encap_num, in_vlan_ingress, xmit_type; struct dst_entry *dst_cache; struct { u16 id, proto; } encap[NF_FLOW_TABLE_ENCAP_MAX]; struct { int ifidx, hw_ifidx; u8 h_dest[6], h_source[6]; } out;
+ int l4proto, dscp; struct { int iifidx; } tc;
+ union { struct in_addr src_v4; struct in6_addr src_v6; };
+ union { struct in_addr dst_v4; struct in6_addr dst_v6; };
+ __be16 src_port, dst_port;
+};
 struct flow_offload { struct { struct flow_offload_tuple tuple; } tuplehash[2]; unsigned priority; };
 struct flow_action_entry { int id; union { struct { u16 vid, proto; u8 prio; } vlan; struct { u16 sid; } pppoe; unsigned priority; }; };
 struct nf_flow_rule { unsigned count; struct flow_action_entry actions[24]; };
@@ -54,7 +60,41 @@ struct airoha_ppe { bool ct_host_ppe; };
 struct airoha_eth { struct airoha_ppe *ppe; struct airoha_gdm_dev *registered; };
 struct flow_rule { struct nf_flow_rule action; unsigned keys; };
 enum { FLOW_DISSECTOR_KEY_VLAN, FLOW_DISSECTOR_KEY_CVLAN, FLOW_DISSECTOR_KEY_PPPOE,
-       FLOW_DISSECTOR_KEY_ENC_CONTROL, FLOW_DISSECTOR_KEY_IPV6_ADDRS };
+       FLOW_DISSECTOR_KEY_ENC_CONTROL, FLOW_DISSECTOR_KEY_IPV6_ADDRS,
+       FLOW_DISSECTOR_KEY_IPV4_ADDRS, FLOW_DISSECTOR_KEY_META, FLOW_DISSECTOR_KEY_CONTROL,
+       FLOW_DISSECTOR_KEY_BASIC, FLOW_DISSECTOR_KEY_IP, FLOW_DISSECTOR_KEY_TCP,
+       FLOW_DISSECTOR_KEY_PORTS };
+#define FLOW_OFFLOAD_XMIT_TC 4
+#define PPP_IP 0x21
+#define PPP_IPV6 0x57
+#define ETH_P_IP 0x0800
+#define ETH_P_IPV6 0x86dd
+#define INET_DSCP_MASK 0xfc
+#define TCP_FLAG_RST htonl(0x00040000)
+#define TCP_FLAG_FIN htonl(0x00010000)
+#define be32_to_cpu ntohl
+#define cpu_to_be16 htons
+#define FIELD_PREP(m, x) (((x) << __builtin_ctz(m)) & (m))
+#define BIT_ULL(n) (UINT64_C(1) << (n))
+struct flow_dissector_key_vlan { u16 vlan_id, vlan_tpid; };
+struct nf_flow_key {
+ struct { u32 ingress_ifindex; } meta;
+ struct { u16 addr_type; } control;
+ struct { u16 n_proto; u8 ip_proto; } basic;
+ struct flow_dissector_key_vlan vlan, cvlan;
+ struct { __be16 session_id, ppp_proto, type; } pppoe;
+ union { struct { u32 src, dst; } ipv4; struct { struct in6_addr src, dst; } ipv6; };
+ struct { u8 tos; } ip;
+ struct { u16 flags; } tcp;
+ struct { u16 src, dst; } tp;
+};
+struct nf_flow_match {
+ struct { size_t offset[16]; uint64_t used_keys; } dissector;
+ struct nf_flow_key key, mask;
+};
+struct ip_tunnel_info;
+#define lwt_tun_info(dst) ((struct ip_tunnel_info *)(dst))
+#define nf_flow_rule_lwt_match(match, info) ((void)(match), (void)(info), assert(false))
 #define AIROHA_DEV_F_PON 2
 #define U16_MAX UINT16_MAX
 #define VLAN_VID_MASK 4095

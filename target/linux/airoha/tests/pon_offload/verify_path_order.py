@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Run unmodified production path, tuple reversal, action and PON selection code."""
-import argparse, hashlib, json, re, shutil, subprocess
+"""Exercise production ingress rules, encapsulation actions and PON selection."""
+import argparse, hashlib, json, re, resource, shutil, signal, subprocess
 from pathlib import Path
 from verify_metadata import function, structure
 
@@ -17,6 +17,10 @@ def main():
     maxline=re.search(r'^#define NF_FLOW_TABLE_ENCAP_MAX\s+\d+',files['include/net/netfilter/nf_flow_table.h'],re.M).group(0)
     (out/'encap_max.inc').write_text(maxline+'\n')
     code=structure(files['net/netfilter/nf_flow_table_path.c'],'nft_forward_info')
+    offload = files['net/netfilter/nf_flow_table_offload.c']
+    macro_start = offload.index('#define NF_FLOW_DISSECTOR(')
+    code += '\n' + offload[macro_start:offload.index('\n\n', macro_start)] + '\n'
+    code += function(offload, 'nf_flow_rule_vlan_match') + function(offload, 'nf_flow_rule_match')
     for file,names in [('net/netfilter/nf_flow_table_path.c',['nft_dev_path_info','nft_dev_forward_path']),('net/netfilter/nf_flow_table_core.c',['flow_offload_fill_route']),('net/netfilter/nf_flow_table_offload.c',['nf_flow_rule_route_common'])]:
         code+='\n'.join(function(files[file],name) for name in names)
     code+='\n'.join(function(ppe,name) for name in ['airoha_ppe_pon_lookup_tag','airoha_ppe_pon_select_flow'])
@@ -41,14 +45,19 @@ def main():
     for name,flags in [('plain',()),('sanitized',('-fsanitize=address,undefined','-fno-omit-frame-pointer'))]:
         r=run(name,flags);r.check_returncode();results.append({'mode':name,'summary':r.stdout.splitlines()[-1]})
     mutations=[]
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     try:
-        for name,old,new in [('inner-select','data->vlan.hdr[0].id : AIROHA_PON_VID_ANY;','data->vlan.hdr[data->vlan.num - 1].id : AIROHA_PON_VID_ANY;'),('omit-reverse','i = route->tuple[dir].in.num_encaps - 1; i >= 0; i--','i = 0; i < route->tuple[dir].in.num_encaps; i++')]:
+        for name,old,new in [
+                ('inner-select','data->vlan.hdr[0].id : AIROHA_PON_VID_ANY;','data->vlan.hdr[data->vlan.num - 1].id : AIROHA_PON_VID_ANY;'),
+                ('omit-reverse','i = route->tuple[dir].in.num_encaps - 1; i >= 0; i--','i = 0; i < route->tuple[dir].in.num_encaps; i++'),
+                ('truncate-session','key->pppoe.session_id = htons(sid);','key->pppoe.session_id = htons(sid & 0xff);'),
+                ('allow-pppoe-foe','if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE))','if (false)')]:
             assert old in code
             path.write_text(code.replace(old,new));r=run(name)
-            assert r.returncode!=0,name
+            assert r.returncode == -signal.SIGABRT,name
             mutations.append({'name':name,'detected':True,'returncode':r.returncode})
     finally:path.write_text(code)
-    report={'passed':True,'production_source_sha256':{str(a.kernel/n):hashlib.sha256(t.encode()).hexdigest() for n,t in files.items()},'ppe_source':str(a.ppe),'ppe_sha256':hashlib.sha256(ppe.encode()).hexdigest(),'extracted_sha256':hashlib.sha256(code.encode()).hexdigest(),'results':results,'mutations':mutations,'stubs':'Device-path discovery, Ethernet MAC actions, dst lifetime and RCU; encapsulation path, reversal, action generation, action parsing, lookup and selector execute production C.'}
+    report={'passed':True,'production_source_sha256':{str(a.kernel/n):hashlib.sha256(t.encode()).hexdigest() for n,t in files.items()},'ppe_source':str(a.ppe),'ppe_sha256':hashlib.sha256(ppe.encode()).hexdigest(),'extracted_sha256':hashlib.sha256(code.encode()).hexdigest(),'results':results,'mutations':mutations,'stubs':'Device-path discovery, Ethernet MAC actions, dst lifetime and RCU; tuple reversal, ingress rule and action generation, PPE encapsulation gate, action parsing, lookup and selector execute production C.'}
     (out/'verification.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report,indent=2))
 
 if __name__=='__main__':main()

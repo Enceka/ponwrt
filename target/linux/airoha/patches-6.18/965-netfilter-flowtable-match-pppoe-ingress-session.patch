@@ -1,0 +1,78 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] netfilter: flowtable: include PPPoE sessions in ingress matches
+
+The flow tuple records the PPPoE session but the offload rule drops it,
+allowing distinct sessions to produce the same IP match. Export the exact
+session ID, EtherType and PPP protocol alongside the existing VLAN and IP
+keys. Keep malformed or unrepresentable PPPoE stacks in software. The
+Airoha PPE has no ingress session selector, so decline these rules before
+programming the FOE, including IPv4 with a physical Ethernet destination.
+
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -27,6 +27,7 @@
+ 	struct flow_dissector_key_basic			basic;
+ 	struct flow_dissector_key_vlan			vlan;
+ 	struct flow_dissector_key_vlan			cvlan;
++	struct flow_dissector_key_pppoe			pppoe;
+ 	union {
+ 		struct flow_dissector_key_ipv4_addrs	ipv4;
+ 		struct flow_dissector_key_ipv6_addrs	ipv6;
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -95,6 +95,10 @@
+ 	struct nf_flow_key *key = &match->key;
+ 	struct ip_tunnel_info *tun_info;
+ 	bool vlan_encap = false;
++	unsigned int i;
+ 
++	if (tuple->encap_num > ARRAY_SIZE(tuple->encap))
++		return -EOPNOTSUPP;
++
+ 	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_META, meta);
+ 	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_CONTROL, control);
+@@ -177,6 +181,25 @@
+ 	match->dissector.used_keys |= BIT_ULL(key->control.addr_type);
+ 	mask->basic.n_proto = 0xffff;
+ 
++	for (i = 0; i < tuple->encap_num; i++) {
++		u16 sid = tuple->encap[i].id;
++
++		if (tuple->encap[i].proto != htons(ETH_P_PPP_SES))
++			continue;
++		if (i != tuple->encap_num - 1 || !sid || sid == U16_MAX ||
++		    (tuple->in_vlan_ingress & BIT(i)) ||
++		    (i && tuple->encap[0].proto != htons(ETH_P_8021Q)))
++			return -EOPNOTSUPP;
++		NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_PPPOE, pppoe);
++		key->pppoe.session_id = htons(sid);
++		key->pppoe.type = htons(ETH_P_PPP_SES);
++		key->pppoe.ppp_proto = htons(tuple->l3proto == AF_INET ? PPP_IP : PPP_IPV6);
++		mask->pppoe.session_id = htons(U16_MAX);
++		mask->pppoe.type = htons(U16_MAX);
++		mask->pppoe.ppp_proto = htons(U16_MAX);
++		match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_PPPOE);
++	}
++
+ 	key->ip.tos = FIELD_PREP(INET_DSCP_MASK, tuple->dscp);
+ 	mask->ip.tos = 0xff;
+ 	match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_IP);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -2315,6 +2315,8 @@
+ 		return -EINVAL;
+ 	if (eth->ppe->ct_host_ppe && !odev)
+ 		return -EOPNOTSUPP;
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE))
++		return -EOPNOTSUPP;
+ 	if (eth->ppe->ct_host_ppe &&
+ 	    (bridge || addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) &&
+ 	    (((data.vlan.num || data.pppoe.num) &&
+@@ -2322,7 +2324,6 @@
+ 	     is_multicast_ether_addr(data.eth.h_dest) ||
+ 	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN) ||
+ 	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN) ||
+-	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE) ||
+ 	     flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_CONTROL)))
+ 		return -EOPNOTSUPP;
+ 
