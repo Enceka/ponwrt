@@ -30,6 +30,7 @@ static void test_log(const char *fmt, ...) { (void)fmt; }
 #define FE_PSE_PORT_PPE2 8
 #define FE_PSE_PORT_DROP 15
 #define AIROHA_GDM1_IDX 1
+#define AIROHA_GDM2_IDX 2
 #define AIROHA_GDM4_IDX 4
 #define REG_GDM_FWD_CFG(id) ((id) - 1)
 #define REG_FE_CSR_IFC_CFG 16
@@ -62,6 +63,7 @@ struct airoha_eth {
     spinlock_t ct_route_lock;
     u16 ct_cpu_route_mask[4];
     bool ct_cpu_fallback, ct_cpu_ifc_disabled, ct_cpu_routes_ready, ct_cpu_wlan_gated;
+    bool ct_ifc_cpu_port_failed, ct_ordinary_full_test;
     struct airoha_ppe *ppe;
     struct airoha_npu *npu;
     struct airoha_soc *soc;
@@ -117,7 +119,7 @@ static void airoha_fe_rmw(struct airoha_eth *e, unsigned int reg, u32 mask, u32 
 { airoha_fe_wr(e,reg,(airoha_fe_rr(e,reg)&~mask)|val); }
 static void airoha_fe_clear(struct airoha_eth *e, unsigned int reg, u32 mask)
 { airoha_fe_rmw(e,reg,mask,0); }
-static void schedule_delayed_work(int *work, int delay) { (void)work; assert(delay==100); schedules++; }
+static void schedule_delayed_work(int *work, int delay) { (void)work; assert(delay==(eth.ct_ifc_cpu_port_failed ? 0 : 100)); schedules++; }
 static int test_pair_cmd(struct airoha_npu *n, struct airoha_ct_pair_msg *msg)
 {
     struct airoha_ppe *p=&ppe;
@@ -143,6 +145,7 @@ static int airoha_ct_fe_control(struct airoha_ppe *p, unsigned int op, u64 gener
 #define read_poll_timeout_atomic(fn,val,cond,a,b,c,...) \
     ({ (void)(a); (void)(b); (void)(c); (val)=fn(__VA_ARGS__); (cond) ? 0 : -ETIMEDOUT; })
 
+static bool ct_ifc_cpu_port_matches(struct airoha_eth *e) { return !e->ct_ifc_cpu_port_failed; }
 #include "airoha_ct_cpu_fallback.h"
 #include "cpu_fallback_extracted.inc"
 
@@ -181,6 +184,21 @@ int main(void)
             assert(after==((before==4||before==8)?cpu:before));
         }
     }
+    cases++;
+    reset(); eth.ct_ordinary_full_test=true;
+    for (u32 low=0;low<0x10000;low++) {
+        assert(!airoha_gdm_fwd_cfg_update(&eth,2,U32_MAX,0xabcd0000|low));
+        u32 expected=0xabcd0000;
+        for (int n=0;n<4;n++) {
+            u32 p=(low>>(4*n))&15;
+            expected|=((p==4||p==8)?5:p)<<(4*n);
+        }
+        assert(eth.regs[1]==expected);
+    }
+    assert(!airoha_set_gdm_port_fwd_cfg(&eth,4,4) && (eth.regs[3]&0xffff)==0x8888);
+    reject_reg=1; assert(airoha_set_gdm_port_fwd_cfg(&eth,2,8)==-EIO);
+    assert(!airoha_ct_ifc_cpu_port_change(&eth,2) && !eth.ct_ifc_cpu_port_failed);
+    assert(!airoha_ct_ifc_cpu_port_change(&eth,24) && eth.ct_ifc_cpu_port_failed);
     cases++;
     reset(); eth.regs[1]=0x07f09999; eth.regs[2]=0x17f0f480;
     assert(airoha_ppe_ct_bridge_fail_closed_from(&ppe,"test",1)==0);

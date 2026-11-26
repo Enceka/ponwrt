@@ -1,0 +1,74 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: keep ordinary full-test optical RX on WAN QDMA
+
+Keep GDM2 out of ordinary PPE lookups while the full-image test exercises
+the PON controller. Check the CPU route readback before starting the line.
+
+--- a/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
+@@ -101,6 +101,12 @@
+ 		}
+ 		cfg = airoha_ct_cpu_selectors(cfg, mask, cpu);
+ 	}
++	/* The ordinary ABI3 image has no optical service. GDM2 is wired to
++	 * WAN QDMA1. Keep PPE destinations on its CPU receiver even across
++	 * native bank start/restore; leave DROP and direct routes intact.
++	 */
++	if (eth->ct_ordinary_full_test && id == AIROHA_GDM2_IDX)
++		cfg = airoha_ct_cpu_selectors(cfg, airoha_ct_ppe_selectors(cfg), FE_PSE_PORT_CDM2);
+ 	airoha_fe_wr(eth, REG_GDM_FWD_CFG(id), cfg);
+ 	if (airoha_fe_rr(eth, REG_GDM_FWD_CFG(id)) != cfg)
+ 		err = -EIO;
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -153,7 +153,7 @@
+ 
+ #include "airoha_ct_cpu_fallback.h"
+ 
+-static void airoha_set_gdm_port_fwd_cfg(struct airoha_eth *eth, u32 id,
++static int airoha_set_gdm_port_fwd_cfg(struct airoha_eth *eth, u32 id,
+ 					u32 val)
+ {
+ 	int err;
+@@ -163,6 +163,7 @@
+ 	err = airoha_gdm_fwd_cfg_update(eth, id, GENMASK(15, 0), val * 0x1111);
+ 	if (err)
+ 		dev_err_ratelimited(eth->dev, "GDM%u forwarding update: %d\n", id, err);
++	return err;
+ }
+ 
+ static void airoha_ifc_update_ports(struct airoha_eth *eth, u32 mask, bool enable)
+@@ -2468,8 +2469,12 @@
+ 	if (!airoha_is_lan_gdm_dev(dev) &&
+ 	    airoha_ppe_is_enabled(qdma->eth, 1))
+ 		pse_port = FE_PSE_PORT_PPE2;
+-	airoha_set_gdm_port_fwd_cfg(qdma->eth, port->id,
+-				    pse_port);
++	err = airoha_set_gdm_port_fwd_cfg(qdma->eth, port->id, pse_port);
++	if (err && qdma->eth->ct_ordinary_full_test && test_bit(AIROHA_DEV_F_PON, &dev->flags)) {
++		port->users--;
++		airoha_set_vip_for_gdm_port(dev, false);
++		goto err_phy_stop;
++	}
+ 
+ 	if (netdev->features & NETIF_F_LRO)
+ 		airoha_dev_lro_enable(dev);
+@@ -4979,6 +4984,8 @@
+ 		return -EINVAL;
+ 
+ 	eth->dev = &pdev->dev;
++	eth->ct_ordinary_full_test = of_property_read_bool(pdev->dev.of_node,
++							  "airoha,connac2-ordinary-full-test");
+ 	spin_lock_init(&eth->ct_route_lock);
+ 	spin_lock_init(&eth->ifc_port_lock);
+ 	mutex_init(&eth->pon_config_lock);
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -861,6 +861,7 @@
+ 	spinlock_t ct_route_lock;
+ 	u16 ct_cpu_route_mask[AIROHA_MAX_NUM_GDM_PORTS];
+ 	bool ct_ifc_cpu_port_failed;
++	bool ct_ordinary_full_test;
+ 	bool ct_cpu_fallback;
+ 	bool ct_cpu_ifc_disabled;
+ 	bool ct_cpu_routes_ready;
