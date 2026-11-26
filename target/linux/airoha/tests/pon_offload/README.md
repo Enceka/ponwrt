@@ -43,6 +43,17 @@ python3 verify_rx_service.py --source /path/to/patched/linux \
   --stock-dir /path/to/stock/lib/modules --output /path/to/results/rx-service
 ```
 
+`verify_gwan_ingress.py` 运行原厂 `gwan_process_rx_message`，将其产出的完整 skb 原样交给原厂 `PpeGemportCheck`。594 个场景涵盖本机单播、未知单播、广播、组播、channel 32、无效映射、OMCI 和 FOE 槽位复用。工具固定两个模块的 SHA，接收函数内无桩；流表函数的日志和最终硬件删除调用以桩记录。
+
+```sh
+python3 verify_gwan_ingress.py --stock-dir /path/to/stock/lib/modules \
+  --output /path/to/results/gwan-ingress.json
+```
+
+数据路径用 `msg0[29:14]` 查 16 位 GEM 映射表，取 `index & 0x7fff`；有效行号为 0–255。每行 `0xc8` 字节，`+0xc` 为启用字节，`+8` 为 channel，`+4` 为 ANI。普通 channel 接受 ANI ≤ 256，channel 32 走独立分支。成功后 skb 的 `+0xba` 持有完整 GEM，`+0xb8` 区分 channel 32，`+0xc0` 为 ANI 低八位，`+0xbc` 置 `0x400`。默认配置下第四个输出参数保持零；启用行内 `+9` 后，channel 0/31 的此参数置一，channel 32 保持零。`msg0[8]` 置位时按控制器的 OMCC 行计数，保留数据 skb 服务字段；OMCC 未配置时返回 -1。
+
+在同一个 FOE 槽位、两个 VLAN 输入和两个 channel 下，`PpeGemportCheck` 读取生成的 skb `+0xba` 与 `foe_ext[entry]+0x5c` 比较。36 次匹配均保留，36 次仅翻转 GEM 高字节一位的错配均清空服务并请求删除该槽。此验证覆盖原厂 CPU 收包及 FOE 复核；NPU 快路径仍需定位 GDM2 写入 FE32 服务字和类型有效位的硬件来源。
+
 `verify_path_order.py` 从真实 netfilter 路径生成、tuple 反转、action 生成和 Airoha action 解析一路执行到 PON GEM 选择。96 个场景覆盖两个方向、IPv4/IPv6、单/双 VLAN、PPPoE+单 VLAN，以及 PPPoE+双 VLAN 的现有两层容量拒绝，另有两个运行期负控制。
 
 ```sh
