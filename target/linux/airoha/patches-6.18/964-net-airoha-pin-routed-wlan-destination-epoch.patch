@@ -1,0 +1,54 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: pin the WLAN station epoch for routed flows
+
+The WDMA action contains a band and WCID, which are reusable. Sample their
+epoch under the PPE lock while publishing a routed wireless candidate, and
+check it again when learning. A blocked, exhausted or reassigned destination
+cannot acquire a new binding from the old candidate.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1173,6 +1173,17 @@
+ 	return epoch == U32_MAX || ppe->ct_wlan_blocked[band][wcid] ? 0 : epoch + 1;
+ }
+ 
++static u32 airoha_ppe_ct_route_wlan_epoch(struct airoha_ppe *ppe,
++					 const struct airoha_foe_entry *hwe)
++{
++	u16 wcid;
++	u8 band;
++
++	if (!airoha_ppe_ct_wlan_dest(hwe, &band, &wcid))
++		return 0;
++	return airoha_ppe_ct_epoch_locked(ppe, band, wcid);
++}
++
+ u32 airoha_ppe_ct_wlan_epoch(struct airoha_ppe_dev *dev, u8 band, u16 wcid)
+ {
+ 	struct airoha_ppe *ppe = dev->priv;
+@@ -1680,6 +1691,11 @@
+ 		if (!airoha_ppe_foe_compare_entry(e, hwe))
+ 			continue;
+ 
++		if (ppe->ct_host_ppe && !e->ct_bridge && !e->egress_dev &&
++		    (!e->ct_dest.epoch ||
++		     e->ct_dest.epoch != airoha_ppe_ct_route_wlan_epoch(ppe, &e->data)))
++			continue;
++
+ 		/* Retain the attempted row for teardown even if its ACK times out. */
+ 		e->hash = hash;
+ 		if (airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan))
+@@ -1759,6 +1775,13 @@
+ 				return -EEXIST;
+ 			}
+ 		}
++		if (!e->ct_bridge && !e->egress_dev) {
++			e->ct_dest.epoch = airoha_ppe_ct_route_wlan_epoch(ppe, &e->data);
++			if (!e->ct_dest.epoch) {
++				spin_unlock_bh(&ppe_lock);
++				return -ESTALE;
++			}
++		}
+ 	}
+ 	if (e->ct_bridge) {
+ 		if (ppe->ct_stopping || ppe->ct_bridge_failed ||

@@ -5,7 +5,7 @@ by `--source`. They need a C compiler supporting AddressSanitizer and
 UndefinedBehaviorSanitizer. All outputs go into a fresh `--output` directory.
 
 ```sh
-python3 verify_admission.py --source /path/to/linux-after-962 --output /path/to/admission-results
+python3 verify_admission.py --source /path/to/linux-after-964 --output /path/to/admission-results
 python3 verify_pon_flows.py --source /path/to/linux --output /path/to/flow-results
 ```
 
@@ -17,7 +17,7 @@ Files to keep together:
 The admission runner executes the production exact-match validator, ingress
 resolution, PON gate/admission functions, actual learn/bind function, cookie
 publication, duplicate-tuple exclusion, netfilter lower-path parser and EN7581
-source-port decoder. It covers 617 cases and 20 runtime mutation controls.
+source-port decoder. It covers 721 cases and 21 runtime mutation controls.
 The retirement runner executes checked row comparison/removal, the two-way
 device walk and the actual flow-destroy function. It covers 62 cases and 7
 runtime mutation controls. SRAM reads/writes, allocation indices and kernel
@@ -39,6 +39,12 @@ The qualifier must eventually own hardware ingress-domain and encapsulation
 isolation before enabling shared IP FOE keys. Software META/encapsulation checks
 and duplicate-candidate rejection apply only to learning; already-bound hardware
 hits need the separate ingress classifier.
+
+Routed WLAN destinations now carry the station epoch obtained from the band
+and WCID encoded in the FOE. Publication and learning check the epoch under
+the PPE lock used by station teardown. A blocked or reassigned WCID leaves
+the candidate unbound. The tests exercise both radio bands and both address
+families, including a synthetic PON-ingress candidate at the actual bind step.
 
 ## Paths exercised with the test qualifier enabled
 

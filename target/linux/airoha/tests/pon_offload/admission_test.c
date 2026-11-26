@@ -35,6 +35,7 @@ typedef uint16_t __u16;
 #define AIROHA_MAX_DSA_PORTS 7
 #define AIROHA_PON_QDMA_HQOS_CFG 0x90
 #define AIROHA_PON_QDMA_HQOS_EN BIT(31)
+#define FE_PSE_PORT_GDM3 3
 #undef static_assert
 #define static_assert(e) _Static_assert(e,#e)
 #include "foe_types.inc"
@@ -108,14 +109,16 @@ struct metadata_dst {int type; union {struct {int port_id;} port_info;} u;};
 struct sk_buff {struct net_device *dev;struct ethhdr hdr;struct metadata_dst *md;bool vlan_tag;};
 static bool skb_vlan_tag_present(struct sk_buff *s) {return s->vlan_tag;}
 static struct metadata_dst *skb_metadata_dst(struct sk_buff *s) {return s->md;}
-struct airoha_ct_bridge_peer {u32 dummy;};
+struct airoha_ct_bridge_peer {u32 epoch;};
 struct airoha_flow_table_entry {
  struct hlist_node list; struct airoha_gdm_dev *egress_dev,*pon_ingress_dev,*ct_ingress_gdm; int ct_ingress_dsa_port;
  int type,ct_ingress_ifindex,node,ct_bridge_node; bool ct_bridge; u32 hash; u64 ct_bridge_generation; struct airoha_foe_entry data;
+ struct airoha_ct_bridge_peer ct_dest;
 };
 struct airoha_ppe {
  struct airoha_eth *eth;bool ct_host_ppe,ct_pon_qualified,ct_stopping,ct_native_pairs,ct_bridge_failed;int ct_bridge_flows;
  struct airoha_flow_table_entry *foe_flow[1];int l2_flows;
+ u32 ct_wlan_epoch[2][151];bool ct_wlan_blocked[2][151];
 };
 static int ppe_lock,airoha_l2_flow_table_params;
 static struct airoha_foe_entry learned;
@@ -183,6 +186,61 @@ static unsigned run_bind(struct airoha_ppe *ppe,struct airoha_flow_table_entry *
  learned.ib1=(learned.ib1&~AIROHA_FOE_IB1_BIND_STATE)|FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,AIROHA_FOE_STATE_UNBIND);
  commits=0;airoha_ppe_foe_insert_entry(ppe,&skb,5,false,NULL);assert(!ppe_lock);return commits;
 }
+
+static unsigned test_wlan_epoch(struct airoha_ppe *ppe, struct net_device *input,
+                                struct airoha_gdm_dev *pon, bool ipv6, u8 band, u16 wcid)
+{
+ struct airoha_flow_table_entry flow = {};
+ u32 ib2 = FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT, FE_PSE_PORT_GDM3) |
+           FIELD_PREP(AIROHA_FOE_IB2_NBQ, 2 + band);
+ u32 data = FIELD_PREP(AIROHA_FOE_CHANNEL, 8 + band);
+ u16 etype = (wcid << 6) | 63;
+ flow.data.ib1 = FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE,
+                            ipv6 ? PPE_PKT_TYPE_IPV6_ROUTE_5T : PPE_PKT_TYPE_IPV4_HNAPT);
+ if (ipv6) {
+  flow.data.ipv6.ib2 = ib2;
+  flow.data.ipv6.data = data;
+  flow.data.ipv6.l2.etype = etype;
+ } else {
+  flow.data.ipv4.ib2 = ib2;
+  flow.data.ipv4.data = data;
+  flow.data.ipv4.l2.common.etype = etype;
+ }
+ ppe->foe_flow[0] = NULL;
+ ppe->ct_wlan_epoch[band][wcid] = 37;
+ ppe->ct_wlan_blocked[band][wcid] = true;
+ assert(airoha_ppe_foe_flow_commit_entry(ppe, &flow) == -ESTALE && !ppe->foe_flow[0]);
+ ppe->ct_wlan_blocked[band][wcid] = false;
+ assert(airoha_ppe_foe_flow_commit_entry(ppe, &flow) == 0 && flow.ct_dest.epoch == 38);
+ assert(run_bind(ppe, &flow, input) == 1);
+ /* Exercise the bind gate independently of the unfinished IFC admission. */
+ flow.pon_ingress_dev = pon;
+ ppe->ct_pon_qualified = false;
+ assert(!run_bind(ppe, &flow, pon->netdev));
+ ppe->ct_pon_qualified = true;
+ assert(run_bind(ppe, &flow, pon->netdev) == 1);
+ flow.pon_ingress_dev = NULL;
+ ppe->ct_wlan_blocked[!band][wcid] = true;
+ assert(run_bind(ppe, &flow, input) == 1);
+ ppe->ct_wlan_blocked[!band][wcid] = false;
+ ppe->ct_wlan_blocked[band][wcid] = true;
+ assert(!run_bind(ppe, &flow, input));
+ ppe->ct_wlan_blocked[band][wcid] = false;
+ ppe->ct_wlan_epoch[band][wcid]++;
+ assert(!run_bind(ppe, &flow, input));
+ flow.pon_ingress_dev = pon;
+ assert(!run_bind(ppe, &flow, pon->netdev));
+ flow.pon_ingress_dev = NULL;
+ ppe->foe_flow[0] = NULL;
+ assert(airoha_ppe_foe_flow_commit_entry(ppe, &flow) == 0 && flow.ct_dest.epoch == 39);
+ assert(run_bind(ppe, &flow, input) == 1);
+ ppe->ct_wlan_epoch[band][wcid] = U32_MAX;
+ assert(!run_bind(ppe, &flow, input));
+ ppe->foe_flow[0] = NULL;
+ assert(airoha_ppe_foe_flow_commit_entry(ppe, &flow) == -ESTALE && !ppe->foe_flow[0]);
+ return 13;
+}
+
 int main(void) {
  unsigned cases=0;
  struct net ns={1},other_ns={2};struct airoha_eth eth={};
@@ -320,6 +378,11 @@ int main(void) {
   assert(airoha_ppe_ct_bridge_publish(&eth,&next)==-EEXIST && links==1 && cookies==1 && removed_cookies==3);cases++;
   next.data.d[0]^=1;
   assert(!airoha_ppe_ct_bridge_publish(&eth,&next) && links==2 && cookies==2);cases++;
+  if (!udp)
+   for (u8 band = 0; band < 2; band++) {
+    cases += test_wlan_epoch(&ppe, &lan, &pon, ip, band, 1);
+    cases += test_wlan_epoch(&ppe, &lan, &pon, ip, band, 150);
+   }
  }
  for(unsigned path=0;path<3;path++) {
   struct net_device_path_stack stack={};
