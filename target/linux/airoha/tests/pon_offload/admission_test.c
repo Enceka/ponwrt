@@ -97,7 +97,7 @@ static bool netif_running(struct net_device *n) {return n->running;}
 static bool netif_carrier_ok(struct net_device *n) {return n->carrier;}
 static bool test_bit(unsigned bit,unsigned long *v) {return !!(*v & (1UL<<bit));}
 static int airoha_get_dsa_port(struct net_device **n) {if((*n)->dsa_conduit){int port=(*n)->dsa_port;*n=(*n)->dsa_conduit;return port;}return -ENODEV;}
-static struct airoha_qdma *airoha_qdma_deref(struct airoha_gdm_dev *d) {return d->qdma;}
+#define rcu_access_pointer(p) (p)
 static u32 airoha_qdma_rr(struct airoha_qdma *q,u32 reg) {assert(reg==0x90);return q->hqos;}
 
 enum {FLOW_TYPE_L4,FLOW_TYPE_L2,FLOW_TYPE_L2_SUBFLOW};
@@ -266,6 +266,13 @@ int main(void) {
   e.egress_dev=&wired;assert(run_bind(&ppe,&e,&wifi)==1);cases++;
   e.egress_dev=&pon;ppe.ct_pon_qualified=true;
   assert(run_bind(&ppe,&e,&lan)==1);cases++;
+  /* The admitted candidate can outlive the exact WAN encoding it used. */
+  assert(airoha_ppe_ct_pon_rule_supported(&ppe,&up,&wired,&pon,false));cases++;
+  eth.qdma[1].hqos=BIT(31);assert(!run_bind(&ppe,&e,&lan));cases++;
+  eth.qdma[1].hqos=0;pon.qdma=&eth.qdma[0];assert(!run_bind(&ppe,&e,&lan));cases++;
+  pon.qdma=NULL;assert(!run_bind(&ppe,&e,&lan));cases++;
+  pon.qdma=&eth.qdma[1];eth.qdma[0].hqos=BIT(31);assert(run_bind(&ppe,&e,&lan)==1);cases++;
+  eth.qdma[0].hqos=0;
   for(unsigned n=0;n<ARRAY_SIZE(unsupported_inputs);n++){rx_proto=unsupported_inputs[n];assert(!run_bind(&ppe,&e,&lan));cases++;}
   rx_proto=0;rx_vlan_tag=true;assert(!run_bind(&ppe,&e,&lan));cases++;rx_vlan_tag=false;
   if(!ip) {

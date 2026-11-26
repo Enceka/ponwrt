@@ -5,7 +5,7 @@ by `--source`. They need a C compiler supporting AddressSanitizer and
 UndefinedBehaviorSanitizer. All outputs go into a fresh `--output` directory.
 
 ```sh
-python3 verify_admission.py --source /path/to/linux --output /path/to/admission-results
+python3 verify_admission.py --source /path/to/linux-after-962 --output /path/to/admission-results
 python3 verify_pon_flows.py --source /path/to/linux --output /path/to/flow-results
 ```
 
@@ -17,7 +17,7 @@ Files to keep together:
 The admission runner executes the production exact-match validator, ingress
 resolution, PON gate/admission functions, actual learn/bind function, cookie
 publication, duplicate-tuple exclusion, netfilter lower-path parser and EN7581
-source-port decoder. It covers 597 cases and 19 runtime mutation controls.
+source-port decoder. It covers 617 cases and 20 runtime mutation controls.
 The retirement runner executes checked row comparison/removal, the two-way
 device walk and the actual flow-destroy function. It covers 62 cases and 7
 runtime mutation controls. SRAM reads/writes, allocation indices and kernel
@@ -51,8 +51,10 @@ hits need the separate ingress classifier.
   and no hardware VLAN tag may be present. The gate checks input framing, so
   plain IPv4 input with VLAN/PPPoE output actions remains valid.
 - Upstream IPv4 egress VLAN/PPPoE uses the existing action encoder and requires
-  one unambiguous GEM/T-CONT mapping. WAN QDMA HQoS enable at offset `0x90`, bit
-  31 must be clear. The test does not modify that hardware setting.
+  one unambiguous GEM/T-CONT mapping. Both admission and binding check that
+  the egress selects WAN QDMA and reads HQoS disabled at offset `0x90`, bit 31.
+  Enabling WAN HQoS or changing the QDMA between admission and learning skips
+  the hardware bind. Restoring the direct encoding allows the next learn to bind.
 - DSA learning checks the physical conduit and the RX `METADATA_HW_PORT_MUX`
   port number. Missing metadata, another metadata type, another port and a
   different conduit are rejected. A bare DSA conduit META is rejected.
@@ -62,8 +64,9 @@ hits need the separate ingress classifier.
 
 ## Remaining software paths
 
-- PON to WLAN: GDM2 is outside the current LAN1-only IFC/NPU short-packet
-  path. This change does not extend IFC ingress or create PON native pairs.
+- PON to WLAN: `airoha_ppe_ct_ifc_covers()` covers LAN1 ingress, while PON
+  enters through GDM2. The PON admission gate also requires a physical egress
+  GDM, whereas the WLAN action returns a WDMA destination and no egress GDM.
 - PON ingress VLAN, CVLAN, PPPoE and tunnel keys: the current FOE tuple match
   does not retain those selectors. VLAN/CVLAN/tunnel keys are rejected at
   admission. This kernel does not emit a PPPoE ingress dissector key; actual

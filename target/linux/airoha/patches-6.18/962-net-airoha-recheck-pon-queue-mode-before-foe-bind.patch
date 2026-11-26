@@ -1,0 +1,54 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: recheck PON queue encoding before FOE bind
+
+The pending FOE uses direct T-CONT encoding. Check that its egress still
+uses WAN QDMA without HQoS remapping when learning, as at admission.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1563,6 +1563,15 @@
+ 	       netif_running(netdev) && netif_carrier_ok(netdev);
+ }
+ 
++static bool airoha_ppe_ct_pon_queue_ready(struct airoha_gdm_dev *dev)
++{
++	struct airoha_qdma *wan = &dev->eth->qdma[1];
++
++	/* Direct T-CONT encoding requires WAN QDMA without HQoS remapping. */
++	return rcu_access_pointer(dev->qdma) == wan &&
++	       !(airoha_qdma_rr(wan, AIROHA_PON_QDMA_HQOS_CFG) & AIROHA_PON_QDMA_HQOS_EN);
++}
++
+ /* Admission is serialized by flow_offload_mutex; learning runs under ppe_lock.
+  * Recheck the gate and actual physical ingress before publishing a PON row.
+  */
+@@ -1596,6 +1605,7 @@
+ 		return false;
+ 	if (egress && test_bit(AIROHA_DEV_F_PON, &egress->flags)) {
+ 		if (!airoha_ppe_ct_pon_dev_ready(egress) ||
++		    !airoha_ppe_ct_pon_queue_ready(egress) ||
+ 		    !net_eq(dev_net(skb->dev), dev_net(netdev_from_priv(egress))))
+ 			return false;
+ 		if (e->ct_ingress_gdm) {
+@@ -2096,6 +2106,5 @@
+ 	bool input_pon = ingress && test_bit(AIROHA_DEV_F_PON, &ingress->flags);
+ 	bool output_pon = egress && test_bit(AIROHA_DEV_F_PON, &egress->flags);
+-	struct airoha_qdma *qdma;
+ 
+ 	if (!input_pon && !output_pon)
+ 		return true;
+@@ -2112,12 +2121,7 @@
+ 		return false;
+ 	if (!output_pon)
+ 		return true;
+-	if (!airoha_ppe_ct_pon_dev_ready(egress))
+-		return false;
+-	qdma = airoha_qdma_deref(egress);
+-	/* The direct T-CONT encoding requires WAN HQoS remapping to be disabled. */
+-	return qdma == &egress->eth->qdma[1] &&
+-	       !(airoha_qdma_rr(qdma, AIROHA_PON_QDMA_HQOS_CFG) &
+-		 AIROHA_PON_QDMA_HQOS_EN);
++	return airoha_ppe_ct_pon_dev_ready(egress) &&
++	       airoha_ppe_ct_pon_queue_ready(egress);
+ }
+ 
