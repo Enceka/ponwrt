@@ -1,3 +1,6 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: offload native WLAN-to-LAN1 bridge traffic
+
 --- a/drivers/net/ethernet/airoha/airoha_eth.h
 +++ b/drivers/net/ethernet/airoha/airoha_eth.h
 @@ -756,6 +756,9 @@

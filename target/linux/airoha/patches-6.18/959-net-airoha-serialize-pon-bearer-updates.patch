@@ -1,3 +1,6 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: serialize PON bearer updates
+
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
 @@ -21,6 +21,7 @@
