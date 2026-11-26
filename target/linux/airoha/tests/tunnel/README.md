@@ -1,5 +1,7 @@
 # 原厂 FE 隧道路由与写表
 
+RAM 系统无需 Python。用 Linux AArch64 工具链构建 `aarch64-linux-gnu-gcc -O2 -static -Wall -Wextra -Werror -o gre-peer gre_peer.c`，以 root 执行 `sh verify_gre_ram.sh ./gre-peer`。内核须支持 netns、veth、AF_PACKET 和 IPv4 GRE，并提供 `ip-full`。脚本在两个临时命名空间中完成六次收发：两个目的地址共用一条 GRE 隧道，撤销第一条路由后要求该地址返回 `ENETUNREACH`、第二条路由双向继续交付，恢复后第一条路由重新交付。每次交换在一个三秒接收期限内同时核对 UDP 端点和对端 wire 入口的 GRE 帧，按随机 256 字节标记、内外地址及 UDP 端口过滤其他报文。接口均位于临时命名空间，退出时清理。这是 CPU 软件路径对照。
+
 软件收发对照：在支持网络命名空间、veth 和 IPv4 GRE 的 Linux 上执行 `sudo python3 verify_gre_wire.py`，需要 iproute2 和 Python 3。工具创建两个临时网络命名空间，两条内层主机路由共用一条无密钥 GRE 隧道；逐包检查两端方向、GRE 头、内层 UDP 端口和载荷。撤销其中一条路由后，该目的地址返回 `ENETUNREACH`，另一条仍交付；重建路由后恢复。工具退出时删除命名空间。此对照使用内核软件路径，实板还需核对硬件流表及隧道行。
 
 ```sh
