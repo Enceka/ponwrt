@@ -63,7 +63,8 @@ class TunnelHost(Module):
         self.instructions += 1
         self.stub_calls[name] += 1
         if name == 'memset':
-            assert x1 == 0 and x2 in (88, 252)
+            assert x1 == 0 and (x2 in (88, 252) or
+                                (x2 == 296 and x0 == self.names['PpeParseResult']))
             cpu.mem_write(x0, bytes(x2))
             cpu.reg_write(R.UC_ARM64_REG_X0, x0)
         else:

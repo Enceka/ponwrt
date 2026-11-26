@@ -1,0 +1,75 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: encode untagged IPv4 GRE egress templates
+
+Build the EN7581 plain IPv4 GRE row from a linear outbound header and
+attach a verified dynamic row to an IPv4 routed FOE. Keep row ownership,
+admission and publication with the caller.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_gre4.h
+@@ -0,0 +1,65 @@
++#ifndef AIROHA_CT_GRE4_H
++#define AIROHA_CT_GRE4_H
++
++#include <linux/unaligned.h>
++#include <linux/ip.h>
++#include <net/flow_offload.h>
++#include "airoha_eth.h"
++
++struct airoha_ct_gre4_row {
++	u32 words[17];
++};
++
++static inline int
++airoha_ct_gre4_row_encode(struct airoha_ct_gre4_row *row,
++			  enum flow_action_id action, const u8 *header, size_t len)
++{
++	const u8 *ip;
++	u32 src, dst, sum;
++
++	if (!row || !header || len < ETH_HLEN + sizeof(struct iphdr) + 4)
++		return -EINVAL;
++	ip = header + ETH_HLEN;
++	if (action != FLOW_ACTION_TUNNEL_ENCAP ||
++	    !is_valid_ether_addr(header) || !is_valid_ether_addr(header + ETH_ALEN) ||
++	    get_unaligned_be16(header + 12) != ETH_P_IP || ip[0] != 0x45 ||
++	    ip[9] != IPPROTO_GRE || !ip[8] ||
++	    (get_unaligned_be16(ip + 6) & ~0x4000) ||
++	    get_unaligned_be32(ip + 20) != ETH_P_IP)
++		return -EOPNOTSUPP;
++	src = get_unaligned_be32(ip + 12);
++	dst = get_unaligned_be32(ip + 16);
++	sum = (src >> 16) + (src & 0xffff) + (dst >> 16) + (dst & 0xffff);
++	sum = (sum >> 16) + (sum & 0xffff);
++	sum = (sum >> 16) + (sum & 0xffff);
++	*row = (struct airoha_ct_gre4_row) { .words = {
++		0x02002600, get_unaligned_be32(header), get_unaligned_be32(header + 4),
++		get_unaligned_be32(header + 8), 0, (u32)ip[8] << 24 | ip[1] << 16 | sum,
++		(u32)get_unaligned_be16(ip + 4) << 16, src, dst,
++	} };
++	return 0;
++}
++
++static inline int
++airoha_ct_gre4_link(struct airoha_foe_entry *foe, enum flow_action_id action,
++		    unsigned int slot)
++{
++	u32 type;
++
++	if (!foe || slot < 32 || slot >= 64)
++		return -EINVAL;
++	type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, foe->ib1);
++	if (action != FLOW_ACTION_TUNNEL_ENCAP ||
++	    (type != PPE_PKT_TYPE_IPV4_HNAPT && type != PPE_PKT_TYPE_IPV4_ROUTE) ||
++	    (foe->ib1 & AIROHA_FOE_IB1_BIND_TUNNEL_DECAP))
++		return -EOPNOTSUPP;
++	static_assert(offsetof(struct airoha_foe_entry, ipv4.rsv[0]) == 0x20);
++	static_assert(offsetof(struct airoha_foe_entry, ipv4.data) == 0x28);
++	foe->ipv4.rsv[0] &= ~GENMASK(31, 20);
++	foe->ipv4.rsv[0] |= FIELD_PREP(GENMASK(31, 29), 6);
++	foe->ipv4.data &= ~AIROHA_FOE_TUNNEL_ID;
++	foe->ipv4.data |= AIROHA_FOE_TUNNEL | FIELD_PREP(AIROHA_FOE_TUNNEL_ID, slot);
++	return 0;
++}
++
++#endif
