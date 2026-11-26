@@ -1,0 +1,1063 @@
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -21,6 +21,7 @@
+ 
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
++#include "airoha_pon_retire.h"
+ 
+ static const struct net_device_ops airoha_netdev_ops;
+ 
+@@ -1359,6 +1360,8 @@
+ 			if (rcu_access_pointer(dev->qdma) != qdma)
+ 				continue;
+ 
++			if (READ_ONCE(dev->pon_update_blocked))
++				continue;
+ 			netdev = netdev_from_priv(dev);
+ 			for (j = 0; j < netdev->num_tx_queues; j++) {
+ 				if (airoha_qdma_get_txq(qdma, j) != qid)
+@@ -1465,6 +1468,10 @@
+ 		e = &q->entry[index];
+ 		skb = e->skb;
+ 		e->skb = NULL;
++		if (e->pon_owner) {
++			atomic_dec(&e->pon_owner->pon_tx_pending);
++			e->pon_owner = NULL;
++		}
+ 
+ 		airoha_unmap_xmit_buf(eth, e);
+ 		list_add_tail(&e->list, &q->tx_list);
+@@ -1658,6 +1665,10 @@
+ 			if (e->dma_type == AIROHA_DMA_UNMAPPED)
+ 				continue;
+ 
++			if (e->pon_owner) {
++				atomic_dec(&e->pon_owner->pon_tx_pending);
++				e->pon_owner = NULL;
++			}
+ 			airoha_unmap_xmit_buf(qdma->eth, e);
+ 			list_add_tail(&e->list, &q->tx_list);
+ 
+@@ -2545,7 +2556,7 @@
+ 	return 0;
+ }
+ 
+-static int airoha_enable_gdm2_loopback(struct airoha_gdm_dev *dev)
++static int __airoha_enable_gdm2_loopback(struct airoha_gdm_dev *dev)
+ {
+ 	struct airoha_gdm_port *port = dev->port;
+ 	struct airoha_eth *eth = dev->eth;
+@@ -2602,7 +2613,29 @@
+ 	return 0;
+ }
+ 
+-static int airoha_disable_gdm2_loopback(struct airoha_gdm_dev *dev)
++static int airoha_enable_gdm2_loopback(struct airoha_gdm_dev *dev)
++{
++	struct airoha_eth *eth = dev->eth;
++	struct airoha_gdm_port *port = eth->ports[AIROHA_GDM2_IDX - 1];
++	int i, err;
++
++	mutex_lock(&eth->pon_config_lock);
++	err = -EBUSY;
++	if (eth->pon_update_owner)
++		goto unlock;
++	if (port)
++		for (i = 0; i < ARRAY_SIZE(port->devs); i++)
++			if (port->devs[i] &&
++			    test_bit(AIROHA_DEV_F_PON, &port->devs[i]->flags))
++				goto unlock;
++	err = __airoha_enable_gdm2_loopback(dev);
++unlock:
++	mutex_unlock(&eth->pon_config_lock);
++	return err;
++}
++
++
++static int __airoha_disable_gdm2_loopback(struct airoha_gdm_dev *dev)
+ {
+ 	struct airoha_gdm_port *port = dev->port;
+ 	struct airoha_eth *eth = dev->eth;
+@@ -2648,6 +2681,28 @@
+ 
+ 	return 0;
+ }
++
++static int airoha_disable_gdm2_loopback(struct airoha_gdm_dev *dev)
++{
++	struct airoha_eth *eth = dev->eth;
++	struct airoha_gdm_port *port = eth->ports[AIROHA_GDM2_IDX - 1];
++	int i, err;
++
++	mutex_lock(&eth->pon_config_lock);
++	err = -EBUSY;
++	if (eth->pon_update_owner)
++		goto unlock;
++	if (port)
++		for (i = 0; i < ARRAY_SIZE(port->devs); i++)
++			if (port->devs[i] &&
++			    test_bit(AIROHA_DEV_F_PON, &port->devs[i]->flags))
++				goto unlock;
++	err = __airoha_disable_gdm2_loopback(dev);
++unlock:
++	mutex_unlock(&eth->pon_config_lock);
++	return err;
++}
++
+ 
+ static struct airoha_gdm_dev *
+ airoha_get_wan_gdm_dev(struct airoha_eth *eth)
+@@ -2959,6 +3014,11 @@
+ 	u8 fport, nboq;
+ 
+ 	rcu_read_lock();
++	if (pon && unlikely(smp_load_acquire(&dev->pon_update_blocked))) {
++		netif_tx_stop_queue(skb_get_tx_queue(owner_netdev, skb));
++		rcu_read_unlock();
++		return NETDEV_TX_BUSY;
++	}
+ 	qdma = rcu_dereference(dev->qdma);
+ 	qid = airoha_qdma_get_txq(qdma, skb_get_queue_mapping(skb));
+ 
+@@ -3096,6 +3156,7 @@
+ 
+ 		list_move_tail(&e->list, &tx_list);
+ 		e->skb = i == nr_frags - 1 ? skb : NULL;
++		e->pon_owner = pon && e->skb ? dev : NULL;
+ 		e->dma_addr = addr;
+ 		e->dma_len = len;
+ 
+@@ -3126,6 +3187,8 @@
+ 		e->dma_type = AIROHA_DMA_MAP_PAGE;
+ 	}
+ 	q->queued += i;
++	if (pon)
++		atomic_inc(&dev->pon_tx_pending);
+ 	if (pon_data) {
+ 		u8 channel = FIELD_GET(QDMA_ETH_TXMSG_CHAN_MASK, msg0);
+ 
+@@ -3147,7 +3210,7 @@
+ 		q->txq_stopped = true;
+ 	}
+ 
+-	if (netif_xmit_stopped(txq) || !netdev_xmit_more())
++	if (pon || netif_xmit_stopped(txq) || !netdev_xmit_more())
+ 		airoha_qdma_rmw(qdma, REG_TX_CPU_IDX(qid),
+ 				TX_RING_CPU_IDX_MASK,
+ 				FIELD_PREP(TX_RING_CPU_IDX_MASK, index));
+@@ -3158,8 +3221,11 @@
+ 	return NETDEV_TX_OK;
+ 
+ error_unmap:
+-	list_for_each_entry(e, &tx_list, list)
++	list_for_each_entry(e, &tx_list, list) {
++		e->skb = NULL;
++		e->pon_owner = NULL;
+ 		airoha_unmap_xmit_buf(dev->eth, e);
++	}
+ 	list_splice(&tx_list, &q->tx_list);
+ error_unlock:
+ 	spin_unlock_bh(&q->lock);
+@@ -3316,7 +3382,7 @@
+ 	return phylink_ethtool_ksettings_set(dev->phylink, cmd);
+ }
+ 
+-static int airoha_qdma_set_chan_tx_sched(struct net_device *netdev,
++static int __airoha_qdma_set_chan_tx_sched(struct net_device *netdev,
+ 					 int channel, enum tx_sched_mode mode,
+ 					 const u16 *weights, u8 n_weights)
+ {
+@@ -3351,6 +3417,24 @@
+ 			__field_prep(CHAN_QOS_MODE_MASK(channel), mode));
+ 
+ 	return 0;
++}
++
++static int airoha_qdma_set_chan_tx_sched(struct net_device *netdev,
++					 int channel, enum tx_sched_mode mode,
++					 const u16 *weights, u8 n_weights)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	struct airoha_eth *eth = dev->eth;
++	int err;
++
++	mutex_lock(&eth->pon_config_lock);
++	if (eth->pon_update_owner && airoha_qdma_deref(dev) == &eth->qdma[1])
++		err = -EBUSY;
++	else
++		err = __airoha_qdma_set_chan_tx_sched(netdev, channel, mode,
++						    weights, n_weights);
++	mutex_unlock(&eth->pon_config_lock);
++	return err;
+ }
+ 
+ static int airoha_qdma_set_tx_prio_sched(struct net_device *dev, int channel)
+@@ -4242,6 +4326,8 @@
+ }
+ EXPORT_SYMBOL_GPL(airoha_eth_pon_xmit_control);
+ 
++#include "airoha_pon_transaction.h"
++
+ static int
+ airoha_eth_pon_commit_config(struct airoha_gdm_dev *dev,
+ 			     struct airoha_pon_flow_table *table, u32 qdma_tag)
+@@ -4254,19 +4340,29 @@
+ 	 * The caller retains ownership of the replacement on failure.
+ 	 */
+ 	mutex_lock(&flow_offload_mutex);
++	mutex_lock(&dev->eth->pon_config_lock);
++	err = -EBUSY;
++	if (dev->eth->pon_update_owner != dev || !dev->pon_update_ready)
++		goto unlock;
++	err = -EINVAL;
++	if (airoha_pon_table_channels(table, qdma_tag) & ~dev->pon_update_channels)
++		goto unlock;
+ 	err = airoha_ppe_remove_egress_flows(dev);
+-	if (err) {
+-		mutex_unlock(&flow_offload_mutex);
+-		return err;
+-	}
++	if (err)
++		goto unlock;
+ 	old = rcu_replace_pointer(dev->pon_flow_table, table,
+ 				  lockdep_is_held(&flow_offload_mutex));
+ 	WRITE_ONCE(dev->pon_qdma_tag, qdma_tag);
++	mutex_unlock(&dev->eth->pon_config_lock);
+ 	mutex_unlock(&flow_offload_mutex);
+ 
+ 	synchronize_net();
+ 	kfree(old);
+ 	return 0;
++unlock:
++	mutex_unlock(&dev->eth->pon_config_lock);
++	mutex_unlock(&flow_offload_mutex);
++	return err;
+ }
+ 
+ int airoha_eth_pon_replace_flows(
+@@ -4715,6 +4811,13 @@
+ 				"airoha,pon-data-path is valid only on GDM2\n");
+ 			return -EINVAL;
+ 		}
++		/* GDM2 retirement temporarily isolates its entire channel set. */
++		if (nbq)
++			return -EINVAL;
++		dev->pon_retirement = devm_kzalloc(eth->dev,
++						 sizeof(*dev->pon_retirement), GFP_KERNEL);
++		if (!dev->pon_retirement)
++			return -ENOMEM;
+ 		set_bit(AIROHA_DEV_F_PON, &dev->flags);
+ 		/* Netdev enumeration assigns one index to each PON data path. */
+ 		strscpy(netdev->name, "pon%d", IFNAMSIZ);
+@@ -4854,6 +4957,7 @@
+ 	eth->dev = &pdev->dev;
+ 	spin_lock_init(&eth->ct_route_lock);
+ 	spin_lock_init(&eth->ifc_port_lock);
++	mutex_init(&eth->pon_config_lock);
+ 
+ 	err = dma_set_mask_and_coherent(eth->dev, DMA_BIT_MASK(32));
+ 	if (err) {
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -195,12 +195,15 @@
+ 	AIROHA_DMA_MAP_PAGE,
+ };
+ 
++struct airoha_pon_retirement;
++
+ struct airoha_queue_entry {
+ 	union {
+ 		void *buf;
+ 		struct {
+ 			struct list_head list;
+ 			struct sk_buff *skb;
++			struct airoha_gdm_dev *pon_owner;
+ 			enum airoha_dma_map_type dma_type;
+ 		};
+ 	};
+@@ -579,11 +582,11 @@
+ 
+ 	struct rhash_head node;
+ 	unsigned long cookie;
+-	/* Track the final egress GDM netdev for each flow. PON bearer mappings
+-	 * can change after O5 recovery or OMCI reconfiguration, so invalidate
+-	 * only FOEs attached to the affected PON egress device.
+-	 */
++	/* Retire both directions when a PON bearer mapping changes. */
+ 	struct airoha_gdm_dev *egress_dev;
++	struct airoha_gdm_dev *pon_ingress_dev;
++	struct airoha_gdm_dev *ct_ingress_gdm;
++	int ct_ingress_dsa_port;
+ 	struct list_head gc_node;
+ 	bool ct_bridge, ct_bridge_dead;
+ 	u64 ct_bridge_generation;
+@@ -708,6 +711,12 @@
+ 	const struct airoha_pon_link_ops *pon_link_ops;
+ 	void *pon_link_priv;
+ 	struct airoha_pon_datapath_counters pon_stats;
++	/* Gate covers data and OMCI/OAM; ownership survives failed updates. */
++	struct airoha_pon_retirement *pon_retirement;
++	atomic_t pon_tx_pending;
++	u32 pon_update_channels;
++	bool pon_update_blocked;
++	bool pon_update_ready;
+ 
+ 	struct airoha_hw_stats stats;
+ 
+@@ -754,6 +763,10 @@
+ 		bool cfg_owned;
+ 	} ct_ifc;
+ 	bool ct_host_ppe;
++	/* Set only after hardware isolates ingress source and encapsulation for
++	 * shared IP FOE keys. No runtime enable path exists yet.
++	 */
++	bool ct_pon_qualified;
+ 	bool ct_native_pairs, ct_pair_failed, ct_pair_hw_stopped, ct_pair_close_pending;
+ 	bool ct_pair_policy_allowed, ct_pair_policy_registered;
+ 	struct notifier_block ct_pair_policy_notifier;
+@@ -831,6 +844,10 @@
+ 	struct airoha_ppe *ppe;
+ 	struct rhashtable flow_table;
+ 
++	/* Lock order: flow_offload_mutex, then pon_config_lock. */
++	struct mutex pon_config_lock;
++	struct airoha_gdm_dev *pon_update_owner;
++
+ 	/* Serializes sticky CPU fallback with GDM routes and QDMA publication. */
+ 	spinlock_t ct_route_lock;
+ 	u16 ct_cpu_route_mask[AIROHA_MAX_NUM_GDM_PORTS];
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_pon_retire.h
+@@ -0,0 +1,207 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _AIROHA_PON_RETIRE_H_
++#define _AIROHA_PON_RETIRE_H_
++
++/* Include after airoha_eth.h. All calls require the same sleepable GDM2
++ * configuration mutex, including queue-scheduler and channel-enable writers.
++ * The caller must stop ALL PON admission and synchronize software TX, then
++ * revoke all PON FOEs before retire. The stock sequence temporarily enables
++ * only one GDM2 TX/RX channel; it therefore needs exclusive use of GDM2.
++ * The controller must retain this state and its service ownership on error.
++ */
++#define AIROHA_PON_RETIRE_CHANNELS	32
++#define AIROHA_PON_RETIRE_START		BIT(0)
++#define AIROHA_PON_RETIRE_DONE		BIT(1)
++#define AIROHA_PON_RETIRE_CHANNEL_MASK	GENMASK(8, 4)
++#define AIROHA_PON_RETIRE_CMD_MASK	(AIROHA_PON_RETIRE_CHANNEL_MASK | \
++					 AIROHA_PON_RETIRE_DONE | \
++					 AIROHA_PON_RETIRE_START)
++#define AIROHA_PON_RETIRE_BUSY_REG	0x1570
++#define AIROHA_PON_RETIRE_QUEUE_REG(ch)	(0x1280 + ((ch) & ~3U))
++
++struct airoha_pon_retirement {
++	u32 owned;
++	u32 drained;
++	u8 saved_close[AIROHA_PON_RETIRE_CHANNELS];
++	/* A failed register restore keeps the original snapshot across retries. */
++	u32 saved_tx;
++	u32 saved_rx;
++	unsigned int active_channel;
++	bool restore_pending;
++	bool command_owned;
++};
++
++static inline u32 airoha_pon_retire_queue_mask(unsigned int channel)
++{
++	return 0xffU << ((channel & 3) * 8);
++}
++
++/* Acquire before any write: even a failed close retains retry ownership. */
++static int airoha_pon_channel_close(struct airoha_eth *eth,
++				  struct airoha_pon_retirement *state,
++				  unsigned int channel)
++{
++	struct airoha_qdma *qdma = &eth->qdma[1];
++	u32 mask, value, bit;
++
++	if (channel >= AIROHA_PON_RETIRE_CHANNELS)
++		return -EINVAL;
++	mask = airoha_pon_retire_queue_mask(channel);
++	bit = BIT(channel);
++	value = airoha_qdma_rr(qdma, REG_QUEUE_CLOSE_CFG(channel));
++	if (!(state->owned & bit)) {
++		state->saved_close[channel] = value >> ((channel & 3) * 8);
++		state->owned |= bit;
++		state->drained &= ~bit;
++	}
++	airoha_qdma_rmw(qdma, REG_QUEUE_CLOSE_CFG(channel), mask, mask);
++	if ((airoha_qdma_rr(qdma, REG_QUEUE_CLOSE_CFG(channel)) & mask) != mask) {
++		state->drained &= ~bit;
++		return -EIO;
++	}
++	return 0;
++}
++
++/* The extra channel comparison rejects a completion from another command. */
++static bool airoha_pon_channel_retire_done(struct airoha_eth *eth,
++					 unsigned int channel)
++{
++	u32 command = airoha_fe_rr(eth, REG_GDM_CHN_RLS(2));
++
++	if (!(command & AIROHA_PON_RETIRE_DONE) ||
++	    (command & AIROHA_PON_RETIRE_CHANNEL_MASK) != (channel << 4))
++		return false;
++	if (airoha_fe_rr(eth, AIROHA_PON_RETIRE_BUSY_REG) & BIT(channel))
++		return false;
++	return !(airoha_qdma_rr(&eth->qdma[1],
++			       AIROHA_PON_RETIRE_QUEUE_REG(channel)) &
++		 airoha_pon_retire_queue_mask(channel));
++}
++
++static int airoha_pon_retire_restore(struct airoha_eth *eth,
++				    struct airoha_pon_retirement *state)
++{
++	int ret = 0;
++
++	if (state->command_owned) {
++		airoha_fe_rmw(eth, REG_GDM_CHN_RLS(2),
++			      AIROHA_PON_RETIRE_CMD_MASK, 0);
++		if (airoha_fe_rr(eth, REG_GDM_CHN_RLS(2)) &
++		    AIROHA_PON_RETIRE_CMD_MASK)
++			ret = -EIO;
++		else
++			state->command_owned = false;
++	}
++	airoha_fe_wr(eth, REG_GDM_TXCHN_EN(2), state->saved_tx);
++	airoha_fe_wr(eth, REG_GDM_RXCHN_EN(2), state->saved_rx);
++	if (airoha_fe_rr(eth, REG_GDM_TXCHN_EN(2)) != state->saved_tx ||
++	    airoha_fe_rr(eth, REG_GDM_RXCHN_EN(2)) != state->saved_rx)
++		ret = -EIO;
++	if (!ret)
++		state->restore_pending = false;
++	return ret;
++}
++
++static int airoha_pon_channel_retire(struct airoha_eth *eth,
++				   struct airoha_pon_retirement *state,
++				   unsigned int channel)
++{
++	u32 command, bit;
++	int remaining, ret;
++
++	if (channel >= AIROHA_PON_RETIRE_CHANNELS)
++		return -EINVAL;
++	if (state->restore_pending && state->active_channel != channel)
++		return -EBUSY;
++	ret = airoha_pon_channel_close(eth, state, channel);
++	if (ret)
++		return ret;
++	bit = BIT(channel);
++	state->drained &= ~bit;
++	if (state->restore_pending) {
++		ret = airoha_pon_retire_restore(eth, state);
++		if (ret)
++			return ret;
++	}
++	command = airoha_fe_rr(eth, REG_GDM_CHN_RLS(2));
++	if (command & AIROHA_PON_RETIRE_CMD_MASK)
++		return -EBUSY;
++	state->saved_tx = airoha_fe_rr(eth, REG_GDM_TXCHN_EN(2));
++	state->saved_rx = airoha_fe_rr(eth, REG_GDM_RXCHN_EN(2));
++	state->active_channel = channel;
++	state->restore_pending = true;
++	/* Match stock fe_core .text+0x72d0, RX first and then TX. */
++	airoha_fe_wr(eth, REG_GDM_RXCHN_EN(2), bit);
++	airoha_fe_wr(eth, REG_GDM_TXCHN_EN(2), bit);
++	ret = -EIO;
++	if (airoha_fe_rr(eth, REG_GDM_RXCHN_EN(2)) != bit ||
++	    airoha_fe_rr(eth, REG_GDM_TXCHN_EN(2)) != bit)
++		goto restore;
++	/* CHN_RLS also holds the live MBI aging selectors. */
++	airoha_fe_rmw(eth, REG_GDM_CHN_RLS(2), AIROHA_PON_RETIRE_CMD_MASK,
++		      (channel << 4) | AIROHA_PON_RETIRE_START);
++	state->command_owned = true;
++	command = airoha_fe_rr(eth, REG_GDM_CHN_RLS(2));
++	if ((command & (AIROHA_PON_RETIRE_CHANNEL_MASK |
++			AIROHA_PON_RETIRE_START)) !=
++	    ((channel << 4) | AIROHA_PON_RETIRE_START))
++		goto restore;
++	ret = -ETIMEDOUT;
++	/* Stock decrements its ten-round budget after each 1 ms delay and
++	 * exits before sampling on the last round. Require two consecutive
++	 * complete observations, restarting the pair after any failed sample.
++	 */
++	for (remaining = 10; remaining; remaining--) {
++		usleep_range(1000, 1100);
++		if (remaining == 1)
++			break;
++		if (airoha_pon_channel_retire_done(eth, channel) &&
++		    airoha_pon_channel_retire_done(eth, channel)) {
++			ret = 0;
++			break;
++		}
++	}
++
++restore:
++	if (airoha_pon_retire_restore(eth, state))
++		ret = -EIO;
++	if (!ret)
++		state->drained |= bit;
++	return ret;
++}
++
++/* Only call after controller updates and mapping publication both succeed.
++ * Restores the original queue byte; it does not implicitly open queues that
++ * the scheduler had already disabled before the transaction.
++ */
++static int airoha_pon_channel_reopen(struct airoha_eth *eth,
++				   struct airoha_pon_retirement *state,
++				   unsigned int channel)
++{
++	struct airoha_qdma *qdma = &eth->qdma[1];
++	u32 bit, mask, value;
++
++	if (channel >= AIROHA_PON_RETIRE_CHANNELS)
++		return -EINVAL;
++	bit = BIT(channel);
++	if (!(state->owned & bit))
++		return 0;
++	if (!(state->drained & bit))
++		return -EBUSY;
++	if (state->restore_pending)
++		return -EBUSY;
++	if (airoha_fe_rr(eth, REG_GDM_CHN_RLS(2)) & AIROHA_PON_RETIRE_CMD_MASK)
++		return -EBUSY;
++	mask = airoha_pon_retire_queue_mask(channel);
++	value = (u32)state->saved_close[channel] << ((channel & 3) * 8);
++	airoha_qdma_rmw(qdma, REG_QUEUE_CLOSE_CFG(channel), mask, value);
++	if ((airoha_qdma_rr(qdma, REG_QUEUE_CLOSE_CFG(channel)) & mask) != value) {
++		airoha_qdma_rmw(qdma, REG_QUEUE_CLOSE_CFG(channel), mask, mask);
++		return -EIO;
++	}
++	state->owned &= ~bit;
++	state->drained &= ~bit;
++	return 0;
++}
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_pon_transaction.h
+@@ -0,0 +1,154 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _AIROHA_PON_TRANSACTION_H_
++#define _AIROHA_PON_TRANSACTION_H_
++
++/* Included after the netdev operations and the PON transmit entry point. */
++static struct airoha_gdm_dev *airoha_pon_update_dev(struct net_device *netdev)
++{
++	struct airoha_gdm_dev *dev;
++
++	if (!netdev || netdev->netdev_ops != &airoha_netdev_ops)
++		return ERR_PTR(-EINVAL);
++	dev = netdev_priv(netdev);
++	if (!test_bit(AIROHA_DEV_F_PON, &dev->flags) || !dev->pon_retirement)
++		return ERR_PTR(-EOPNOTSUPP);
++	return dev;
++}
++
++static u32 airoha_pon_table_channels(const struct airoha_pon_flow_table *table,
++				   u32 tag)
++{
++	u32 mask = 0;
++	unsigned int i;
++
++	if (tag & AIROHA_PON_QDMA_VALID)
++		mask |= BIT(FIELD_GET(AIROHA_PON_QDMA_TCONT_MASK, tag));
++	if (table)
++		for (i = 0; i < table->count; i++)
++			mask |= BIT(FIELD_GET(AIROHA_PON_QDMA_TCONT_MASK,
++					     table->entries[i].tag));
++	return mask;
++}
++
++static u32 airoha_pon_mapping_channels(struct airoha_gdm_dev *dev)
++{
++	lockdep_assert_held(&flow_offload_mutex);
++	return airoha_pon_table_channels(
++		rcu_dereference_protected(dev->pon_flow_table,
++					  lockdep_is_held(&flow_offload_mutex)),
++		READ_ONCE(dev->pon_qdma_tag));
++}
++
++int airoha_eth_pon_update_begin(struct net_device *netdev, u32 channel_mask)
++{
++	struct airoha_gdm_dev *dev = airoha_pon_update_dev(netdev);
++	struct airoha_pon_retirement *state;
++	struct airoha_eth *eth;
++	unsigned int channel;
++	int pending, err;
++
++	if (IS_ERR(dev))
++		return PTR_ERR(dev);
++	eth = dev->eth;
++	state = dev->pon_retirement;
++	mutex_lock(&flow_offload_mutex);
++	mutex_lock(&eth->pon_config_lock);
++	if (eth->pon_update_owner && eth->pon_update_owner != dev) {
++		err = -EBUSY;
++		goto unlock;
++	}
++	eth->pon_update_owner = dev;
++	dev->pon_update_ready = false;
++	WRITE_ONCE(dev->pon_update_blocked, true);
++	dev->pon_update_channels |= channel_mask | airoha_pon_mapping_channels(dev);
++	/* The same RCU section covers both data and control descriptor submission.
++	 * The gate prevents all new submissions, including wake races from NAPI.
++	 */
++	netif_tx_disable(netdev);
++	synchronize_net();
++	err = read_poll_timeout(atomic_read, pending, !pending,
++				1000, 100000, false, &dev->pon_tx_pending);
++	if (err)
++		goto unlock;
++	err = airoha_ppe_remove_egress_flows(dev);
++	if (err)
++		goto unlock;
++
++	/* Repair a failed whole-register restore before touching another channel. */
++	if (state->restore_pending) {
++		err = airoha_pon_channel_retire(eth, state, state->active_channel);
++		if (err)
++			goto unlock;
++	}
++	for (channel = 0; channel < AIROHA_PON_RETIRE_CHANNELS; channel++) {
++		if (!(dev->pon_update_channels & BIT(channel)))
++			continue;
++		err = airoha_pon_channel_close(eth, state, channel);
++		if (err)
++			goto unlock;
++	}
++	for (channel = 0; channel < AIROHA_PON_RETIRE_CHANNELS; channel++) {
++		if (!(dev->pon_update_channels & BIT(channel)))
++			continue;
++		err = airoha_pon_channel_retire(eth, state, channel);
++		if (err)
++			goto unlock;
++	}
++	dev->pon_update_ready = true;
++	err = 0;
++unlock:
++	mutex_unlock(&eth->pon_config_lock);
++	mutex_unlock(&flow_offload_mutex);
++	return err;
++}
++EXPORT_SYMBOL_GPL(airoha_eth_pon_update_begin);
++
++int airoha_eth_pon_update_end(struct net_device *netdev)
++{
++	struct airoha_gdm_dev *dev = airoha_pon_update_dev(netdev);
++	struct airoha_pon_retirement *state;
++	struct airoha_eth *eth;
++	unsigned int channel;
++	int err;
++
++	if (IS_ERR(dev))
++		return PTR_ERR(dev);
++	eth = dev->eth;
++	state = dev->pon_retirement;
++	mutex_lock(&flow_offload_mutex);
++	mutex_lock(&eth->pon_config_lock);
++	err = -EBUSY;
++	if (eth->pon_update_owner != dev || !dev->pon_update_ready)
++		goto unlock;
++	for (channel = 0; channel < AIROHA_PON_RETIRE_CHANNELS; channel++) {
++		if (!(dev->pon_update_channels & BIT(channel)))
++			continue;
++		err = airoha_pon_channel_reopen(eth, state, channel);
++		if (err)
++			goto reclose;
++	}
++	dev->pon_update_channels = 0;
++	dev->pon_update_ready = false;
++	eth->pon_update_owner = NULL;
++	/* Mapping writes precede release of the gate. TX readers use RCU. */
++	smp_store_release(&dev->pon_update_blocked, false);
++	if (netif_running(netdev) && netif_carrier_ok(netdev))
++		netif_tx_wake_all_queues(netdev);
++	err = 0;
++	goto unlock;
++reclose:
++	/* No CPU or offloaded TX was admitted during this partial reopen.
++	 * Preserve the first failure and retry the entire transaction via begin.
++	 */
++	dev->pon_update_ready = false;
++	for (channel = 0; channel < AIROHA_PON_RETIRE_CHANNELS; channel++)
++		if (dev->pon_update_channels & BIT(channel))
++			airoha_pon_channel_close(eth, state, channel);
++unlock:
++	mutex_unlock(&eth->pon_config_lock);
++	mutex_unlock(&flow_offload_mutex);
++	return err;
++}
++EXPORT_SYMBOL_GPL(airoha_eth_pon_update_end);
++
++#endif
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -7,6 +7,7 @@
+ #include <linux/airoha-eth.h>
+ #include <linux/ip.h>
+ #include <linux/ipv6.h>
++#include <linux/if_vlan.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/rhashtable.h>
+@@ -16,6 +17,7 @@
+ #include <net/switchdev.h>
+ #include <net/pkt_cls.h>
+ #include <net/route.h>
++#include <net/dst_metadata.h>
+ 
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
+@@ -25,6 +27,10 @@
+  */
+ DEFINE_MUTEX(flow_offload_mutex);
+ static DEFINE_SPINLOCK(ppe_lock);
++
++/* qdma_dev_hqos_init() controls WAN channel remapping with this bit. */
++#define AIROHA_PON_QDMA_HQOS_CFG	0x0090
++#define AIROHA_PON_QDMA_HQOS_EN	BIT(31)
+ 
+ #include "airoha_ct_ifc.h"
+ #include "airoha_ct_smac.h"
+@@ -410,12 +416,12 @@
+ 	if (!table)
+ 		return -EOPNOTSUPP;
+ 
+-	/* nf_flow_table orders VLAN_PUSH from upper devices toward hardware.
+-	 * The final VLAN is the outer service tag seen by pon0; untagged packets
+-	 * use VID_ANY and P-bit 0, matching ndo_start_xmit classification.
++	/* flow_offload_fill_route reverses the device path into wire order.
++	 * VLAN_PUSH follows that order, so the first VLAN is the outer service
++	 * tag seen by pon0. Untagged packets use VID_ANY and P-bit 0.
+ 	 */
+ 	vlan_id = data->vlan.num ?
+-		data->vlan.hdr[data->vlan.num - 1].id : AIROHA_PON_VID_ANY;
++		data->vlan.hdr[0].id : AIROHA_PON_VID_ANY;
+ 	if (!data->vlan.num) {
+ 		tag = airoha_ppe_pon_lookup_tag(table, vlan_id, 0);
+ 		if (!(tag & AIROHA_PON_QDMA_VALID))
+@@ -460,11 +466,12 @@
+ 	memset(hwe, 0, sizeof(*hwe));
+ 	*egress_dev = NULL;
+ 
++	/* VLAN actions accept only 802.1Q: VPM 1 selects its TPID at any depth. */
+ 	val = FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE, type) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_UDP, l4proto == IPPROTO_UDP) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VLAN_LAYER, data->vlan.num) |
+-	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, data->vlan.num) |
++	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, !!data->vlan.num) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PPPOE, data->pppoe.num) |
+ 	      AIROHA_FOE_IB1_BIND_TTL;
+ 	hwe->ib1 = val;
+@@ -1088,7 +1095,8 @@
+ 			err = PTR_ERR(e);
+ 			break;
+ 		}
+-		if (e->egress_dev == dev && list_empty(&e->gc_node))
++		if ((e->egress_dev == dev || e->pon_ingress_dev == dev) &&
++		    list_empty(&e->gc_node))
+ 			list_add_tail(&e->gc_node, &remove_list);
+ 	}
+ 	rhashtable_walk_stop(&iter);
+@@ -1541,6 +1549,75 @@
+ 	return 0;
+ }
+ 
++static bool airoha_ppe_ct_pon_flow(struct airoha_flow_table_entry *e)
++{
++	return e->pon_ingress_dev ||
++	       (e->egress_dev && test_bit(AIROHA_DEV_F_PON, &e->egress_dev->flags));
++}
++
++static bool airoha_ppe_ct_pon_dev_ready(struct airoha_gdm_dev *dev)
++{
++	struct net_device *netdev = netdev_from_priv(dev);
++
++	return !READ_ONCE(dev->pon_update_blocked) &&
++	       netif_running(netdev) && netif_carrier_ok(netdev);
++}
++
++/* Admission is serialized by flow_offload_mutex; learning runs under ppe_lock.
++ * Recheck the gate and actual physical ingress before publishing a PON row.
++ */
++static bool airoha_ppe_ct_pon_flow_current(struct airoha_ppe *ppe,
++					   struct airoha_flow_table_entry *e,
++					   struct sk_buff *skb)
++{
++	struct airoha_gdm_dev *ingress = e->pon_ingress_dev;
++	struct airoha_gdm_dev *egress = e->egress_dev;
++	struct airoha_gdm_dev *actual = netdev_priv(skb->dev);
++	u32 type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, e->data.ib1);
++	__be16 protocol;
++
++	if (airoha_is_valid_gdm_dev(ppe->eth, actual) &&
++	    test_bit(AIROHA_DEV_F_PON, &actual->flags) && ingress != actual)
++		return false;
++	if (!airoha_ppe_ct_pon_flow(e))
++		return true;
++	if (!READ_ONCE(ppe->ct_pon_qualified))
++		return false;
++	protocol = htons(type == PPE_PKT_TYPE_IPV6_ROUTE_5T ? ETH_P_IPV6 : ETH_P_IP);
++	/* nf_flow_table does not emit a PPPoE ingress dissector key. Check the
++	 * actual input frame; output VLAN/PPPoE actions are independent of it.
++	 * WLAN invokes learning before eth_type_trans(), so use the MAC header.
++	 */
++	if (skb_vlan_tag_present(skb) || eth_hdr(skb)->h_proto != protocol)
++		return false;
++
++	if (ingress && (!airoha_ppe_ct_pon_dev_ready(ingress) ||
++			skb->dev != netdev_from_priv(ingress)))
++		return false;
++	if (egress && test_bit(AIROHA_DEV_F_PON, &egress->flags)) {
++		if (!airoha_ppe_ct_pon_dev_ready(egress) ||
++		    !net_eq(dev_net(skb->dev), dev_net(netdev_from_priv(egress))))
++			return false;
++		if (e->ct_ingress_gdm) {
++			if (skb->dev != netdev_from_priv(e->ct_ingress_gdm))
++				return false;
++			if (e->ct_ingress_dsa_port >= 0) {
++				struct metadata_dst *md = skb_metadata_dst(skb);
++
++				/* RX attaches the descriptor source port before DSA
++				 * demultiplexing changes skb->dev to the user port.
++				 */
++				if (!md || md->type != METADATA_HW_PORT_MUX ||
++				    md->u.port_info.port_id != e->ct_ingress_dsa_port)
++					return false;
++			}
++		} else if (skb->dev->ifindex != e->ct_ingress_ifindex) {
++			return false;
++		}
++	}
++	return true;
++}
++
+ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 					struct sk_buff *skb,
+ 					u32 hash, bool rx_wlan,
+@@ -1587,6 +1664,8 @@
+ 			continue;
+ 		}
+ 
++		if (ppe->ct_host_ppe && !airoha_ppe_ct_pon_flow_current(ppe, e, skb))
++			continue;
+ 		if (e->ct_bridge &&
+ 		    !airoha_ppe_ct_bridge_current(ppe, e, peer, skb))
+ 			continue;
+@@ -1652,7 +1731,8 @@
+ 
+ 		/* IP lookup has no ingress-MAC key: keep one action per tuple. */
+ 		hlist_for_each_entry(prev, &ppe->foe_flow[hash], list) {
+-			if ((e->ct_bridge || prev->ct_bridge) &&
++			if ((e->ct_bridge || prev->ct_bridge ||
++			     airoha_ppe_ct_pon_flow(e) || airoha_ppe_ct_pon_flow(prev)) &&
+ 			    airoha_ppe_foe_compare_entry(prev, &e->data)) {
+ 				spin_unlock_bh(&ppe_lock);
+ 				return -EEXIST;
+@@ -1808,7 +1888,7 @@
+ 	flow_rule_match_control(rule, &control);
+ 	if (control.key->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS)
+ 		required_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS);
+-	else if (bridge && control.key->addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS)
++	else if (control.key->addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS)
+ 		required_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS);
+ 	else
+ 		return false;
+@@ -1937,12 +2017,115 @@
+ 	return err;
+ }
+ 
++/* nf_flow_table_path flattens VLAN and PPPoE forward paths before setting
++ * tuple.iifidx. META therefore names the final physical ingress, while VLAN
++ * and PPPoE matching remains in separate dissector keys. Do not select an
++ * arbitrary lower device from a VLAN/PPP upper whose path was not resolved.
++ */
++static int airoha_ppe_ct_ingress_dev(struct airoha_eth *eth,
++				   struct flow_rule *rule,
++				   struct net_device *odev,
++				   struct airoha_gdm_dev *egress,
++				   struct airoha_gdm_dev **ingress,
++				   int *ifindex, int *dsa_port)
++{
++	struct flow_match_meta meta;
++	struct net_device *idev, *lower;
++	struct airoha_gdm_dev *dev;
++	bool pon = egress && test_bit(AIROHA_DEV_F_PON, &egress->flags);
++	int err = -EOPNOTSUPP, i, j;
++
++	*ingress = NULL;
++	*ifindex = 0;
++	*dsa_port = -1;
++	flow_rule_match_meta(rule, &meta);
++	/* Preserve existing non-PON admission. A masked META that could include
++	 * PON must satisfy the same exact source contract as a PON egress.
++	 */
++	for (i = 0; !pon && i < ARRAY_SIZE(eth->ports); i++) {
++		struct airoha_gdm_port *port = eth->ports[i];
++
++		if (!port)
++			continue;
++		for (j = 0; j < ARRAY_SIZE(port->devs); j++) {
++			dev = port->devs[j];
++			if (!dev || !test_bit(AIROHA_DEV_F_PON, &dev->flags))
++				continue;
++			idev = netdev_from_priv(dev);
++			if (net_eq(dev_net(idev), dev_net(odev)) &&
++			    !((idev->ifindex ^ meta.key->ingress_ifindex) &
++			      meta.mask->ingress_ifindex)) {
++				pon = true;
++				break;
++			}
++		}
++	}
++	if (!pon)
++		return 0;
++	if (meta.mask->ingress_ifindex != U32_MAX ||
++	    meta.mask->ingress_iftype || meta.mask->l2_miss ||
++	    meta.key->ingress_ifindex <= 0)
++		return -EOPNOTSUPP;
++	*ifindex = meta.key->ingress_ifindex;
++	idev = dev_get_by_index(dev_net(odev), *ifindex);
++	if (!idev)
++		return -ENODEV;
++	lower = idev;
++	*dsa_port = airoha_get_dsa_port(&lower);
++	dev = netdev_priv(lower);
++	if (airoha_is_valid_gdm_dev(eth, dev)) {
++		if (*dsa_port >= AIROHA_MAX_DSA_PORTS ||
++		    (*dsa_port < 0 && netdev_uses_dsa(lower)))
++			goto out;
++		*ingress = dev;
++		err = 0;
++	} else if (idev->ieee80211_ptr) {
++		err = 0;
++	}
++out:
++	dev_put(idev);
++	return err;
++}
++
++static bool airoha_ppe_ct_pon_rule_supported(struct airoha_ppe *ppe,
++					   struct flow_rule *rule,
++					   struct airoha_gdm_dev *ingress,
++					   struct airoha_gdm_dev *egress,
++					   bool bridge)
++{
++	bool input_pon = ingress && test_bit(AIROHA_DEV_F_PON, &ingress->flags);
++	bool output_pon = egress && test_bit(AIROHA_DEV_F_PON, &egress->flags);
++	struct airoha_qdma *qdma;
++
++	if (!input_pon && !output_pon)
++		return true;
++	/* IP FOE keys omit ingress domain and encapsulation. Keep both PON
++	 * directions in software until the hardware qualifier owns that scope.
++	 */
++	if (!READ_ONCE(ppe->ct_pon_qualified))
++		return false;
++	if (bridge || (input_pon && output_pon) ||
++	    !airoha_ppe_ct_ip_rule_supported(rule, false))
++		return false;
++	if (input_pon && (!airoha_ppe_ct_pon_dev_ready(ingress) || !egress))
++		return false;
++	if (!output_pon)
++		return true;
++	if (!airoha_ppe_ct_pon_dev_ready(egress))
++		return false;
++	qdma = airoha_qdma_deref(egress);
++	/* The direct T-CONT encoding requires WAN HQoS remapping to be disabled. */
++	return qdma == &egress->eth->qdma[1] &&
++	       !(airoha_qdma_rr(qdma, AIROHA_PON_QDMA_HQOS_CFG) &
++		 AIROHA_PON_QDMA_HQOS_EN);
++}
++
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+ 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+ 	struct airoha_flow_table_entry *e;
+-	struct airoha_gdm_dev *egress_dev;
++	struct airoha_gdm_dev *egress_dev, *ingress_dev = NULL;
+ 	struct airoha_flow_data data = {};
+ 	struct airoha_wdma_info bridge_src = {}, bridge_dest = {};
+ 	bool bridge = eth->ppe->ct_host_ppe && f->bridge;
+@@ -1950,7 +2133,7 @@
+ 	struct flow_action_entry *act;
+ 	u8 dsfield = 0, l4proto = 0;
+ 	struct airoha_foe_entry hwe;
+-	int err, i, offload_type;
++	int err, i, offload_type, ingress_ifindex = 0, ingress_dsa_port = -1;
+ 	u16 addr_type = 0;
+ 
+ 	if (rhashtable_lookup(&eth->flow_table, &f->cookie,
+@@ -2117,9 +2300,15 @@
+ 	if (eth->ppe->ct_host_ppe && !bridge && !egress_dev &&
+ 	    !airoha_ppe_ct_ifc_covers(eth->ppe, rule, odev))
+ 		return -EOPNOTSUPP;
+-	if (eth->ppe->ct_host_ppe && egress_dev &&
+-	    test_bit(AIROHA_DEV_F_PON, &egress_dev->flags))
+-		return -EOPNOTSUPP;
++	if (eth->ppe->ct_host_ppe) {
++		err = airoha_ppe_ct_ingress_dev(eth, rule, odev, egress_dev, &ingress_dev,
++					      &ingress_ifindex, &ingress_dsa_port);
++		if (err)
++			return err;
++		if (!airoha_ppe_ct_pon_rule_supported(eth->ppe, rule, ingress_dev, egress_dev,
++						    bridge))
++			return -EOPNOTSUPP;
++	}
+ 
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS)) {
+ 		struct flow_match_ports ports;
+@@ -2221,6 +2410,11 @@
+ 	INIT_LIST_HEAD(&e->gc_node);
+ 	e->cookie = f->cookie;
+ 	e->egress_dev = egress_dev;
++	if (ingress_dev && test_bit(AIROHA_DEV_F_PON, &ingress_dev->flags))
++		e->pon_ingress_dev = ingress_dev;
++	e->ct_ingress_ifindex = ingress_ifindex;
++	e->ct_ingress_gdm = ingress_dev;
++	e->ct_ingress_dsa_port = ingress_dsa_port;
+ 	e->ct_bridge = bridge;
+ 	e->ct_bridge_generation = f->bridge_generation;
+ 	INIT_LIST_HEAD(&e->ct_bridge_node);
+@@ -2248,7 +2442,7 @@
+ 	}
+ 	memcpy(&e->data, &hwe, sizeof(e->data));
+ 
+-	if (bridge) {
++	if (bridge || (eth->ppe->ct_host_ppe && airoha_ppe_ct_pon_flow(e))) {
+ 		err = airoha_ppe_ct_bridge_publish(eth, e);
+ 		if (err)
+ 			goto free_entry;
+@@ -2284,8 +2478,7 @@
+ 	if (!e)
+ 		return -ENOENT;
+ 
+-	if (eth->ppe->ct_host_ppe && e->egress_dev &&
+-	    test_bit(AIROHA_DEV_F_PON, &e->egress_dev->flags)) {
++	if (eth->ppe->ct_host_ppe && airoha_ppe_ct_pon_flow(e)) {
+ 		int err = airoha_ppe_ct_remove_pon_flow(eth->ppe, e);
+ 
+ 		if (err)
+--- a/include/linux/airoha-eth.h
++++ b/include/linux/airoha-eth.h
+@@ -82,6 +82,14 @@
+ 	void (*wake_control_tx)(void *priv);
+ };
+ 
++/* The controller serializes begin/update/end with its state mutex.
++ * begin blocks data/control TX, revokes flows and drains old/new channels.
++ * Errors retain the gate and channel state; retry begin before reusing a bearer.
++ * Publish mappings only after begin succeeds; end restores queues and admission.
++ */
++int airoha_eth_pon_update_begin(struct net_device *netdev, u32 channel_mask);
++int airoha_eth_pon_update_end(struct net_device *netdev);
++
+ /* Configure the T-CONT and GEM Port-ID mapping used by QDMA TX descriptors. */
+ int airoha_eth_pon_configure(struct net_device *netdev, u8 tcont,
+ 			     u16 gem_id, bool valid);

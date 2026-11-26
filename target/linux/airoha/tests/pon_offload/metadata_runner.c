@@ -22,7 +22,7 @@ int main(void)
         struct airoha_ppe ppe = { .ct_host_ppe=true };
         struct airoha_eth eth = { .ppe=&ppe };
         struct airoha_flow_data data = { .eth={{0x02,1,2,3,4,5}, {0x02,6,7,8,9,10}, 0},
-            .vlan={.hdr={{v0,0x8100},{v1,0x88a8}},.num=vn}, .pppoe={.sid=sid,.num=pn} };
+            .vlan={.hdr={{v0,htons(0x8100)},{v1,htons(0x8100)}},.num=vn}, .pppoe={.sid=sid,.num=pn} };
         u32 selected = 0x55aa55aa;
         struct airoha_foe_entry hwe;
         struct airoha_gdm_dev *egress = NULL;
@@ -31,7 +31,7 @@ int main(void)
                                                         kind, &data, proto, ds, &egress);
         printf("%d %u %d %d", select_result, selected, prepare_result, egress == &dev);
         for (unsigned pbit = 0; pbit < 8; pbit++)
-            printf(" %u", airoha_ppe_pon_lookup_tag(table, vn ? (vn == 1 ? v0 : v1) : AIROHA_PON_VID_ANY, pbit));
+            printf(" %u", airoha_ppe_pon_lookup_tag(table, vn ? v0 : AIROHA_PON_VID_ANY, pbit));
         putchar(' ');
         for (unsigned i = 0; i < sizeof(hwe); i++) printf("%02x", hwe.data[i]);
         putchar('\n');

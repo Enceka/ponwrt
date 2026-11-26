@@ -30,7 +30,7 @@ class Module:
         assert self.sha256 == HASHES[self.path.name], ('stock hash', self.path)
         self.cpu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
         self.calls, self.names, self.stub_calls = {}, {}, Counter()
-        self.local_stubs, self.hir, self.vpm = {}, 0xa, 0
+        self.local_stubs, self.hir = {}, 0xa
         self.qos_remap = 0
         self.instructions = 0
         cpu = self.cpu
@@ -117,8 +117,9 @@ class Module:
         self.stub_calls[name] += 1
         if name == 'GET_HIR':
             value = self.hir
-        elif name == 'ppe_trans_tpid_to_vpm':
-            value = self.vpm
+        elif name == 'get_frame_engine_data':
+            assert cpu.reg_read(R.UC_ARM64_REG_W0) == 0xbfb50f18
+            value = 0x8100
         elif name == '__ECNT_HOOK':
             group = cpu.reg_read(R.UC_ARM64_REG_W0)
             command = cpu.reg_read(R.UC_ARM64_REG_W1)
@@ -159,8 +160,6 @@ class StockOracle:
         self.ppe = Module(Path(modules) / 'hw_nat.ko')
         self.ppe.local_stubs[self.ppe.names['GET_HIR']] = (
             'GET_HIR', lambda m: m.cpu.reg_write(R.UC_ARM64_REG_W0, m.hir))
-        self.ppe.local_stubs[self.ppe.names['ppe_trans_tpid_to_vpm']] = (
-            'ppe_trans_tpid_to_vpm', lambda m: m.cpu.reg_write(R.UC_ARM64_REG_W0, m.vpm))
         tx = self.tx
         tx.put(tx.names['gpWanPriv'], '<Q', tx.DATA + 0x10000)
         tx.put(tx.names['gpPonSysData'], '<Q', tx.DATA + 0x50000)
@@ -188,17 +187,18 @@ class StockOracle:
         result = m.call('gwan_prepare_tx_message', msg, 0, skb, 0, info)
         return dict(result=result, msg=list(m.get(msg, '<II')), info=bytes(m.cpu.mem_read(info, 16)).hex())
 
-    def foe(self, gem, tcont, kind=0, *, hir=0xa, vpm=0, sid=0, vlan1=0, vlan2=0, qos_remap=0):
+    def foe(self, gem, tcont, kind=0, *, hir=0xa, tpid=0, sid=0, vlan1=0, vlan2=0, qos_remap=0):
         m = self.ppe
         foe, info = m.DATA, m.DATA + 0x1000
-        m.hir, m.vpm, m.qos_remap = hir, vpm, qos_remap
+        m.hir, m.qos_remap = hir, qos_remap
+        m.cpu.mem_write(m.names['PpeParseResult'] + 0xc, struct.pack('>H', tpid))
         m.cpu.mem_write(foe, bytes(80))
         m.cpu.mem_write(info, bytes(32))
         # Feed real stock TX metadata into the real stock FOE handler.
         tx = self.tx_message(gem, tcont)
         assert tx['result'] == 0
         m.cpu.mem_write(info, bytes.fromhex(tx['info']))
-        m.put(foe, '<I', (kind << 25) | ((1 if sid else 0) << 22) | (vpm << 20))
+        m.put(foe, '<I', (kind << 25) | ((1 if sid else 0) << 22))
         # PpeSetPortInfo only sets output fields; existing session/VLAN fields
         # are seeded exactly as preceding stock parser stages would provide.
         if kind < 4 and kind != 2:
@@ -233,13 +233,29 @@ class StockOracle:
                                     instructions=m.instructions, helpers=dict(m.stub_calls)))
         return results
 
+    def verify_tpid_encoding(self):
+        """Run both stock conversion entries, then the real port encoder."""
+        rows = []
+        for tpid, want in [(0, 0), (0x8100, 1), (0x88a8, 2), (0x9100, 0)]:
+            host = self.ppe.call('Convert_TPIDtoVPM', tpid)
+            network = self.ppe.call('ppe_trans_tpid_to_vpm',
+                                    struct.unpack('<H', struct.pack('>H', tpid))[0])
+            for kind in (0, 5):
+                raw = self.foe(321, 7, kind=kind, tpid=tpid, vlan1=100, vlan2=200)
+                encoded = (struct.unpack_from('<I', raw)[0] >> 20) & 3
+                assert (host, network, encoded) == (want, want, want)
+                rows.append(dict(tpid=tpid, kind=kind, host_vpm=host,
+                                 network_vpm=network, port_vpm=encoded))
+        return rows
+
     def metadata(self):
         return dict(mode='actual-stock-AArch64-function-entry-to-return',
                     modules={m.path.name: m.sha256 for m in (self.tx, self.ppe)},
-                    functions=['gwan_prepare_tx_message@0x4b7dc', 'PpeSetPortInfo@0x54bb0'],
+                    functions=['gwan_prepare_tx_message@0x4b7dc', 'PpeSetPortInfo@0x54bb0',
+                               'ppe_trans_tpid_to_vpm@0x1073c', 'Convert_TPIDtoVPM@0x22a5c'],
                     stubs={m.path.name: dict(m.stub_calls) for m in (self.tx, self.ppe)},
                     instructions={m.path.name: m.instructions for m in (self.tx, self.ppe)},
-                    environment='Optional hook pointers disabled; stock mapping table and skb handle supplied; QoS config helper defaults retained; HIR, VPM and explicit QoS remap state supplied per case; no device I/O')
+                    environment='Optional hook pointers disabled; stock mapping table and skb handle supplied; QoS config helper defaults retained; HIR, outer TPID and explicit QoS remap state supplied per case; real VPM conversion reads a stubbed 0x8100 custom-TPID register; no device I/O')
 
 
 if __name__ == '__main__':

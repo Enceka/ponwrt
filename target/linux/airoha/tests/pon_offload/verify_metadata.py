@@ -78,7 +78,7 @@ def vectors():
     for gem, tc, kind, encap in itertools.product([0, 1, 255, 1023, 4095, 4096, 65534, 65535], range(32), [0, 5], range(4)):
         vlans = [100] if encap == 1 else [100, 200] if encap == 2 else []
         sid = 0x4321 if encap == 3 else 0
-        add('bearer', [entry(vlans[-1] if vlans else ANY, 255, gem, tc)], kind=kind, vlans=vlans, sid=sid)
+        add('bearer', [entry(vlans[0] if vlans else ANY, 255, gem, tc)], kind=kind, vlans=vlans, sid=sid)
     for kind in [0, 1, 2, 3, 4, 5, 7]:
         for sid in [0, 1, 65535]:
             add('layout', [entry(ANY, 255, 0x1234, 29)], kind=kind, sid=sid)
@@ -100,7 +100,8 @@ def vectors():
         if order: entries.reverse()
         add('exact-before-fallback', entries, vlans=[100])
         add('fallback', entries, vlans=[200])
-        add('double-vlan-outer', entries, vlans=[200, 100])
+        add('double-vlan-outer', entries, vlans=[100, 200])
+        add('double-vlan-inner-different', [entry(100, 255, 77, 21), entry(200, 255, 88, 22)], vlans=[100, 200])
     for tc in range(32):
         add('epon-fixed-llid', fixed=VALID | EPON | (tc << 16), present=False)
     # Adjacent vectors model table replacement, deletion and re-addition;
@@ -111,7 +112,7 @@ def vectors():
 
 
 def expectation(v):
-    vid = v['vlans'][-1] if v['vlans'] else ANY
+    vid = v['vlans'][0] if v['vlans'] else ANY
     def lookup(pbit):
         candidates = [e for e in v['entries'] if e[1] & (1 << pbit)]
         exact = [e for e in candidates if e[0] == vid]
@@ -166,13 +167,16 @@ def compare(vs, output, oracle=None):
         assert (u32(ib2off) >> 5) & 15 == 2, (i, 'GDM2')
         assert u32(ib2off) & (1 << 9), (i, 'PSE QoS')
         assert u16(l2off + 2) == gem, (i, 'GEM', raw.hex())
+        assert (u32(0) >> 20) & 3 == bool(v['vlans']), (i, 'VPM')
+        assert (u32(0) >> 16) & 15 == len(v['vlans']), (i, 'VLAN depth')
         assert (u32(0) >> 22) & 1 == bool(v['sid']), (i, 'PPPoE flag')
         assert (u16(l2off + 16) if kind <= 3 else u32(l2off + 12) & 65535) == v['sid'], (i, 'PPPoE sid')
         assert [u16(l2off + off) for off in [0, 8]][:len(v['vlans'])] == v['vlans'], (i, 'VLAN')
         assert u32(ib2off) >> 24 == v['ds'], (i, 'DSCP/ECN')
         if oracle and not tag & EPON:
-            original = oracle.foe(gem, tc, kind=kind, vpm=len(v['vlans']), sid=v['sid'],
+            original = oracle.foe(gem, tc, kind=kind, tpid=0x8100 if v['vlans'] else 0, sid=v['sid'],
                                   vlan1=(v['vlans'] + [0])[0], vlan2=(v['vlans'] + [0, 0])[1])
+            assert (struct.unpack_from('<I', original, 0)[0] >> 20) & 3 == (u32(0) >> 20) & 3, (i, 'stock VPM')
             stock32 = lambda off: struct.unpack_from('<I', original, off)[0]
             stock16 = lambda off: struct.unpack_from('<H', original, off)[0]
             # Stock type2 uses hardware L2B layout; production prepare emits
@@ -251,11 +255,14 @@ def main():
                 hir_cases += 1
     (build / 'stock-chip-layouts.json').write_text(json.dumps(stock_layouts, indent=2) + '\n')
     hqos_hooks = oracle.verify_hqos_hooks()
+    tpid_cases = oracle.verify_tpid_encoding()
     mutations = []
     if a.mutations:
         path = build / 'production_functions.inc'
         original = path.read_text()
         changes = {
+            'inner-vlan-selects-gem': ('data->vlan.hdr[0].id : AIROHA_PON_VID_ANY;', 'data->vlan.hdr[data->vlan.num - 1].id : AIROHA_PON_VID_ANY;'),
+            'vpm-is-vlan-depth': ('FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, !!data->vlan.num)', 'FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, data->vlan.num)'),
             'gem-replaced-by-pppoe': ('FIELD_GET(AIROHA_PON_QDMA_GEM_MASK, pon_tag);', 'ETH_P_PPP_SES;'),
             'channel-truncated-to-four': ('channel = FIELD_GET(AIROHA_PON_QDMA_TCONT_MASK,', 'channel = 3 & FIELD_GET(AIROHA_PON_QDMA_TCONT_MASK,'),
             'ignore-pcp-split': ('else if (tag != first_tag)', 'else if (0 && tag != first_tag)'),
@@ -278,7 +285,8 @@ def main():
                   labels=dict(Counter(v['label'] for v in vs)), stock=oracle.metadata(),
                   stock_invalid_mapping_cases=6, stock_chip_layout_cases=hir_cases,
                   stock_missing_qos_hook_cases=missing_hook_cases,
-                  stock_hqos_hook_cases=hqos_hooks, mutations=mutations,
+                  stock_hqos_hook_cases=hqos_hooks, stock_tpid_cases=tpid_cases,
+                  mutations=mutations,
                   boundaries=['Production classifier/FOE template functions only; flow admission is tested separately.',
                               'Queue selection fixed at zero; DSCP/ECN retention checked.',
                               'Mapping replacement inputs checked; concurrent live FOE invalidation is tested by lifecycle suite.',
