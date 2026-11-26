@@ -46,7 +46,7 @@ bash target/linux/airoha/hg5585f-ct/prepare-overlay.sh \
 The stock `SHA256SUMS` keeps its two original entries. `SHA256SUMS.rebuilt`
 verifies the separately named native files; the overlay also records the digest
 of every copied file and `local.config`. It contains the complete Connac2 patch
-sequence through 957, native tests, firmware inputs and this guide. Apply its
+sequence through 960, native tests, firmware inputs and this guide. Apply its
 `tree/` to the matching OpenWrt revision and merge `local.config` before building.
 
 Generate the NAND-disabled native trial DTS using the live factory digest:
@@ -141,6 +141,56 @@ NBQ 0; WLAN output uses PSE 3, channel 9, NBQ 3. Native rows preserve TTL/hop
 limit, DSCP/ECN and IPv6 flow labels. The firmware handles simple IPv4/IPv6 TCP
 and UDP, including short frames using padding; fragments, IP options, IPv6
 extension headers and TCP FIN/RST use the host path.
+
+## LAN1 ingress classification
+
+Patch 960 restricts native IFC rows 54/55 to source port 24, type 0,
+plain IPv4/IPv6, with neither VLAN-present bit nor PPPoE set. The existing
+short-frame guards 62/63 keep precedence over those rows. CPU rows 32–50
+cover the three encapsulation bits and the exact complement of the two IP
+EtherTypes. CPU and native eligibility are disjoint; overlapping CPU rules
+share the same action. VID 0 is classified as tagged traffic.
+
+The CPU action selects ring 1 and uses the source port's QDMA CPU mapping.
+IFC activation verifies that port 24 maps to CDM1 or CDM2 according to its
+actual QDMA. Both CPU-map writers and QDMA reassignment close IFC and read
+the gate back before publishing a new mapping. Failure retains the old map
+and schedules sticky CPU recovery. Rule installation and restoration share
+the existing IFC ownership, snapshots and dirty-state retry handling.
+GDM4 retains its ordinary forwarding configuration: a default CPU override
+would bypass IFC and prevent native LAN1 forwarding.
+
+Run the ingress checks against a Linux tree prepared through patch 960:
+
+```sh
+python3 target/linux/airoha/tests/native_pair/verify_ifc_cpu.py \
+  --host /path/to/linux/drivers/net/ethernet/airoha --output /path/to/ifc-results
+python3 target/linux/airoha/tests/native_pair/verify_ingress_native.py \
+  --kernel /path/to/linux --output /path/to/native-ingress-results
+python3 target/linux/airoha/tests/native_pair/verify_ingress_mutations.py \
+  --kernel /path/to/linux --output /path/to/new/ingress-mutation-results
+```
+
+The extracted driver checks pass 2,485 IFC lifecycle cases, 538,624 classifier
+combinations and 3,277 native cases under ASan/UBSan, and reject 16 deliberate
+mutations. The patch applies with zero fuzz and reproduces all 47 driver files
+of the tested candidate. The matched kernel builds with zero warnings/errors.
+
+The 2026-11-26 NAND-disabled RAM trial passed all 26 classification templates
+in 1,040 frames. Plain IP and short-boundary native frames bypassed CPU and
+arrived intact; VLAN, QinQ, PPPoE, short and non-IP frames reached CPU as
+expected. All plain controls arrived, with zero socket/capture drops,
+duplicates or modified exact matches. Exact Wi-Fi delivery was 984/1,040:
+the remaining 56 are VID 0 frames, whose forwarding/tag handling is under
+separate investigation.
+
+Ordinary native TCP passed in four directions with stable rows and zero FE
+faults/drops: LAN1→Mac Wi-Fi 1,278.229 Mbps, reverse 939.507 Mbps,
+Mac Wi-Fi→CMCC 321.362 Mbps, reverse 583.714 Mbps. Router CPU was
+3.574%, 1.375%, 2.783% and 2.084%, respectively. FIT SHA256:
+`a280833362721af081124c6212221db30444800e21a3bf2b4f568fb2abe52071`.
+The NPU payload remains the `hostbusy1` image listed above. PON qualification
+stays disabled while its service identity and bank1 lifecycle are rebuilt.
 
 ## Revocation and fault handling
 

@@ -1,0 +1,501 @@
+--- a/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
+@@ -2,6 +2,26 @@
+ /* Included by airoha_eth.c. Lock order: ppe_lock -> ct_route_lock.
+  * No helper holding ct_route_lock takes a mutex or ppe_lock.
+  */
++/* Stop forceCPU users before either its source map or QDMA receiver changes.
++ * Failed gate readback leaves the old map and receiver in place.
++ */
++static int airoha_ct_ifc_cpu_port_change(struct airoha_eth *eth, int sport)
++{
++	int err = 0;
++
++	spin_lock_bh(&eth->ct_route_lock);
++	if (sport == 24 && eth->ppe && READ_ONCE(eth->ppe->ct_ifc.cfg_owned)) {
++		WRITE_ONCE(eth->ct_ifc_cpu_port_failed, true);
++		airoha_fe_clear(eth, REG_FE_CSR_IFC_CFG, FE_IFC_EN_MASK);
++		if (airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK)
++			err = -EIO;
++		if (eth->ppe->ct_native_pairs && !READ_ONCE(eth->ppe->ct_fe.health_stopping))
++			schedule_delayed_work(&eth->ppe->ct_fe.health_work, 0);
++	}
++	spin_unlock_bh(&eth->ct_route_lock);
++	return err;
++}
++
+ static u16 airoha_ct_ppe_selectors(u32 cfg)
+ {
+ 	u16 mask = 0;
+--- a/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
+@@ -187,7 +187,8 @@
+ 
+ 	lockdep_assert_held(&ppe_lock);
+ 	if (!ppe->ct_fe.epoch || ppe->ct_fe.pending || ppe->ct_fe.drain_pending ||
+-	    ppe->ct_pair_failed || ppe->ct_stopping || ppe->ct_fe.generation != generation)
++	    ppe->ct_pair_failed || ppe->ct_stopping ||
++	    READ_ONCE(ppe->eth->ct_ifc_cpu_port_failed) || ppe->ct_fe.generation != generation)
+ 		return -ESTALE;
+ 	if (ppe->ct_fe.armed && ppe->ct_fe.active)
+ 		return 0;
+@@ -202,8 +203,19 @@
+ 	ppe->ct_fe.armed = true;
+ 	ppe->ct_fe.touched = true;
+ 	for (r = 0; r < 2; r++) {
+-		tcam[8][0] = r ? 0x41 : 0x42;
+-		tcam[8][1] = 0xc3;
++		/* A type-0 rule qualifies the physical source and plain outer L2.
++		 * Requiring no short-packet LUT hit keeps this producer disjoint
++		 * from the CPU guards, independently of TCAM row priority.
++		 */
++		tcam[0][0] = XSI_ETH_VIP_PORT_MASK;
++		tcam[0][1] = XSI_ETH_VIP_PORT_MASK;
++		tcam[4][0] = 0;
++		tcam[4][1] = BIT(ppe->ct_ifc.rule[r].lut_index);
++		tcam[5][0] = r ? 0x86dd : 0x0800;
++		tcam[5][1] = 0xffff;
++		tcam[7][1] = BIT(10) | BIT(5) | BIT(4);
++		tcam[8][0] = 0;
++		tcam[8][1] = 0xc0;
+ 		for (page = 0; page < 9; page++) {
+ 			err = airoha_ct_fe_put(ppe, CT_IFC_TCAM_BANK, CT_FE_NATIVE_ROW + r,
+ 					       page, tcam[page], 2);
+--- a/drivers/net/ethernet/airoha/airoha_ct_ifc.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_ifc.h
+@@ -129,6 +129,8 @@
+ 
+ static const u8 ct_ifc_action_words[] = { 2, 3, 1 };
+ 
++#include "airoha_ct_ifc_cpu.h"
++
+ /* UDF0/UDF1 occupy the low/high halfwords of the same register. */
+ static const struct {
+ 	u16 udf, min, max;
+@@ -150,6 +152,10 @@
+ 		if (ppe->ct_ifc.rule[guard].lut_dirty || ppe->ct_ifc.rule[guard].tcam_dirty ||
+ 		    ppe->ct_ifc.rule[guard].action_dirty)
+ 			return true;
++	for (guard = 0; guard < ARRAY_SIZE(ppe->ct_ifc.cpu_rule); guard++)
++		if (ppe->ct_ifc.cpu_rule[guard].tcam_dirty ||
++		    ppe->ct_ifc.cpu_rule[guard].action_dirty)
++			return true;
+ 	return false;
+ }
+ 
+@@ -195,7 +201,33 @@
+ 				return err;
+ 		}
+ 	}
+-	return 0;
++	return ct_ifc_cpu_audit(ppe);
++}
++
++/* forceCPU selects the existing source-port map, plus its action RX ring. */
++static bool ct_ifc_cpu_port_matches(struct airoha_eth *eth)
++{
++	struct net_device *netdev = airoha_ppe_ct_ifc_ingress(eth);
++	struct airoha_gdm_dev *dev;
++	struct airoha_qdma *qdma;
++	int cpu = -ENODEV, sport;
++	u32 map;
++
++	if (!netdev)
++		return false;
++	dev = netdev_priv(netdev);
++	sport = eth->soc->ops.get_sport(dev->port, dev->nbq);
++	if (sport != 24)
++		return false;
++	rcu_read_lock();
++	qdma = rcu_dereference(dev->qdma);
++	if (qdma == &eth->qdma[0])
++		cpu = FE_PSE_PORT_CDM1;
++	else if (qdma == &eth->qdma[1])
++		cpu = FE_PSE_PORT_CDM2;
++	rcu_read_unlock();
++	map = airoha_fe_rr(eth, REG_SP_DFT_CPORT(sport >> fls(SP_CPORT_DFT_MASK)));
++	return cpu >= 0 && __field_get(SP_CPORT_MASK(sport & SP_CPORT_DFT_MASK), map) == (u32)cpu;
+ }
+ 
+ static int ct_ifc_write_reg(struct airoha_eth *eth, u32 reg, u32 mask, u32 value)
+@@ -206,8 +238,9 @@
+ 		return 0;
+ 	if (reg == REG_FE_CSR_IFC_CFG)
+ 		spin_lock_bh(&eth->ct_route_lock);
+-	if (reg == REG_FE_CSR_IFC_CFG && eth->ct_cpu_fallback &&
+-	    (value & mask & FE_IFC_EN_MASK)) {
++	if (reg == REG_FE_CSR_IFC_CFG && (value & mask & FE_IFC_EN_MASK) &&
++	    (eth->ct_cpu_fallback || eth->ct_ifc_cpu_port_failed ||
++	     !ct_ifc_cpu_port_matches(eth))) {
+ 		err = -ESHUTDOWN;
+ 		goto out;
+ 	}
+@@ -240,6 +273,7 @@
+ 		dev_err(eth->dev, "CT IFC classifier is owned elsewhere; restoration deferred\n");
+ 		return -EBUSY;
+ 	}
++	err = ct_ifc_cpu_stop(ppe);
+ 	for (guard = 0; guard < ARRAY_SIZE(ppe->ct_ifc.rule); guard++) {
+ 		for (page = ARRAY_SIZE(ct_ifc_action_words); page-- > 0;) {
+ 			if (ppe->ct_ifc.rule[guard].action_dirty & BIT(page)) {
+@@ -361,6 +395,9 @@
+ 				goto fail;
+ 		}
+ 	}
++	err = ct_ifc_cpu_start(ppe);
++	if (err)
++		goto fail;
+ 	err = airoha_ifc_scope_ports(eth, XSI_ETH_VIP_PORT_MASK);
+ 	if (err)
+ 		goto fail;
+@@ -372,7 +409,7 @@
+ 
+ fail:
+ 	airoha_ppe_ct_ifc_stop(ppe);
+-	dev_warn(eth->dev, "CT WLAN egress short packet guards unavailable: %d\n", err);
++	dev_warn(eth->dev, "CT IFC CPU exception guards unavailable: %d\n", err);
+ }
+ 
+ #endif
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_ifc_cpu.h
+@@ -0,0 +1,141 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Included by airoha_ct_ifc.h. All guards share the existing IFC ownership. */
++#define CT_IFC_CPU_ROW(_guard) (32 + (_guard))
++
++/* Complement of { 0x0800, 0x86dd } in sixteen ternary cubes. Shared bits
++ * reject their opposite value. Differing bits, XORed with 0x0800, must all
++ * be zero or all one for an IP EtherType; every mixed vector has a 0 -> 1
++ * transition in the cyclic bit order. These guards may overlap each other,
++ * but none overlaps a native plain-IP row, independent of row priority.
++ */
++static const struct {
++	u16 key, mask;
++} ct_ifc_non_ip[] = {
++	{ 0x0002, 0x0002 },
++	{ 0x0020, 0x0020 },
++	{ 0x0100, 0x0100 },
++	{ 0x1000, 0x1000 },
++	{ 0x2000, 0x2000 },
++	{ 0x4000, 0x4000 },
++	{ 0x0004, 0x0005 },
++	{ 0x0008, 0x000c },
++	{ 0x0010, 0x0018 },
++	{ 0x0040, 0x0050 },
++	{ 0x0080, 0x00c0 },
++	{ 0x0200, 0x0280 },
++	{ 0x0400, 0x0600 },
++	{ 0x0000, 0x0c00 },
++	{ 0x8800, 0x8800 },
++	{ 0x0001, 0x8001 },
++};
++
++static void ct_ifc_cpu_words(unsigned int guard, unsigned int page, u32 *words)
++{
++	static const u16 encap[] = { BIT(5), BIT(4), BIT(10) };
++
++	words[0] = words[1] = 0;
++	if (page == 0) {
++		words[0] = words[1] = XSI_ETH_VIP_PORT_MASK;
++	} else if (page == 8) {
++		/* Type0 supplies EtherType plus VLAN0/VLAN1/PPPoE presence. */
++		words[1] = CT_IFC_TCAM_TYPE_MASK;
++	} else if (guard < ARRAY_SIZE(encap) && page == 7) {
++		words[0] = words[1] = encap[guard];
++	} else if (guard >= ARRAY_SIZE(encap) && page == 5) {
++		words[0] = ct_ifc_non_ip[guard - ARRAY_SIZE(encap)].key;
++		words[1] = ct_ifc_non_ip[guard - ARRAY_SIZE(encap)].mask;
++	}
++}
++
++static int ct_ifc_cpu_audit(struct airoha_ppe *ppe)
++{
++	unsigned int guard, page;
++	int err;
++
++	for (guard = 0; guard < ARRAY_SIZE(ppe->ct_ifc.cpu_rule); guard++) {
++		struct airoha_ct_ifc_cpu_rule *rule = &ppe->ct_ifc.cpu_rule[guard];
++
++		for (page = 0; page < ARRAY_SIZE(ct_ifc_action_words); page++) {
++			err = ct_ifc_access(ppe->eth, CT_IFC_ACTION_BANK, CT_IFC_CPU_ROW(guard),
++					    page, false, rule->action[page], ct_ifc_action_words[page]);
++			if (err)
++				return err;
++		}
++		for (page = 0; page < ARRAY_SIZE(rule->tcam); page++) {
++			err = ct_ifc_access(ppe->eth, CT_IFC_TCAM_BANK, CT_IFC_CPU_ROW(guard),
++					    page, false, rule->tcam[page], 2);
++			if (err)
++				return err;
++		}
++	}
++	return 0;
++}
++
++static int ct_ifc_cpu_start(struct airoha_ppe *ppe)
++{
++	u32 action[][3] = { {}, { 0, 0, CT_IFC_CPU_RX_RING << 10 },
++			    { CT_IFC_ACTION_ENABLE | CT_IFC_ACTION_STOP |
++			      CT_IFC_ACTION_FORCE_CPU } };
++	unsigned int guard, page;
++	int err;
++
++	for (guard = 0; guard < ARRAY_SIZE(ppe->ct_ifc.cpu_rule); guard++) {
++		struct airoha_ct_ifc_cpu_rule *rule = &ppe->ct_ifc.cpu_rule[guard];
++
++		for (page = ARRAY_SIZE(rule->tcam); page-- > 0;) {
++			u32 words[2];
++
++			ct_ifc_cpu_words(guard, page, words);
++			rule->tcam_dirty |= BIT(page);
++			err = ct_ifc_write_verify(ppe->eth, CT_IFC_TCAM_BANK, CT_IFC_CPU_ROW(guard),
++						  page, words, 2);
++			if (err)
++				return err;
++		}
++		for (page = 0; page < ARRAY_SIZE(ct_ifc_action_words); page++) {
++			rule->action_dirty |= BIT(page);
++			err = ct_ifc_write_verify(ppe->eth, CT_IFC_ACTION_BANK, CT_IFC_CPU_ROW(guard),
++						  page, action[page], ct_ifc_action_words[page]);
++			if (err)
++				return err;
++		}
++	}
++	return 0;
++}
++
++/* Global IFC is already closed. Retain every failed shadow for a retry. */
++static int ct_ifc_cpu_stop(struct airoha_ppe *ppe)
++{
++	unsigned int guard, page;
++	int err = 0;
++
++	for (guard = 0; guard < ARRAY_SIZE(ppe->ct_ifc.cpu_rule); guard++) {
++		struct airoha_ct_ifc_cpu_rule *rule = &ppe->ct_ifc.cpu_rule[guard];
++
++		for (page = ARRAY_SIZE(ct_ifc_action_words); page-- > 0;) {
++			int ret;
++
++			if (!(rule->action_dirty & BIT(page)))
++				continue;
++			ret = ct_ifc_write_verify(ppe->eth, CT_IFC_ACTION_BANK, CT_IFC_CPU_ROW(guard),
++						 page, rule->action[page], ct_ifc_action_words[page]);
++			if (ret)
++				err = ret;
++			else
++				rule->action_dirty &= ~BIT(page);
++		}
++		for (page = 0; page < ARRAY_SIZE(rule->tcam); page++) {
++			int ret;
++
++			if (!(rule->tcam_dirty & BIT(page)))
++				continue;
++			ret = ct_ifc_write_verify(ppe->eth, CT_IFC_TCAM_BANK, CT_IFC_CPU_ROW(guard),
++						 page, rule->tcam[page], 2);
++			if (ret)
++				err = ret;
++			else
++				rule->tcam_dirty &= ~BIT(page);
++		}
++	}
++	return err;
++}
+--- a/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
+@@ -185,6 +185,9 @@
+ 	int err;
+ 
+ 	spin_lock_bh(&ppe_lock);
++	if (!ppe->ct_fe.health_stopping &&
++	    READ_ONCE(ppe->eth->ct_ifc_cpu_port_failed) && !ppe->ct_pair_failed)
++		airoha_ct_pair_fail(ppe, -EIO);
+ 	if (!ppe->ct_fe.health_stopping && ppe->ct_pair_failed &&
+ 	    (!READ_ONCE(ppe->eth->ct_cpu_ifc_disabled) ||
+ 	     !READ_ONCE(ppe->eth->ct_cpu_routes_ready)))
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2561,11 +2561,14 @@
+ 	struct airoha_gdm_port *port = dev->port;
+ 	struct airoha_eth *eth = dev->eth;
+ 	u32 val, pse_port, chan;
+-	int i, src_port;
++	int i, src_port, err;
+ 
+ 	src_port = eth->soc->ops.get_sport(port, dev->nbq);
+ 	if (src_port < 0)
+ 		return src_port;
++	err = airoha_ct_ifc_cpu_port_change(eth, src_port);
++	if (err)
++		return err;
+ 
+ 	airoha_set_gdm_port_fwd_cfg(eth, AIROHA_GDM2_IDX,
+ 				    FE_PSE_PORT_DROP);
+@@ -2639,12 +2642,15 @@
+ {
+ 	struct airoha_gdm_port *port = dev->port;
+ 	struct airoha_eth *eth = dev->eth;
+-	int i, src_port;
++	int i, src_port, err;
+ 	u32 pse_port;
+ 
+ 	src_port = eth->soc->ops.get_sport(dev->port, dev->nbq);
+ 	if (src_port < 0)
+ 		return src_port;
++	err = airoha_ct_ifc_cpu_port_change(eth, src_port);
++	if (err)
++		return err;
+ 
+ 	airoha_fe_clear(eth,
+ 			REG_SP_DFT_CPORT(src_port >> fls(SP_CPORT_DFT_MASK)),
+@@ -2727,16 +2733,23 @@
+ 	return NULL;
+ }
+ 
+-static void airoha_dev_set_qdma(struct airoha_gdm_dev *dev)
++static int airoha_dev_set_qdma(struct airoha_gdm_dev *dev)
+ {
+ 	struct net_device *netdev = netdev_from_priv(dev);
+ 	struct airoha_qdma *cur_qdma, *qdma;
+ 	struct airoha_eth *eth = dev->eth;
+-	int i, ppe_id;
++	int i, ppe_id, err;
+ 
+ 	/* QDMA0 is used for lan ports while QDMA1 is used for WAN ports */
+ 	qdma = &eth->qdma[!airoha_is_lan_gdm_dev(dev)];
+ 	cur_qdma = airoha_qdma_deref(dev);
++
++	if (cur_qdma && cur_qdma != qdma) {
++		err = airoha_ct_ifc_cpu_port_change(eth,
++			eth->soc->ops.get_sport(dev->port, dev->nbq));
++		if (err)
++			return err;
++	}
+ 
+ 	if (cur_qdma) {
+ 		netif_tx_stop_all_queues(netdev);
+@@ -2775,12 +2788,14 @@
+ 	airoha_update_netdev_features(dev);
+ 	if (netdev->features & NETIF_F_LRO)
+ 		airoha_dev_lro_enable(dev);
++	return 0;
+ }
+ 
+ static int airoha_dev_init(struct net_device *netdev)
+ {
+ 	struct airoha_gdm_dev *dev = netdev_priv(netdev);
+ 	struct airoha_gdm_port *port = dev->port;
++	int err;
+ 
+ 	switch (port->id) {
+ 	case AIROHA_GDM3_IDX:
+@@ -2796,7 +2811,9 @@
+ 		break;
+ 	}
+ 
+-	airoha_dev_set_qdma(dev);
++	err = airoha_dev_set_qdma(dev);
++	if (err)
++		return err;
+ 	airoha_set_macaddr(dev, netdev->dev_addr);
+ 
+ 	if (!airoha_is_lan_gdm_dev(dev) &&
+@@ -4106,7 +4123,7 @@
+ 	return 0;
+ }
+ 
+-static void airoha_disable_qos_for_gdm34(struct net_device *netdev)
++static int airoha_disable_qos_for_gdm34(struct net_device *netdev)
+ {
+ 	struct airoha_gdm_dev *dev = netdev_priv(netdev);
+ 	struct airoha_gdm_port *port = dev->port;
+@@ -4114,15 +4131,16 @@
+ 
+ 	if (port->id != AIROHA_GDM3_IDX &&
+ 	    port->id != AIROHA_GDM4_IDX)
+-		return;
++		return 0;
+ 
+ 	err = airoha_disable_gdm2_loopback(dev);
+ 	if (err)
+-		netdev_warn(netdev,
+-			    "failed disabling GDM2 loopback: %d\n", err);
++		return err;
+ 
+ 	clear_bit(AIROHA_DEV_F_WAN, &dev->flags);
+-	airoha_dev_set_qdma(dev);
++	err = airoha_dev_set_qdma(dev);
++	if (err)
++		return err;
+ 	airoha_dev_set_xmit_frame_size(netdev);
+ 
+ 	airoha_set_macaddr(dev, netdev->dev_addr);
+@@ -4131,6 +4149,7 @@
+ 		airoha_set_gdm_port_fwd_cfg(dev->eth,
+ 					    port->id,
+ 					    FE_PSE_PORT_PPE1);
++	return 0;
+ }
+ 
+ static int airoha_enable_qos_for_gdm34(struct net_device *netdev,
+@@ -4161,11 +4180,15 @@
+ 			err = -EBUSY;
+ 			goto error_unlock;
+ 		}
+-		airoha_disable_qos_for_gdm34(netdev_from_priv(wan_dev));
++		err = airoha_disable_qos_for_gdm34(netdev_from_priv(wan_dev));
++		if (err)
++			goto error_unlock;
+ 	}
+ 
+ 	set_bit(AIROHA_DEV_F_WAN, &dev->flags);
+-	airoha_dev_set_qdma(dev);
++	err = airoha_dev_set_qdma(dev);
++	if (err)
++		goto error_disable_wan;
+ 	err = airoha_enable_gdm2_loopback(dev);
+ 	if (err)
+ 		goto error_disable_wan;
+@@ -4192,7 +4215,8 @@
+ 	airoha_disable_gdm2_loopback(dev);
+ error_disable_wan:
+ 	clear_bit(AIROHA_DEV_F_WAN, &dev->flags);
+-	airoha_dev_set_qdma(dev);
++	if (airoha_dev_set_qdma(dev))
++		err = -EIO;
+ error_unlock:
+ 	mutex_unlock(&flow_offload_mutex);
+ 
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -745,6 +745,14 @@
+ #define AIROHA_RXD4_PPE_CPU_REASON	GENMASK(20, 16)
+ #define AIROHA_RXD4_FOE_ENTRY		GENMASK(15, 0)
+ 
++#define AIROHA_CT_IFC_CPU_RULES 19
++
++struct airoha_ct_ifc_cpu_rule {
++	u32 tcam[9][2], action[3][3];
++	u16 tcam_dirty;
++	u8 action_dirty;
++};
++
+ struct airoha_ct_native_pair;
+ 
+ struct airoha_ppe {
+@@ -760,6 +768,7 @@
+ 			u8 lut_index, action_dirty;
+ 			bool lut_dirty;
+ 		} rule[2];
++		struct airoha_ct_ifc_cpu_rule cpu_rule[AIROHA_CT_IFC_CPU_RULES];
+ 		bool cfg_owned;
+ 	} ct_ifc;
+ 	bool ct_host_ppe;
+@@ -851,6 +860,7 @@
+ 	/* Serializes sticky CPU fallback with GDM routes and QDMA publication. */
+ 	spinlock_t ct_route_lock;
+ 	u16 ct_cpu_route_mask[AIROHA_MAX_NUM_GDM_PORTS];
++	bool ct_ifc_cpu_port_failed;
+ 	bool ct_cpu_fallback;
+ 	bool ct_cpu_ifc_disabled;
+ 	bool ct_cpu_routes_ready;
