@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# != 2 && $# != 3 ]]; then
-  echo "usage: bash $0 STOCK_USERFS NEW_OVERLAY_DIRECTORY [REBUILT_PAYLOAD_DIRECTORY]" >&2
+if [[ $# != 2 && $# != 3 && !( $# == 4 && $3 == --full-test ) ]]; then
+  echo "usage: bash $0 STOCK_USERFS NEW_OVERLAY_DIRECTORY [REBUILT_PAYLOAD_DIRECTORY | --full-test PAYLOAD_DIRECTORY]" >&2
   exit 2
 fi
 source_dir=$(cd "$1" && pwd)
 repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 rebuilt_dir=
+full_dir=
 if [[ $# == 3 ]]; then
   rebuilt_dir=$(cd "$3" && pwd)
+elif [[ $# == 4 ]]; then
+  full_dir=$(cd "$4" && pwd)
 fi
 package=package/firmware/hg5585f-ct-npu-firmware
 firmware=(npu_rv32.bin npu_data.bin)
@@ -17,7 +20,7 @@ firmware=(npu_rv32.bin npu_data.bin)
 mkdir -- "$2"
 overlay=$(cd "$2" && pwd)
 cd "$repo"
-for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebuilt" \
+for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebuilt" "$package/SHA256SUMS.full-test" \
   package/kernel/mt76/{Makefile,patches/111-mt7915-connac2-mailbox.patch,patches/112-mt7915-connac2-counters.patch,patches/113-mt7915-connac2-rx-rings.patch} \
   package/kernel/mt76/patches/{114-mt7915-connac2-host-rx.patch,115-mt7915-connac2-host-dequeue.patch,116-mt7915-connac2-packet-count.patch} \
   package/kernel/mt76/patches/{117-mt7915-connac2-pcie-windows.patch,118-mt7915-connac2-completion-counts.patch} \
@@ -74,14 +77,15 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/patches-6.18/958-net-airoha-retain-pon-mappings-on-flow-retirement-errors.patch \
   target/linux/airoha/patches-6.18/959-net-airoha-serialize-pon-bearer-updates.patch \
   target/linux/airoha/patches-6.18/960-net-airoha-isolate-native-ingress-with-ifc-cpu-guards.patch \
-  target/linux/airoha/patches-6.18/96[1-8]-*.patch \
+  target/linux/airoha/patches-6.18/96[1-9]-*.patch \
+  target/linux/airoha/patches-6.18/970-net-airoha-keep-optical-ingress-on-wan-cpu-in-full-test.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config,NATIVE_PAIRS.md} \
   target/linux/airoha/tests/native_pair/*.{py,c} \
   target/linux/airoha/tests/native_pair/fixtures/*.inc \
   target/linux/airoha/tests/station_activity/*.py \
   target/linux/airoha/tests/pon_offload/*.{py,c,h,md} \
   target/linux/airoha/tests/tunnel/*.{py,c,sh,md} \
-  target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed.dts}; do
+  target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed-full-test.dts}; do
   mkdir -p "$overlay/tree/$(dirname "$path")"
   install -m 644 "$path" "$overlay/tree/$path"
 done
@@ -100,6 +104,14 @@ printf '%s\n' CONFIG_MT7915_NPU=y CONFIG_PACKAGE_hg5585f-ct-npu-firmware=y \
   CONFIG_PACKAGE_kmod-mt7916-ct-wed-prepare=y > "$overlay/local.config"
 if [[ -n "$rebuilt_dir" ]]; then
   printf '%s\n' CONFIG_PACKAGE_hg5585f-ct-npu-rebuilt-firmware=y \
+    CONFIG_PACKAGE_kmod-nft-core=y CONFIG_PACKAGE_kmod-nft-bridge=y >> "$overlay/local.config"
+fi
+if [[ -n "$full_dir" ]]; then
+  for kind in rv32 data; do
+    install -m 644 "$full_dir/ram-npu_$kind.bin" "$overlay/tree/$package/files/npu_full_test_$kind.bin"
+  done
+  (cd "$overlay/tree/$package/files" && sha256sum -c ../SHA256SUMS.full-test)
+  printf '%s\n' CONFIG_PACKAGE_hg5585f-ct-npu-full-test-firmware=y \
     CONFIG_PACKAGE_kmod-nft-core=y CONFIG_PACKAGE_kmod-nft-bridge=y >> "$overlay/local.config"
 fi
 python3 - "$overlay" <<'PY_MANIFEST'
