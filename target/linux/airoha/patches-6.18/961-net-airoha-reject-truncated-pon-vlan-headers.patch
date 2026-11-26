@@ -1,0 +1,50 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: reject truncated PON VLAN headers before GEM lookup
+
+An unreadable VLAN header must not select the wildcard GEM as an untagged
+frame. Read the EtherType before requiring a complete VLAN header so real
+untagged frames shorter than VLAN_ETH_HLEN still select their bearer.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2963,11 +2963,13 @@
+-static void airoha_pon_skb_vlan(struct sk_buff *skb, u16 *vlan_id,
++static bool airoha_pon_skb_vlan(struct sk_buff *skb, u16 *vlan_id,
+ 				 u8 *pbit)
+ {
+ 	struct vlan_ethhdr vlan_header;
+ 	const struct vlan_ethhdr *header;
++	struct ethhdr eth_header;
++	const struct ethhdr *eth;
+ 	u16 tci;
+ 
+ 	*vlan_id = AIROHA_PON_VID_ANY;
+ 	*pbit = 0;
+ 	if (skb_vlan_tag_present(skb)) {
+ 		*vlan_id = skb_vlan_tag_get_id(skb);
+@@ -2975,10 +2977,16 @@
+-		return;
++		return true;
+ 	}
++	eth = skb_header_pointer(skb, 0, sizeof(eth_header), &eth_header);
++	if (!eth)
++		return false;
++	if (!eth_type_vlan(eth->h_proto))
++		return true;
+ 	header = skb_header_pointer(skb, 0, sizeof(vlan_header), &vlan_header);
+-	if (!header || !eth_type_vlan(header->h_vlan_proto))
+-		return;
++	if (!header)
++		return false;
+ 
+ 	tci = ntohs(header->h_vlan_TCI);
+ 	*vlan_id = tci & VLAN_VID_MASK;
+ 	*pbit = (tci & VLAN_PRIO_MASK) >> VLAN_PRIO_SHIFT;
++	return true;
+ }
+@@ -2995,3 +3003,4 @@
+-	airoha_pon_skb_vlan(skb, &vlan_id, &pbit);
++	if (!airoha_pon_skb_vlan(skb, &vlan_id, &pbit))
++		return 0;
+ 	table = rcu_dereference(dev->pon_flow_table);
+ 	if (!table)
