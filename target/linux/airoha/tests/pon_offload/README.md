@@ -63,6 +63,8 @@ python3 verify_ewan_ingress.py --stock-dir /path/to/stock/lib/modules \
 
 4,608 个场景从固定 SHA 的原厂函数入口执行至返回。覆盖 32 个 channel、18 种 `msg0[29:14]` 值和全部三位行标志组合，邻行有效位与目标行相反。结果为 1,152 次接收、1,152 次策略丢弃、2,304 次行未启用。此处记录的是 EPON CPU 数据路径；GDM2→FE32 的硬件业务来源和有效条件仍须独立核对。
 
+`971` 在主机 QDMA 收到 PPE 学习请求时，将完整 GEM 与已发布的单播映射比对，EPON 则只比对当前注册的 channel。映射更新中、描述符标错、控制包和跨描述符的光侧帧跳过学习，软件收发路径保留。RCU 读段覆盖映射查询和学习调用，沿用现有撤流事务的 `synchronize_net()`。运行 `python3 verify_rx_learn.py --source /path/to/linux-after-971` 可核对所有 65,536 个 GEM 值、32×32 对 EPON channel 及异常条件。这项检查用于 CPU 学习入口；已绑定硬件流的逐包业务隔离仍由 FE 分类器负责。
+
 `verify_path_order.py` 从真实 netfilter 路径生成、tuple 反转、action 生成和 Airoha action 解析一路执行到 PON GEM 选择。96 个场景覆盖两个方向、IPv4/IPv6、单/双 VLAN、PPPoE+单 VLAN，以及 PPPoE+双 VLAN 的现有两层容量拒绝。IPv6 测试执行驱动的出口准入判断，并检查物理端口、桥接、输入封装键、VLAN 剥离、优先级、保留 VID 和 PPPoE 会话号。
 
 `965` 把入方向 PPPoE 会话号、EtherType 和 PPP 协议加入 flowtable 交给驱动的精确匹配键。184 次入向检查涵盖 IPv4/IPv6、TCP/UDP、相同五元组下仅 SID 高位不同、裸 PPPoE 和外层 802.1Q、硬件处理外层 VLAN，以及保留 SID、倒置和超限封装。Airoha 的 IPv4/IPv6 FOE 当前无法匹配入方向 SID，驱动在发布前拒绝该类规则，保留原有普通 IP 路径和出方向 PPPoE 动作。测试在 CT 和普通 PPE 模式下均检查物理有线出口，另有四个运行期负控制。

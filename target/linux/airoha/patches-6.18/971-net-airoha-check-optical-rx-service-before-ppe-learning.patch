@@ -1,0 +1,72 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: check optical RX service before PPE learning
+
+Check the host QDMA descriptor against the published bearer mapping before
+passing an optical data packet to the PPE learner. Keep the read section
+through learning so bearer retirement waits for in-flight checks. Leave
+software delivery and the separate optical hardware qualifier unchanged.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1013,6 +1013,53 @@
+ 	rcu_read_unlock();
+ }
+ 
++static bool airoha_qdma_pon_learnable(struct airoha_gdm_dev *dev, u32 msg0)
++{
++	const struct airoha_pon_flow_table *table;
++	u16 gem = FIELD_GET(QDMA_ETH_RXMSG_GEM_MASK, msg0);
++	u32 tag;
++	unsigned int i;
++
++	if (smp_load_acquire(&dev->pon_update_blocked) ||
++	    (msg0 & (QDMA_ETH_RXMSG_OAM_MASK | QDMA_ETH_RXMSG_CRC_ERR_MASK |
++		     QDMA_ETH_RXMSG_RUNT_MASK | QDMA_ETH_RXMSG_LONG_MASK)))
++		return false;
++
++	tag = READ_ONCE(dev->pon_qdma_tag);
++	if (tag & AIROHA_PON_QDMA_EPON)
++		return (tag & AIROHA_PON_QDMA_VALID) &&
++		       FIELD_GET(QDMA_ETH_RXMSG_CHANNEL_MASK, msg0) ==
++		       FIELD_GET(AIROHA_PON_QDMA_TCONT_MASK, tag);
++
++	table = rcu_dereference(dev->pon_flow_table);
++	for (i = 0; table && i < table->count; i++) {
++		tag = table->entries[i].tag;
++		if ((tag & AIROHA_PON_QDMA_VALID) &&
++		    FIELD_GET(AIROHA_PON_QDMA_GEM_MASK, tag) == gem)
++			return true;
++	}
++	return false;
++}
++
++static void airoha_qdma_learn_skb(struct airoha_gdm_dev *dev,
++				 struct sk_buff *skb, u32 hash, u32 msg0)
++{
++	if (skb->dev != netdev_from_priv(dev))
++		return;
++	if (!test_bit(AIROHA_DEV_F_PON, &dev->flags)) {
++		airoha_ppe_check_skb(&dev->eth->ppe->dev, skb, hash, false);
++		return;
++	}
++
++	/* Only one descriptor supplies provenance for the entire frame. */
++	if (skb_is_nonlinear(skb))
++		return;
++	rcu_read_lock();
++	if (airoha_qdma_pon_learnable(dev, msg0))
++		airoha_ppe_check_skb(&dev->eth->ppe->dev, skb, hash, false);
++	rcu_read_unlock();
++}
++
+ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget)
+ {
+ 	enum dma_data_direction dir = page_pool_get_dma_dir(q->page_pool);
+@@ -1156,6 +1203,5 @@
+ 		reason = FIELD_GET(AIROHA_RXD4_PPE_CPU_REASON, msg1);
+ 		if (reason == PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED)
+-			airoha_ppe_check_skb(&eth->ppe->dev, q->skb, hash,
+-					     false);
++			airoha_qdma_learn_skb(dev, q->skb, hash, msg0);
+ 
+ 		done++;
