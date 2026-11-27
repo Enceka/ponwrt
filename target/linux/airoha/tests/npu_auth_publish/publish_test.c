@@ -11,6 +11,7 @@
 #define TEST_COUNT 32u
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
 #define CHECK(condition) do { \
+	++checks; \
 	if (!(condition)) { \
 		fprintf(stderr, "CHECK failed [%s] line %d: %s\n", \
 			test_name, __LINE__, #condition); \
@@ -20,6 +21,8 @@
 
 static const char *test_name = "startup";
 static unsigned int publications;
+static unsigned long checks;
+static auth_u32 test_bank;
 
 enum fault_kind {
 	FAULT_NONE, FAULT_BEFORE, FAULT_AFTER, FAULT_XOR, FAULT_SET
@@ -50,6 +53,7 @@ static struct airoha_npu_auth_rule make_rule(auth_u32 index)
 	};
 
 	rule.raw[2] += index;
+	rule.raw[3] = test_bank;
 	rule.raw[4] += index;
 	rule.raw[19] += index;
 	return rule;
@@ -320,7 +324,7 @@ static void test_invalid(void)
 		auth_u32 word, value;
 	} invalid[] = {
 		{ 0, 0 }, { 0, 2 }, { 1, 0 }, { 1, TEST_EPOCH + 1 },
-		{ 2, 0 }, { 3, 0 }, { 3, 2 }, { 4, 8192 }, { 4, UINT32_MAX },
+		{ 2, 0 }, { 3, 2 }, { 3, UINT32_MAX }, { 4, 8192 }, { 4, UINT32_MAX },
 		{ 5, 1 }, { 5, 2 }, { 5, 3 }, { 5, 5 }, { 6, 0 }, { 6, 3 },
 		{ 6, 24 }, { 7, 65536 }, { 7, UINT32_MAX },
 		{ 8, 0 }, { 8, TEST_GENERATION + 1 },
@@ -407,36 +411,70 @@ static void check_firmware_conflict(const struct airoha_npu_auth_rule *first,
 static void test_duplicates(void)
 {
 	struct airoha_npu_auth_rule rules[TEST_COUNT];
-	auth_u32 variant;
+	auth_u32 variant, other_bank;
 
 	test_name = "firmware-duplicate-key-token-row";
-	for (variant = 0; variant < 7; ++variant) {
-		fill_rules(rules, TEST_COUNT);
-		if (variant == 0)
-			rules[31].raw[2] = rules[0].raw[2];
-		else if (variant == 1)
-			rules[31].raw[4] = rules[0].raw[4];
-		else {
-			rules[31].raw[19] = rules[0].raw[19];
-			if (variant == 3)
-				rules[31].raw[7] = 0x1234;
-			if (variant == 4) {
-				rules[31].raw[20] = 2;
-				rules[31].raw[21] = 0x88a8f123;
-				rules[31].raw[22] = 0x8100b456;
+	for (other_bank = 0; other_bank < 2; ++other_bank) {
+		for (variant = 0; variant < 7; ++variant) {
+			fill_rules(rules, TEST_COUNT);
+			rules[31].raw[3] = test_bank ^ other_bank;
+			if (variant == 0)
+				rules[31].raw[2] = rules[0].raw[2];
+			else if (variant == 1)
+				rules[31].raw[4] = rules[0].raw[4];
+			else {
+				rules[31].raw[19] = rules[0].raw[19];
+				if (variant == 3)
+					rules[31].raw[7] = 0x1234;
+				if (variant == 4) {
+					rules[31].raw[20] = 2;
+					rules[31].raw[21] = 0x88a8f123;
+					rules[31].raw[22] = 0x8100b456;
+				}
+				if (variant == 5) {
+					rules[31].raw[23] = 0x1234;
+					rules[31].raw[24] = 0x21;
+				}
+				if (variant == 6) {
+					rules[31].raw[25] ^= 0x02000000u;
+					rules[31].raw[26] ^= 0x200u;
+				}
 			}
-			if (variant == 5) {
-				rules[31].raw[23] = 0x1234;
-				rules[31].raw[24] = 0x21;
-			}
-			if (variant == 6) {
-				rules[31].raw[25] ^= 0x02000000u;
-				rules[31].raw[26] ^= 0x200u;
-			}
+			check_frame(&rules[31]);
+			check_firmware_conflict(&rules[0], &rules[31]);
+			expect_rejected(TEST_EPOCH, TEST_GENERATION, rules, TEST_COUNT, -EEXIST);
 		}
-		check_frame(&rules[31]);
-		check_firmware_conflict(&rules[0], &rules[31]);
-		expect_rejected(TEST_EPOCH, TEST_GENERATION, rules, TEST_COUNT, -EEXIST);
+	}
+}
+
+static void test_bank_metadata(void)
+{
+	static const auth_u32 rows[] = { 0, 1, 0x458, 8191 };
+	static const auth_u32 invalid_banks[] = { 2, UINT32_MAX };
+	struct airoha_npu_auth_rule rules[TEST_COUNT];
+	struct npu_auth_state state;
+	struct npu_auth_rule firmware_rule;
+	auth_u32 index;
+
+	test_name = "bank-row-boundaries-and-mixed-publication";
+	for (index = 0; index < ARRAY_SIZE(rows); ++index) {
+		rules[0] = make_rule(0);
+		rules[0].raw[4] = rows[index];
+		expect_success(rules, 1);
+	}
+	fill_rules(rules, TEST_COUNT);
+	for (index = 0; index < TEST_COUNT; ++index)
+		rules[index].raw[3] = test_bank ^ (index & 1u);
+	expect_success(rules, TEST_COUNT);
+	for (index = 0; index < ARRAY_SIZE(invalid_banks); ++index) {
+		rules[0] = make_rule(0);
+		rules[0].raw[3] = invalid_banks[index];
+		expect_rejected(TEST_EPOCH, TEST_GENERATION, rules, 1, -EINVAL);
+		npu_auth_init(&state);
+		CHECK(!npu_auth_begin(&state, TEST_EPOCH));
+		memcpy(&firmware_rule, rules, sizeof(firmware_rule));
+		CHECK(npu_auth_add(&state, &firmware_rule) == NPU_AUTH_INVALID);
+		CHECK(!state.count && !state.enabled && !state.inflight);
 	}
 }
 
@@ -527,6 +565,8 @@ static void test_transport_values(void)
 	prepare(&mock, &rule, 1);
 	CHECK(publish(&mock, &rule) == 0);
 	CHECK(mock.last_add.w[AM_ABI_OP] == 0x00020001);
+	CHECK(mock.last_add.w[AM_RULE + 3] == test_bank);
+	CHECK(mock.last_add.w[AM_RULE + 4] == 127);
 	CHECK(mock.last_add.w[AM_RULE + 1] == 0x10203040);
 	CHECK(mock.last_add.w[AM_RULE + 7] == 0xabcd);
 	CHECK(mock.last_add.w[AM_RULE + 8] == 0x8090a0b0);
@@ -542,6 +582,9 @@ static void test_transport_values(void)
 	CHECK(!memcmp(wire + AM_ABI_OP * 4, "\x01\x00\x02\x00", 4));
 	CHECK(!memcmp(wire + AM_EPOCH * 4, "\x40\x30\x20\x10", 4));
 	CHECK(!memcmp(wire + AM_GENERATION * 4, "\xb0\xa0\x90\x80", 4));
+	CHECK(!memcmp(wire + (AM_RULE + 3) * 4,
+		      test_bank ? "\x01\x00\x00\x00" : "\x00\x00\x00\x00", 4));
+	CHECK(!memcmp(wire + (AM_RULE + 4) * 4, "\x7f\x00\x00\x00", 4));
 	CHECK(!memcmp(wire + (AM_RULE + 7) * 4, "\xcd\xab\x00\x00", 4));
 	CHECK(!memcmp(wire + (AM_RULE + 11) * 4, "\x01\x02\x00\xc0", 4));
 	CHECK(!memcmp(wire + (AM_RULE + 19) * 4, "\xcd\xab\x34\x12", 4));
@@ -564,19 +607,22 @@ static int null_context_command(void *ctx, struct npu_auth_message *message)
 
 int main(void)
 {
-	struct airoha_npu_auth_rule rule = make_rule(0);
+	for (test_bank = 0; test_bank < 2; ++test_bank) {
+		struct airoha_npu_auth_rule rule = make_rule(0);
 
-	test_valid();
-	test_invalid();
-	test_duplicates();
-	test_failures();
-	test_replies();
-	test_transport_values();
-	test_name = "optional-context";
-	CHECK(airoha_npu_auth_publish(TEST_EPOCH, TEST_GENERATION, &rule, 1,
-				     null_context_command, NULL) == 0);
-	printf("PASS: %u publications; canonical/firmware, numeric transport, "
-	       "34 boundaries, all 48 reply words, lost ACK and zero-command rejection\n",
-	       publications + 1);
+		test_valid();
+		test_invalid();
+		test_duplicates();
+		test_bank_metadata();
+		test_failures();
+		test_replies();
+		test_transport_values();
+		test_name = "optional-context";
+		++publications;
+		CHECK(airoha_npu_auth_publish(TEST_EPOCH, TEST_GENERATION, &rule, 1,
+					     null_context_command, NULL) == 0);
+	}
+	printf("{\"passed\":true,\"banks\":2,\"publications\":%u,\"checks\":%lu}\n",
+	       publications, checks);
 	return 0;
 }

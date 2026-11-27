@@ -1,14 +1,36 @@
 import argparse
+from datetime import datetime
+import hashlib
+import json
 import os
 from pathlib import Path
 import resource
 import shlex
-import shutil
 import subprocess
-import tempfile
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "npu_ingress"))
+from source_binding import SourceBinding
+
+FINAL_PATCH = "999-zw-net-airoha-align-pon-auth-bank-metadata.patch"
 
 
 MUTANTS = (
+    ("reject-bank0", "raw[3] > 1u", "raw[3] != 1u"),
+    ("reject-bank1", "raw[3] > 1u", "raw[3] != 0u"),
+    ("accept-invalid-bank", "raw[3] > 1u", "0u"),
+    ("allow-cross-bank-duplicate-row", "raw[4] == other[4]",
+     "(raw[3] == other[3] && raw[4] == other[4])"),
+    ("allow-cross-bank-duplicate-token", "raw[2] == other[2]",
+     "(raw[3] == other[3] && raw[2] == other[2])"),
+    ("allow-cross-bank-duplicate-tuple",
+     "!memcmp(key, other + 9, 11u * sizeof(auth_u32))",
+     "(raw[3] == other[3] && !memcmp(key, other + 9, 11u * sizeof(auth_u32)))"),
+    ("rewrite-published-bank",
+     "memcpy(message.w + AM_RULE, rule->raw, sizeof(rule->raw));",
+     "memcpy(message.w + AM_RULE, rule->raw, sizeof(rule->raw));\n"
+     "\tmessage.w[AM_RULE + 3] = 1u;"),
     (
         "accept-zero-token",
         "raw[1] != epoch || !raw[2] ||",
@@ -75,7 +97,7 @@ MUTANTS = (
 )
 
 
-def run(arguments, environment):
+def run(arguments, environment, log, expect_success=True):
     result = subprocess.run(
         [str(argument) for argument in arguments],
         env=environment,
@@ -84,21 +106,23 @@ def run(arguments, environment):
         stderr=subprocess.STDOUT,
         timeout=120,
     )
-    if result.returncode:
+    log.write_text(result.stdout)
+    if expect_success and result.returncode:
         raise RuntimeError(
             "command failed: " + shlex.join([str(value) for value in arguments])
             + "\n" + result.stdout
         )
-    return result.stdout
+    return result
 
 
 def main():
-    repository = Path(__file__).resolve().parents[5]
-    parser = argparse.ArgumentParser(description="Exercise the applied 995 production header.")
+    tests = Path(__file__).resolve().parent
+    repository = tests.parents[4]
+    parser = argparse.ArgumentParser(description="Exercise the production AUTH header through ZW against firmware.")
     parser.add_argument(
-        "--source-snapshot",
+        "--source-snapshot", "--source", dest="source_snapshot",
         type=Path,
-        default=repository.parent / "pon-er-consumer-20261127" / "owner-source-final",
+        default=repository.parent / "pon-npu-diag-20261127/auth-bank-metadata/source",
     )
     parser.add_argument(
         "--firmware",
@@ -106,25 +130,40 @@ def main():
         default=repository.parent.parent / "an7581-npu-firmware",
     )
     parser.add_argument("--cc", default=os.environ.get("CC", "clang"))
+    parser.add_argument("--output", type=Path,
+                        default=repository.parent / "pon-npu-diag-20261127/auth-bank-metadata" /
+                        ("publish-" + datetime.now().strftime("%Y%m%d-%H%M%S")))
     arguments = parser.parse_args()
     firmware = arguments.firmware.resolve()
     snapshot = arguments.source_snapshot.resolve()
-    patch_file = repository / "target/linux/airoha/patches-6.18/995-net-airoha-validate-pon-authorization-publication.patch"
+    output = arguments.output.resolve()
+    if (output.is_relative_to(repository) or any(
+            output == root or output.is_relative_to(root) or root.is_relative_to(output)
+            for root in (snapshot, firmware))):
+        parser.error("output must be new, outside ponwrt, and separate from source and firmware")
+    output.mkdir(parents=True, exist_ok=False)
     relative_header = Path("drivers/net/ethernet/airoha/airoha_npu_auth_publish.h")
     abi_name = "npu_auth_mailbox_abi.h"
     abi_file = snapshot / relative_header.parent / abi_name
-    patch_text = patch_file.read_text()
-    if patch_text.splitlines()[0] != "From: Enceka <enceka@yeah.net>":
-        raise RuntimeError("unexpected patch author")
-    targets = [line[6:] for line in patch_text.splitlines() if line.startswith("+++ b/")]
-    if targets != [str(relative_header)] or patch_text.count("--- /dev/null\n") != 1:
-        raise RuntimeError("995 must add only the production publication header")
-    if abi_file.read_bytes() != (firmware / "include" / abi_name).read_bytes():
+    inputs = {path: path.read_bytes() for path in (
+        snapshot / relative_header, abi_file, firmware / "src/ingress_auth.c",
+        firmware / "include/npu_ingress_auth.h", firmware / "include" / abi_name,
+    )}
+    test_inputs = {tests / name: (tests / name).read_bytes()
+                   for name in ("verify.py", "publish_test.c", "README.md")}
+    helper = tests.parent / "npu_ingress/source_binding.py"
+    helper_bytes = helper.read_bytes()
+    binding = SourceBinding(repository / "target/linux/airoha/patches-6.18", output, FINAL_PATCH)
+    binding.bind(snapshot / relative_header.parent, (relative_header.name,))
+    if inputs[abi_file] != inputs[firmware / "include" / abi_name]:
         raise RuntimeError("snapshot and firmware mailbox ABI headers differ")
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     environment = dict(os.environ)
     environment["ASAN_OPTIONS"] = "halt_on_error=1:abort_on_error=1"
     environment["UBSAN_OPTIONS"] = "halt_on_error=1:print_stacktrace=1"
+    temporary = output / "tmp"
+    temporary.mkdir()
+    environment["TMPDIR"] = str(temporary)
     compiler = shlex.split(arguments.cc)
     flags = [
         "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
@@ -132,56 +171,62 @@ def main():
         "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
         "-DNPU_CT_FE_PON_AUTH=1",
     ]
-    print("Compiler: " + run(compiler + ["--version"], environment).splitlines()[0], flush=True)
+    version = run(compiler + ["--version"], environment, output / "compiler.log").stdout
+    print("Compiler: " + version.splitlines()[0], flush=True)
     print("Flags: " + shlex.join(flags), flush=True)
-    with tempfile.TemporaryDirectory(prefix="npu-auth-publish-") as directory:
-        temporary = Path(directory)
-        header = temporary / relative_header
-        header.parent.mkdir(parents=True)
-        print(run(
-            ["patch", "--batch", "-p1", "-d", temporary, "-i", patch_file],
-            environment,
-        ).strip(), flush=True)
-        original = header.read_text()
-        shutil.copyfile(abi_file, header.parent / abi_name)
-        includes = ["-I", str(header.parent), "-I", str(firmware / "include")]
-        firmware_object = temporary / "ingress_auth.o"
-        run(
-            compiler + flags + includes
-            + ["-c", str(firmware / "src/ingress_auth.c"), "-o", str(firmware_object)],
-            environment,
-        )
-        executable = temporary / "publish_test"
-        build = (
-            compiler + flags + includes
-            + [str(Path(__file__).with_name("publish_test.c")), str(firmware_object),
-               "-o", str(executable)]
-        )
-        run(build, environment)
-        print(run([executable], environment).strip(), flush=True)
-        for name, before, after in MUTANTS:
-            if original.count(before) != 1:
-                raise RuntimeError("mutant anchor is not unique: " + name)
-            header.write_text(original.replace(before, after, 1))
-            run(build, environment)
-            result = subprocess.run(
-                [str(executable)],
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=120,
-            )
-            if result.returncode == 0 or "CHECK failed [" not in result.stdout:
-                raise RuntimeError("mutant was not caught by a runtime assertion: "
-                                   + name + "\n" + result.stdout)
-            failure = next(line for line in result.stdout.splitlines()
-                           if "CHECK failed [" in line)
-            print("KILLED " + name + ": " + failure, flush=True)
-        header.write_text(original)
-    print("PASS: applied production header; ASan/UBSan; "
-          + str(len(MUTANTS)) + "/" + str(len(MUTANTS))
-          + " compiled runtime mutants killed; temporary outputs removed", flush=True)
+    print("PASS exact source binding through " + FINAL_PATCH, flush=True)
+    original = inputs[snapshot / relative_header].decode()
+    firmware_object = output / "ingress_auth.o"
+    firmware_build = compiler + flags + ["-I", str(firmware / "include"),
+        "-c", str(firmware / "src/ingress_auth.c"), "-o", str(firmware_object)]
+    run(firmware_build, environment, output / "firmware-build.log")
+    commands = [firmware_build]
+
+    def build_run(name, header_text):
+        directory = output / name
+        directory.mkdir()
+        (directory / relative_header.name).write_text(header_text)
+        (directory / abi_name).write_bytes(inputs[abi_file])
+        executable = directory / "publish_test"
+        build = compiler + flags + ["-I", str(directory), "-I", str(firmware / "include"),
+            str(tests / "publish_test.c"), str(firmware_object), "-o", str(executable)]
+        commands.extend((build, [str(executable)]))
+        run(build, environment, directory / "build.log")
+        return run([executable], environment, directory / "run.log", expect_success=False)
+
+    baseline = build_run("baseline", original)
+    if baseline.returncode:
+        raise RuntimeError("baseline failed:\n" + baseline.stdout)
+    summary = json.loads(baseline.stdout)
+    assert summary["passed"]
+    print("PASS baseline " + baseline.stdout.strip(), flush=True)
+    detected = []
+    for name, before, after in MUTANTS:
+        if original.count(before) != 1:
+            raise RuntimeError("mutant anchor is not unique: " + name)
+        result = build_run(name, original.replace(before, after, 1))
+        if (result.returncode != 1 or "CHECK failed [" not in result.stdout or
+                "Sanitizer" in result.stdout or "runtime error:" in result.stdout):
+            raise RuntimeError("mutant requires a runtime CHECK failure: " + name + "\n" + result.stdout)
+        failure = next(line for line in result.stdout.splitlines() if "CHECK failed [" in line)
+        detected.append({"name": name, "exit_code": result.returncode, "assertion": failure})
+        print("KILLED " + name + ": " + failure, flush=True)
+    binding.verify_unchanged()
+    for path, data in {**inputs, **test_inputs, helper: helper_bytes}.items():
+        if path.read_bytes() != data:
+            raise RuntimeError("input changed during run: " + str(path))
+    report = {
+        "passed": True, "baseline": summary, "source_binding": binding.report(),
+        "sanitizers": ["address", "undefined"], "negative_controls": detected,
+        "source_binding_helper_sha256": hashlib.sha256(helper_bytes).hexdigest(),
+        "inputs_sha256": {str(path): hashlib.sha256(data).hexdigest() for path, data in inputs.items()},
+        "tests_sha256": {path.name: hashlib.sha256(data).hexdigest() for path, data in test_inputs.items()},
+        "compiler": version, "commands": commands,
+        "scope": "Public AUTH validator/publication helper linked with unchanged firmware ingress_auth.c; owner admission and diagnostic publication are tested separately.",
+    }
+    (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    print("PASS: source binding; address/undefined sanitizers; " + str(len(detected)) +
+          "/" + str(len(MUTANTS)) + " runtime mutants; report: " + str(output / "report.json"), flush=True)
 
 
 if __name__ == "__main__":
