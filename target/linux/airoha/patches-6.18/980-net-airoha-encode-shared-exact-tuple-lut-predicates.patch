@@ -1,0 +1,70 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: encode shared exact tuple LUT predicates
+
+Encode independent END predicates for IPv4 and IPv6 TCP/UDP tuples.
+Keep tuple words independent of service and physical LUT placement so
+identical predicates can be shared by a future reference-counted owner.
+Leave service row construction, packet validity and length guards,
+allocation and hardware admission to a separately validated consumer.
+This header performs no I/O and exposes no admission or row API.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_ifc_tuple_words.h
+@@ -0,0 +1,57 @@
++#ifndef AIROHA_CT_IFC_TUPLE_WORDS_H
++#define AIROHA_CT_IFC_TUPLE_WORDS_H
++
++#define AIROHA_CT_IFC_TUPLE_MAX 11
++
++struct airoha_ct_ifc_tuple {
++	u32 src[4];
++	u32 dst[4];
++	u16 sport;
++	u16 dport;
++	u8 family;
++	u8 protocol;
++};
++
++struct airoha_ct_ifc_tuple_words {
++	u32 lut[AIROHA_CT_IFC_TUPLE_MAX][2];
++	u8 count;
++};
++
++static inline int
++airoha_ct_ifc_tuple_encode(struct airoha_ct_ifc_tuple_words *words,
++			    const struct airoha_ct_ifc_tuple *tuple)
++{
++	struct airoha_ct_ifc_tuple_words encoded = {};
++	unsigned int index, count;
++
++	if (!words || !tuple || (tuple->family != 4 && tuple->family != 6) ||
++	    (tuple->protocol != 6 && tuple->protocol != 17))
++		return -EINVAL;
++	if (tuple->family == 4)
++		for (index = 1; index < 4; index++)
++			if (tuple->src[index] || tuple->dst[index])
++				return -EINVAL;
++	count = tuple->family == 4 ? 1 : 4;
++	for (index = 0; index < count; index++) {
++		unsigned int part = count - 1 - index;
++		u32 dst_field = tuple->family == 4 ? 3 : 5 + index;
++		u32 src_field = tuple->family == 4 ? 4 : 9 + index;
++
++		encoded.lut[index][0] = tuple->dst[part];
++		encoded.lut[index][1] = BIT(15) | BIT(14) | BIT(13) | dst_field;
++		encoded.lut[count + index][0] = tuple->src[part];
++		encoded.lut[count + index][1] = BIT(15) | BIT(14) | BIT(13) | src_field;
++	}
++	index = count * 2;
++	encoded.lut[index][0] = (0xffU << 16) | tuple->protocol;
++	encoded.lut[index][1] = BIT(15) | BIT(14) | (tuple->family == 4 ? 24 : 25);
++	encoded.lut[index + 1][0] = (0xffffU << 16) | tuple->dport;
++	encoded.lut[index + 1][1] = BIT(15) | BIT(14) | 28;
++	encoded.lut[index + 2][0] = (0xffffU << 16) | tuple->sport;
++	encoded.lut[index + 2][1] = BIT(15) | BIT(14) | 29;
++	encoded.count = index + 3;
++	*words = encoded;
++	return 0;
++}
++
++#endif
