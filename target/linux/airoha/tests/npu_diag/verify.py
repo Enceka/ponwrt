@@ -8,12 +8,18 @@ import resource
 import subprocess
 import sys
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'npu_ingress'))
+from source_binding import SourceBinding
+
 
 FUNCTIONS = {
     'airoha_npu_owner.h': {'active': 'airoha_ppe_npu_diag_active',
                            'retire': 'airoha_npu_owner_retire_locked'},
     'airoha_npu_diag.h': {'platform': 'airoha_npu_diag_platform',
                          'snapshot': 'airoha_npu_diag_snapshot',
+                         'diag_authorize': 'airoha_npu_diag_authorize',
+                         'start_mode': 'airoha_npu_diag_start_mode',
                          'start': 'airoha_npu_diag_start', 'close': 'airoha_npu_diag_close'},
     'airoha_npu_admission.h': {'authorize': 'airoha_ppe_npu_owner_authorize_locked',
                               'ready': 'airoha_npu_owner_ready'},
@@ -60,15 +66,19 @@ def main():
     repo = tests.parents[4]
     output = args.output.resolve()
     source = args.source.resolve()
-    if output.is_relative_to(repo) or output == source or source.is_relative_to(output):
-        parser.error('output must be new, outside ponwrt and separate from source')
+    if (output.is_relative_to(repo) or
+            output == source or source.is_relative_to(output) or output.is_relative_to(source)):
+        parser.error('output must be new, outside ponwrt, and separate from source')
     output.mkdir(parents=True, exist_ok=False)
     extracted = output / 'source'
     extracted.mkdir()
     driver = source / 'drivers/net/ethernet/airoha'
     inputs = {name: (driver / name).read_bytes() for name in [*FUNCTIONS, *HEADERS]}
-    patch = repo / 'target/linux/airoha/patches-6.18/999-zk-net-airoha-add-ram-pon-npu-return-diagnostic.patch'
-    patch_data = patch.read_bytes()
+    binding = SourceBinding(repo / 'target/linux/airoha/patches-6.18', output,
+                            '999-zq-net-airoha-add-nonempty-pon-auth-diagnostic.patch')
+    binding.bind(driver, ('airoha_npu_owner.h', 'airoha_npu_diag.h'))
+    binding_module = tests.parent / 'npu_ingress/source_binding.py'
+    binding_bytes = binding_module.read_bytes()
     for name, functions in FUNCTIONS.items():
         for target, symbol in functions.items():
             (extracted / (target + '.inc')).write_text(function(inputs[name].decode(), symbol))
@@ -87,13 +97,13 @@ def main():
         'ignore_token': ('active.inc', 'owner != token ||', 'false ||'),
         'ignore_policy': ('active.inc', 'ppe->ct_pair_policy_allowed ||', 'false ||'),
         'ignore_qualification': ('active.inc', 'ppe->ct_pon_qualified ||', 'false ||'),
-        'ignore_auth_count': ('active.inc', 'owner->auth_count)', 'false)'),
+        'ignore_auth_count': ('active.inc', 'owner->auth_count > (owner->diag_auth ? 1 : 0)', 'false'),
         'ignore_platform_dt': ('platform.inc', '!of_property_read_bool(ppe->eth->dev->of_node, "airoha,connac2-pon-er-diagnostic")', 'false'),
         'ignore_hog_available': ('platform.inc', 'node && of_device_is_available(node) &&', 'node && true &&'),
         'ignore_hog_count': ('platform.inc', 'of_property_count_u32_elems(node, "gpios") == 2', 'true'),
         'ignore_hog_gpio': ('platform.inc', 'gpios[0] == 38', 'true'),
         'ignore_hog_flags': ('platform.inc', '!gpios[1]', 'true'),
-        'ignore_netdev_parent': ('start.inc', 'lower->dev.parent != eth->dev', 'false'),
+        'ignore_netdev_parent': ('start_mode.inc', 'lower->dev.parent != eth->dev', 'false'),
         'allow_production_auth': ('authorize.inc', 'if (owner->diag_lower)', 'if (false)'),
         'ignore_empty_auth_reply': ('ready.inc', 'message.w[AM_COUNT] != owner->auth_count', 'false'),
         'ignore_restore_error': ('close.inc', 'return error ?: airoha_npu_owner_retire_locked(ppe);', 'return airoha_npu_owner_retire_locked(ppe);'),
@@ -102,6 +112,25 @@ def main():
         'ignore_restore_flow': ('restore.inc', '!airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) &&', 'true &&'),
         'ignore_route_flow': ('routes.inc', 'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) ||', 'false ||'),
         'ignore_route_busy': ('routes.inc', '(airoha_fe_rr(eth, REG_PPE_GLO_CFG(1)) & PPE_GLO_CFG_BUSY_MASK)', 'false'),
+        'allow_two_diagnostic_rules': ('active.inc', '(owner->diag_auth ? 1 : 0)', '(owner->diag_auth ? 2 : 0)'),
+        'ignore_explicit_auth_mode': ('diag_authorize.inc', '!owner->diag_auth ||', 'false ||'),
+        'ignore_closed_phase': ('diag_authorize.inc', 'owner->txn.phase != NPU_TXN_CLOSED', 'false'),
+        'allow_repeated_auth': ('diag_authorize.inc', 'owner->auth_attempted ||', 'false ||'),
+        'ignore_start_service_range': ('start_mode.inc', 'if (service > U16_MAX)', 'if (false)'),
+        'lose_auth_mode': ('start_mode.inc', 'owner->diag_auth = authorize;', 'owner->diag_auth = false;'),
+        'truncate_service': ('diag_authorize.inc', '0, 4, 2, service,', '0, 4, 2, service & 0x7fffu,'),
+        'omit_service_valid': ('diag_authorize.inc', 'ER_SERVICE_VALID | service', 'service'),
+        'ignore_binding_result': ('diag_authorize.inc', '? 0 : -ESTALE', '? 0 : 0'),
+        'wrong_ipv4_source': ('diag_authorize.inc', '0xc0000201', '0xc0000203'),
+        'wrong_ipv4_destination': ('diag_authorize.inc', '0xc0000202', '0xc0000203'),
+        'wrong_udp_ports': ('diag_authorize.inc', '0xc000c001', '0xc001c000'),
+        'wrong_l4_protocol': ('diag_authorize.inc', '4, IPPROTO_UDP,', '4, 6,'),
+        'wrong_source_mac': ('diag_authorize.inc', '{ 2, 0, 0, 0, 0, 1 }', '{ 2, 0, 0, 0, 0, 2 }'),
+        'ignore_post_auth_readiness': ('diag_authorize.inc',
+            'error = airoha_npu_owner_return_ready(owner, &owner->txn.id);', 'error = 0;'),
+        'lose_published_rule_count': ('diag_authorize.inc', 'owner->auth_count = 1;', 'owner->auth_count = 0;'),
+        'ignore_ack_count': ('airoha_npu_auth_publish.h', 'message.w[AM_COUNT] != count ||', 'false ||'),
+        'ignore_ack_rule_echo': ('airoha_npu_auth_publish.h', 'AM_STATUS * sizeof(auth_u32)', 'AM_RULE * sizeof(auth_u32)'),
     }
     caught = {}
     for name, (filename, before, after) in mutations.items():
@@ -118,11 +147,13 @@ def main():
             caught[name] = outcome.returncode
         finally:
             path.write_text(original)
-    assert patch.read_bytes() == patch_data, 'production patch changed during tests; rerun'
+    binding.verify_unchanged()
+    assert binding_module.read_bytes() == binding_bytes, 'source-binding helper changed during tests; rerun'
     assert all((driver / name).read_bytes() == data for name, data in inputs.items()), 'source changed during tests; rerun'
     passed = review['accepted_invalid_hogs'] == 0
     report = {'passed': passed, 'regression_passed': True, 'result': result, 'review': review,
-              'caught_mutations': caught, 'patch_sha256': digest(patch_data),
+              'caught_mutations': caught, 'source_binding': binding.report(),
+              'source_binding_helper_sha256': digest(binding_bytes),
               'source_sha256': {name: digest(data) for name, data in inputs.items()},
               'tests_sha256': {path.name: digest(path.read_bytes()) for path in tests.iterdir() if path.is_file()}}
     (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')

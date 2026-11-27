@@ -1,0 +1,166 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: add bounded nonempty PON AUTH diagnostics
+
+Allow an explicit RAM-only session with one fixed IPv4 UDP authorization
+for an existing service mapping. Keep bank1 learning disabled and retain
+normal production authorization isolation and teardown.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu_owner.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_owner.h
+@@ -25,6 +25,7 @@
+ 	struct net_device *diag_lower;
+ 	const struct airoha_pon_link_ops *diag_controller;
+ 	void *diag_priv;
++	bool diag_auth;
+ 	struct airoha_er_stats diag_stats;
+ 	struct airoha_er_observation diag_observation;
+ };
+@@ -36,7 +37,7 @@
+ 
+ 	if (!owner || owner != token || !owner->diag_lower || owner->retiring ||
+ 	    ppe->ct_pon_qualified || ppe->ct_pair_policy_allowed ||
+-	    ppe->eth->ct_ordinary_full_test || owner->auth_count)
++	    ppe->eth->ct_ordinary_full_test || owner->auth_count > (owner->diag_auth ? 1 : 0))
+ 		return false;
+ 	dev = netdev_priv(owner->diag_lower);
+ 	return dev->eth == ppe->eth && dev->port->id == AIROHA_GDM2_IDX && !dev->nbq &&
+--- a/drivers/net/ethernet/airoha/airoha_npu_diag.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_diag.h
+@@ -41,7 +41,49 @@
+ 	return true;
+ }
+ 
+-static int airoha_npu_diag_start(struct airoha_ppe *ppe)
++static int airoha_npu_diag_authorize(struct airoha_npu_owner *owner, u32 service)
++{
++	struct airoha_npu_auth_rule rule = {
++		.raw = { AUTH_MBOX_ABI, owner->txn.id.epoch, 1, 1, 0, 4, 2, service,
++			 owner->txn.id.generation, 4, IPPROTO_UDP, 0xc0000201, 0, 0, 0,
++			 0xc0000202, 0, 0, 0, 0xc000c001 },
++	};
++	static const u8 source[ETH_ALEN] = { 2, 0, 0, 0, 0, 1 };
++	struct airoha_npu_return *path = owner->return_path;
++	u8 addresses[2 * ETH_ALEN];
++	unsigned int index;
++	int error;
++
++	if (!owner->diag_auth || !airoha_ppe_npu_diag_active(owner->ppe, owner) ||
++	    owner->txn.phase != NPU_TXN_CLOSED || owner->auth_attempted ||
++	    service > U16_MAX || !path)
++		return -EINVAL;
++	ether_addr_copy(addresses, owner->diag_lower->dev_addr);
++	ether_addr_copy(addresses + ETH_ALEN, source);
++	for (index = 0; index < 3; ++index)
++		rule.raw[25 + index] = get_unaligned_be32(addresses + index * sizeof(u32));
++	error = airoha_npu_auth_rules_validate(owner->txn.id.epoch,
++					      owner->txn.id.generation, &rule, 1);
++	if (error)
++		return error;
++	rcu_read_lock();
++	error = airoha_npu_return_binding(path, owner->diag_lower, &path->config,
++					  ER_SERVICE_VALID | service) ? 0 : -ESTALE;
++	rcu_read_unlock();
++	if (error)
++		return error;
++	owner->auth_attempted = true;
++	owner->epoch_dirty = true;
++	error = airoha_npu_auth_publish(owner->txn.id.epoch, owner->txn.id.generation,
++					&rule, 1, airoha_npu_owner_auth, owner);
++	if (!error)
++		error = airoha_npu_owner_return_ready(owner, &owner->txn.id);
++	if (!error)
++		owner->auth_count = 1;
++	return error;
++}
++
++static int airoha_npu_diag_start_mode(struct airoha_ppe *ppe, bool authorize, u32 service)
+ {
+ 	struct airoha_eth *eth = ppe->eth;
+ 	struct airoha_npu_owner *owner;
+@@ -50,6 +92,8 @@
+ 	int error;
+ 
+ 	lockdep_assert_held(&flow_offload_mutex);
++	if (service > U16_MAX)
++		return -EINVAL;
+ 	if (!airoha_npu_diag_platform(ppe))
+ 		return -EPERM;
+ 	if (ppe->ct_npu_owner || ppe->ct_pair_failed || ppe->ct_stopping ||
+@@ -80,6 +124,7 @@
+ 	owner->diag_lower = lower;
+ 	owner->diag_controller = dev->pon_link_ops;
+ 	owner->diag_priv = dev->pon_link_priv;
++	owner->diag_auth = authorize;
+ 	if (error)
+ 		goto out;
+ 	error = airoha_ppe_npu_return_prepare_locked(eth, dev, 8);
+@@ -93,13 +138,17 @@
+ 		error = -ESTALE;
+ 		goto out;
+ 	}
+-	owner->auth_attempted = true;
+-	owner->epoch_dirty = true;
+-	error = airoha_npu_auth_publish_step(owner->txn.id.epoch, owner->txn.id.generation,
+-			AUTH_MBOX_BEGIN, NULL, 0, airoha_npu_owner_auth, owner);
+-	if (!error)
++	if (authorize) {
++		error = airoha_npu_diag_authorize(owner, service);
++	} else {
++		owner->auth_attempted = true;
++		owner->epoch_dirty = true;
+ 		error = airoha_npu_auth_publish_step(owner->txn.id.epoch, owner->txn.id.generation,
++				AUTH_MBOX_BEGIN, NULL, 0, airoha_npu_owner_auth, owner);
++		if (!error)
++			error = airoha_npu_auth_publish_step(owner->txn.id.epoch, owner->txn.id.generation,
+ 				AUTH_MBOX_ARM, NULL, 0, airoha_npu_owner_auth, owner);
++	}
+ 	if (!error)
+ 		error = airoha_ppe_npu_owner_open_locked(eth);
+ out:
+@@ -108,6 +157,11 @@
+ put:
+ 	dev_put(lower);
+ 	return error;
++}
++
++static int airoha_npu_diag_start(struct airoha_ppe *ppe)
++{
++	return airoha_npu_diag_start_mode(ppe, false, 0);
+ }
+ 
+ static void airoha_npu_diag_snapshot(struct airoha_npu_owner *owner)
+@@ -198,10 +252,10 @@
+ 		struct airoha_er_stats *stats = &owner->diag_stats;
+ 
+ 		airoha_npu_diag_snapshot(owner);
+-		seq_printf(stream, "phase=%u error=%d epoch=%u generation=%u invalidated=%u closed_ack=%u saved_flow=%08x saved_tb=%08x ring=%u\n",
++		seq_printf(stream, "phase=%u error=%d epoch=%u generation=%u invalidated=%u closed_ack=%u saved_flow=%08x saved_tb=%08x ring=%u auth_mode=%u\n",
+ 			owner->txn.phase, owner->txn.last_error, owner->txn.id.epoch, owner->txn.id.generation,
+ 			owner->invalidated, owner->closed_ack, owner->bank1_flow, owner->bank1_tb,
+-			owner->return_path && !!owner->return_path->ring);
++			owner->return_path && !!owner->return_path->ring, owner->diag_auth);
+ 		seq_printf(stream, "packets=%llu bytes=%llu dropped=%llu consumed=%u fault=%u observed_produced=%u observed_consumed=%u frame_bytes=%u\n",
+ 			stats->packets, stats->bytes, stats->dropped, stats->consumed, stats->fault,
+ 			observation->produced, observation->consumed, observation->frame_bytes);
+@@ -226,7 +280,8 @@
+ 				   size_t count, loff_t *offset)
+ {
+ 	struct airoha_ppe *ppe = ((struct seq_file *)file->private_data)->private;
+-	char command[16];
++	char command[32];
++	unsigned int service;
+ 	int error;
+ 
+ 	if (!count || count >= sizeof(command) || copy_from_user(command, buffer, count))
+@@ -235,6 +290,11 @@
+ 	mutex_lock(&flow_offload_mutex);
+ 	if (sysfs_streq(command, "start"))
+ 		error = airoha_npu_diag_start(ppe);
++	else if (!strncmp(command, "start-auth ", 11)) {
++		error = kstrtouint(command + 11, 0, &service);
++		if (!error)
++			error = airoha_npu_diag_start_mode(ppe, true, service);
++	}
+ 	else if (sysfs_streq(command, "close"))
+ 		error = airoha_npu_diag_close(ppe, false);
+ 	else if (sysfs_streq(command, "release"))

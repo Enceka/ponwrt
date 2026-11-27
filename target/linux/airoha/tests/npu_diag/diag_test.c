@@ -14,6 +14,9 @@ typedef uint64_t u64;
 typedef uint8_t u8;
 #define BIT(index) (1u << (index))
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
+#define U16_MAX UINT16_MAX
+#define ETH_ALEN 6
+#define IPPROTO_UDP 17
 #define READ_ONCE(value) (value)
 #define WRITE_ONCE(target, value) ((target) = (value))
 #define rcu_access_pointer(pointer) (pointer)
@@ -36,9 +39,10 @@ typedef uint8_t u8;
 static unsigned int checks, cases;
 #define CHECK(condition) do { assert(condition); checks++; } while (0)
 static int flow_offload_mutex = 1, ppe_lock;
+static unsigned int rcu_depth;
 #define lockdep_assert_held(lock) CHECK(*(lock) == 1)
-#define rcu_read_lock() CHECK(flow_offload_mutex)
-#define rcu_read_unlock() CHECK(flow_offload_mutex)
+#define rcu_read_lock() do { CHECK(flow_offload_mutex); rcu_depth++; } while (0)
+#define rcu_read_unlock() do { CHECK(flow_offload_mutex && rcu_depth); rcu_depth--; } while (0)
 
 enum { ETH_NODE, NAND_NODE, MAC_NODE, HOG_NODE, SNAND_NODE, EXTRA_SNAND, NODE_COUNT };
 struct device_node {
@@ -49,7 +53,13 @@ struct device_node {
 	u32 gpio, gpio_flags;
 };
 struct device { struct device *parent; struct device_node *of_node; };
-struct net_device { struct device dev; void *priv; int references; bool running, carrier; };
+struct net_device {
+	struct device dev;
+	void *priv;
+	int references;
+	bool running, carrier;
+	u8 dev_addr[ETH_ALEN];
+};
 struct airoha_pon_link_ops { int identity; };
 struct airoha_qdma { int identity; };
 struct airoha_gdm_port { int id; };
@@ -83,7 +93,7 @@ struct airoha_npu_owner {
 	const struct airoha_pon_link_ops *diag_controller;
 	void *diag_priv;
 	bool retiring, bank1_saved, bank1_host_retired, closed_ack;
-	bool auth_attempted, epoch_dirty;
+	bool auth_attempted, epoch_dirty, diag_auth;
 	u32 auth_count, bank1_next_row, bank1_flow, bank1_tb;
 	struct { bool saved_valid, dirty, active, pending; } ingress;
 	struct airoha_npu_return *return_path;
@@ -129,6 +139,27 @@ static bool mismatch_controller, binding_valid, closed_postconditions;
 static int claim_error, prepare_error, state_error, open_error, close_error;
 static int release_error, fe_error, fail_write, fail_auth_op, bad_auth_word;
 static int route_write_error, scope_error, cpu_port;
+static u32 binding_service;
+static unsigned int binding_calls, ready_calls;
+static int bad_auth_op, fail_auth_status_op;
+static bool fail_ready_after_auth;
+enum { TRACE_BINDING = 5, TRACE_READY, TRACE_OPEN };
+static u32 trace[128], trace_count;
+static struct npu_auth_message auth_requests[5];
+
+static void record_event(u32 event)
+{
+	CHECK(trace_count < ARRAY_SIZE(trace));
+	trace[trace_count++] = event;
+}
+static void ether_addr_copy(u8 *destination, const u8 *source)
+{
+	memcpy(destination, source, ETH_ALEN);
+}
+static u32 get_unaligned_be32(const u8 *bytes)
+{
+	return (u32)bytes[0] << 24 | (u32)bytes[1] << 16 | (u32)bytes[2] << 8 | bytes[3];
+}
 
 static void spin_lock_bh(int *lock) { CHECK(!*lock); *lock = 1; }
 static void spin_unlock_bh(int *lock) { CHECK(*lock == 1); *lock = 0; }
@@ -253,14 +284,20 @@ static int airoha_npu_owner_return_state(struct airoha_npu_owner *owner,
 static int airoha_npu_owner_return_ready(struct airoha_npu_owner *owner,
 					const struct airoha_npu_txn_identity *id)
 {
+	ready_calls++;
+	record_event(TRACE_READY);
+	if (fail_ready_after_auth && auth_calls[AUTH_MBOX_ARM])
+		return -ESTALE;
 	return airoha_npu_owner_return_state(owner, id, NPU_TXN_READY);
 }
 static bool airoha_npu_return_binding(struct airoha_npu_return *actual, struct net_device *netdev,
 				     const struct er_config *config, u32 service)
 {
 	CHECK(actual == &path && netdev == &lower && config == &path.config);
-	CHECK(service == (ER_SERVICE_VALID | 0x1001u));
-	return binding_valid;
+	CHECK(rcu_depth);
+	binding_calls++;
+	record_event(TRACE_BINDING);
+	return binding_valid && service == (ER_SERVICE_VALID | binding_service);
 }
 static int airoha_npu_owner_auth(void *ctx, struct npu_auth_message *message)
 {
@@ -269,6 +306,11 @@ static int airoha_npu_owner_auth(void *ctx, struct npu_auth_message *message)
 
 	CHECK(owner == &session && operation < ARRAY_SIZE(auth_calls));
 	CHECK(message->w[AM_MAGIC] == AUTH_MBOX_MAGIC && message->w[AM_BYTES] == AUTH_MBOX_BYTES);
+	auth_requests[operation] = *message;
+	record_event(operation);
+	if (owner->diag_auth && operation != AUTH_MBOX_QUERY)
+		CHECK(binding_calls == 1 && owner->auth_attempted && owner->epoch_dirty &&
+		      !registers[REG_PPE_PPE_FLOW_CFG(1)]);
 	auth_calls[operation]++;
 	if ((int)operation == fail_auth_op)
 		return -ETIMEDOUT;
@@ -284,7 +326,9 @@ static int airoha_npu_owner_auth(void *ctx, struct npu_auth_message *message)
 	message->w[AM_STATE_GENERATION] = owner->txn.id.generation;
 	message->w[AM_COUNT] = auth_count;
 	message->w[AM_ENABLED] = auth_enabled;
-	if (bad_auth_word >= 0)
+	if ((int)operation == fail_auth_status_op)
+		message->w[AM_STATUS] = (u32)-EIO;
+	if (bad_auth_word >= 0 && (bad_auth_op < 0 || bad_auth_op == (int)operation))
 		message->w[bad_auth_word]++;
 	return 0;
 }
@@ -311,9 +355,12 @@ static int airoha_ppe_npu_return_prepare_locked(struct airoha_eth *actual,
 }
 static int airoha_ppe_npu_owner_open_locked(struct airoha_eth *actual)
 {
-	CHECK(actual == &eth && !session.auth_count && auth_enabled);
-	CHECK(!auth_calls[AUTH_MBOX_ADD] && session.auth_attempted && session.epoch_dirty);
+	CHECK(actual == &eth && auth_enabled);
+	CHECK(session.auth_count == (session.diag_auth ? 1u : 0u));
+	CHECK(auth_calls[AUTH_MBOX_ADD] == (session.diag_auth ? 1u : 0u));
+	CHECK(session.auth_attempted && session.epoch_dirty);
 	CHECK(!registers[REG_PPE_PPE_FLOW_CFG(1)]);
+	record_event(TRACE_OPEN);
 	open_calls++;
 	return open_error;
 }
@@ -378,6 +425,8 @@ static int airoha_bank1_routes_revoke_locked(struct airoha_eth *actual)
 #include "er_enable.inc"
 #include "retire.inc"
 #include "snapshot.inc"
+#include "diag_authorize.inc"
+#include "start_mode.inc"
 #include "start.inc"
 #include "close.inc"
 #include "authorize.inc"
@@ -400,6 +449,13 @@ static void fixture(void)
 	memset(&ring, 0, sizeof(ring));
 	memset(registers, 0, sizeof(registers));
 	memset(auth_calls, 0, sizeof(auth_calls));
+	memset(auth_requests, 0, sizeof(auth_requests));
+	memset(trace, 0, sizeof(trace));
+	trace_count = binding_calls = ready_calls = 0;
+	binding_service = 0x1001u;
+	fail_ready_after_auth = false;
+	bad_auth_op = fail_auth_status_op = -1;
+	CHECK(!rcu_depth);
 	for (index = 0; index < NODE_COUNT; index++)
 		nodes[index].present = true;
 	nodes[ETH_NODE].diagnostic = nodes[ETH_NODE].native = true;
@@ -415,6 +471,7 @@ static void fixture(void)
 	lower.dev.parent = eth.dev;
 	lower.priv = &gdm;
 	lower.running = lower.carrier = true;
+	memcpy(lower.dev_addr, (const u8[]) { 2, 0x11, 0x22, 0x33, 0x44, 0x55 }, ETH_ALEN);
 	gdm.eth = &eth;
 	gdm.port = &port;
 	port.id = 2;
@@ -462,7 +519,7 @@ static void balanced(void)
 
 	for (index = 0; index < NODE_COUNT; index++)
 		CHECK(!nodes[index].references);
-	CHECK(!ppe_lock && !eth.ct_route_lock && !ring.observation_lock);
+	CHECK(!ppe_lock && !eth.ct_route_lock && !ring.observation_lock && !rcu_depth);
 	CHECK(registers[0] == 0xabc001 && registers[1] == 0xabc002 && registers[2] == 0xabc003);
 	CHECK(lower.references == (ppe.ct_npu_owner && session.diag_lower ? 1 : 0));
 	cases++;
@@ -688,6 +745,191 @@ static void test_auth_isolation(void)
 	CHECK(!airoha_npu_owner_ready(&session, &session.txn.id));
 	balanced();
 }
+
+static void test_auth_mode_active(void)
+{
+	for (unsigned int mode = 0; mode < 2; ++mode) {
+		for (u32 count = 0; count <= 3; ++count) {
+			fixture();
+			attach();
+			session.diag_auth = mode;
+			session.auth_count = count;
+			CHECK(airoha_ppe_npu_diag_active(&ppe, &session) == (count <= mode));
+			balanced();
+		}
+	}
+}
+
+static void auth_retained(int expected, bool attempted)
+{
+	CHECK(ppe.ct_npu_owner == &session && session.diag_lower == &lower);
+	CHECK(lower.references == 1 && session.diag_auth && session.return_path == &path);
+	CHECK(session.txn.last_error == expected && session.txn.phase == NPU_TXN_CLOSED);
+	CHECK(session.auth_attempted == attempted && session.epoch_dirty == attempted);
+	CHECK(!session.auth_count && !open_calls && !freed && !netdev_puts && !writes);
+	CHECK(!registers[REG_PPE_PPE_FLOW_CFG(1)] && !ppe.ct_pon_qualified);
+}
+
+static void test_auth_start(void)
+{
+	static const u32 services[] = { 0, 1, 0x8000, 0xffff };
+	static const u32 expected_trace[] = {
+		TRACE_READY, TRACE_BINDING, AUTH_MBOX_BEGIN, AUTH_MBOX_ADD,
+		AUTH_MBOX_ARM, TRACE_READY, TRACE_OPEN,
+	};
+
+	for (unsigned int index = 0; index < ARRAY_SIZE(services); ++index) {
+		u32 expected_rule[32] = {
+			1, 7, 1, 1, 0, 4, 2, services[index], 19,
+			4, 17, 0xc0000201, 0, 0, 0, 0xc0000202, 0, 0, 0,
+			0xc000c001, 0, 0, 0, 0, 0, 0x02112233,
+			0x44550200u + (index << 16), 1, 0, 0, 0, 0,
+		};
+
+		fixture();
+		binding_service = services[index];
+		lower.dev_addr[5] += index;
+		CHECK(!airoha_npu_diag_start_mode(&ppe, true, services[index]));
+		CHECK(session.diag_auth && session.auth_count == 1 && auth_count == 1 && auth_enabled == 1);
+		CHECK(auth_calls[AUTH_MBOX_BEGIN] == 1 && auth_calls[AUTH_MBOX_ADD] == 1 &&
+		      auth_calls[AUTH_MBOX_ARM] == 1 && open_calls == 1 && binding_calls == 1);
+		CHECK(trace_count == ARRAY_SIZE(expected_trace));
+		CHECK(!memcmp(trace, expected_trace, sizeof(expected_trace)));
+		CHECK(auth_requests[AUTH_MBOX_ADD].w[AM_RULE_COUNT] == 1);
+		CHECK(!memcmp(auth_requests[AUTH_MBOX_ADD].w + AM_RULE, expected_rule, sizeof(expected_rule)));
+		CHECK(session.auth_attempted && session.epoch_dirty && !writes && ring.observation_enabled);
+		CHECK(!ppe.ct_pon_qualified && !registers[REG_PPE_PPE_FLOW_CFG(1)]);
+		CHECK(airoha_ppe_npu_diag_active(&ppe, &session));
+		CHECK(!airoha_npu_owner_ready(&session, &session.txn.id));
+		CHECK(airoha_npu_diag_authorize(&session, services[index]) == -EINVAL);
+		CHECK(!airoha_npu_diag_close(&ppe, true));
+		CHECK(!ppe.ct_npu_owner && freed == 1 && netdev_puts == 1);
+		balanced();
+	}
+}
+
+static void test_auth_admission(void)
+{
+	static const u32 invalid_services[] = { 0x10000, 0x80000000, UINT32_MAX };
+	static const u32 services[] = { 0, 1, 0x8000, 0xffff };
+
+	for (unsigned int mode = 0; mode < 2; ++mode) {
+		for (unsigned int index = 0; index < ARRAY_SIZE(invalid_services); ++index) {
+			fixture();
+			CHECK(airoha_npu_diag_start_mode(&ppe, mode, invalid_services[index]) == -EINVAL);
+			CHECK(!claim_calls && !binding_calls && !auth_calls[AUTH_MBOX_BEGIN] && !open_calls);
+			CHECK(!ppe.ct_npu_owner && !lower.references && !netdev_puts && !writes);
+			balanced();
+		}
+	}
+	for (unsigned int index = 0; index < ARRAY_SIZE(services); ++index) {
+		for (unsigned int high = 0; high < 2; ++high) {
+			fixture();
+			binding_service = services[index] ^ (high ? 0x8000u : 1u);
+			CHECK(airoha_npu_diag_start_mode(&ppe, true, services[index]) == -ESTALE);
+			auth_retained(-ESTALE, false);
+			CHECK(binding_calls == 1 && !auth_calls[AUTH_MBOX_BEGIN] && !auth_calls[AUTH_MBOX_ADD]);
+			balanced();
+		}
+	}
+	for (unsigned int scenario = 0; scenario < 9; ++scenario) {
+		u32 service = 0x1001;
+
+		fixture();
+		attach();
+		session.diag_auth = true;
+		session.return_path = &path;
+		switch (scenario) {
+		case 0: session.diag_auth = false; break;
+		case 1: gdm.pon_link_ops = &other_controller; break;
+		case 2: session.txn.phase = NPU_TXN_OPEN; break;
+		case 3: session.auth_attempted = true; break;
+		case 4: service = 0x10000; break;
+		case 5: session.return_path = NULL; break;
+		case 6: lower.dev_addr[0] = 1; break;
+		case 7: memset(lower.dev_addr, 0, ETH_ALEN); break;
+		default: session.auth_count = 2; break;
+		}
+		CHECK(airoha_npu_diag_authorize(&session, service) == -EINVAL);
+		CHECK(!binding_calls && !auth_calls[AUTH_MBOX_BEGIN] && !open_calls);
+		CHECK(ppe.ct_npu_owner == &session && !freed && !netdev_puts);
+		balanced();
+	}
+	for (unsigned int mode = 0; mode < 2; ++mode) {
+		struct airoha_npu_auth_rule rule = valid_rule();
+
+		fixture();
+		attach();
+		session.diag_auth = mode;
+		session.return_path = &path;
+		CHECK(airoha_ppe_npu_owner_authorize_locked(&eth, &rule, 1) == -EOPNOTSUPP);
+		CHECK(!binding_calls && !auth_calls[AUTH_MBOX_BEGIN] && !session.auth_attempted);
+		balanced();
+	}
+}
+
+static void test_auth_failures(void)
+{
+	static const int fields[] = {
+		AM_MAGIC, AM_ABI_OP, AM_BYTES, AM_EPOCH, AM_GENERATION, AM_RULE_COUNT,
+		AM_RULE, AM_RULE + 31, AM_STATUS, AM_CAPS, AM_STATE_EPOCH,
+		AM_STATE_GENERATION, AM_COUNT, AM_INFLIGHT, AM_ENABLED, AM_RESERVED2,
+	};
+
+	for (int operation = AUTH_MBOX_BEGIN; operation <= AUTH_MBOX_ARM; ++operation) {
+		fixture();
+		fail_auth_op = operation;
+		CHECK(airoha_npu_diag_start_mode(&ppe, true, binding_service) == -ETIMEDOUT);
+		auth_retained(-ETIMEDOUT, true);
+		CHECK(auth_calls[operation] == 1);
+		if (operation < AUTH_MBOX_ARM)
+			CHECK(!auth_calls[operation + 1]);
+		balanced();
+		for (unsigned int index = 0; index < ARRAY_SIZE(fields); ++index) {
+			fixture();
+			bad_auth_op = operation;
+			bad_auth_word = fields[index];
+			CHECK(airoha_npu_diag_start_mode(&ppe, true, binding_service) == -EPROTO);
+			auth_retained(-EPROTO, true);
+			CHECK(auth_calls[operation] == 1);
+			if (operation < AUTH_MBOX_ARM)
+				CHECK(!auth_calls[operation + 1]);
+			balanced();
+		}
+	}
+	fixture();
+	fail_auth_status_op = AUTH_MBOX_ADD;
+	CHECK(airoha_npu_diag_start_mode(&ppe, true, binding_service) == -EPROTO);
+	auth_retained(-EPROTO, true);
+	CHECK(auth_calls[AUTH_MBOX_ADD] == 1 && !auth_calls[AUTH_MBOX_ARM]);
+	balanced();
+	fixture();
+	fail_ready_after_auth = true;
+	CHECK(airoha_npu_diag_start_mode(&ppe, true, binding_service) == -ESTALE);
+	auth_retained(-ESTALE, true);
+	CHECK(ready_calls == 2 && auth_calls[AUTH_MBOX_ARM] == 1);
+	balanced();
+}
+
+static void test_auth_bank1(void)
+{
+	for (unsigned int scenario = 0; scenario < 4; ++scenario) {
+		fixture();
+		CHECK(!airoha_npu_diag_start_mode(&ppe, true, binding_service));
+		eth.ct_bank1_routes.owner = &session;
+		eth.ct_bank1_routes.ready = eth.ct_bank1_routes.ingress_ready = true;
+		if (scenario == 1)
+			registers[3] = 1;
+		if (scenario == 2)
+			registers[4] = 1;
+		if (scenario == 3)
+			registers[5] |= PPE_GLO_CFG_BUSY_MASK;
+		CHECK(airoha_npu_owner_bank1_restore(&session, &session.txn.id) == (scenario ? -EIO : 0));
+		CHECK(airoha_bank1_routes_open(&eth, &session) == (scenario ? -EIO : 0));
+		CHECK(!writes && eth.ct_bank1_routes.pon_open == !scenario);
+		balanced();
+	}
+}
 static void prepare_close(void)
 {
 	fixture();
@@ -844,6 +1086,11 @@ int main(int argc, char **argv)
 	test_auth_isolation();
 	test_release();
 	test_bank1();
+	test_auth_mode_active();
+	test_auth_start();
+	test_auth_admission();
+	test_auth_failures();
+	test_auth_bank1();
 	printf("{\"passed\":true,\"cases\":%u,\"checks\":%u}\n", cases, checks);
 	return 0;
 }
