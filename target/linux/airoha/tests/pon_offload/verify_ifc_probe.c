@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,6 +26,7 @@ typedef uint32_t u32;
 #define ETH_P_IPV6 0x86dd
 #define AIROHA_GDM1_IDX 1
 #define AIROHA_GDM2_IDX 2
+#define AIROHA_GDM3_IDX 3
 #define AIROHA_GDM4_IDX 4
 #define AIROHA_DEV_F_PON 0
 #define FE_PSE_PORT_CDM1 1
@@ -85,8 +87,8 @@ static void schedule_delayed_work(struct work *work, unsigned int delay)
 struct queue { void *desc, *page_pool; int ndesc; };
 struct airoha_qdma { struct queue q_rx[5]; };
 struct airoha_gdm_dev { unsigned long flags; unsigned int nbq; struct airoha_qdma *qdma; bool running; };
-struct airoha_gdm_port { struct airoha_gdm_dev *devs[2]; };
-struct soc { struct { int (*get_sport)(struct airoha_gdm_port *, unsigned int); } ops; };
+struct airoha_gdm_port { struct airoha_gdm_dev *devs[2]; unsigned int id; };
+struct soc { struct { int (*get_sport)(struct airoha_gdm_port *, int); } ops; };
 struct airoha_eth {
 	struct airoha_ppe *ppe;
 	struct airoha_gdm_port *ports[4];
@@ -118,7 +120,6 @@ struct simulation {
 	unsigned int route_reads;
 	enum fault fault;
 	bool busy, release, late, gate_stuck, route_drop, require_gate_closed;
-	int sport;
 };
 struct fixture {
 	struct airoha_eth eth;
@@ -130,6 +131,7 @@ struct fixture {
 static struct simulation mock;
 static unsigned int cases, transport_faults, blocked_retries, dependency_faults, readback_faults;
 static unsigned int scope_cases, fallback_stop_cases, rejected_set_retries;
+static unsigned int sport_cases, sport_close_cases;
 
 static unsigned int page_words(unsigned int bank, unsigned int page)
 {
@@ -230,25 +232,19 @@ static void airoha_fe_clear(struct airoha_eth *eth, unsigned int address, u32 ma
 
 #include "probe_production.inc"
 
-static int get_sport(struct airoha_gdm_port *port, unsigned int nbq)
-{
-	assert(port && nbq < 2);
-	return mock.sport;
-}
-
 static void initialize(struct fixture *fixture)
 {
 	memset(fixture, 0, sizeof(*fixture));
 	memset(&mock, 0, sizeof(mock));
 	assert(!ppe_lock.held && !rcu_depth && !lock_depth);
 	flow_offload_mutex.held = rtnl = true;
-	mock.sport = 2;
 	fixture->eth.ppe = &fixture->ppe;
 	fixture->eth.ct_route_lock.rank = 2;
 	fixture->eth.ifc_port_lock.rank = 3;
 	fixture->ppe.eth = &fixture->eth;
 	fixture->eth.soc = &fixture->soc;
-	fixture->soc.ops.get_sport = get_sport;
+	fixture->soc.ops.get_sport = airoha_en7581_get_sport;
+	fixture->port.id = AIROHA_GDM2_IDX;
 	fixture->eth.ports[1] = &fixture->port;
 	fixture->port.devs[0] = &fixture->dev[0];
 	fixture->dev[0] = (struct airoha_gdm_dev) {
@@ -383,7 +379,7 @@ static void route_and_inputs(void)
 		case 1: fixture.soc.ops.get_sport = NULL; break;
 		case 2: fixture.port.devs[0] = NULL; break;
 		case 3: fixture.dev[0].flags = 0; break;
-		case 4: mock.sport = 1; break;
+		case 4: fixture.dev[0].nbq = 1; break;
 		case 5: fixture.dev[0].qdma = &fixture.eth.qdma[0]; break;
 		case 6: fixture.eth.qdma[1].q_rx[2].desc = NULL; break;
 		case 7: fixture.eth.qdma[1].q_rx[4].desc = NULL; break;
@@ -820,8 +816,54 @@ static void fallback_stop(void)
 	}
 }
 
+static void source_port_mapping(void)
+{
+	struct fixture fixture;
+	int nbqs[] = { INT_MIN, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, INT_MAX };
+
+	initialize(&fixture);
+	for (unsigned int port = 0; port <= 5; port++)
+		for (unsigned int index = 0; index < ARRAY_SIZE(nbqs); index++) {
+			int nbq = nbqs[index], expected = -EINVAL;
+
+			fixture.port.id = port;
+			if (port == 2 && nbq == 0)
+				expected = 2;
+			else if (port == 3 && nbq == 4)
+				expected = 22;
+			else if (port == 3 && nbq == 5)
+				expected = 23;
+			else if (port == 4 && nbq == 0)
+				expected = 24;
+			else if (port == 4 && nbq == 1)
+				expected = 25;
+			assert(fixture.soc.ops.get_sport(&fixture.port, nbq) == expected);
+			sport_cases++;
+			cases++;
+		}
+	for (unsigned int failed = 0; failed < 2; failed++) {
+		int sport;
+
+		prepare(&fixture);
+		mock.gate_stuck = failed;
+		sport = fixture.soc.ops.get_sport(&fixture.port, fixture.dev[0].nbq);
+		assert(sport == 2);
+		assert(airoha_ct_ifc_cpu_port_change(&fixture.eth, sport) == (failed ? -EIO : 0));
+		assert(mock.gate_clears == 1 && fixture.eth.ct_ifc_cpu_port_failed);
+		assert(!!(mock.registers[REG_FE_CSR_IFC_CFG / 4] & FE_IFC_EN_MASK) == !!failed);
+		assert(fixture.dev[0].qdma == &fixture.eth.qdma[1]);
+		check_shadow(&fixture);
+		mock.gate_stuck = false;
+		assert(airoha_ct_pon_ifc_cpu_stop(&fixture.ppe) == (failed ? -ESHUTDOWN : 0));
+		check_restored(&fixture);
+		sport_close_cases++;
+		cases++;
+	}
+}
+
 int main(void)
 {
+	source_port_mapping();
 	lifecycle();
 	route_and_inputs();
 	dependency_failures();
@@ -833,8 +875,9 @@ int main(void)
 	fallback_stop();
 	printf("{\"passed\":true,\"cases\":%u,\"transport_faults\":%u,\"blocked_retries\":%u,"
 	       "\"dependency_faults\":%u,\"readback_faults\":%u,\"scope_cases\":%u,"
-	       "\"fallback_stop_cases\":%u,\"rejected_set_retries\":%u}\n",
+	       "\"fallback_stop_cases\":%u,\"rejected_set_retries\":%u,"
+	       "\"sport_cases\":%u,\"sport_close_cases\":%u}\n",
 	       cases, transport_faults, blocked_retries, dependency_faults, readback_faults,
-	       scope_cases, fallback_stop_cases, rejected_set_retries);
+	       scope_cases, fallback_stop_cases, rejected_set_retries, sport_cases, sport_close_cases);
 	return 0;
 }

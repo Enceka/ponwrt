@@ -1,0 +1,21 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: map EN7581 optical GDM2 source port
+
+Return SPORT2 for EN7581 GDM2 NBQ0. This lets the optical CPU probe
+validate its WAN receiver and lets QDMA migration close the optical
+classifier through the existing source-port change guard. Reject all
+other GDM2 NBQs and preserve the GDM3 and GDM4 mappings.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -5175,6 +5175,10 @@
+ static int airoha_en7581_get_sport(struct airoha_gdm_port *port, int nbq)
+ {
+ 	switch (port->id) {
++	case AIROHA_GDM2_IDX:
++		if (!nbq)
++			return 2;
++		break;
+ 	case AIROHA_GDM3_IDX:
+ 		/* 7581 SoC supports PCIe serdes on GDM3 port */
+ 		if (nbq == 4)

@@ -38,7 +38,8 @@ def main():
             'airoha_ct_ifc_cpu_route_close_locked', 'airoha_ct_ifc_cpu_port_change',
             'airoha_ct_ppe_selectors', 'airoha_ct_cpu_selectors', 'airoha_ct_gdm_cpu_locked',
             'airoha_ct_gdm_route_locked', 'airoha_gdm_fwd_cfg_update', 'airoha_ct_cpu_fallback'],
-        'airoha_eth.c': ['airoha_ifc_scope_update', 'airoha_ifc_lan_ports_ready'],
+        'airoha_eth.c': ['airoha_ifc_scope_update', 'airoha_ifc_lan_ports_ready',
+                         'airoha_en7581_get_sport'],
         'airoha_ct_pon_ifc_cpu.h': [
             'airoha_ct_pon_ifc_read', 'airoha_ct_pon_ifc_put', 'airoha_ct_pon_ifc_drain',
             'airoha_ct_pon_ifc_io', 'airoha_ct_pon_ifc_route_ready',
@@ -48,13 +49,17 @@ def main():
     }
     complete = ['airoha_ct_pon_ifc_words.h', 'airoha_ct_pon_ifc_owner.h',
                 'airoha_ct_ifc_command.h']
-    sources = {name: (headers / name).read_text() for name in list(selections) + complete}
+    sources = {name: (headers / name).read_text() for name in list(selections) + complete + ['airoha_eth.h']}
     constants = '\n'.join(re.findall(r'(?m)^#define CT_IFC_.*$', sources['airoha_ct_ifc.h'])) + '\n'
     guards = re.search(r'static const struct \{\s*u16 udf, min, max;.*?ct_ifc_guard\[\] = \{.*?\n\};',
                        sources['airoha_ct_ifc.h'], re.S)
     actions = re.search(r'static const u8 ct_ifc_action_words\[\] = .*?;', sources['airoha_ct_ifc.h'])
     assert guards and actions
     constants += guards.group() + '\n' + actions.group() + '\n'
+    sport_enum = re.search(r'enum\s*\{\s*HSGMII_LAN_7581_PCIE0_SRCPORT.*?\n\};',
+                           sources['airoha_eth.h'], re.S)
+    assert sport_enum
+    constants += sport_enum.group() + '\n'
     extracted = '#include "airoha_ct_ifc_command.h"\n' + ''.join(
         function(sources[name], selected) for name, names in selections.items() for selected in names)
     test = output / 'verify_ifc_probe.c'
@@ -92,11 +97,16 @@ def main():
         assert result['blocked_retries'] == 2160 and result['readback_faults'] == 156
         assert result['scope_cases'] == 28 and result['fallback_stop_cases'] == 3
         assert result['rejected_set_retries'] == 1276
+        assert result['sport_cases'] == 72 and result['sport_close_cases'] == 2
         results.append(dict(mode=mode, **result))
     assert {key: value for key, value in results[0].items() if key != 'mode'} == {
         key: value for key, value in results[1].items() if key != 'mode'}
 
     mutations = [
+        ('missing_gdm2_sport', 'airoha_en7581_get_sport',
+         'case AIROHA_GDM2_IDX:\n\t\tif (!nbq)\n\t\t\treturn 2;\n\t\tbreak;\n', ''),
+        ('gdm2_accepts_other_nbq', 'airoha_en7581_get_sport', 'if (!nbq)', 'if (true)'),
+        ('gdm2_wrong_sport', 'airoha_en7581_get_sport', 'return 2;', 'return 1;'),
         ('clear_both_slots', 'airoha_ct_pon_ifc_cpu_clear',
          'airoha_ct_pon_ifc_withdraw(&ppe->ct_pon_ifc, &io, slot)',
          'airoha_ct_pon_ifc_restore(&ppe->ct_pon_ifc, &io)'),
