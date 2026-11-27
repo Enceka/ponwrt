@@ -22,7 +22,7 @@ def fields(text):
     return dict(re.findall(r'\b([a-z][a-z0-9_]*)=([^\s]+)', text))
 
 
-def check_session(state, auth_count=0):
+def check_session(state, auth_count=0, learn=False):
     for name, expected in dict(owner=1, diagnostic=1, qualified=0, policy=0, fallback=0,
                                 route_owner=1, fe_owner=1, ingress=1, phase=15,
                                 error=0, invalidated=0, ring=1, auth_count=auth_count, auth_enabled=1,
@@ -30,17 +30,20 @@ def check_session(state, auth_count=0):
                                 gate_error=0, auth_error=0, er_error=0, er_fault=0,
                                 dropped=0, fault=0).items():
         require(int(state[name]) == expected, 'diagnostic state: ' + name)
-    require(int(state['flow'], 16) == 0 and int(state['scope'], 16) == 0x01000004 and
+    require(int(state['flow'], 16) == (0x2000 if learn else 0) and int(state['scope'], 16) == 0x01000004 and
             int(state['ports'], 16) == 0x01000004 and int(state['gdm2'], 16) & 0xffff == 0x8888,
             'bank1 learning or ingress scope changed')
+    if learn:
+        require(state['learn_mode'] == '1' and state['next_row'] == '0' and
+                (int(state['tb'], 16) >> 4 & 3) == 3, 'PPE learning configuration mismatch')
     require(all(state[family + '_' + name] == state[name]
                 for family in ('gate', 'auth') for name in ('epoch', 'generation')),
             'GATE/AUTH transaction identity mismatch')
 
 
-def check_packet(diag, probe, service, count, kind, previous, auth_count=0):
+def check_packet(diag, probe, service, count, kind, previous, auth_count=0, learn=False):
     state, packet = fields(diag), fields(probe)
-    check_session(state, auth_count)
+    check_session(state, auth_count, learn)
     for name in ('packets', 'consumed'):
         require(int(state[name]) == count, 'diagnostic state: ' + name)
     require(int(packet['sequence']) == previous + 1 and
@@ -80,8 +83,10 @@ def main():
     modes.add_argument('--capture-service', type=lambda value: int(value, 0),
                         help='Capture raw ER metadata for one 16-bit service without accepting it as a matrix pass')
     modes.add_argument('--auth', action='store_true', help='Verify one exact AUTH rule against bounded match/miss packets')
+    modes.add_argument('--learn', action='store_true', help='Verify exact AUTH with bounded PPE unbound row learning')
     parser.add_argument('--run', action='store_true')
     args = parser.parse_args()
+    args.auth = args.auth or args.learn
     if args.capture_service is not None:
         require(0 <= args.capture_service <= 65535, 'capture service out of range')
     uuid.UUID(args.boot)
@@ -131,6 +136,8 @@ def main():
                   matrix_passed=False, passed=False, restored=False)
     if args.auth:
         report.update(auth_mode=True, auth_observations=[])
+    if args.learn:
+        report.update(learn_mode=True, learned_rows=[])
     if args.capture_service is not None:
         report.update(capture_service=args.capture_service, captures=[])
     loaded = False
@@ -150,7 +157,8 @@ def main():
         for service in ((args.capture_service,) if args.capture_service is not None else (0, 0x8000)):
             prefix = 'service-' + str(service)
             write(prefix + '-map', PROBE + 'command', 'map ' + str(service))
-            write(prefix + '-start', DIAG, 'start-auth ' + str(service) if args.auth else 'start')
+            start = ('start-learn ' if args.learn else 'start-auth ') + str(service) if args.auth else 'start'
+            write(prefix + '-start', DIAG, start)
             remote(prefix + '-started', 'cat ' + DIAG)
             if args.capture_service is not None:
                 for count, kind in enumerate(('ipv4', 'ipv6'), 1):
@@ -193,7 +201,7 @@ def main():
                     require(packet['tx_fixed'] == str(int(variant is not None)) and
                             packet['tx_variant'] == str(variant or 0), 'AUTH packet shape mismatch')
                     if matched:
-                        check_session(state, 1)
+                        check_session(state, 1, args.learn)
                         require(state['auth_mode'] == '1' and
                                 int(state['consumed']) == int(state['packets']) == returned,
                                 'AUTH match unexpectedly returned through ER')
@@ -210,7 +218,7 @@ def main():
                     else:
                         returned += 1
                         observation = check_packet(observed, received, service, returned, kind,
-                                                   int(previous['sequence']), 1)
+                                                   int(previous['sequence']), 1, args.learn)
                         if cookie is not None:
                             require(cookie == observation['cookie'], 'probe cookie changed')
                         cookie = observation['cookie']
@@ -237,10 +245,38 @@ def main():
                     require(cookie == observation['cookie'], 'probe cookie changed')
                 cookie = observation['cookie']
                 report['observations'].append(observation)
+            if args.learn:
+                entries = remote(prefix + '-learned', 'cat /sys/kernel/debug/ppe/entries')
+                rows = []
+                expected = {'192.0.2.1:49152->192.0.2.2:49153',
+                            '192.0.2.2:49152->192.0.2.2:49153',
+                            '192.0.2.1:49152->192.0.2.3:49153',
+                            '192.0.2.1:49153->192.0.2.2:49153',
+                            '192.0.2.1:49152->192.0.2.2:49154'}
+                for line in entries.splitlines():
+                    match = re.match(r'^([0-9a-f]+)\s+(UNB|BND|FIN)\s+', line)
+                    if match and 0x2000 <= int(match[1], 16) < 0x4000:
+                        original = fields(line).get('orig')
+                        require(match[2] == 'UNB' and original in expected,
+                                'unexpected bank1 learned entry')
+                        rows.append(dict(hash=int(match[1], 16), tuple=original, entry=line))
+                require(len(rows) == 5 and {row['tuple'] for row in rows} == expected,
+                        'expected the five injected IPv4 tuples in bank1')
+                target = next(row for row in rows if row['tuple'] == '192.0.2.1:49152->192.0.2.2:49153')
+                matches = [entry for entry in report['auth_observations'] if entry['service'] == service and entry['matched']]
+                require(all(int(entry['rx_msg1'], 16) & 0xffff == target['hash'] for entry in matches),
+                        'QDMA learned hash differs from bank1 tuple')
+                report['learned_rows'].append(dict(service=service, hash=target['hash'], entries=rows))
             write(prefix + '-close', DIAG, 'close')
             closed = fields(remote(prefix + '-closed', 'cat ' + DIAG))
             require(closed['ring'] == '0' and closed['gate_mask'] == '0' and closed['auth_enabled'] == '0'
                     and closed['qualified'] == '0' and closed['ingress'] == '0', 'close incomplete')
+            if args.learn:
+                require(closed['next_row'] == '8192', 'learned bank1 cleanup incomplete')
+                entries = remote(prefix + '-cleared', 'cat /sys/kernel/debug/ppe/entries')
+                require(not any(0x2000 <= int(match[1], 16) < 0x4000 for match in
+                                re.finditer(r'^([0-9a-f]+)\s+(?:UNB|BND|FIN)\s+', entries, re.M)),
+                        'bank1 learned rows retained after close')
             for kind in ('ipv4', 'ipv6'):
                 previous = fields(remote(prefix + '-cpu-' + kind + '-before', 'cat ' + PROBE + 'status'))
                 write(prefix + '-cpu-' + kind, PROBE + 'command', 'send-current ' + kind)

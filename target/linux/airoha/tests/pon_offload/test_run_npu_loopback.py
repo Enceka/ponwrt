@@ -66,7 +66,7 @@ def render(values):
 class BoardFixture:
     def __init__(self, failures=(), snapshot_timeout=False, start_error=False,
                  identity_fault=None, closed_drift=False, observation_delay=0,
-                 corrupt_restore=False, send_error=None, auth_qdma_fault=False):
+                 corrupt_restore=False, send_error=None, auth_qdma_fault=False, learn_fault=None):
         self.failures = set(failures)
         self.snapshot_timeout = snapshot_timeout
         self.start_error = start_error
@@ -77,6 +77,9 @@ class BoardFixture:
         self.send_error = send_error
         self.auth_qdma_fault = auth_qdma_fault
         self.auth_mode = False
+        self.learn_mode = False
+        self.learn_fault = learn_fault
+        self.learned = False
         self.commands = []
         self.sent = []
         self.loaded = False
@@ -95,7 +98,9 @@ class BoardFixture:
     def diag(self):
         state = dict(owner=int(self.owner), diagnostic=int(self.owner), qualified=0,
                      policy=0, fallback=0, route_owner=int(self.owner), fe_owner=int(self.owner),
-                     flow='00000000' if self.owner else '00003200', tb='83c0cfb4',
+                     flow=('00002000' if self.learn_mode and self.ring else '00000000') if self.owner else '00003200',
+                     tb='83c0cfb4', learn_mode=int(self.learn_mode),
+                     next_row=0 if self.learn_mode and self.ring else 8192,
                      scope='01000004' if self.ring else '01000000', ingress=int(self.ring),
                      ports='01000004' if self.ring else '01000000',
                      gdm2='07f08888' if self.ring else '07f05555',
@@ -140,10 +145,13 @@ class BoardFixture:
         qdma_received = sum(packet['path'] != 'er' and
                             not (self.auth_qdma_fault and packet['path'] == 'auth') for packet in self.sent)
         last = self.sent[-1] if self.sent else {}
+        msg1 = 2 << 21
+        if self.learn_mode and last.get('path') == 'auth':
+            msg1 |= 0x2135 if self.learn_fault == 'hash' else 0x2134
         text = (f'retained={state} controller={state} opened={state} saved={state} '
                 f'error=0 pending=0 sequence={sequence} received={sequence} '
                 f'rx_sequence={sequence} rx_msg0={(self.service or 0) << 14:08x} '
-                f'rx_msg1={2 << 21:08x}\n'
+                f'rx_msg1={msg1:08x}\n'
                 f'tx_kind={kind} tx_length=128 rx_kind={kind} rx_length=114\n')
         text += (f'tx_fixed={int(last.get("fixed", False))} tx_variant={last.get("variant", 0)} '
                  f'rx_data={qdma_received} rx_delivered={qdma_received}\n')
@@ -173,6 +181,8 @@ class BoardFixture:
                 fixed = value.startswith('send-fixed ')
                 variant = int(value.split()[2]) if fixed else 0
                 matched = self.auth_mode and self.ring and fixed and kind == 'ipv4' and variant == 0
+                if matched and self.learn_mode:
+                    self.learned = True
                 path = 'auth' if matched else 'er' if self.ring else 'cpu'
                 self.sent.append(dict(service=self.service, kind=kind,
                                       sequence=len(self.sent) + 1, path=path, fixed=fixed, variant=variant))
@@ -188,10 +198,11 @@ class BoardFixture:
             else:
                 raise AssertionError('unexpected probe command: ' + value)
         elif destination == runner.DIAG:
-            if value == 'start' or value.startswith('start-auth '):
+            if value == 'start' or value.startswith(('start-auth ', 'start-learn ')):
                 assert self.prepared and not self.owner and self.service is not None
                 self.owner = True
-                self.auth_mode = value.startswith('start-auth ')
+                self.auth_mode = value.startswith(('start-auth ', 'start-learn '))
+                self.learn_mode = value.startswith('start-learn ')
                 self.epoch += 1
                 self.consumed = 0
                 self.last_er = None
@@ -199,6 +210,8 @@ class BoardFixture:
             elif value == 'close':
                 assert self.owner and self.ring
                 self.ring = False
+                if self.learn_fault != 'retained':
+                    self.learned = False
             elif value == 'release':
                 self.ring = self.owner = False
             else:
@@ -230,6 +243,16 @@ class BoardFixture:
             text = self.diag() + self.probe()
         elif command == 'cat ' + runner.DIAG:
             text = self.diag()
+        elif command == 'cat /sys/kernel/debug/ppe/entries':
+            if self.learned and self.learn_fault != 'missing':
+                state = 'BND' if self.learn_fault == 'bound' else 'UNB'
+                tuples = ['192.0.2.1:49152->192.0.2.2:49153', '192.0.2.2:49152->192.0.2.2:49153',
+                          '192.0.2.1:49152->192.0.2.3:49153', '192.0.2.1:49153->192.0.2.2:49153',
+                          '192.0.2.1:49152->192.0.2.2:49154']
+                if self.learn_fault == 'tuple':
+                    tuples[0] = '192.0.2.3:49152->192.0.2.2:49153'
+                text = ''.join(f'{0x2134 + index:05x} {state} IPv4 5T orig={original} ib1=00000000\n'
+                               for index, original in enumerate(tuples))
         elif command == 'cat ' + runner.PROBE + 'status':
             assert self.loaded
             text = self.probe()
@@ -258,7 +281,7 @@ class BoardFixture:
 
 
 class RunnerTests(unittest.TestCase):
-    def invoke(self, board, run=True, capture_service=None, auth=False):
+    def invoke(self, board, run=True, capture_service=None, auth=False, learn=False):
         self.files = {'/fixture/module.ko': MODULE}
         directories = {'/fixture'}
         arguments = ['run_npu_loopback.py', '--pin', '/fixture/known-hosts', '--boot', BOOT,
@@ -270,6 +293,8 @@ class RunnerTests(unittest.TestCase):
             arguments.extend(('--capture-service', str(capture_service)))
         if auth:
             arguments.append('--auth')
+        if learn:
+            arguments.append('--learn')
         stdout = io.StringIO()
         with mock.patch.object(runner, 'Path', side_effect=lambda name: MemoryPath(name, self.files, directories)), \
                 mock.patch.object(sys, 'argv', arguments), \
@@ -484,6 +509,24 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(self.report()['passed'])
         self.assertTrue(self.report()['restored'])
         self.assert_restored(board)
+
+    def test_learning_requires_exact_unbound_row_and_cleanup(self):
+        board = BoardFixture()
+        report = self.invoke(board, learn=True)
+        self.assertTrue(report['passed'])
+        self.assertEqual([row['hash'] for row in report['learned_rows']], [0x2134, 0x2134])
+        self.assertEqual([row['service'] for row in report['learned_rows']], [0, 0x8000])
+        self.assert_restored(board)
+
+    def test_learning_rejects_missing_wrong_or_retained_rows(self):
+        for fault in ('missing', 'tuple', 'bound', 'retained', 'hash'):
+            with self.subTest(fault=fault):
+                board = BoardFixture(learn_fault=fault)
+                with self.assertRaises(ValueError):
+                    self.invoke(board, learn=True)
+                self.assertFalse(self.report()['passed'])
+                self.assertTrue(self.report()['restored'])
+                self.assert_restored(board)
 
     def test_capture_success_and_expected_timeout_restore(self):
         for service in (0, 1, 0x8000, 0xffff):

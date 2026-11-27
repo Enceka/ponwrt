@@ -286,3 +286,21 @@ NPU code 与上一轮相同。本地报告为
 `build/pon-npu-diag-20261127/board-auth-match-matrix/report.json`。
 主机测试完成 210 场景、7006 断言及 38 个负对照。
 下一步开放有界 PPE 学习、核验真实硬件行并绑定 LAN 出口；完成后再合入完整镜像。
+
+### PPE 实际选行与撤销（2026-11-27）
+
+`999-zr` 增加 `start-learn <service>`，保持一条 AUTH，显式开启 IPv4
+NAPT 和 UNB 学习。配置前先将清表游标归零，TB/FLOW 每笔写入均读回，
+正常 close 关闭学习后清空 bank1，release 再恢复保存的路由与寄存器。
+
+`run_npu_loopback.py --learn` 在 service0/0x8000 两个独立会话完成
+32 个命中/错配包和关闭后的 4 个 CPU 包。匹配报文的 QDMA hash 与真实
+bank1 tuple 均为 `0x2458`，原始 RX message1 为 `0x204e2458`。
+硬件在 AUTH 前的首次 PPE 处理就生成 UNB 行，因此五种 IPv4 tuple 均有
+对应记录；错配包仍通过 ER 返回。验收逐项核对这五条记录，要求全部为
+UNB、没有 BND，并在每次 close 后核对整个 bank1 无剩余行。
+
+RAM FIT SHA-256：`361876f5bfdc3bcfaac34cc46f8b70c33136b46dfb24cd8be1f5cf8ccd415eba`。
+报告：`build/pon-npu-diag-20261127/board-learn-matrix-v2/report.json`。
+同镜像的不学习 AUTH 回归也通过。下一步将实测行绑定 LAN 出口，并验证
+绑定前后分类、完整 GEM 隔离及撤销重装；PON qualification 继续关闭。
