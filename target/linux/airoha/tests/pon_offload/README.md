@@ -236,9 +236,32 @@ CPU fallback 的路由及 IFC 写入失败在 owner 关闭后继续重试，状�
 无光纤 service0 回环 runner 已加入双栈 A/B/A、撤销重装和精确 tuple 矩阵，
 2026-11-27 新 RAM 镜像的 service0 双栈撤销 18 包及精确 tuple 撤销 28 包
 均通过，寄存器恢复、lease 释放及模块卸载完成，详情见 `ram_loopback/README.md`。
-接下来核验常驻 supplier 运行期关系并验证 PON NPU 入口，再构建完整镜像。
+后续 NPU 入口的实板结果见下节。
 当前 GPON GEM 准备路径已接通；
 EPON 还需配对 wire LLID、channel、IFC service 和 FE service。
 硬件强制退役需补齐全部 hart 停止、GDMA 完成和 DRAM 总线排空条件；
 正常退役继续使用 QUIESCE→STOP→消费完成→UNBIND。
-PON 硬件准入仍关闭，设备运行包含 `999-zi` 的新版 RAM 镜像。
+PON 硬件准入仍关闭。
+
+### PON NPU 返回链路实板验收（2026-11-27）
+
+`999-zj` 完成常驻 supplier 核验；`999-zk` 增加独立 RAM 诊断会话，
+`999-zl` 按 TCAM mask 校验有效 key 位。`999-zm/zo` 安装两行 NPU 入口
+及两行 CPU 兜底规则，按顺序切换 PPE2/CPU 路由，失败保留可恢复的分类状态。
+`999-zn` 在 binding 或 skb 分配丢包前保存合法 ER 观测，`999-zp` 同步
+实测服务号布局：FE word1 低 16 位。QDMA message0 的服务字段保持原布局。
+
+`run_npu_loopback.py` 已在新 RAM 镜像完成 service0/0x8000 各 18 个
+IPv4/IPv6 交替包，八槽环各自回绕，36 个 ER 包全部交付，零丢包、零故障。
+每次 close 后各两个 CPU 包通过；owner、分类器、回环寄存器和 IPv6 状态
+恢复，模块卸载。WED 状态为 3、IRQ ready、error=0，WAN 网关连通。
+此次 AUTH 为空表，下一步验证非空 AUTH 与真实 PPE 查表、出口转发。
+
+RAM FIT SHA-256：`72a6143b70fb8879316002c022bc248c852b936a450d742dcbd6c3a8ea942b73`。
+NPU code SHA-256：`9e1c4492bfbfc11c310ac0070d084631276011504abf871ea6b3efe57de610a1`。
+本地完整报告：`build/pon-npu-diag-20261127/board-word1-matrix/report.json`，
+从工作区根目录解析。镜像与设备维持 `pon_ppe_qualified=false`。
+
+runner 的 `--capture-service 0x2134` 用于记录单个服务的双栈原始描述符；
+允许成功或指定的 RX marker 超时，其他发送错误立即失败并清理。
+采样报告单独标记 `capture_completed`，正常矩阵由 `matrix_passed` 标记。

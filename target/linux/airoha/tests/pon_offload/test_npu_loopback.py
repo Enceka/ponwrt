@@ -11,13 +11,15 @@ class PacketTests(unittest.TestCase):
         offset = 14 + (40 if kind == 'ipv6' else 20) + 8
         struct.pack_into('>5I', frame, offset, 0x4354504e, 41, 123, kind == 'ipv6', 128)
         desc = [0x80000080, 7, count, 2, 11, 0x80000000 | service, 0x44001000, 0,
-                128, 0, 7, 0, service << 14, 6 << 28, 2, 0]
+                128, 0x00e00000 | service, 7, 0, 0x05dc7fff, 6 << 28, 2, 0]
         state = dict(owner=1, diagnostic=1, qualified=0, policy=0, fallback=0,
+                     route_owner=1, fe_owner=1, ingress=1, phase=15,
                      error=0, invalidated=0, ring=1, auth_count=0, auth_enabled=1,
                      auth_inflight=0, gate_mask=4, gate_closed=0, gate_fault=0,
                      gate_error=0, auth_error=0, er_error=0, er_fault=0,
                      packets=count, consumed=count, dropped=0, fault=0,
-                     flow='00000000', scope='01000004', epoch=7, generation=11,
+                     flow='00000000', scope='01000004', ports='01000004',
+                     gdm2='07f08888', epoch=7, generation=11,
                      gate_epoch=7, gate_generation=11, auth_epoch=7, auth_generation=11,
                      er_desc='/'.join(f'{word:08x}' for word in desc), er_frame=frame.hex(),
                      observed_produced=count, observed_consumed=count, frame_bytes=128)
@@ -37,15 +39,17 @@ class PacketTests(unittest.TestCase):
     def test_protocol_and_identity_faults(self):
         state, packet = self.fixture(0, 'ipv4')
         faults = dict(qualified=1, policy=1, invalidated=1, auth_count=1, gate_mask=1,
+                      route_owner=0, fe_owner=0, ingress=0, phase=14,
                       consumed=17, observed_produced=17, packets=17, dropped=1, fault=1,
-                      flow='00003200', scope='01000000', epoch=8, generation=12,
+                      flow='00003200', scope='01000000', ports='01000000',
+                      gdm2='07f05555', epoch=8, generation=12,
                       gate_epoch=8, gate_generation=12, auth_epoch=8, auth_generation=12)
         for name, value in faults.items():
             with self.subTest(name=name), self.assertRaises(ValueError):
                 check_packet(self.render(dict(state, **{name: value})), self.render(packet), 0, 18, 'ipv4', 40)
-        for index in (0, 1, 2, 3, 4, 5, 7, 8, 10, 12, 13, 14):
+        for index in (0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 13, 14):
             words = state['er_desc'].split('/')
-            mask = 1 << 14 if index == 12 else 1 << 28 if index == 13 else 1
+            mask = 1 << 28 if index == 13 else 1
             words[index] = f'{int(words[index], 16) ^ mask:08x}'
             with self.subTest(index=index), self.assertRaises(ValueError):
                 check_packet(self.render(dict(state, er_desc='/'.join(words))), self.render(packet), 0, 18, 'ipv4', 40)

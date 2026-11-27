@@ -25,12 +25,14 @@ def fields(text):
 def check_packet(diag, probe, service, count, kind, previous):
     state, packet = fields(diag), fields(probe)
     for name, expected in dict(owner=1, diagnostic=1, qualified=0, policy=0, fallback=0,
+                                route_owner=1, fe_owner=1, ingress=1, phase=15,
                                 error=0, invalidated=0, ring=1, auth_count=0, auth_enabled=1,
                                 auth_inflight=0, gate_mask=4, gate_closed=0, gate_fault=0,
                                 gate_error=0, auth_error=0, er_error=0, er_fault=0,
                                 packets=count, consumed=count, dropped=0, fault=0).items():
         require(int(state[name]) == expected, 'diagnostic state: ' + name)
-    require(int(state['flow'], 16) == 0 and int(state['scope'], 16) == 0x01000004,
+    require(int(state['flow'], 16) == 0 and int(state['scope'], 16) == 0x01000004 and
+            int(state['ports'], 16) == 0x01000004 and int(state['gdm2'], 16) & 0xffff == 0x8888,
             'bank1 learning or ingress scope changed')
     require(all(state[family + '_' + name] == state[name]
                 for family in ('gate', 'auth') for name in ('epoch', 'generation')),
@@ -46,7 +48,7 @@ def check_packet(diag, probe, service, count, kind, previous):
             descriptor[5] == 0x80000000 | service and not descriptor[7], 'ER identity mismatch')
     require(descriptor[8] & 0xffff == 128 and descriptor[10] == 7 and
             descriptor[13] >> 28 == 6 and descriptor[14] & 31 == 2 and
-            descriptor[12] >> 14 & 0xffff == service, 'FE prefix mismatch')
+            descriptor[9] & 0xffff == service, 'FE prefix mismatch')
     frame = bytes.fromhex(state['er_frame'])
     offset = 14 + (40 if kind == 'ipv6' else 20) + 8
     require(len(frame) == 128 and int(state['frame_bytes']) == 128, 'ER frame length')
@@ -68,8 +70,12 @@ def main():
     parser.add_argument('--sha256', required=True)
     parser.add_argument('--firmware-sha256', required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--capture-service', type=lambda value: int(value, 0),
+                        help='Capture raw ER metadata for one 16-bit service without accepting it as a matrix pass')
     parser.add_argument('--run', action='store_true')
     args = parser.parse_args()
+    if args.capture_service is not None:
+        require(0 <= args.capture_service <= 65535, 'capture service out of range')
     uuid.UUID(args.boot)
     blob = args.module.read_bytes()
     require(sha256(blob) == args.sha256, 'module hash mismatch')
@@ -115,6 +121,8 @@ def main():
     report = dict(boot=args.boot, module_sha256=args.sha256, firmware_sha256=args.firmware_sha256,
                   pon_ppe_qualified=False, observations=[], cpu_observations=[],
                   matrix_passed=False, passed=False, restored=False)
+    if args.capture_service is not None:
+        report.update(capture_service=args.capture_service, captures=[])
     loaded = False
     baseline = ''
     failure = None
@@ -129,11 +137,37 @@ def main():
         baseline = remote('baseline', 'cat ' + PROBE + 'status')
         write('prepare', PROBE + 'command', 'prepare')
         cookie = None
-        for service in (0, 0x8000):
+        for service in ((args.capture_service,) if args.capture_service is not None else (0, 0x8000)):
             prefix = 'service-' + str(service)
             write(prefix + '-map', PROBE + 'command', 'map ' + str(service))
             write(prefix + '-start', DIAG, 'start')
             remote(prefix + '-started', 'cat ' + DIAG)
+            if args.capture_service is not None:
+                for count, kind in enumerate(('ipv4', 'ipv6'), 1):
+                    label = prefix + '-capture-' + kind
+                    send_error = None
+                    try:
+                        write(label + '-send', PROBE + 'command', 'send-current ' + kind)
+                    except subprocess.CalledProcessError as error:
+                        require(error.returncode == 1 and error.stderr.strip() ==
+                                b'ash: write error: Operation timed out', 'unexpected capture send failure')
+                        send_error = 'RX marker timed out'
+                    state = fields(remote(label + '-observation', 'cat ' + DIAG))
+                    probe = fields(remote(label + '-probe', 'cat ' + PROBE + 'status'))
+                    for name, expected in dict(owner=1, diagnostic=1, qualified=0, policy=0,
+                                                fallback=0, invalidated=0, fault=0, ring=1,
+                                                consumed=count, observed_consumed=count).items():
+                        require(int(state[name]) == expected, 'capture state: ' + name)
+                    descriptor = [int(word, 16) for word in state['er_desc'].split('/')]
+                    frame = bytes.fromhex(state['er_frame'])
+                    require(len(descriptor) == 16 and len(frame) == 128, 'capture shape')
+                    marker = struct.unpack_from('>5I', frame, 14 + (40 if kind == 'ipv6' else 20) + 8)
+                    require(marker[0] == 0x4354504e and marker[1] == int(probe['sequence']) and
+                            marker[3] == (kind == 'ipv6') and marker[4] == 128, 'capture packet marker')
+                    report['captures'].append(dict(service=service, kind=kind, descriptor=descriptor,
+                        frame=frame.hex(), host_packets=int(state['packets']),
+                        host_dropped=int(state['dropped']), send_error=send_error))
+                continue
             for index in range(18):
                 label = prefix + '-packet-' + str(index + 1)
                 kind = 'ipv4' if index % 2 == 0 else 'ipv6'
@@ -173,7 +207,9 @@ def main():
             released = fields(remote(prefix + '-released', 'cat ' + DIAG))
             require(released['owner'] == released['route_owner'] == released['fe_owner'] == '0', 'owner release incomplete')
             require(released['flow'] == initial['flow'] and released['tb'] == initial['tb'], 'bank1 restore mismatch')
-        report['matrix_passed'] = True
+        report['matrix_passed'] = args.capture_service is None
+        if args.capture_service is not None:
+            report['capture_completed'] = True
     except Exception as error:
         failure = error
         report['error'] = repr(error)

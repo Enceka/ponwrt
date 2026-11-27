@@ -66,7 +66,7 @@ def render(values):
 class BoardFixture:
     def __init__(self, failures=(), snapshot_timeout=False, start_error=False,
                  identity_fault=None, closed_drift=False, observation_delay=0,
-                 corrupt_restore=False):
+                 corrupt_restore=False, send_error=None):
         self.failures = set(failures)
         self.snapshot_timeout = snapshot_timeout
         self.start_error = start_error
@@ -74,6 +74,7 @@ class BoardFixture:
         self.closed_drift = closed_drift
         self.observation_delay = observation_delay
         self.corrupt_restore = corrupt_restore
+        self.send_error = send_error
         self.commands = []
         self.sent = []
         self.loaded = False
@@ -94,6 +95,9 @@ class BoardFixture:
                      policy=0, fallback=0, route_owner=int(self.owner), fe_owner=int(self.owner),
                      flow='00000000' if self.owner else '00003200', tb='83c0cfb4',
                      scope='01000004' if self.ring else '01000000', ingress=int(self.ring),
+                     ports='01000004' if self.ring else '01000000',
+                     gdm2='07f08888' if self.ring else '07f05555',
+                     phase=15 if self.ring else 9,
                      gate_error=0, gate_caps=15, gate_epoch=self.epoch,
                      gate_generation=self.generation, gate_mask=4 if self.ring else 0,
                      gate_closed=int(not self.ring), gate_fault=0,
@@ -119,7 +123,7 @@ class BoardFixture:
                 buffer = 0x44000000 + 64 + 8 * 64 + ((self.consumed - 1) & 7) * 2048
                 descriptor = [0x80000080, self.epoch, self.consumed, 2,
                               self.generation, 0x80000000 | self.service, buffer, 0,
-                              128, 0, 7, 0, self.service << 14, 6 << 28, 2, 0]
+                              128, 0x00e00000 | self.service, 7, 0, 0x05dc7fff, 6 << 28, 2, 0]
                 state.update(er_desc='/'.join(f'{word:08x}' for word in descriptor),
                              er_frame=frame.hex())
             if self.ring and self.consumed and self.identity_fault:
@@ -155,7 +159,7 @@ class BoardFixture:
                 assert self.prepared and not self.owner
                 self.service = int(value.split()[1])
             elif value.startswith('send-current '):
-                assert self.prepared and self.owner and self.service in (0, 0x8000)
+                assert self.prepared and self.owner and 0 <= self.service <= 65535
                 kind = value.split()[1]
                 assert kind in ('ipv4', 'ipv6')
                 self.sent.append(dict(service=self.service, kind=kind,
@@ -233,13 +237,15 @@ class BoardFixture:
             self.write(words[3], words[1])
             if self.start_error and words[3] == runner.DIAG and words[1] == 'start':
                 return subprocess.CompletedProcess(arguments, 1, b'', b'Input/output error\n')
+            if self.send_error and words[3] == runner.PROBE + 'command' and words[1].startswith('send-current '):
+                return subprocess.CompletedProcess(arguments, self.send_error[0], b'', self.send_error[1])
         else:
             raise AssertionError('unexpected remote command: ' + command)
         return subprocess.CompletedProcess(arguments, 0, text.encode(), b'')
 
 
 class RunnerTests(unittest.TestCase):
-    def invoke(self, board, run=True):
+    def invoke(self, board, run=True, capture_service=None):
         self.files = {'/fixture/module.ko': MODULE}
         directories = {'/fixture'}
         arguments = ['run_npu_loopback.py', '--pin', '/fixture/known-hosts', '--boot', BOOT,
@@ -247,6 +253,8 @@ class RunnerTests(unittest.TestCase):
                      '--firmware-sha256', FIRMWARE_SHA, '--output', '/fixture/output']
         if run:
             arguments.append('--run')
+        if capture_service is not None:
+            arguments.extend(('--capture-service', str(capture_service)))
         stdout = io.StringIO()
         with mock.patch.object(runner, 'Path', side_effect=lambda name: MemoryPath(name, self.files, directories)), \
                 mock.patch.object(sys, 'argv', arguments), \
@@ -439,6 +447,60 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(report['passed'])
         self.assertEqual(self.sleep.call_count, 36)
         self.assert_restored(board)
+
+    def test_capture_success_and_expected_timeout_restore(self):
+        for service in (0, 1, 0x8000, 0xffff):
+            for send_error in (None, (1, b'ash: write error: Operation timed out\n')):
+                with self.subTest(service=service, send_error=send_error):
+                    board = BoardFixture(send_error=send_error)
+                    report = self.invoke(board, capture_service=service)
+                    self.assertTrue(report['capture_completed'])
+                    self.assertFalse(report['matrix_passed'])
+                    self.assertFalse(report['passed'])
+                    self.assertTrue(report['restored'])
+                    self.assertEqual(report['observations'], [])
+                    self.assertEqual(report['cpu_observations'], [])
+                    self.assertEqual([entry['kind'] for entry in report['captures']], ['ipv4', 'ipv6'])
+                    for entry in report['captures']:
+                        self.assertEqual(entry['descriptor'][9] & 0xffff, service)
+                        self.assertEqual(entry['send_error'], 'RX marker timed out' if send_error else None)
+                    self.assert_restored(board)
+
+    def test_capture_unexpected_send_error_fails_and_restores(self):
+        for send_error in ((1, b'Input/output error\n'),
+                           (255, b'ash: write error: Operation timed out\n'),
+                           (1, b'ash: write error: Operation timed out\nextra error\n')):
+            with self.subTest(send_error=send_error):
+                board = BoardFixture(send_error=send_error)
+                with self.assertRaisesRegex(ValueError, 'unexpected capture send failure'):
+                    self.invoke(board, capture_service=0x2134)
+                report = self.report()
+                self.assertFalse(report['passed'])
+                self.assertTrue(report['restored'])
+                self.assertNotIn('capture_completed', report)
+                self.assertEqual(report['captures'], [])
+                self.assert_restored(board)
+
+    def test_capture_cleanup_failure_is_reported(self):
+        board = BoardFixture(failures=((RELEASE, 1),))
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.invoke(board, capture_service=1)
+        report = self.report()
+        self.assertTrue(report['capture_completed'])
+        self.assertFalse(report['passed'])
+        self.assertFalse(report['restored'])
+        self.assertIn('cleanup_error', report)
+        self.assertTrue(board.owner)
+        self.assertTrue(board.loaded)
+        self.assertNotIn(RESTORE, board.commands)
+
+    def test_capture_service_range_checked_before_ssh(self):
+        for service in (-1, 65536):
+            with self.subTest(service=service):
+                board = BoardFixture()
+                with self.assertRaisesRegex(ValueError, 'capture service out of range'):
+                    self.invoke(board, capture_service=service)
+                self.assertEqual(board.commands, [])
 
     def test_er_observation_retry_is_bounded(self):
         board = BoardFixture(observation_delay=20)
