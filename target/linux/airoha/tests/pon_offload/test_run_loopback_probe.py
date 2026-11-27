@@ -43,13 +43,14 @@ class BoardFixture:
         self.cover = False
         self.classified = False
         self.ipv6 = '0'
+        self.pool_clean = 'tuple=0 pool=00000000 pool_pending=0 leases=0'
 
     def classifier_status(self):
         if not self.cover and not self.classified:
-            return CLEAN + 'service0=0 service1=0 ppe=0 errors=0 cover=00 routed=0\n'
-        return ('saved=1 dirty=00 active=03 pending=0 scope=01000000 ready=1\n'
+            return CLEAN + 'service0=0 service1=0 ppe=0 errors=0 cover=00 routed=0\n' + self.pool_clean + '\n'
+        return ('saved=1 dirty=0f active=0f pending=0 scope=01000004 ready=1\n'
                 'service0=8500 service1=0 ppe=0 errors=0 cover=02 routed=' +
-                str(int(self.routed)) + '\n')
+                str(int(self.routed)) + '\n tuple=1 pool=00003fff pool_pending=0 leases=2\n')
 
     def status(self):
         sequence = len(self.sent)
@@ -201,6 +202,7 @@ class LoopbackRunnerTests(unittest.TestCase):
         self.assertTrue(report['commands_completed'])
         self.assertTrue(report['numbered_packets_returned'])
         self.assertTrue(report['service_preserved'])
+        self.assertTrue(report['tuple_pool_released'])
         self.assertEqual(len(board.sent), 20)
         self.assertEqual(set(board.sent), {(service, family, variant)
                                           for service in (0x2134, 0xa134)
@@ -312,6 +314,32 @@ class LoopbackRunnerTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, 2)
                 self.assertEqual(board.commands, [])
                 self.assertFalse(self.output.exists())
+
+    def test_dirty_tuple_pool_rejects_preflight(self):
+        for field in ('tuple=1', 'pool=00000001', 'pool_pending=1', 'leases=1'):
+            with self.subTest(field=field):
+                board = BoardFixture()
+                original = next(part for part in board.pool_clean.split() if part.split('=')[0] == field.split('=')[0])
+                board.pool_clean = board.pool_clean.replace(original, field)
+                with self.assertRaisesRegex(AssertionError, 'tuple pool is not idle'):
+                    self.invoke(board)
+                self.assertEqual(len(board.commands), 1)
+
+    def test_failed_tuple_release_retains_module(self):
+        board = BoardFixture()
+        original_status = board.classifier_status
+
+        def status_after_withdrawal():
+            result = original_status()
+            if 'echo off > ' + CLASSIFIER in board.commands:
+                result = result.replace('pool=00000000', 'pool=00000001')
+            return result
+
+        board.classifier_status = status_after_withdrawal
+        with self.assertRaisesRegex(AssertionError, 'tuple pool was not released'):
+            self.invoke(board)
+        self.assertTrue(board.loaded)
+        self.assertNotIn('rmmod ct_pon_loopback', board.commands)
 
     def test_optimized_python_is_rejected(self):
         result = subprocess.run([sys.executable, '-B', '-O', str(RUNNER_PATH)],

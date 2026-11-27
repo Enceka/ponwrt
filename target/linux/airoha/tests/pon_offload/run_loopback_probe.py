@@ -79,6 +79,9 @@ def main():
     assert 'saved=0 dirty=00 active=00 pending=0 scope=01000000 ready=0' in before
     assert 'ct_cpu_fallback: 0 ' in before
     assert 'state DOWN' in before
+    tuple_clean = 'tuple=0 pool=00000000 pool_pending=0 leases=0'
+    if args.exact_tuple:
+        assert tuple_clean in before, 'tuple pool is not idle'
     policy_pattern = r'^generation=\d+ allowed=' + ('1' if args.require_native else r'\d+') + r' failed=0$'
     assert re.search(policy_pattern, before, re.M)
     report = {'boot': args.boot, 'module_sha256': args.sha256, 'special_tag': args.special_tag,
@@ -110,7 +113,11 @@ def main():
             classify_command = 'tuple' if args.exact_tuple else 'set'
             write('classify-a', classifier, classify_command + ' ' + str(args.cover_slot ^ 1) + ' 0x2134')
             write('route', classifier, 'route')
-        remote('classified', 'cat ' + classifier + '; cat /sys/kernel/debug/ppe/config')
+        classified, _ = remote('classified', 'cat ' + classifier + '; cat /sys/kernel/debug/ppe/config')
+        if args.exact_tuple:
+            pool = re.search(r' tuple=1 pool=([0-9a-f]{8}) pool_pending=0 leases=2\b', classified)
+            assert pool and bin(int(pool[1], 16)).count('1') == 14, 'tuple pool ownership mismatch'
+            assert 'active=0f' in classified and 'ppe=0 ' in classified
         cases = [(service, (), True) for service in (0x2134, 0xa134, 0x2134)]
         if args.sif_sweep:
             cases = [(0x2134, (args.sif_mode + ' ' + str(source), 'route'), True) for source in range(32)]
@@ -199,6 +206,9 @@ def main():
             initial_regs = re.findall(r'^([0-9a-f]{4})=([0-9a-f]{8}) ', baseline, re.M)
             final_regs = re.findall(r'^([0-9a-f]{4})=([0-9a-f]{8}) ', restored, re.M)
             assert initial_regs == final_regs and len(initial_regs) == 10
+            if args.exact_tuple:
+                assert tuple_clean in restored, 'tuple pool was not released'
+                report['tuple_pool_released'] = True
             report['registers_restored'] = True
             remote('unload', 'rmmod ct_pon_loopback')
         remote('ipv6-restore', 'echo ' + ipv6_state.strip() + ' > /proc/sys/net/ipv6/conf/pon0/disable_ipv6')
@@ -206,6 +216,8 @@ def main():
                           '; cat /sys/bus/platform/devices/1fb50000.ethernet/ct_native_pair_policy; dmesg | tail -45')
         assert 'ct_cpu_fallback: 0 ' in after
         assert 'saved=0 dirty=00 active=00 pending=0 scope=01000000 ready=0' in after
+        if args.exact_tuple:
+            assert tuple_clean in after, 'tuple pool is not idle after cleanup'
         assert re.search(policy_pattern, after, re.M)
         (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     assert report['numbered_packets_returned'], 'numbered loopback packets missing'
