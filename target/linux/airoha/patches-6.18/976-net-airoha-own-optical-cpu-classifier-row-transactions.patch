@@ -1,0 +1,248 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: own optical CPU classifier row transactions
+
+Save four disabled classifier rows before publishing independent IPv4/IPv6
+service pairs. Stop both rows of a pair before changing dependencies, then
+enable the pair only after every dependency has been acknowledged.
+
+Retain the original row shadows across failed and ambiguous I/O. Require
+transport drain before retrying any command after an error. Restoration
+stops every dirty row before restoring dependencies and keeps incomplete
+rows owned for retry. Support withdrawing one service pair while preserving
+the other pair and the four-row reservation. Leave scope, locking and kernel
+integration to the caller.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_owner.h
+@@ -0,0 +1,231 @@
++#ifndef AIROHA_CT_PON_IFC_OWNER_H
++#define AIROHA_CT_PON_IFC_OWNER_H
++
++#include "airoha_ct_pon_ifc_words.h"
++
++#define AIROHA_CT_PON_IFC_ROW_BASE	56
++#define AIROHA_CT_PON_IFC_ROW_COUNT	4
++
++struct airoha_ct_pon_ifc_owner {
++	struct airoha_ct_pon_ifc_words saved[AIROHA_CT_PON_IFC_ROW_COUNT];
++	bool saved_valid;
++	bool pending;
++	u8 dirty;
++	u8 active;
++};
++
++struct airoha_ct_pon_ifc_io {
++	void *ctx;
++	int (*read)(void *ctx, unsigned int bank, unsigned int row,
++		    unsigned int page, u32 *words, unsigned int count);
++	int (*put)(void *ctx, unsigned int bank, unsigned int row,
++		   unsigned int page, const u32 *words, unsigned int count);
++	int (*drain)(void *ctx);
++};
++
++static const u8 airoha_ct_pon_ifc_action_words[] = { 2, 3, 1 };
++
++static inline bool
++airoha_ct_pon_ifc_io_valid(const struct airoha_ct_pon_ifc_owner *owner,
++			  const struct airoha_ct_pon_ifc_io *io)
++{
++	return owner && io && io->read && io->put && io->drain;
++}
++
++static inline int
++airoha_ct_pon_ifc_sync(struct airoha_ct_pon_ifc_owner *owner,
++		      const struct airoha_ct_pon_ifc_io *io)
++{
++	int err;
++
++	if (!owner->pending)
++		return 0;
++	err = io->drain(io->ctx);
++	if (!err)
++		owner->pending = false;
++	return err;
++}
++
++static inline int
++airoha_ct_pon_ifc_snapshot(struct airoha_ct_pon_ifc_owner *owner,
++			  const struct airoha_ct_pon_ifc_io *io)
++{
++	unsigned int row, page;
++	int err;
++
++	if (!airoha_ct_pon_ifc_io_valid(owner, io))
++		return -EINVAL;
++	if (owner->saved_valid || owner->dirty || owner->active)
++		return -EBUSY;
++	err = airoha_ct_pon_ifc_sync(owner, io);
++	if (err)
++		return err;
++	for (row = 0; row < AIROHA_CT_PON_IFC_ROW_COUNT; row++) {
++		owner->saved[row] = (struct airoha_ct_pon_ifc_words) {};
++		for (page = 0; page < 9; page++) {
++			err = io->read(io->ctx, 0, AIROHA_CT_PON_IFC_ROW_BASE + row,
++				       page, owner->saved[row].tcam[page], 2);
++			if (err)
++				goto fail;
++		}
++		for (page = 0; page < 3; page++) {
++			err = io->read(io->ctx, 2, AIROHA_CT_PON_IFC_ROW_BASE + row,
++				       page, owner->saved[row].action[page],
++				       airoha_ct_pon_ifc_action_words[page]);
++			if (err)
++				goto fail;
++		}
++	}
++	for (row = 0; row < AIROHA_CT_PON_IFC_ROW_COUNT; row++)
++		if (owner->saved[row].action[2][0] & BIT(31))
++			return -EBUSY;
++	owner->saved_valid = true;
++	return 0;
++
++fail:
++	owner->pending = true;
++	return err;
++}
++
++static inline int
++airoha_ct_pon_ifc_publish(struct airoha_ct_pon_ifc_owner *owner,
++			 const struct airoha_ct_pon_ifc_io *io, unsigned int slot,
++			 const struct airoha_ct_pon_ifc_words rows[2])
++{
++	unsigned int index, page, first;
++	u32 disabled = 0;
++	u8 mask;
++	int err;
++
++	if (!airoha_ct_pon_ifc_io_valid(owner, io) || !rows || slot >= 2 ||
++	    !owner->saved_valid || !(rows[0].action[2][0] & BIT(31)) ||
++	    !(rows[1].action[2][0] & BIT(31)))
++		return -EINVAL;
++	err = airoha_ct_pon_ifc_sync(owner, io);
++	if (err)
++		return err;
++	first = slot * 2;
++	mask = 3 << first;
++	owner->dirty |= mask;
++	owner->active &= ~mask;
++	for (index = 0; index < 2; index++) {
++		err = io->put(io->ctx, 2, AIROHA_CT_PON_IFC_ROW_BASE + first + index,
++			      2, &disabled, 1);
++		if (err)
++			goto fail;
++	}
++	for (index = 0; index < 2; index++) {
++		for (page = 0; page < 9; page++) {
++			err = io->put(io->ctx, 0,
++				      AIROHA_CT_PON_IFC_ROW_BASE + first + index,
++				      page, rows[index].tcam[page], 2);
++			if (err)
++				goto fail;
++		}
++		for (page = 0; page < 2; page++) {
++			err = io->put(io->ctx, 2,
++				      AIROHA_CT_PON_IFC_ROW_BASE + first + index,
++				      page, rows[index].action[page],
++				      airoha_ct_pon_ifc_action_words[page]);
++			if (err)
++				goto fail;
++		}
++	}
++	for (index = 0; index < 2; index++) {
++		err = io->put(io->ctx, 2, AIROHA_CT_PON_IFC_ROW_BASE + first + index,
++			      2, rows[index].action[2], 1);
++		if (err)
++			goto fail;
++	}
++	owner->active |= mask;
++	return 0;
++
++fail:
++	owner->pending = true;
++	return err;
++}
++
++static inline int
++airoha_ct_pon_ifc_restore_mask(struct airoha_ct_pon_ifc_owner *owner,
++			      const struct airoha_ct_pon_ifc_io *io, u8 dirty)
++{
++	unsigned int row, page;
++	u32 disabled = 0;
++	int err;
++
++	err = airoha_ct_pon_ifc_sync(owner, io);
++	if (err)
++		return err;
++	owner->dirty |= dirty;
++	owner->active &= ~dirty;
++	for (row = 0; row < AIROHA_CT_PON_IFC_ROW_COUNT; row++) {
++		if (!(dirty & BIT(row)))
++			continue;
++		err = io->put(io->ctx, 2, AIROHA_CT_PON_IFC_ROW_BASE + row,
++			      2, &disabled, 1);
++		if (err)
++			goto fail;
++	}
++	for (row = 0; row < AIROHA_CT_PON_IFC_ROW_COUNT; row++) {
++		if (!(dirty & BIT(row)))
++			continue;
++		for (page = 0; page < 9; page++) {
++			err = io->put(io->ctx, 0, AIROHA_CT_PON_IFC_ROW_BASE + row,
++				      page, owner->saved[row].tcam[page], 2);
++			if (err)
++				goto fail;
++		}
++		for (page = 0; page < 2; page++) {
++			err = io->put(io->ctx, 2, AIROHA_CT_PON_IFC_ROW_BASE + row,
++				      page, owner->saved[row].action[page],
++				      airoha_ct_pon_ifc_action_words[page]);
++			if (err)
++				goto fail;
++		}
++	}
++	for (row = 0; row < AIROHA_CT_PON_IFC_ROW_COUNT; row++) {
++		if (!(dirty & BIT(row)))
++			continue;
++		err = io->put(io->ctx, 2, AIROHA_CT_PON_IFC_ROW_BASE + row,
++			      2, owner->saved[row].action[2], 1);
++		if (err)
++			goto fail;
++		owner->dirty &= ~BIT(row);
++	}
++	return 0;
++
++fail:
++	owner->pending = true;
++	return err;
++}
++
++static inline int
++airoha_ct_pon_ifc_withdraw(struct airoha_ct_pon_ifc_owner *owner,
++			  const struct airoha_ct_pon_ifc_io *io, unsigned int slot)
++{
++	if (!airoha_ct_pon_ifc_io_valid(owner, io) || slot >= 2 ||
++	    !owner->saved_valid)
++		return -EINVAL;
++	return airoha_ct_pon_ifc_restore_mask(owner, io, 3 << (slot * 2));
++}
++
++static inline int
++airoha_ct_pon_ifc_restore(struct airoha_ct_pon_ifc_owner *owner,
++			 const struct airoha_ct_pon_ifc_io *io)
++{
++	int err;
++
++	if (!airoha_ct_pon_ifc_io_valid(owner, io))
++		return -EINVAL;
++	if (!owner->saved_valid) {
++		if (owner->dirty || owner->active)
++			return -EUCLEAN;
++		return airoha_ct_pon_ifc_sync(owner, io);
++	}
++	err = airoha_ct_pon_ifc_restore_mask(owner, io, owner->dirty);
++	if (!err)
++		owner->saved_valid = false;
++	return err;
++}
++
++#endif
