@@ -160,7 +160,22 @@ the existing IFC ownership, snapshots and dirty-state retry handling.
 GDM4 retains its ordinary forwarding configuration: a default CPU override
 would bypass IFC and prevent native LAN1 forwarding.
 
-Run the ingress checks against a Linux tree prepared through patch 960:
+Patch 974 adds an internal compare-and-update operation for the same IFC owner.
+Initial ownership stays at port 24. Extending it to ports 24 and 2 requires
+classifier authorization; this patch adds no caller or user setter for that
+authorization or the update operation. Optical PPE qualification stays closed.
+The update preserves the desired port state, verifies register readback, and
+restores the previous scope on failure. Failed rollback retains ownership and
+enters sticky CPU fallback. Scope acquisition and release require IFC disabled.
+
+Scope writers hold `flow_offload_mutex`, then `ct_route_lock`, then
+`ifc_port_lock`. The shared LAN readiness check takes only the two spinlocks,
+so both flow admission and native snapshots under `ppe_lock` can use it.
+It requires exact equality with `desired & scope`, an enabled owned classifier,
+authorized ports and healthy CPU recovery state. Ordinary port enable/disable
+continues to update the saved desired state under `ifc_port_lock`.
+
+Run the ingress checks against a Linux tree prepared through patch 974:
 
 ```sh
 python3 target/linux/airoha/tests/native_pair/verify_ifc_cpu.py \
@@ -171,10 +186,15 @@ python3 target/linux/airoha/tests/native_pair/verify_ingress_mutations.py \
   --kernel /path/to/linux --output /path/to/new/ingress-mutation-results
 ```
 
-The extracted driver checks pass 2,485 IFC lifecycle cases, 538,624 classifier
-combinations and 3,277 native cases under ASan/UBSan, and reject 16 deliberate
-mutations. The patch applies with zero fuzz and reproduces all 47 driver files
-of the tested candidate. The matched kernel builds with zero warnings/errors.
+The extracted driver checks pass 2,485 IFC lifecycle cases, 130 scope cases,
+538,624 classifier combinations and 3,287 native cases under ASan/UBSan.
+They also check both missing-flow-mutex assertions and reject 28 deliberate
+runtime mutations plus two source-order audit mutations. Runtime mutation
+acceptance requires a compiled C test ending with an assertion and `SIGABRT`;
+compile failures are rejected. Scope coverage includes
+unauthorized ports, stale ownership/register state, desired port changes,
+successful rollback, failed rollback, recovery scheduling and global gate
+failure. Native snapshot checks exercise shared scope under `ppe_lock`.
 
 The 2026-11-26 NAND-disabled RAM trial passed all 26 classification templates
 in 1,040 frames. Plain IP and short-boundary native frames bypassed CPU and

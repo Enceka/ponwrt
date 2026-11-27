@@ -1,0 +1,194 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: update the owned IFC port scope in place
+
+Keep initial ownership limited to LAN1. Provide an internal compare-and-update
+operation for the existing owner to include GDM2 after a future classifier
+owner publishes ct_ifc_pon_ready. No production caller sets that authorization
+or invokes the update yet.
+
+Serialize scope changes with CPU fallback and port enable writers. Preserve
+the desired port state across updates and failed restoration. Roll back a
+failed update; if rollback also fails, retain ownership and enter the existing
+sticky CPU fallback. Require IFC to be disabled before releasing the scope.
+
+Use one owned-port check for LAN1 flow admission and native table snapshots.
+Accept authorized GDM2 coexistence while rejecting unrelated ports, stale
+register state, and fallback. Leave the optical PPE gate closed.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -187,26 +187,121 @@
+ 	u32 ports;
+ 	int err = 0;
+ 
++	lockdep_assert_held(&flow_offload_mutex);
++	if (scope && scope != XSI_ETH_VIP_PORT_MASK)
++		return -EINVAL;
++	spin_lock_bh(&eth->ct_route_lock);
+ 	spin_lock_bh(&eth->ifc_port_lock);
++	if (!scope && !eth->ct_ifc_port_mask)
++		goto unlock;
++	if ((scope && eth->ct_ifc_port_mask) ||
++	    (airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK)) {
++		err = -EBUSY;
++		goto unlock;
++	}
+ 	if (scope) {
+-		if (eth->ct_ifc_port_mask) {
+-			err = -EBUSY;
+-			goto unlock;
+-		}
+ 		eth->ifc_port_desired = airoha_fe_rr(eth, REG_FE_IFC_PORT_EN);
+ 		eth->ct_ifc_port_mask = scope;
+-	} else if (!eth->ct_ifc_port_mask) {
+-		goto unlock;
++		eth->ct_ifc_pon_ready = false;
+ 	}
+ 	ports = scope ? eth->ifc_port_desired & scope : eth->ifc_port_desired;
+ 	airoha_fe_wr(eth, REG_FE_IFC_PORT_EN, ports);
+ 	if (airoha_fe_rr(eth, REG_FE_IFC_PORT_EN) != ports)
+ 		err = -EIO;
+-	else if (!scope)
++	else if (!scope) {
+ 		eth->ct_ifc_port_mask = 0;
++		eth->ct_ifc_pon_ready = false;
++	}
+ unlock:
+ 	spin_unlock_bh(&eth->ifc_port_lock);
++	spin_unlock_bh(&eth->ct_route_lock);
+ 	return err;
++}
++
++int airoha_ifc_scope_update(struct airoha_eth *eth, u32 expected, u32 scope)
++{
++	u32 allowed = XSI_ETH_VIP_PORT_MASK | BIT(AIROHA_GDM2_IDX);
++	bool recover = false;
++	u32 previous, ports;
++	int err = 0;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!(scope & XSI_ETH_VIP_PORT_MASK) || (scope & ~allowed))
++		return -EINVAL;
++	spin_lock_bh(&eth->ct_route_lock);
++	spin_lock_bh(&eth->ifc_port_lock);
++	if (!eth->ct_ifc_port_mask) {
++		err = -ENOENT;
++		goto unlock;
++	}
++	if (eth->ct_ifc_port_mask != expected) {
++		err = -ESTALE;
++		goto unlock;
++	}
++	if (!eth->ppe || !READ_ONCE(eth->ppe->ct_ifc.cfg_owned) ||
++	    !READ_ONCE(eth->ppe->ct_host_ppe) || READ_ONCE(eth->ppe->ct_stopping) ||
++	    eth->ct_cpu_fallback || eth->ct_ifc_cpu_port_failed ||
++	    !(airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK)) {
++		err = -ESHUTDOWN;
++		goto unlock;
++	}
++	if ((expected & ~allowed) || !(expected & XSI_ETH_VIP_PORT_MASK)) {
++		err = -EUCLEAN;
++		goto unlock;
++	}
++	if ((scope & BIT(AIROHA_GDM2_IDX)) && !eth->ct_ifc_pon_ready) {
++		err = -EACCES;
++		goto unlock;
++	}
++	previous = eth->ifc_port_desired & expected;
++	if (airoha_fe_rr(eth, REG_FE_IFC_PORT_EN) != previous) {
++		err = -EUCLEAN;
++		goto unlock;
++	}
++	ports = eth->ifc_port_desired & scope;
++	if (ports != previous)
++		airoha_fe_wr(eth, REG_FE_IFC_PORT_EN, ports);
++	if (airoha_fe_rr(eth, REG_FE_IFC_PORT_EN) == ports) {
++		eth->ct_ifc_port_mask = scope;
++		goto unlock;
++	}
++	err = -EIO;
++	airoha_fe_wr(eth, REG_FE_IFC_PORT_EN, previous);
++	if (airoha_fe_rr(eth, REG_FE_IFC_PORT_EN) != previous) {
++		WRITE_ONCE(eth->ct_ifc_cpu_port_failed, true);
++		recover = true;
++	}
++unlock:
++	spin_unlock_bh(&eth->ifc_port_lock);
++	spin_unlock_bh(&eth->ct_route_lock);
++	if (recover) {
++		airoha_ct_cpu_fallback(eth);
++		if (eth->ppe->ct_native_pairs && !READ_ONCE(eth->ppe->ct_fe.health_stopping))
++			schedule_delayed_work(&eth->ppe->ct_fe.health_work, 0);
++	}
++	return err;
++}
++
++bool airoha_ifc_lan_ports_ready(struct airoha_eth *eth)
++{
++	u32 allowed = XSI_ETH_VIP_PORT_MASK | BIT(AIROHA_GDM2_IDX);
++	u32 scope, ports;
++	bool ready;
++
++	spin_lock_bh(&eth->ct_route_lock);
++	spin_lock_bh(&eth->ifc_port_lock);
++	scope = eth->ct_ifc_port_mask;
++	ports = eth->ifc_port_desired & scope;
++	ready = eth->ppe && READ_ONCE(eth->ppe->ct_ifc.cfg_owned) &&
++		!eth->ct_cpu_fallback && !eth->ct_ifc_cpu_port_failed &&
++		(airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK) &&
++		(scope & XSI_ETH_VIP_PORT_MASK) && !(scope & ~allowed) &&
++		(!(scope & BIT(AIROHA_GDM2_IDX)) || eth->ct_ifc_pon_ready) &&
++		(ports & XSI_ETH_VIP_PORT_MASK) &&
++		airoha_fe_rr(eth, REG_FE_IFC_PORT_EN) == ports;
++	spin_unlock_bh(&eth->ifc_port_lock);
++	spin_unlock_bh(&eth->ct_route_lock);
++	return ready;
+ }
+ 
+ static int airoha_set_vip_for_gdm_port(struct airoha_gdm_dev *dev, bool enable)
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -869,6 +869,7 @@
+ 	spinlock_t ifc_port_lock;
+ 	u32 ifc_port_desired;
+ 	u32 ct_ifc_port_mask;
++	bool ct_ifc_pon_ready;
+ 
+ 	struct reset_control_bulk_data rsts[AIROHA_MAX_NUM_RSTS];
+ 	struct reset_control_bulk_data *xsi_rsts;
+@@ -966,6 +967,8 @@
+ int airoha_ppe_init(struct airoha_eth *eth);
+ int airoha_ppe_deinit(struct airoha_eth *eth);
+ int airoha_ifc_scope_ports(struct airoha_eth *eth, u32 scope);
++int airoha_ifc_scope_update(struct airoha_eth *eth, u32 expected, u32 scope);
++bool airoha_ifc_lan_ports_ready(struct airoha_eth *eth);
+ int airoha_gdm_fwd_cfg_update(struct airoha_eth *eth, unsigned int id,
+ 			     u32 mask, u32 value);
+ int airoha_ct_cpu_fallback(struct airoha_eth *eth);
+--- a/drivers/net/ethernet/airoha/airoha_ct_ifc.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_ifc.h
+@@ -55,9 +55,8 @@
+ 	struct flow_match_meta match;
+ 
+ 	lockdep_assert_held(&flow_offload_mutex);
+-	if (!ppe->ct_ifc.cfg_owned || !ingress || !net_eq(dev_net(ingress), dev_net(egress)) ||
+-	    !(airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK) ||
+-	    airoha_fe_rr(eth, REG_FE_IFC_PORT_EN) != XSI_ETH_VIP_PORT_MASK ||
++	if (!airoha_ifc_lan_ports_ready(eth) || !ingress ||
++	    !net_eq(dev_net(ingress), dev_net(egress)) ||
+ 	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN) ||
+ 	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN) ||
+ 	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE) ||
+--- a/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
+@@ -48,9 +48,7 @@
+ 	unsigned int r, page;
+ 	int err;
+ 
+-	if (!ppe->ct_ifc.cfg_owned ||
+-	    !(airoha_fe_rr(ppe->eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK) ||
+-	    airoha_fe_rr(ppe->eth, REG_FE_IFC_PORT_EN) != XSI_ETH_VIP_PORT_MASK)
++	if (!airoha_ifc_lan_ports_ready(ppe->eth))
+ 		return -EINVAL;
+ 	if (ppe->ct_fe.touched)
+ 		return -EBUSY;

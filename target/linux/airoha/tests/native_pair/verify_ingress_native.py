@@ -23,7 +23,7 @@ pre = pre.replace('u32 ct_pair_token,ct_wlan_epoch', '''struct { u32 tcam[2][9][
  u64 generation,pending_generation; bool saved,touched,active,armed,pending,arm_pending,health_stopping,drain_pending; struct delayed_work health_work; } ct_fe;
  struct {bool cfg_owned;struct {u8 lut_index;} rule[2];} ct_ifc;
  u32 ct_pair_token,ct_wlan_epoch''')
-pre = pre.replace('struct airoha_eth {', 'struct airoha_ppe; struct airoha_qdma {int id;}; struct airoha_soc {int num_ppe;}; struct airoha_eth {struct airoha_ppe*ppe; struct airoha_soc*soc;struct airoha_qdma qdma[2];int ct_route_lock;u16 ct_cpu_route_mask[4];bool ct_ifc_cpu_port_failed;bool ct_cpu_fallback,ct_cpu_ifc_disabled,ct_cpu_routes_ready,ct_cpu_wlan_gated;')
+pre = pre.replace('struct airoha_eth {', 'struct airoha_ppe; struct airoha_qdma {int id;}; struct airoha_soc {int num_ppe;}; struct airoha_eth {struct airoha_ppe*ppe; struct airoha_soc*soc;struct airoha_qdma qdma[2];int ct_route_lock,ifc_port_lock;u32 ct_ifc_port_mask,ifc_port_desired;u16 ct_cpu_route_mask[4];bool ct_ifc_cpu_port_failed,ct_ifc_pon_ready,ct_ordinary_full_test;bool ct_cpu_fallback,ct_cpu_ifc_disabled,ct_cpu_routes_ready,ct_cpu_wlan_gated;')
 pre = pre.replace('struct airoha_gdm_dev {', 'struct airoha_gdm_dev {struct airoha_qdma*qdma;')
 pre = pre.replace('bool ct_native_pairs,', 'bool ct_bridge_failed;bool ct_native_pairs,')
 pre = pre.replace('bool ct_native_pairs,', 'bool ct_pair_close_pending;bool ct_native_pairs,')
@@ -41,6 +41,7 @@ pre += r'''
 #define FE_PSE_PORT_PPE2 8
 #define FE_PSE_PORT_DROP 15
 #define AIROHA_GDM1_IDX 1
+#define AIROHA_GDM2_IDX 2
 #define REG_GDM_FWD_CFG(id) (0x700+4*(id))
 static void test_log(const char*fmt,...){(void)fmt;}
 #define pr_err(...) test_log(__VA_ARGS__)
@@ -158,7 +159,7 @@ static void tables_restored(void){
  for(unsigned bank=0;bank<2;bank++)assert(ifc_regs[REG_PPE_GLO_CFG(bank)/4]==PPE_GLO_CFG_EN_MASK&&ifc_regs[REG_PPE_PPE_FLOW_CFG(bank)/4]==0x89abcdef&&ifc_regs[REG_PPE_TB_CFG(bank)/4]==0x9876543f);
 }
 '''
-fixture = fixture.replace('ppe_lock=rcu=0;', 'eth.ppe=&ppe;eth.soc=&test_soc;eth.ct_ifc_cpu_port_failed=false;eth.ct_cpu_fallback=eth.ct_cpu_ifc_disabled=eth.ct_cpu_routes_ready=eth.ct_cpu_wlan_gated=false;eth.ct_route_lock=0;memset(eth.ct_cpu_route_mask,0,sizeof eth.ct_cpu_route_mask);schedules=0;ppe.ct_ifc.cfg_owned=true;ppe.ct_ifc.rule[0].lut_index=31;ppe.ct_ifc.rule[1].lut_index=30;mmio_reset();ppe_lock=rcu=0;')
+fixture = fixture.replace('ppe_lock=rcu=0;', 'eth.ppe=&ppe;eth.soc=&test_soc;eth.ct_ifc_cpu_port_failed=false;eth.ct_cpu_fallback=eth.ct_cpu_ifc_disabled=eth.ct_cpu_routes_ready=eth.ct_cpu_wlan_gated=false;eth.ct_route_lock=eth.ifc_port_lock=0;eth.ct_ifc_port_mask=eth.ifc_port_desired=BIT(24);eth.ct_ifc_pon_ready=eth.ct_ordinary_full_test=false;memset(eth.ct_cpu_route_mask,0,sizeof eth.ct_cpu_route_mask);schedules=0;ppe.ct_ifc.cfg_owned=true;ppe.ct_ifc.rule[0].lut_index=31;ppe.ct_ifc.rule[1].lut_index=30;mmio_reset();ppe_lock=rcu=0;')
 fixture = fixture.replace('wired=(struct airoha_gdm_dev){', 'wired=(struct airoha_gdm_dev){.qdma=&eth.qdma[1],')
 body = '''#include "airoha_ct_cpu_fallback.h"\nstatic int airoha_ct_pair_fault_close(struct airoha_ppe *ppe);\n#include "fail_closed.inc"\n#define airoha_ppe_ct_bridge_fail_closed(ppe) airoha_ppe_ct_bridge_fail_closed_from(ppe,__func__,__LINE__)\n#include "airoha_ct_native_pair.h"\n#include "pair_policy_event.inc"\n'''
 main = r'''
@@ -180,6 +181,26 @@ static void source_reset(void){reset();src.ieee80211_ptr=NULL;src.running=src.ca
 static void cpu_bind(unsigned hash){struct net_device*egress=skb.dev;skb.dev=&src;napi=true;test_bind(hash,NULL);napi=false;skb.dev=egress;}
 static int stop_fe(void){int err;spin_lock_bh(&ppe_lock);err=airoha_ct_fe_quiesce(&ppe,generation);spin_unlock_bh(&ppe_lock);return err;}
 int main(void){unsigned cases=0;
+ for(unsigned mode=0;mode<10;mode++){
+  source_reset();
+  eth.ct_ifc_port_mask=eth.ifc_port_desired=BIT(24)|BIT(2);
+  eth.ct_ifc_pon_ready=true;ifc_regs[REG_FE_IFC_PORT_EN/4]=eth.ct_ifc_port_mask;
+  switch(mode){
+   case 1:eth.ct_ifc_pon_ready=false;break;
+   case 2:eth.ct_ifc_port_mask|=BIT(3);eth.ifc_port_desired|=BIT(3);ifc_regs[REG_FE_IFC_PORT_EN/4]|=BIT(3);break;
+   case 3:ifc_regs[REG_FE_IFC_PORT_EN/4]|=BIT(5);break;
+   case 4:ifc_regs[REG_FE_IFC_PORT_EN/4]&=~BIT(2);break;
+   case 5:eth.ct_cpu_fallback=true;break;
+   case 6:eth.ct_ifc_cpu_port_failed=true;break;
+   case 7:ifc_regs[REG_FE_CSR_IFC_CFG/4]&=~FE_IFC_EN_MASK;break;
+   case 8:ppe.ct_ifc.cfg_owned=false;break;
+   case 9:eth.ifc_port_desired&=~BIT(24);ifc_regs[REG_FE_IFC_PORT_EN/4]&=~BIT(24);break;
+  }
+  spin_lock_bh(&ppe_lock);
+  assert(airoha_ct_fe_snapshot(&ppe)==(mode?-EINVAL:0));
+  spin_unlock_bh(&ppe_lock);
+  assert(ppe.ct_fe.saved==(mode==0)&&!eth.ct_route_lock&&!eth.ifc_port_lock&&!table_writes);cases++;
+ }
  reset();struct airoha_ct_pair_msg cap={.op=AIROHA_CT_PAIR_CAP};retries=5;assert(!airoha_ct_pair_exchange(&npu,&cap)&&calls==6&&!ppe_lock&&!rcu);cases++;
  reset();retries=20000;assert(airoha_ct_pair_exchange(&npu,&cap)==-ETIMEDOUT&&!ppe_lock&&!rcu);cases++;
  reset();assert(airoha_ct_pair_exchange(NULL,&cap)==-EOPNOTSUPP&&!calls);cases++;
@@ -361,13 +382,15 @@ main = main.replace(' printf("{', r'''
  source_reset();assert(ct_native_pair_policy_store(&eth_dev,NULL,"whole-mac-ip 38",15)==-ESTALE&&!nops&&!policy_locks);cases++;
  source_reset();policy_hooks_ok=false;assert(ct_native_pair_policy_store(&eth_dev,NULL,"whole-mac-ip 39",15)==-EOPNOTSUPP&&!nops&&!policy_locks);policy_hooks_ok=true;cases++;
  printf("{''')
-(B/'test.c').write_text(pre + body + fixture + policy_pre + policy_store + main)
+ports_ready = function((H/'airoha_eth.c').read_text(), 'bool airoha_ifc_lan_ports_ready(')
+(B/'test.c').write_text(pre + ports_ready + '\n' + body + fixture + policy_pre + policy_store + main)
 subprocess.run(['clang', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
                 '-fsanitize=address,undefined', '-I'+str(B), str(B/'test.c'), '-o', str(B/'test')], check=True)
 p = subprocess.run([str(B/'test')], capture_output=True, text=True)
 (B/'stdout.txt').write_text(p.stdout); (B/'stderr.txt').write_text(p.stderr)
+(B/'exit-status.json').write_text(json.dumps({'returncode':p.returncode})+'\n')
 p.check_returncode()
 report = json.loads(p.stdout)
-report.update(sanitizers=['address', 'undefined'], source_sha256={name: hashlib.sha256((a.header if name=='airoha_ct_fe_native.h' else H/name).read_bytes()).hexdigest() for name in ('airoha_ct_native_pair.h', 'airoha_ct_fe_native.h', 'airoha_ct_pair_policy.h', 'airoha_ct_cpu_fallback.h', 'airoha_ppe.c')})
+report.update(sanitizers=['address', 'undefined'], source_sha256={name: hashlib.sha256((a.header if name=='airoha_ct_fe_native.h' else H/name).read_bytes()).hexdigest() for name in ('airoha_ct_native_pair.h', 'airoha_ct_fe_native.h', 'airoha_ct_pair_policy.h', 'airoha_ct_cpu_fallback.h', 'airoha_eth.c', 'airoha_ppe.c')})
 (B/'source3-verification.json').write_text(json.dumps(report, indent=2)+'\n')
 print(json.dumps(report, indent=2))
