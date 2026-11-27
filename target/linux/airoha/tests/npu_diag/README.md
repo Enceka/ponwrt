@@ -109,6 +109,14 @@ retirement. Ownership tests keep bank0 excluded during carrier loss,
 controller changes, invalidation and failed close/restore retries, then
 permit ordinary host use after owner release.
 
+Bank0 takeover retires host cookies and L2 subflows after disabling learning
+and waiting for PPE idle, before clearing SRAM rows. The owner tests inject
+table-walk errors, then a row-clear timeout: ownership and original registers
+survive both failures, while a successful software retirement runs only once
+per owner. Binding, learning restore and final release each require the
+retirement marker. Actual mixed-bank cookie/L2 detachment and stale
+stats/destroy handling are exercised by the `npu_bank1` suite.
+
 All 38 existing separately compiled negative controls remain and must fail assertions. They
 remove identity, policy, qualification, netdevice parent and AUTH-count
 checks, permit production AUTH in the diagnostic session, ignore restore
@@ -156,7 +164,7 @@ reproduction uses the generated binary:
 /absolute/test-output/npu-diag --review-platform
 ```
 
-The final dual-bank matrix has 699 cases, 30,274 assertions and 104
+The final dual-bank matrix has 706 cases, 31,570 assertions and 112
 negative controls. The runner also checks that both host insertion paths
 use the stable bank0 ownership predicate.
 The report records the assertion count, all mutation results, the twelve

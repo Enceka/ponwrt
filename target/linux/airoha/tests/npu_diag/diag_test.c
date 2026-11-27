@@ -115,7 +115,7 @@ struct airoha_npu_owner {
 	bool retiring, bank1_saved, bank1_host_retired, closed_ack;
 	bool auth_attempted, epoch_dirty, diag_auth, diag_learn;
 	bool diag_bound, invalidated;
-	bool bank0_saved;
+	bool bank0_saved, bank0_host_retired;
 	u32 bank0_next_row, bank0_flow, bank0_tb;
 	u32 diag_service, diag_hash;
 	struct net_device *diag_egress;
@@ -187,6 +187,8 @@ static unsigned int mmio_count, scope_calls;
 static u32 close_entry_row, close_bank0_row;
 static unsigned int clear_calls[2], clear_order[8], clear_count;
 static int clear_error[2], retire_error;
+static int bank0_retire_error;
+static unsigned int bank0_retire_calls;
 enum { TRACE_BINDING = 5, TRACE_READY, TRACE_OPEN };
 static u32 trace[128], trace_count;
 static struct npu_auth_message auth_requests[5];
@@ -374,6 +376,7 @@ static int clear_bank(struct airoha_ppe *actual, u32 bank, u32 *cursor)
 {
 	CHECK(actual == &ppe && !ppe_lock && flow_offload_mutex == 1);
 	CHECK(cursor == (bank ? &session.bank1_next_row : &session.bank0_next_row));
+	CHECK(bank ? session.bank1_host_retired : session.bank0_host_retired);
 	CHECK(!registers[REG_PPE_PPE_FLOW_CFG(bank)]);
 	CHECK(FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, registers[REG_PPE_TB_CFG(bank)]) == 2);
 	CHECK((registers[REG_PPE_GLO_CFG(bank)] & (PPE_GLO_CFG_EN_MASK | PPE_GLO_CFG_BUSY_MASK)) == PPE_GLO_CFG_EN_MASK);
@@ -401,6 +404,16 @@ static int airoha_ppe_bank1_retire_flows(struct airoha_ppe *actual)
 {
 	CHECK(actual == &ppe && !ppe_lock);
 	return retire_error;
+}
+static int airoha_ppe_bank0_retire_flows(struct airoha_ppe *actual)
+{
+	CHECK(actual == &ppe && !ppe_lock && flow_offload_mutex == 1);
+	CHECK(session.bank0_saved && !session.bank0_host_retired);
+	CHECK(!registers[REG_PPE_PPE_FLOW_CFG(0)]);
+	CHECK(FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, registers[REG_PPE_TB_CFG(0)]) == 2);
+	CHECK((registers[REG_PPE_GLO_CFG(0)] & (PPE_GLO_CFG_EN_MASK | PPE_GLO_CFG_BUSY_MASK)) == PPE_GLO_CFG_EN_MASK);
+	bank0_retire_calls++;
+	return bank0_retire_error;
 }
 #include "bank0_drain.inc"
 #include "bank1_drain.inc"
@@ -763,6 +776,7 @@ static void fixture(void)
 	memset(clear_calls, 0, sizeof(clear_calls));
 	memset(clear_error, 0, sizeof(clear_error));
 	clear_count = retire_error = 0;
+	bank0_retire_calls = bank0_retire_error = 0;
 	memset(registers, 0, sizeof(registers));
 	memset(auth_calls, 0, sizeof(auth_calls));
 	memset(auth_requests, 0, sizeof(auth_requests));
@@ -1464,6 +1478,7 @@ static void prepare_learning_restore(void)
 {
 	prepare_open();
 	session.diag_auth = session.diag_learn = session.bank0_saved = true;
+	session.bank0_host_retired = true;
 	session.auth_count = 1;
 	session.bank0_flow = registers[REG_PPE_PPE_FLOW_CFG(0)];
 	session.bank0_tb = registers[REG_PPE_TB_CFG(0)];
@@ -2131,6 +2146,61 @@ static void test_bank0_ownership(void)
 	}
 }
 
+static void test_bank0_host_retirement(void)
+{
+	const int errors[] = { -EIO, -ENOMEM, -EINVAL };
+
+	for (unsigned int index = 0; index < ARRAY_SIZE(errors); index++) {
+		fixture();
+		bank0_retire_error = errors[index];
+		CHECK(airoha_npu_diag_start_mode(&ppe, 2, binding_service) == errors[index]);
+		CHECK(bank0_retire_calls == 1 && !session.bank0_host_retired);
+		CHECK(session.bank0_saved && bank0_owned() && !session.bank0_next_row);
+		CHECK(!clear_calls[0] && !open_calls && !binding_calls && !freed);
+		CHECK(session.bank0_flow == 0xabc001 && session.bank0_tb == 0xabc002);
+		bank0_retire_error = 0;
+		clear_error[0] = -ETIMEDOUT;
+		close_clears_rows = true;
+		CHECK(airoha_npu_diag_close(&ppe, true) == -ETIMEDOUT);
+		CHECK(bank0_retire_calls == 2 && session.bank0_host_retired);
+		CHECK(session.bank0_next_row == 17 && bank0_owned() && !freed);
+		clear_error[0] = 0;
+		CHECK(!airoha_npu_diag_close(&ppe, true));
+		CHECK(bank0_retire_calls == 2 && session.bank0_host_retired);
+		CHECK(!bank0_owned() && freed == 1 && netdev_puts == 1);
+		CHECK(registers[0] == 0xabc001 && registers[1] == 0xabc002);
+		balanced();
+	}
+	fixture();
+	CHECK(!airoha_npu_diag_start_mode(&ppe, 2, binding_service));
+	CHECK(bank0_retire_calls == 1 && session.bank0_host_retired);
+	close_clears_rows = true;
+	CHECK(!airoha_npu_diag_close(&ppe, false));
+	CHECK(!airoha_npu_diag_close(&ppe, false));
+	CHECK(bank0_retire_calls == 1 && bank0_owned());
+	CHECK(!airoha_npu_diag_close(&ppe, true));
+	CHECK(bank0_retire_calls == 1 && !bank0_owned());
+	balanced();
+
+	prepare_learning_restore();
+	session.bank0_host_retired = false;
+	CHECK(airoha_npu_owner_bank1_restore(&session, &session.txn.id) == -EIO);
+	CHECK(!writes && !sram_commits);
+	balanced();
+	prepare_bound_install();
+	session.bank0_host_retired = false;
+	CHECK(airoha_npu_diag_install(&session) == -EINVAL);
+	CHECK(!writes && !sram_reads && !sram_commits);
+	balanced();
+	prepare_learning_restore();
+	session.bank0_host_retired = false;
+	session.auth_attempted = false;
+	CHECK(airoha_npu_owner_retire_locked(&ppe) == -EBUSY);
+	CHECK(airoha_npu_diag_close(&ppe, true) == -EBUSY);
+	CHECK(!writes && !route_releases && !fe_releases && !freed && !netdev_puts);
+	balanced();
+}
+
 static void review_platform(void)
 {
 	unsigned int scenario, accepted = 0;
@@ -2178,6 +2248,7 @@ int main(int argc, char **argv)
 	test_dualbank_drain();
 	test_dualbank_release();
 	test_bank0_ownership();
+	test_bank0_host_retirement();
 	printf("{\"passed\":true,\"cases\":%u,\"checks\":%u}\n", cases, checks);
 	return 0;
 }

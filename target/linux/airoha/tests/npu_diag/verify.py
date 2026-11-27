@@ -87,7 +87,7 @@ def main():
               for name in [*FUNCTIONS, *HEADERS, 'airoha_eth.h', 'airoha_regs.h']}
     test_inputs = {name: (tests / name).read_bytes() for name in ('verify.py', 'diag_test.c')}
     binding = SourceBinding(repo / 'target/linux/airoha/patches-6.18', output,
-                            '999-zu-net-airoha-retain-pon-bank0-ownership.patch')
+                            '999-zv-net-airoha-retire-host-bank0-before-npu-reuse.patch')
     binding_error = None
     try:
         binding.bind(driver, ('airoha_npu_owner.h', 'airoha_npu_diag.h',
@@ -228,8 +228,16 @@ def main():
         'ignore_bank0_drain_miss': ('bank0_drain.inc', '(airoha_fe_rr(eth, REG_PPE_TB_CFG(0)) & PPE_TB_CFG_SEARCH_MISS_MASK) != no_foe', 'false'),
         'ignore_bank0_drain_busy': ('bank0_drain.inc', '!(status & PPE_GLO_CFG_BUSY_MASK)', 'true'),
         'ignore_bank0_drain_enabled': ('bank0_drain.inc', '!(status & PPE_GLO_CFG_EN_MASK)', 'false'),
-        'ignore_bank0_release_cursor': ('close.inc', '(owner->bank0_saved && owner->bank0_next_row != PPE_SRAM_NUM_ENTRIES) ||', 'false ||'),
-        'ignore_bank0_retire_cursor': ('retire.inc', '(owner->bank0_saved && owner->bank0_next_row != PPE_SRAM_NUM_ENTRIES) ||', 'false ||'),
+        'ignore_bank0_release_cursor': ('close.inc', 'owner->bank0_next_row != PPE_SRAM_NUM_ENTRIES)) ||', 'false)) ||'),
+        'ignore_bank0_retire_cursor': ('retire.inc', 'owner->bank0_next_row != PPE_SRAM_NUM_ENTRIES)) ||', 'false)) ||'),
+        'skip_bank0_host_retirement': ('bank0_drain.inc', 'error = airoha_ppe_bank0_retire_flows(owner->ppe);', 'error = 0;'),
+        'repeat_bank0_host_retirement': ('bank0_drain.inc', '!error && !owner->bank0_host_retired', '!error'),
+        'ignore_bank0_retirement_failure': ('bank0_drain.inc', 'error = airoha_ppe_bank0_retire_flows(owner->ppe);', '(void)airoha_ppe_bank0_retire_flows(owner->ppe);'),
+        'forget_bank0_retirement': ('bank0_drain.inc', 'owner->bank0_host_retired = true;', 'owner->bank0_host_retired = false;'),
+        'ignore_bank0_restore_retirement': ('restore.inc', '!owner->bank0_host_retired ||', 'false ||'),
+        'ignore_bank0_install_retirement': ('install.inc', '!owner->bank0_host_retired ||', 'false ||'),
+        'ignore_bank0_release_retirement': ('close.inc', '!owner->bank0_host_retired ||', 'false ||'),
+        'ignore_bank0_owner_retirement': ('retire.inc', '!owner->bank0_host_retired ||', 'false ||'),
         'skip_bank0_release': ('close.inc', 'if (!error && owner->bank0_saved)', 'if (false)'),
         'skip_bank0_table_readback': ('close.inc', 'airoha_fe_rr(eth, REG_PPE_TB_CFG(0)) != owner->bank0_tb', 'false'),
         'skip_bank0_flow_readback': ('close.inc', 'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) == owner->bank0_flow ? 0 : -EIO', '0'),
