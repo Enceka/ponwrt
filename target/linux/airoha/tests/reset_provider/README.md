@@ -61,3 +61,34 @@ QUIESCE→STOP→消费完成→UNBIND；强制退役在硬件完成条件满足
 逐项 assert 保留已经成功的步骤，避免 bulk assert 失败回滚。
 待硬件条件补齐期间保留 ring、ctx 和 provider 生命周期，走 CPU fallback；
 remove 路径同步处理 devres、timer、NAPI 和 delayed work 的最后引用。
+
+## 驱动解绑与资源保活
+
+2026-11-27 对截至 `999-zc` 的合成源码复核：`airoha_remove()` 是 void
+回调，`airoha_ppe_ct_shutdown()` 或后续 `airoha_hw_cleanup()` 失败后返回，
+driver core 仍继续解绑并释放 devres。`eth/ppe/QDMA` 元数据和 `dmam_*`
+分配会随之释放；普通分配保留的 owner、return path 和 ER ring 仍引用它们。
+因此异常退役需要保留整个宿主/provider 生命周期。
+
+成功退役路径已有相应顺序：ER QUIESCE/STOP、消费完成、UNBIND 后停止
+hrtimer/NAPI，再释放 ring；随后停止 path fault work，最终停止 owner
+health work。普通可重试的 close 错误仍需 NAPI 消费完成，不能提前 park。
+若新增终止专用 park，应独立记录状态，避免重复 `napi_disable()`，同时
+封住所有 work 重排入口。
+
+当前 HG5585F 配置把 `NET_AIROHA` 和 `NET_AIROHA_NPU` 编为 built-in，
+两个 platform driver 均设置 `suppress_bind_attrs=true`。后续可先为专用
+镜像强制检查这些条件与固定 DT，保持常驻运行；动态设备/supplier 注销
+仍需单独约束。device link 管理解绑顺序，`get_device()` 保留 device 对象，
+二者都不承担阻止 driver core 释放 devres 的职责。
+
+源码入口（相对截至 `999-zc` 的内核树）：
+
+- `drivers/net/ethernet/airoha/airoha_eth.c`：`airoha_remove()`、驱动注册。
+- `drivers/net/ethernet/airoha/airoha_npu.c`：provider 无 remove 回调，
+  shutdown 仅撤 capability，mailbox DMA/MMIO 使用 devres。
+- `drivers/net/ethernet/airoha/airoha_eth_return.c`：`er_release()`。
+- `drivers/net/ethernet/airoha/airoha_npu_return.h`：return path 销毁。
+- `drivers/net/ethernet/airoha/airoha_npu_owner.h`：owner 退役。
+- Linux v6.18 `drivers/base/dd.c`：`__device_release_driver()`、
+  `device_unbind_cleanup()` 与 `devres_release_all()`。
