@@ -615,11 +615,6 @@ static void io_failures(void)
 				else
 					assert(!invoke(&fixture, operation, slot));
 				assert(!fixture.ppe.ct_pon_ifc.pending && !mock.busy);
-				if (operation == SET_INITIAL && position <= 74) {
-					u32 words[2];
-					assert(fixture.eth.ct_ifc_command_pending);
-					assert(!ct_ifc_access(&fixture.eth, 0, 56, 0, false, words, 2));
-				}
 				assert(!fixture.eth.ct_ifc_command_pending);
 				check_shadow(&fixture);
 				assert(!airoha_ct_pon_ifc_cpu_stop(&fixture.ppe));
@@ -1474,12 +1469,6 @@ static void cover_publication_failures(void)
 					mock.release = true;
 					mock.fail_at = 0;
 					assert(store(&fixture, "off") == 3);
-					if (fixture.eth.ct_ifc_command_pending) {
-						u32 words[2];
-
-						assert(!operation && failure <= 74);
-						assert(!ct_ifc_access(&fixture.eth, 0, 56, 0, false, words, 2));
-					}
 					assert(!fixture.eth.ct_ifc_command_pending && !mock.busy);
 					check_restored(&fixture);
 					cover_publish_faults++;

@@ -1,0 +1,57 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: complete shared IFC state on optical drain
+
+Clear the global command pending flag when an optical recovery observes
+completion without issuing a replacement command. Share the drain helper
+with the ordinary command path so a failed drain retains pending state.
+
+--- a/drivers/net/ethernet/airoha/airoha_ct_ifc_command.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_ifc_command.h
+@@ -1,5 +1,18 @@
+ #ifndef AIROHA_CT_IFC_COMMAND_H
+ #define AIROHA_CT_IFC_COMMAND_H
++
++static int airoha_ct_ifc_command_drain(struct airoha_eth *eth)
++{
++	u32 status;
++	int err;
++
++	lockdep_assert_held(&ppe_lock);
++	err = read_poll_timeout_atomic(airoha_fe_rr, status, status & CT_IFC_DONE,
++				       2, 1000, false, eth, CT_IFC_CONTROL);
++	if (!err)
++		eth->ct_ifc_command_pending = false;
++	return err;
++}
+ 
+ static int airoha_ct_ifc_command(struct airoha_eth *eth, unsigned int bank,
+ 				unsigned int index, unsigned int page, bool write,
+@@ -12,11 +25,9 @@
+ 
+ 	lockdep_assert_held(&ppe_lock);
+ 	if (eth->ct_ifc_command_pending) {
+-		err = read_poll_timeout_atomic(airoha_fe_rr, status, status & CT_IFC_DONE,
+-					       2, 1000, false, eth, CT_IFC_CONTROL);
++		err = airoha_ct_ifc_command_drain(eth);
+ 		if (err)
+ 			return err;
+-		eth->ct_ifc_command_pending = false;
+ 	}
+ 	if (write)
+ 		for (word = 0; word < count; word++)
+--- a/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_cpu.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_cpu.h
+@@ -34,11 +34,8 @@
+ static int airoha_ct_pon_ifc_drain(void *ctx)
+ {
+ 	struct airoha_ppe *ppe = ctx;
+-	u32 status;
+-
+-	lockdep_assert_held(&ppe_lock);
+-	return read_poll_timeout_atomic(airoha_fe_rr, status, status & CT_IFC_DONE,
+-					2, 1000, false, ppe->eth, CT_IFC_CONTROL);
++
++	return airoha_ct_ifc_command_drain(ppe->eth);
+ }
+ 
+ static struct airoha_ct_pon_ifc_io airoha_ct_pon_ifc_io(struct airoha_ppe *ppe)

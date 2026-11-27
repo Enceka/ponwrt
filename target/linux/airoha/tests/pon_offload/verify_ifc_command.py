@@ -21,16 +21,20 @@ def extract(source, signature):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    if not __debug__:
+        parser.error('Run without -O; validation requires assertions.')
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     headers = args.source.resolve() / 'drivers/net/ethernet/airoha'
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    names = ('airoha_ct_ifc_command.h', 'airoha_ct_ifc.h', 'airoha_ct_fe_native.h')
+    names = ('airoha_ct_ifc_command.h', 'airoha_ct_ifc.h', 'airoha_ct_fe_native.h',
+             'airoha_ct_pon_ifc_cpu.h')
     sources = {name: (headers / name).read_text() for name in names}
     callers = extract(sources[names[1]], 'static int ct_ifc_access(') + '\n'
     callers += extract(sources[names[2]], 'static int airoha_ct_fe_table(') + '\n'
+    callers += extract(sources[names[3]], 'static int airoha_ct_pon_ifc_drain(') + '\n'
     mutations = {
         'baseline': sources[names[0]],
         'skip_pending_drain': sources[names[0]].replace('if (eth->ct_ifc_command_pending)', 'if (false)'),
@@ -58,6 +62,7 @@ def main():
             result.check_returncode()
             report.update(json.loads(result.stdout))
             assert report['cases'] == 32 and report['blocked_retries'] == 96
+            assert report['standalone_drains'] == 4
         else:
             assert header != sources[names[0]] and result.returncode < 0, name
             assert 'Assertion' in result.stderr or 'assertion' in result.stderr, result.stderr

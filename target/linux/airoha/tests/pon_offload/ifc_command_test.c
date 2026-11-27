@@ -79,6 +79,41 @@ static int transfer(struct airoha_eth *eth, unsigned int caller,
     return err;
 }
 
+static unsigned int standalone_drain(void)
+{
+    unsigned int cases = 0;
+
+    for (unsigned int write = 0; write < 2; write++)
+    for (unsigned int effect = 0; effect < 2; effect++) {
+        struct airoha_eth eth = {};
+        struct airoha_ppe ppe = { .eth = &eth };
+        u32 words[] = { 0x12345678, 0x9abcdef0, 0x10203040 };
+        unsigned int saved_writes;
+
+        commands = data_writes = polls = control = 0;
+        memset(data, 0, sizeof(data));
+        memset(table, 0x39, sizeof(table));
+        stall = true;
+        assert(transfer(&eth, 1, 56, write, words) == -ETIMEDOUT);
+        saved_writes = data_writes;
+        spin_lock_bh(&ppe_lock);
+        for (unsigned int retry = 0; retry < 3; retry++) {
+            assert(airoha_ct_pon_ifc_drain(&ppe) == -ETIMEDOUT);
+            assert(eth.ct_ifc_command_pending);
+            assert(commands == 1 && data_writes == saved_writes);
+        }
+        complete(effect);
+        assert(!airoha_ct_pon_ifc_drain(&ppe));
+        assert(!eth.ct_ifc_command_pending);
+        assert(commands == 1 && data_writes == saved_writes);
+        assert(!airoha_ct_pon_ifc_drain(&ppe));
+        assert(!eth.ct_ifc_command_pending);
+        spin_unlock_bh(&ppe_lock);
+        cases++;
+    }
+    return cases;
+}
+
 int main(void)
 {
     unsigned int cases = 0;
@@ -121,6 +156,7 @@ int main(void)
         assert(!ppe_lock);
         cases++;
     }
-    printf("{\"passed\":true,\"cases\":%u,\"blocked_retries\":%u}\n", cases, cases * 3);
+    printf("{\"passed\":true,\"cases\":%u,\"blocked_retries\":%u,\"standalone_drains\":%u}\n",
+           cases, cases * 3, standalone_drain());
     return 0;
 }

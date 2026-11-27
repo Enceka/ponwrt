@@ -118,6 +118,36 @@ then same-source recovery/sysupgrade validation and reversible flashing.
 
 ## Next ingress and tuple work
 
+### Standalone command drain recovery
+
+Patch986 fixes completion accounting when optical recovery only drains an
+outstanding IFC read and has no dirty row left to restore. Previously the
+optical owner cleared its local pending flag, but the shared command flag
+remained set until another command arrived. The shared drain helper now
+clears that flag after observing DONE and retains it on timeout. Optical
+recovery and the ordinary command path use the same helper under `ppe_lock`.
+
+Four direct drain cases cover reads/writes and late write effects, including
+three blocked retries without new I/O. The new assertion fails on kernel984
+and passes with patch986. The probe suite now requires recovery to clear
+both pending flags without issuing a compensating read.
+
+On 2026-11-27, validation passed 32 command combinations, 96 blocked command
+retries and the four standalone drain cases under ASan/UBSan. All three
+command mutants were caught. The complete probe suite passed 6,915 cases
+in plain and ASan/UBSan builds, including 1,080 transport faults, 2,160
+blocked retries, 56 caught runtime mutations and the stuck-route case.
+AArch64 `airoha_eth.o` and `airoha_ppe.o` compiled against the matching
+kernel984 configuration without diagnostics.
+
+Evidence directories in the enclosing workspace are
+`build/pon-ifc-drain-986-before`, `build/pon-ifc-drain-986-command`,
+`build/pon-ifc-drain-986-probe-final` and `build/pon-ifc-drain-986-source`.
+Patch986 is ready for integration in the next RAM image; the current board
+continues to run kernel984.
+
+### Tuple consumers
+
 The stock investigation identified GDM2 loopback and special-tag configuration
 as the next no-fiber ingress experiment. Relevant stock FE symbols are
 `fe_api_set_loopback_enable` at `0x7df8`, `fe_api_set_loopback_mode` at `0x7e68`,
