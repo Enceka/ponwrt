@@ -47,6 +47,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   package/kernel/mt76/ct-wed/patches/142-mt7915-refresh-ct-native-rx-activity.patch \
   package/kernel/mac80211/{Makefile,patches/subsys/601-mac80211-bridge-ct-ap-unicast-and-isolation-policy.patch} \
   package/kernel/mac80211/patches/subsys/602-mac80211-track-driver-reported-rx-activity.patch \
+  target/linux/airoha/patches-6.18/609-05-clk-en7523-fix-reset-values-and-regmap-errors.patch \
   target/linux/airoha/patches-6.18/931-net-airoha-initialize-ct-connac2-packet-pool.patch \
   target/linux/airoha/patches-6.18/932-net-airoha-initialize-ct-connac2-host-ppe.patch \
   target/linux/airoha/patches-6.18/933-net-airoha-quiesce-ct-ppe-on-shutdown.patch \
@@ -105,6 +106,9 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/patches-6.18/994-net-airoha-own-pon-return-consumer-lifetimes.patch \
   target/linux/airoha/patches-6.18/995-net-airoha-validate-pon-authorization-publication.patch \
   target/linux/airoha/patches-6.18/996-net-airoha-bind-pon-authorization-to-owner.patch \
+  target/linux/airoha/patches-6.18/997-net-airoha-arm-fe-through-npu-owner.patch \
+  target/linux/airoha/patches-6.18/998-net-airoha-reopen-owned-pon-default-route.patch \
+  target/linux/airoha/patches-6.18/999-net-airoha-reopen-pon-hardware-through-owner.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config,NATIVE_PAIRS.md} \
   target/linux/airoha/tests/native_pair/*.{py,c} \
   target/linux/airoha/tests/native_pair/fixtures/*.inc \
@@ -112,8 +116,10 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/tests/pon_offload/*.{py,c,h,md} \
   target/linux/airoha/tests/npu_transaction_transport/*.{py,c,md} \
   target/linux/airoha/tests/npu_transaction_core/*.{py,c,md} \
-  target/linux/airoha/tests/bank1_routes/*.{py,c,md} \
+  target/linux/airoha/tests/bank1_routes/*.{py,c,inc,md} \
   target/linux/airoha/tests/npu_fe_owner/*.{py,c,inc,md} \
+  target/linux/airoha/tests/npu_fe_owner_arm/*.{py,c,inc,md} \
+  target/linux/airoha/tests/reset_provider/*.{py,c,md} \
   target/linux/airoha/tests/npu_owner/*.{py,c,h,inc,md} \
   target/linux/airoha/tests/npu_auth_publish/*.{py,c,md} \
   target/linux/airoha/tests/eth_return/*.{py,c,h,md} \
