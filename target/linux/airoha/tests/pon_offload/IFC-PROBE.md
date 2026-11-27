@@ -47,6 +47,7 @@ nonzero 16-bit service IDs. `clear` restores that slot's original disabled
 rows. Clearing the final slot releases the optical scope and reservation;
 `off` restores both slots. `routed=0` records the default destination, while
 `active` records consumers that can still select a CPU receive ring.
+Without a cover, another `route` request returns `-ESHUTDOWN`.
 Status includes saved/dirty/active masks, pending
 I/O, scope, readiness, service IDs, PON PPE qualification and error count.
 
@@ -225,14 +226,14 @@ The initial failed expectation and its successful cleanup remain in
 `build/pon-tuple-987-board/exact-native-withdraw/`.
 
 The stock investigation identified GDM2 loopback and special-tag configuration
-as the next no-fiber ingress experiment. Relevant stock FE symbols are
+for the no-fiber ingress experiments recorded here. Relevant stock FE symbols are
 `fe_api_set_loopback_enable` at `0x7df8`, `fe_api_set_loopback_mode` at `0x7e68`,
 `fe_set_gdm2_sptag_for_loopback` at `0x2620`, and its command-0x87 wrapper at
 `0x9b18`. `fe_show_gdm_sptag_info` at `0x2278` names its selector source
-`pkt flow idx`. The open connection is TX GEM/LLID through that special tag
-to the GDM2 RX parser. The ordinary Ethernet WAN loopback currently disables
-GDM2 IFC and redirects to GDM3/4; a dedicated RAM experiment must explicitly
-preserve SPORT2 scope and restore every changed route/tag/loopback register.
+`pkt flow idx`. The dedicated RAM module carries TX service IDs through that
+special tag to the GDM2 RX parser, preserves SPORT2 and restores changed
+route/tag/loopback registers. The ordinary Ethernet WAN loopback disables
+GDM2 IFC and redirects to GDM3/4.
 
 For tuple admission, use independent shared LUT predicates with the type0
 service row. Its page4 key is the required tuple hit mask `T`; the mask is
@@ -242,10 +243,10 @@ two existing short guards. Validity, fragmentation, extension headers and
 other owners must be accounted for before allocation. Withdraw consumer
 actions before releasing their last LUT references.
 
-The next offline check should execute the stock full-packet parser, then
-the LUT parser and combined type0 hit mask. Cover incorrect service,
-individual tuple fields, undersized packets, IPv4 fragmentation and IPv6
-extension headers before enabling PPE forwarding. Stock `ifc_set_lut1_rules`
+The offline oracle executes the stock full-packet parser, LUT parser and
+combined type0 hit mask; its results are in `IFC-TUPLE-PACKET.md`.
+Full-packet admission must cover undersized packets, IPv4 fragmentation and
+IPv6 extension headers before enabling PPE forwarding. Stock `ifc_set_lut1_rules`
 is at `0x1261c`; `ifc_lut1_rule_parser` is at `0x1da84` in the existing
 `build/private-ram-trials/ct230-ipv6/ifc.dis` investigation. Cross-type chains
 remain a separate path because the SINF branch at `0x2b34..0x2bc4` changes
@@ -312,7 +313,8 @@ With native policy disabled, numbered 128-byte IPv4/UDP packets produce:
 | A rows56/57, cover rows58/59 | RX2 | RX4 |
 | A withdrawn, cover retained | RX4 | RX4 |
 | A republished, cover retained | RX2 | RX4 |
-| Cover withdrawn, CPU route restored | ordinary CPU RX0 | ordinary CPU RX0 |
+| Cover withdrawn, CPU route restored | Not sent in this step | ordinary CPU RX0 |
+| Remaining service A slot withdrawn | ordinary CPU RX0 | Not sent in this step |
 
 All three initial A/B/A packets in each slot arrangement and all eight
 withdrawal-cycle packets returned with the exact full service and SPORT2.
@@ -370,8 +372,10 @@ Native policy stayed `generation=49 allowed=1 failed=0` during the full
 
 Every packet returned with its sequence, kind, cookie and full service ID.
 Deleting the service rows sent both services to RX4; republishing restored
-RX2 selection for service2134. Deleting the cover restored default CPU
-RX0 before retiring the rows. All ten saved GDM2 registers were restored,
+RX2 selection for service2134. After deleting the cover, servicea134 missed
+the remaining rule and returned on default RX0. The following `clear 0`
+removed the service2134 rule before its packet returned on RX0.
+All ten saved GDM2 registers were restored,
 the module unloaded, and the classifier ended at
 `saved=0 dirty=00 active=00 pending=0 scope=01000000 ready=0 cover=00 routed=0`.
 Wi-Fi HTTPS returned 200 afterward. Evidence:
@@ -384,15 +388,16 @@ cases; CPU guards passed 2485 lifecycle, 130 scope and 538624 classifier
 checks. Stock setter/readback suites cover both new exclusive source
 encodings and rejection of the old partial masks.
 
-PON PPE qualification remains closed. The next dataplane work is shared
-tuple allocation, fragment/length admission and service-qualified PPE
-lookup/egress. The fragment row above deliberately selects CPU; fragment
-admission must be resolved before publishing accelerated consumers.
+Patches985/987 now provide shared tuple allocation and verified CPU consumers.
+PON PPE qualification remains closed. Next are fragment/length admission and
+service-qualified PPE lookup/egress. The fragment row above selects CPU;
+fragment admission must be resolved before publishing accelerated consumers.
 
 The full-packet stock oracle and pure tuple encoder are now separate
 reproducible artifacts. See `IFC-TUPLE-PACKET.md`, `IFC-TUPLE.md` and
 `IFC-FIELD-LAYOUT.md`. The field-layout audit corrected an invalid type0/
 type1 combination: type0 page7 bits9:8 are DMAC_TYPE, whereas the L4-valid
-flags at that position belong to type1. Packet-length/fragment guards and
-shared LUT lifetime still need implementation before tuple consumers become
-eligible for hardware publication.
+flags at that position belong to type1. Packet-length/fragment admission
+and an accelerator shutdown sequence remain necessary for PPE consumers.
+Shutdown must close accelerated ingress/consumers, confirm the hardware
+state and drain in-flight accesses before releasing flow and LUT ownership.
