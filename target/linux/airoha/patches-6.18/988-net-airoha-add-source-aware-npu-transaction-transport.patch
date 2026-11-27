@@ -1,0 +1,400 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: add source-aware NPU transaction transport
+
+Move the validated AUTH36, ER35 and GATE37 typed transports into the
+driver, retaining the verified rebuilt-RAM readiness guard. Provide
+shared ABI headers, declarations and GPL exports for the subsequent ring
+owner in the separate Ethernet module.
+
+Accept only ER/gate capabilities 7 and 15. Check source and OPEN mask
+against the advertised capability, and bound aggregate queued by the
+number of supported rings. Single-source OPEN with dual-ring firmware
+may observe an unselected stopped ring in the aggregate ER flags.
+
+Preserve immutable echo and validated negative snapshots, and leave the
+request untouched on transport or protocol failure. Keep AUTH's existing
+operation contract. No probe, lifecycle caller or PON qualification is
+enabled by this patch.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -7,6 +7,7 @@
+ #include <crypto/sha2.h>
+ #include <linux/devcoredump.h>
+ #include <linux/devm-helpers.h>
++#include <linux/export.h>
+ #include <linux/firmware.h>
+ #include <linux/platform_device.h>
+ #include <linux/of_net.h>
+@@ -19,6 +20,7 @@
+ #include "airoha_eth.h"
+ #include "airoha_ct_npu_guard.h"
++#include "airoha_npu_transaction.h"
+ 
+ #define NPU_EN7581_FIRMWARE_DATA		"airoha/en7581_npu_data.bin"
+ #define NPU_EN7581_FIRMWARE_RV32		"airoha/en7581_npu_rv32.bin"
+ #define NPU_EN7581_7996_FIRMWARE_DATA		"airoha/en7581_MT7996_npu_data.bin"
+@@ -382,6 +384,11 @@
+ 	       READ_ONCE(npu->wlan_short_guard_verified);
+ }
+ 
++#include "airoha_npu_transaction.inc"
++EXPORT_SYMBOL_GPL(airoha_npu_auth_command);
++EXPORT_SYMBOL_GPL(airoha_npu_er_command);
++EXPORT_SYMBOL_GPL(airoha_npu_gate_command);
++
+ static int airoha_npu_ct_pair_cmd(struct airoha_npu *npu,
+ 				 struct airoha_ct_pair_msg *msg)
+ {
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_transaction.h
+@@ -0,0 +1,14 @@
++#ifndef AIROHA_NPU_TRANSACTION_H
++#define AIROHA_NPU_TRANSACTION_H
++
++#include "npu_auth_mailbox_abi.h"
++#include "npu_eth_return_abi.h"
++#include "npu_bank1_gate_abi.h"
++
++struct airoha_npu;
++
++int airoha_npu_auth_command(struct airoha_npu *npu, struct npu_auth_message *msg);
++int airoha_npu_er_command(struct airoha_npu *npu, struct er_message *msg);
++int airoha_npu_gate_command(struct airoha_npu *npu, struct npu_gate_message *msg);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_transaction.inc
+@@ -0,0 +1,183 @@
++#include "npu_eth_return_abi.h"
++
++int airoha_npu_auth_command(struct airoha_npu *npu,
++			    struct npu_auth_message *msg)
++{
++	struct {
++		__le32 command, function, data[AUTH_MBOX_WORDS];
++	} packet = {
++		.command = cpu_to_le32(NPU_OP_SET << 4),
++		.function = cpu_to_le32(AUTH_MBOX_FUNC),
++	};
++	__le32 reply[AUTH_MBOX_WORDS] = {};
++	u32 epoch, generation, count, inflight, enabled, op, index;
++	int err;
++
++	if (!npu || !msg || !airoha_npu_wlan_short_guard_ready(npu) ||
++	    !of_property_read_bool(npu->dev->of_node, "airoha,connac2-rebuilt-ram-lab"))
++		return -EOPNOTSUPP;
++
++	for (index = 0; index < AUTH_MBOX_WORDS; index++)
++		packet.data[index] = cpu_to_le32(msg->w[index]);
++	err = __airoha_npu_send_msg(npu, NPU_FUNC_WIFI, &packet, sizeof(packet),
++				    reply, sizeof(reply));
++	if (err)
++		return err;
++	if (memcmp(packet.data, reply, AM_STATUS * sizeof(*reply)) ||
++	    le32_to_cpu(reply[AM_CAPS]) != AUTH_MBOX_CAPS || reply[AM_RESERVED2])
++		return -EPROTO;
++
++	err = (s32)le32_to_cpu(reply[AM_STATUS]);
++	epoch = le32_to_cpu(reply[AM_STATE_EPOCH]);
++	generation = le32_to_cpu(reply[AM_STATE_GENERATION]);
++	count = le32_to_cpu(reply[AM_COUNT]);
++	inflight = le32_to_cpu(reply[AM_INFLIGHT]);
++	enabled = le32_to_cpu(reply[AM_ENABLED]);
++	op = msg->w[AM_ABI_OP] >> 16;
++	if (err > 0 || count > 32 || inflight > 64 || enabled > 1 ||
++	    (!epoch != !generation) || (!epoch && (count || inflight || enabled)))
++		return -EPROTO;
++	if (!err && (op > AUTH_MBOX_DISARM ||
++	    (op != AUTH_MBOX_QUERY &&
++	     (epoch != msg->w[AM_EPOCH] || generation != msg->w[AM_GENERATION])) ||
++	    (op == AUTH_MBOX_BEGIN && (count || inflight || enabled)) ||
++	    (op == AUTH_MBOX_ADD && (!count || inflight || enabled)) ||
++	    (op == AUTH_MBOX_ARM && (inflight || !enabled)) ||
++	    (op == AUTH_MBOX_DISARM && enabled)))
++		return -EPROTO;
++
++	for (index = 0; index < AUTH_MBOX_WORDS; index++)
++		msg->w[index] = le32_to_cpu(reply[index]);
++	return err;
++}
++
++int airoha_npu_er_command(struct airoha_npu *npu, struct er_message *msg)
++{
++	struct {
++		__le32 command, function, data[16];
++	} packet = {
++		.command = cpu_to_le32(NPU_OP_SET << 4),
++		.function = cpu_to_le32(ER_FUNC),
++	};
++	__le32 reply[16] = {};
++	u32 caps, sport, op, index;
++	bool discovery;
++	int err;
++
++	if (!npu || !msg || !airoha_npu_wlan_short_guard_ready(npu) ||
++	    !of_property_read_bool(npu->dev->of_node, "airoha,connac2-rebuilt-ram-lab"))
++		return -EOPNOTSUPP;
++
++	for (index = 0; index < 16; index++)
++		packet.data[index] = cpu_to_le32(msg->w[index]);
++	err = __airoha_npu_send_msg(npu, NPU_FUNC_WIFI, &packet, sizeof(packet),
++				    reply, sizeof(reply));
++	if (err)
++		return err;
++	caps = le32_to_cpu(reply[9]);
++	if (memcmp(packet.data, reply, 8 * sizeof(*reply)) ||
++	    (caps != ER_CAPS && caps != (ER_CAPS | ER_CAP_SOURCES)) ||
++	    le32_to_cpu(reply[10]) > ER_FAULT || reply[13] || reply[14] || reply[15])
++		return -EPROTO;
++
++	err = (s32)le32_to_cpu(reply[8]);
++	sport = msg->w[6];
++	op = msg->w[1] >> 16;
++	discovery = op == ER_QUERY && !msg->w[2] && !msg->w[3] &&
++		    !msg->w[4] && !msg->w[5] && !sport && !msg->w[7];
++	if (err > 0 || (!err && (op > ER_UNBIND ||
++	    (!discovery && sport != ER_LAN1 &&
++	     (sport != ER_PON || !(caps & ER_CAP_SOURCES))))))
++		return -EPROTO;
++
++	for (index = 0; index < 16; index++)
++		msg->w[index] = le32_to_cpu(reply[index]);
++	return err;
++}
++
++int airoha_npu_gate_command(struct airoha_npu *npu, struct npu_gate_message *msg)
++{
++	struct {
++		__le32 command, function, data[GATE_WORDS];
++	} packet = {
++		.command = cpu_to_le32(NPU_OP_SET << 4),
++		.function = cpu_to_le32(GATE_FUNC),
++	};
++	__le32 reply[GATE_WORDS] = {};
++	u32 words[GATE_WORDS], allowed, queued_max, requested, op, index;
++	int err;
++
++	if (!npu || !msg || !airoha_npu_wlan_short_guard_ready(npu) ||
++	    !of_property_read_bool(npu->dev->of_node, "airoha,connac2-rebuilt-ram-lab"))
++		return -EOPNOTSUPP;
++
++	for (index = 0; index < GATE_WORDS; index++)
++		packet.data[index] = cpu_to_le32(msg->w[index]);
++	err = __airoha_npu_send_msg(npu, NPU_FUNC_WIFI, &packet, sizeof(packet),
++				    reply, sizeof(reply));
++	if (err)
++		return err;
++	if (memcmp(packet.data, reply, GM_STATUS * sizeof(*reply)))
++		return -EPROTO;
++	for (index = 0; index < GATE_WORDS; index++)
++		words[index] = le32_to_cpu(reply[index]);
++
++	err = (s32)words[GM_STATUS];
++	op = msg->w[GM_ABI_OP] >> 16;
++	requested = msg->w[GM_OPEN_MASK];
++	allowed = GATE_FE24;
++	queued_max = ER_MAX_COUNT;
++	if (words[GM_CAPS] & GATE_CAP_PON2) {
++		allowed |= GATE_PON2;
++		queued_max += ER_MAX_COUNT;
++	}
++	if (err > 0 ||
++	    (words[GM_CAPS] != GATE_CAPS &&
++	     words[GM_CAPS] != (GATE_CAPS | GATE_CAP_PON2)) ||
++	    words[GM_RESERVED2] ||
++	    (!words[GM_STATE_EPOCH] != !words[GM_STATE_GENERATION]) ||
++	    (words[GM_MASK] & ~allowed) || words[GM_CLOSED] != !words[GM_MASK] ||
++	    words[GM_QUIET_ACK] > 1 || (words[GM_QUIET_ACK] && !words[GM_CLOSED]) ||
++	    words[GM_TDMA0] > 3000 || words[GM_TDMA1] > 3000 ||
++	    words[GM_TDMA0] + words[GM_TDMA1] > 3000 ||
++	    words[GM_COMPLETION] > 1 || words[GM_DONE] > 65535 ||
++	    words[GM_FE_ENABLED] > 1 || words[GM_FE_QUIESCED] > 1 ||
++	    words[GM_FE_INFLIGHT] > 1 || words[GM_ER_STATE] > ER_FAULT ||
++	    words[GM_ER_FLAGS] > (GATE_ER_BOUND | GATE_ER_ACTIVE) ||
++	    words[GM_ER_FLAGS] == GATE_ER_ACTIVE || words[GM_ER_QUEUED] > queued_max ||
++	    words[GM_DMA_IDLE] > 1 || words[GM_AUTH_INFLIGHT] > 64 ||
++	    words[GM_AUTH_ENABLED] > 1 ||
++	    (!words[GM_AUTH_EPOCH] != !words[GM_AUTH_GENERATION]))
++		return -EPROTO;
++
++	if (!err) {
++		if (op > GATE_OPEN || (op != GATE_QUERY &&
++		    (words[GM_STATE_EPOCH] != msg->w[GM_EPOCH] ||
++		     words[GM_STATE_GENERATION] != msg->w[GM_GENERATION])))
++			return -EPROTO;
++		if (op == GATE_CLOSE && (!words[GM_CLOSED] || words[GM_MASK]))
++			return -EPROTO;
++		if (op == GATE_QUIET &&
++		    (!words[GM_CLOSED] || !words[GM_QUIET_ACK] || words[GM_FAULT] ||
++		     words[GM_TDMA0] || words[GM_TDMA1] || words[GM_COMPLETION] ||
++		     words[GM_DONE] || words[GM_FE_ENABLED] || !words[GM_FE_QUIESCED] ||
++		     words[GM_FE_INFLIGHT] || words[GM_ER_STATE] || words[GM_ER_QUEUED] ||
++		     !words[GM_DMA_IDLE] || words[GM_AUTH_INFLIGHT]))
++			return -EPROTO;
++		if (op == GATE_OPEN &&
++		    (!requested || (requested & ~allowed) || words[GM_CLOSED] ||
++		     words[GM_MASK] != requested || words[GM_QUIET_ACK] ||
++		     words[GM_FAULT] || !words[GM_FE_ENABLED] || words[GM_FE_QUIESCED] ||
++		     !(words[GM_ER_FLAGS] & GATE_ER_BOUND) ||
++		     ((words[GM_CAPS] == GATE_CAPS ||
++		       requested == (GATE_FE24 | GATE_PON2)) &&
++		      !(words[GM_ER_FLAGS] & GATE_ER_ACTIVE)) ||
++		     !words[GM_AUTH_ENABLED] || words[GM_AUTH_EPOCH] != msg->w[GM_EPOCH] ||
++		     words[GM_AUTH_GENERATION] != msg->w[GM_GENERATION]))
++			return -EPROTO;
++	}
++
++	for (index = 0; index < GATE_WORDS; index++)
++		msg->w[index] = words[index];
++	return err;
++}
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/npu_auth_mailbox_abi.h
+@@ -0,0 +1,23 @@
++#ifndef NPU_AUTH_MAILBOX_ABI_H
++#define NPU_AUTH_MAILBOX_ABI_H
++#ifdef __KERNEL__
++#include <linux/types.h>
++typedef u32 auth_u32;
++#else
++#include <stdint.h>
++typedef uint32_t auth_u32;
++#endif
++#define AUTH_MBOX_MAGIC 0x41555431u
++#define AUTH_MBOX_ABI 1u
++#define AUTH_MBOX_FUNC 36u
++#define AUTH_MBOX_CAPS 7u
++#define AUTH_MBOX_WORDS 48u
++#define AUTH_MBOX_BYTES 192u
++#define AUTH_MBOX_TRANSPORT_BYTES 200u
++enum { AUTH_MBOX_QUERY, AUTH_MBOX_BEGIN, AUTH_MBOX_ADD, AUTH_MBOX_ARM, AUTH_MBOX_DISARM };
++enum { AM_MAGIC, AM_ABI_OP, AM_BYTES, AM_EPOCH, AM_GENERATION, AM_RULE_COUNT,
++       AM_RESERVED0, AM_RESERVED1, AM_RULE=8, AM_STATUS=40, AM_CAPS,
++       AM_STATE_EPOCH, AM_STATE_GENERATION, AM_COUNT, AM_INFLIGHT, AM_ENABLED, AM_RESERVED2 };
++struct npu_auth_message { auth_u32 w[AUTH_MBOX_WORDS]; };
++_Static_assert(sizeof(struct npu_auth_message) == AUTH_MBOX_BYTES, "auth mailbox ABI1 is 48 words");
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/npu_eth_return_abi.h
+@@ -0,0 +1,85 @@
++#ifndef NPU_ETH_RETURN_ABI_H
++#define NPU_ETH_RETURN_ABI_H
++/* ABI1: all shared words are little endian. Never reuse the WiFi RX ABI. */
++#ifdef __KERNEL__
++#include <linux/types.h>
++typedef u32 er_u32;
++#else
++#include <stdint.h>
++typedef uint32_t er_u32;
++#endif
++#define ER_MAGIC 0x45525231u
++#define ER_ABI 1u
++#define ER_FUNC 35u
++#define ER_CAPS 7u
++#define ER_CAP_SOURCES 8u
++#define ER_WINDOW 0x40000000u
++#define ER_DONE 0x80000000u
++#define ER_BUFFER 2048u
++#define ER_MIN_COUNT 8u
++#define ER_MAX_COUNT 512u
++#define ER_LAN1 24u
++#define ER_PON 2u
++#define ER_SERVICE_VALID 0x80000000u
++enum { ER_QUERY, ER_BIND, ER_STOP, ER_UNBIND };
++enum { ER_IDLE, ER_QUEUED, ER_COPYING, ER_PUBLISHED, ER_RELEASING, ER_FAULT };
++enum { ER_C_MAGIC, ER_C_ABI, ER_C_EPOCH, ER_C_COUNT, ER_C_PRODUCER,
++       ER_C_CONSUMER, ER_C_HOST_ENABLED, ER_C_STOPPED, ER_C_FAULT,
++       ER_C_GENERATION, ER_C_SPORT, ER_C_BUFFER, ER_C_BYTES,
++       ER_C_RESERVED0, ER_C_RESERVED1, ER_C_RESERVED2 };
++enum { ER_D_CONTROL, ER_D_EPOCH, ER_D_SEQUENCE, ER_D_SPORT,
++       ER_D_GENERATION, ER_D_SERVICE, ER_D_BUFFER, ER_D_RESERVED,
++       ER_D_PREFIX };
++struct er_config { er_u32 dma, bytes, epoch, count, sport, generation; };
++struct er_control { er_u32 w[16]; };
++struct er_descriptor { er_u32 w[16]; };
++struct er_message { er_u32 w[16]; };
++/* Message words0..7 are immutable echo: magic, ABI|op<<16 and config.
++ * Reply words8..12: signed status, caps, request-state, producer, fault.
++ * words13..15 must be zero; request status is -EINPROGRESS (-115). */
++static inline er_u32 er_bytes(er_u32 count)
++{
++    return 64u + count * (64u + ER_BUFFER);
++}
++static inline int er_config_valid(const struct er_config *c)
++{
++    er_u32 low = c->dma & (ER_WINDOW - 1u);
++    return c->count >= ER_MIN_COUNT && c->count <= ER_MAX_COUNT &&
++           !(c->count & (c->count - 1u)) && c->bytes == er_bytes(c->count) &&
++           c->dma && !(c->dma & 63u) && low &&
++           low <= ER_WINDOW - c->bytes && c->dma <= 0xffffffffu - c->bytes &&
++           c->epoch && c->generation && (c->sport == ER_LAN1 || c->sport == ER_PON);
++}
++static inline er_u32 er_slot_dma(const struct er_config *c, er_u32 sequence)
++{
++    return c->dma + 64u + ((sequence - 1u) & (c->count - 1u)) * 64u;
++}
++static inline er_u32 er_payload_dma(const struct er_config *c, er_u32 sequence)
++{
++    return c->dma + 64u + c->count * 64u +
++           ((sequence - 1u) & (c->count - 1u)) * ER_BUFFER;
++}
++static inline int er_prefix_valid(const er_u32 raw[8], er_u32 bytes, er_u32 sport)
++{
++    return bytes >= 14u && bytes <= 1518u && (raw[0] & 0xffffu) == bytes &&
++           raw[2] == 7u && (raw[5] >> 28u) == 6u && (raw[6] & 31u) == sport;
++}
++/* The experimental PON producer encodes its saved FE word4, not a VLAN
++ * ID. ER_SERVICE_VALID is an ER publication flag, not a silicon RX flag. */
++static inline er_u32 er_pon_service(er_u32 word4)
++{
++    return ER_SERVICE_VALID | ((word4 >> 14u) & 0xffffu);
++}
++/* Called only after DONE acquire/dma_rmb and a stable descriptor snapshot. */
++static inline int er_descriptor_valid(const struct er_config *c, const er_u32 d[16],
++                                      er_u32 sequence)
++{
++    er_u32 bytes = d[0] & 0xffffu;
++    if (!er_config_valid(c) || !sequence || d[0] != (ER_DONE | bytes) ||
++        d[1] != c->epoch || d[2] != sequence || d[3] != c->sport ||
++        d[4] != c->generation || d[6] != er_payload_dma(c, sequence) || d[7] ||
++        !er_prefix_valid(d + 8, bytes, c->sport)) return 0;
++    return d[ER_D_SERVICE] == (c->sport == ER_PON ?
++           er_pon_service(d[ER_D_PREFIX + 4]) : 0u);
++}
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/npu_bank1_gate_abi.h
+@@ -0,0 +1,32 @@
++#ifndef NPU_BANK1_GATE_ABI_H
++#define NPU_BANK1_GATE_ABI_H
++#ifdef __KERNEL__
++#include <linux/types.h>
++typedef u32 gate_u32;
++#else
++#include <stdint.h>
++typedef uint32_t gate_u32;
++#endif
++#define GATE_MAGIC 0x47415431u
++#define GATE_ABI 1u
++#define GATE_FUNC 37u
++#define GATE_CAPS 7u
++#define GATE_WORDS 32u
++#define GATE_BYTES 128u
++#define GATE_TRANSPORT_BYTES 136u
++#define GATE_FE24 1u
++#define GATE_PON2 4u
++#define GATE_CAP_PON2 8u
++#define GATE_ER_BOUND 1u
++#define GATE_ER_ACTIVE 2u
++enum { GATE_QUERY, GATE_CLOSE, GATE_QUIET, GATE_OPEN };
++enum { GM_MAGIC, GM_ABI_OP, GM_BYTES, GM_EPOCH, GM_GENERATION, GM_OPEN_MASK,
++       GM_RESERVED0, GM_RESERVED1, GM_STATUS, GM_CAPS, GM_STATE_EPOCH,
++       GM_STATE_GENERATION, GM_CLOSED, GM_MASK, GM_QUIET_ACK, GM_FAULT,
++       GM_TDMA0, GM_TDMA1, GM_COMPLETION, GM_DONE, GM_FE_ENABLED,
++       GM_FE_QUIESCED, GM_FE_INFLIGHT, GM_ER_STATE, GM_ER_FLAGS, GM_ER_QUEUED,
++       GM_DMA_IDLE, GM_AUTH_INFLIGHT, GM_AUTH_ENABLED, GM_AUTH_EPOCH,
++       GM_AUTH_GENERATION, GM_RESERVED2 };
++struct npu_gate_message { gate_u32 w[GATE_WORDS]; };
++_Static_assert(sizeof(struct npu_gate_message)==GATE_BYTES,"bank1 gate ABI1 is 32 words");
++#endif
