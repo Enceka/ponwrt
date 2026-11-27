@@ -68,3 +68,31 @@ This artifact retains all original native-pairs, WED, host-PPE and probe-seed
 properties. Its only additions are the GDM2 enumeration changes and explicit
 GPIO38 TX_DISABLE hog. It contains the board's original calibration and stays
 in the private VM output directory.
+
+## Board run, 2026-11-27
+
+The RAM FIT with SHA256
+`b0021ca72c608b0b23aaef5137096edef8f54314de0a18e4161a9ffe05ba6f61`
+booted with the kernel changes through patch 973. It retains the previously
+tested NPU payload and all 1,101 initramfs entries byte for byte. The board
+registered `pon0` with its separate local MAC while LAN1, the LAN4 uplink and
+both wireless interfaces stayed available. `/proc/mtd` contained its header
+and no partitions.
+
+Readback confirmed GPIO38 was output high with consumer `ram-pon-tx-disable`.
+SPORT2 mapped to CDM2 (`REG_SP_DFT_CPORT(0)=0x00500500`, port 5). WAN QDMA1
+RX rings 2 and 4 each had 128 descriptors, threshold 16 and valid indices.
+Opening `pon0` returned `ENODEV` and left it down, matching the disabled
+controller profile. GDM2 forwarding read back `0x07f15555`; the IFC scope
+remained `0x01000000`.
+
+After restoring the lab WAN, a DNS query and an HTTPS request through the
+Mac's wireless interface passed; the HTTPS status was 200. The existing
+LAN1/WLAN native policy was re-enabled after its audit, with `allowed=1` and
+`failed=0`. All operations used RAM; the installed NAND image stayed intact.
+
+The private result directory is
+`build/pon-gdm2-enum.e_6sejfa/` in the enclosing workspace. It contains the FIT
+identity, serial boot log, GDM2 and RX-ring snapshots, WAN/Wi-Fi verification
+and native-policy audit. The next classifier step uses the shared IFC owner
+to add SPORT2 service rows before opening its port scope.
