@@ -22,14 +22,13 @@ def fields(text):
     return dict(re.findall(r'\b([a-z][a-z0-9_]*)=([^\s]+)', text))
 
 
-def check_packet(diag, probe, service, count, kind, previous):
-    state, packet = fields(diag), fields(probe)
+def check_session(state, auth_count=0):
     for name, expected in dict(owner=1, diagnostic=1, qualified=0, policy=0, fallback=0,
                                 route_owner=1, fe_owner=1, ingress=1, phase=15,
-                                error=0, invalidated=0, ring=1, auth_count=0, auth_enabled=1,
+                                error=0, invalidated=0, ring=1, auth_count=auth_count, auth_enabled=1,
                                 auth_inflight=0, gate_mask=4, gate_closed=0, gate_fault=0,
                                 gate_error=0, auth_error=0, er_error=0, er_fault=0,
-                                packets=count, consumed=count, dropped=0, fault=0).items():
+                                dropped=0, fault=0).items():
         require(int(state[name]) == expected, 'diagnostic state: ' + name)
     require(int(state['flow'], 16) == 0 and int(state['scope'], 16) == 0x01000004 and
             int(state['ports'], 16) == 0x01000004 and int(state['gdm2'], 16) & 0xffff == 0x8888,
@@ -37,6 +36,13 @@ def check_packet(diag, probe, service, count, kind, previous):
     require(all(state[family + '_' + name] == state[name]
                 for family in ('gate', 'auth') for name in ('epoch', 'generation')),
             'GATE/AUTH transaction identity mismatch')
+
+
+def check_packet(diag, probe, service, count, kind, previous, auth_count=0):
+    state, packet = fields(diag), fields(probe)
+    check_session(state, auth_count)
+    for name in ('packets', 'consumed'):
+        require(int(state[name]) == count, 'diagnostic state: ' + name)
     require(int(packet['sequence']) == previous + 1 and
             packet['sequence'] == packet['rx_sequence'] and packet['error'] == '0' and
             packet['tx_kind'] == packet['rx_kind'] == kind and packet['pending'] == '0',
@@ -70,8 +76,10 @@ def main():
     parser.add_argument('--sha256', required=True)
     parser.add_argument('--firmware-sha256', required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--capture-service', type=lambda value: int(value, 0),
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--capture-service', type=lambda value: int(value, 0),
                         help='Capture raw ER metadata for one 16-bit service without accepting it as a matrix pass')
+    modes.add_argument('--auth', action='store_true', help='Verify one exact AUTH rule against bounded match/miss packets')
     parser.add_argument('--run', action='store_true')
     args = parser.parse_args()
     if args.capture_service is not None:
@@ -121,6 +129,8 @@ def main():
     report = dict(boot=args.boot, module_sha256=args.sha256, firmware_sha256=args.firmware_sha256,
                   pon_ppe_qualified=False, observations=[], cpu_observations=[],
                   matrix_passed=False, passed=False, restored=False)
+    if args.auth:
+        report.update(auth_mode=True, auth_observations=[])
     if args.capture_service is not None:
         report.update(capture_service=args.capture_service, captures=[])
     loaded = False
@@ -140,7 +150,7 @@ def main():
         for service in ((args.capture_service,) if args.capture_service is not None else (0, 0x8000)):
             prefix = 'service-' + str(service)
             write(prefix + '-map', PROBE + 'command', 'map ' + str(service))
-            write(prefix + '-start', DIAG, 'start')
+            write(prefix + '-start', DIAG, 'start-auth ' + str(service) if args.auth else 'start')
             remote(prefix + '-started', 'cat ' + DIAG)
             if args.capture_service is not None:
                 for count, kind in enumerate(('ipv4', 'ipv6'), 1):
@@ -168,7 +178,50 @@ def main():
                         frame=frame.hex(), host_packets=int(state['packets']),
                         host_dropped=int(state['dropped']), send_error=send_error))
                 continue
-            for index in range(18):
+            if args.auth:
+                returned = 0
+                samples = [('ipv4', variant) for variant in range(5)] + [('ipv6', 0), ('ipv4', None), ('ipv4', 0)]
+                for index, (kind, variant) in enumerate(samples * 2):
+                    label = prefix + '-auth-' + str(index + 1)
+                    previous = fields(remote(label + '-before', 'cat ' + PROBE + 'status'))
+                    command = 'send-current ' + kind if variant is None else 'send-fixed ' + kind + ' ' + str(variant) + ' rx'
+                    write(label + '-send', PROBE + 'command', command)
+                    observed = remote(label + '-observation', 'cat ' + DIAG)
+                    received = remote(label + '-received', 'cat ' + PROBE + 'status')
+                    state, packet = fields(observed), fields(received)
+                    matched = kind == 'ipv4' and variant == 0
+                    require(packet['tx_fixed'] == str(int(variant is not None)) and
+                            packet['tx_variant'] == str(variant or 0), 'AUTH packet shape mismatch')
+                    if matched:
+                        check_session(state, 1)
+                        require(state['auth_mode'] == '1' and
+                                int(state['consumed']) == int(state['packets']) == returned,
+                                'AUTH match unexpectedly returned through ER')
+                        require(int(packet['sequence']) == int(previous['sequence']) + 1 and
+                                packet['rx_sequence'] == packet['sequence'] and packet['error'] == '0' and
+                                packet['pending'] == '0' and packet['tx_kind'] == packet['rx_kind'] == kind and
+                                int(packet['received']) == int(previous['received']) + 1,
+                                'AUTH matched RX marker missing')
+                        require(int(packet['rx_data']) == int(previous['rx_data']) + 1 and
+                                int(packet['rx_delivered']) == int(previous['rx_delivered']) + 1,
+                                'AUTH match missing QDMA receive')
+                        require(int(packet['rx_msg0'], 16) >> 14 & 0xffff == service,
+                                'AUTH QDMA service mismatch')
+                    else:
+                        returned += 1
+                        observation = check_packet(observed, received, service, returned, kind,
+                                                   int(previous['sequence']), 1)
+                        if cookie is not None:
+                            require(cookie == observation['cookie'], 'probe cookie changed')
+                        cookie = observation['cookie']
+                        report['observations'].append(observation)
+                        require(packet['rx_data'] == previous['rx_data'] and
+                                packet['rx_delivered'] == previous['rx_delivered'],
+                                'AUTH mismatch unexpectedly received through QDMA')
+                    report['auth_observations'].append(dict(service=service, kind=kind, variant=variant,
+                        matched=matched, sequence=int(packet['rx_sequence']), er_consumed=returned,
+                        rx_msg0=packet['rx_msg0'], rx_msg1=packet['rx_msg1'], rx_data=int(packet['rx_data'])))
+            for index in range(0 if args.auth else 18):
                 label = prefix + '-packet-' + str(index + 1)
                 kind = 'ipv4' if index % 2 == 0 else 'ipv6'
                 previous = int(fields(remote(label + '-before', 'cat ' + PROBE + 'status'))['sequence'])

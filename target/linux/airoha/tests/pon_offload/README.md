@@ -265,3 +265,24 @@ NPU code SHA-256：`9e1c4492bfbfc11c310ac0070d084631276011504abf871ea6b3efe57de6
 runner 的 `--capture-service 0x2134` 用于记录单个服务的双栈原始描述符；
 允许成功或指定的 RX marker 超时，其他发送错误立即失败并清理。
 采样报告单独标记 `capture_completed`，正常矩阵由 `matrix_passed` 标记。
+
+### 单条 AUTH 命中与错配（2026-11-27）
+
+`999-zq` 增加 `start-auth <service>` RAM 诊断模式：只发布一条固定
+IPv4/UDP 规则，先校验现有 service binding，再执行 BEGIN→ADD→ARM。
+源 MAC 为 `02:00:00:00:00:01`，目的 MAC 为 `pon0` 地址，tuple 为
+`192.0.2.1:49152 → 192.0.2.2:49153`。bank1 FLOW 保持 0、SEARCH_MISS=2，
+普通生产授权接口继续隔离诊断 owner。
+
+`run_npu_loopback.py --auth` 在 service0/0x8000 两个独立会话上运行
+32 个编号包：8 个匹配包经 NPU 重注入 PPE 后由 QDMA 返回，24 个错配包
+走 ER；错配覆盖源/目的 IP、源/目的端口、随机源 MAC 和 IPv6。
+两条路径通过 QDMA 计数与 ER 描述符区分，ER 环回绕，关闭后另有 4 个
+CPU 包通过。全部交付，零丢包、零故障，清理与寄存器恢复完成。
+同镜像的原 36 ER + 4 CPU 空表回归也通过。
+
+RAM FIT SHA-256：`1354b65067d01b67f208c07a3489d2408bfecbb5e342a1c347bfdc1e89e02e99`；
+NPU code 与上一轮相同。本地报告为
+`build/pon-npu-diag-20261127/board-auth-match-matrix/report.json`。
+主机测试完成 210 场景、7006 断言及 38 个负对照。
+下一步开放有界 PPE 学习、核验真实硬件行并绑定 LAN 出口；完成后再合入完整镜像。

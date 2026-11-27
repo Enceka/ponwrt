@@ -66,7 +66,7 @@ def render(values):
 class BoardFixture:
     def __init__(self, failures=(), snapshot_timeout=False, start_error=False,
                  identity_fault=None, closed_drift=False, observation_delay=0,
-                 corrupt_restore=False, send_error=None):
+                 corrupt_restore=False, send_error=None, auth_qdma_fault=False):
         self.failures = set(failures)
         self.snapshot_timeout = snapshot_timeout
         self.start_error = start_error
@@ -75,6 +75,8 @@ class BoardFixture:
         self.observation_delay = observation_delay
         self.corrupt_restore = corrupt_restore
         self.send_error = send_error
+        self.auth_qdma_fault = auth_qdma_fault
+        self.auth_mode = False
         self.commands = []
         self.sent = []
         self.loaded = False
@@ -102,7 +104,8 @@ class BoardFixture:
                      gate_generation=self.generation, gate_mask=4 if self.ring else 0,
                      gate_closed=int(not self.ring), gate_fault=0,
                      auth_error=0, auth_caps=7, auth_epoch=self.epoch,
-                     auth_generation=self.generation, auth_count=0,
+                     auth_generation=self.generation, auth_count=int(self.auth_mode and self.ring),
+                     auth_mode=int(self.auth_mode),
                      auth_enabled=int(self.ring), auth_inflight=0,
                      er_error=0, er_caps=15, er_state=0, er_fault=0)
         if self.owner:
@@ -134,11 +137,16 @@ class BoardFixture:
         sequence = len(self.sent)
         kind = self.sent[-1]['kind'] if self.sent else 'ipv4'
         state = int(self.prepared)
+        qdma_received = sum(packet['path'] != 'er' and
+                            not (self.auth_qdma_fault and packet['path'] == 'auth') for packet in self.sent)
+        last = self.sent[-1] if self.sent else {}
         text = (f'retained={state} controller={state} opened={state} saved={state} '
                 f'error=0 pending=0 sequence={sequence} received={sequence} '
                 f'rx_sequence={sequence} rx_msg0={(self.service or 0) << 14:08x} '
                 f'rx_msg1={2 << 21:08x}\n'
                 f'tx_kind={kind} tx_length=128 rx_kind={kind} rx_length=114\n')
+        text += (f'tx_fixed={int(last.get("fixed", False))} tx_variant={last.get("variant", 0)} '
+                 f'rx_data={qdma_received} rx_delivered={qdma_received}\n')
         for index in range(10):
             value = 0x12340000 + index + (0x100 if self.prepared else 0)
             if index == 0 and self.corrupt_restore and self.was_prepared and not self.prepared:
@@ -158,17 +166,21 @@ class BoardFixture:
             elif value.startswith('map '):
                 assert self.prepared and not self.owner
                 self.service = int(value.split()[1])
-            elif value.startswith('send-current '):
+            elif value.startswith(('send-current ', 'send-fixed ')):
                 assert self.prepared and self.owner and 0 <= self.service <= 65535
                 kind = value.split()[1]
                 assert kind in ('ipv4', 'ipv6')
+                fixed = value.startswith('send-fixed ')
+                variant = int(value.split()[2]) if fixed else 0
+                matched = self.auth_mode and self.ring and fixed and kind == 'ipv4' and variant == 0
+                path = 'auth' if matched else 'er' if self.ring else 'cpu'
                 self.sent.append(dict(service=self.service, kind=kind,
-                                      sequence=len(self.sent) + 1, path='er' if self.ring else 'cpu'))
-                if self.ring:
+                                      sequence=len(self.sent) + 1, path=path, fixed=fixed, variant=variant))
+                if self.ring and not matched:
                     self.consumed += 1
                     self.last_er = (len(self.sent), kind)
                     self.pending_reads = self.observation_delay
-                elif self.closed_drift:
+                elif not self.ring and self.closed_drift:
                     self.consumed += 1
             elif value == 'restore':
                 assert not self.owner and not self.ring
@@ -176,9 +188,10 @@ class BoardFixture:
             else:
                 raise AssertionError('unexpected probe command: ' + value)
         elif destination == runner.DIAG:
-            if value == 'start':
+            if value == 'start' or value.startswith('start-auth '):
                 assert self.prepared and not self.owner and self.service is not None
                 self.owner = True
+                self.auth_mode = value.startswith('start-auth ')
                 self.epoch += 1
                 self.consumed = 0
                 self.last_er = None
@@ -245,7 +258,7 @@ class BoardFixture:
 
 
 class RunnerTests(unittest.TestCase):
-    def invoke(self, board, run=True, capture_service=None):
+    def invoke(self, board, run=True, capture_service=None, auth=False):
         self.files = {'/fixture/module.ko': MODULE}
         directories = {'/fixture'}
         arguments = ['run_npu_loopback.py', '--pin', '/fixture/known-hosts', '--boot', BOOT,
@@ -255,6 +268,8 @@ class RunnerTests(unittest.TestCase):
             arguments.append('--run')
         if capture_service is not None:
             arguments.extend(('--capture-service', str(capture_service)))
+        if auth:
+            arguments.append('--auth')
         stdout = io.StringIO()
         with mock.patch.object(runner, 'Path', side_effect=lambda name: MemoryPath(name, self.files, directories)), \
                 mock.patch.object(sys, 'argv', arguments), \
@@ -446,6 +461,28 @@ class RunnerTests(unittest.TestCase):
         self.assert_matrix(report)
         self.assertTrue(report['passed'])
         self.assertEqual(self.sleep.call_count, 36)
+        self.assert_restored(board)
+
+    def test_auth_matches_qdma_and_mismatches_er(self):
+        board = BoardFixture()
+        report = self.invoke(board, auth=True)
+        self.assertTrue(report['passed'])
+        self.assertTrue(report['restored'])
+        self.assertEqual(len(report['auth_observations']), 32)
+        self.assertEqual(sum(entry['matched'] for entry in report['auth_observations']), 8)
+        self.assertEqual(len(report['observations']), 24)
+        self.assertEqual(len(report['cpu_observations']), 4)
+        for service in (0, 0x8000):
+            packets = [packet for packet in report['observations'] if packet['service'] == service]
+            self.assertEqual([packet['er_sequence'] for packet in packets], list(range(1, 13)))
+        self.assert_restored(board)
+
+    def test_auth_requires_qdma_evidence_for_match(self):
+        board = BoardFixture(auth_qdma_fault=True)
+        with self.assertRaisesRegex(ValueError, 'AUTH match missing QDMA receive'):
+            self.invoke(board, auth=True)
+        self.assertFalse(self.report()['passed'])
+        self.assertTrue(self.report()['restored'])
         self.assert_restored(board)
 
     def test_capture_success_and_expected_timeout_restore(self):
