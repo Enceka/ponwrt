@@ -184,7 +184,24 @@ AUTH 发布测试运行真实固件 parser/授权表，2,644 次发布和 11 项
 这些主机测试使用 ASan/UBSan；994–996 完整 AArch64 内核编译和链接纳入本轮
 验收，产物保存在 `build/pon-er-consumer-20261127/`。
 
-下一步补齐 PPE/FE/routes 重开、owner 失效通知和 DMA reset 退役，接着隔离
+`997` 补齐 owner FE ARM，同身份重试保留待确认状态，关闭使用下一 epoch。
+`998` 在保留路由 owner 的同时仅开放 GDM2，路由变化和 QDMA 发布前先撤销
+开放状态，读回失败保持 CPU 回退。`999` 接通 bank1 寄存器恢复、FE ARM、
+GATE OPEN 和路由开放，跨阶段与命令返回后复查映射和 generation。公开重开
+入口遇错执行完整关闭；关闭失败保留阶段、队列和引用，供后续关闭重试。
+
+FE ARM 的 344 个场景与 14 个运行时变体、重开 owner 的 80,451 项检查与
+24 个变体、路由的 118 个场景和 524,288 个选择器向量与十一个变体通过
+ASan/UBSan。PON 更新事务继续通过原有 74 个场景。`609-05` 同时修复 reset
+provider 未初始化的 reset 值和丢失的 regmap 错误，68 种初值下的 1,005,312
+个用例及七个负对照通过。联合 Linux 6.18.60 AArch64 vmlinux 编译、modpost、
+链接无警告；源码与编译树逐文件校验一致，overlay 的 269 个文件 SHA 校验通过。
+
+下一步补齐 owner 失效通知、持续健康检查和 DMA reset 退役，接着隔离
 同 tuple 的 LAN/PON 软件候选与硬件表项，再开放 PON 准入并构建镜像刷测。
 当前内部准备路径支持 GPON GEM 映射；EPON LLID 对应关系继续单独完善。
+DMA 退役需由 NPU provider 记录完整 ER 配置并撤销全部 harts 与独立 host DMA
+的 DRAM 访问，再结束 NAPI/work 并释放内存。实现 reset fence 前需核实
+`NPU_RST` 的复位覆盖范围、`0x1fb30000` DMA 的复位归属及 outstanding writes
+完成条件；Ethernet remove 的失败路径也需先结束 DMA，随后归还 devres。
 设备沿用之前通过验收的 RAM 镜像。
