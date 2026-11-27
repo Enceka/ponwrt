@@ -797,6 +797,9 @@ static void test_selectors(void)
 #ifdef TEST_PON_REOPEN
 #include "reopen_test.inc"
 #endif
+#ifdef TEST_OWNER_INVALIDATION
+#include "invalidation_test.inc"
+#endif
 
 int main(int argc, char **argv)
 {
@@ -808,6 +811,9 @@ int main(int argc, char **argv)
 		{ "qdma", test_qdma }, { "native", test_native },
 #ifdef TEST_PON_REOPEN
 		{ "reopen", test_reopen },
+#endif
+#ifdef TEST_OWNER_INVALIDATION
+		{ "invalidation", test_invalidation },
 #endif
 	};
 	size_t index;

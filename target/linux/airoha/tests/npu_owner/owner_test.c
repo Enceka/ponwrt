@@ -15,6 +15,7 @@ static unsigned int checks;
 #define CHECK(condition) do { checks++; if (!(condition)) { \
     fprintf(stderr, "CHECK failed: %s at %d\n", #condition, __LINE__); exit(1); } } while (0)
 #define U32_MAX UINT32_MAX
+#define U64_MAX UINT64_MAX
 #define GFP_KERNEL 0
 #define PPE_TB_CFG_SEARCH_MISS_MASK 3u
 #define PPE_GLO_CFG_BUSY_MASK 2u
@@ -58,14 +59,15 @@ struct airoha_ppe {
     struct airoha_npu_owner *ct_npu_owner;
     void *foe;
     bool ct_host_ppe, ct_restore_pending;
-    bool ct_native_pairs, ct_pair_policy_allowed, ct_stopping, ct_owns_sram;
+    bool ct_native_pairs, ct_pair_policy_allowed, ct_stopping, ct_owns_sram, ct_pair_failed;
+    bool ct_pair_wired_registered;
     bool ct_pon_ifc_route_owned;
     bool ct_pon_qualified;
     u32 ct_pair_token;
     struct { u32 regs[2], glo; } ct_saved[2];
     u32 ct_pair_wired_epoch;
     struct { const void *owner; u32 epoch; u64 generation;
-             bool pending, armed, touched, arm_pending, owner_quiesced; } ct_fe;
+             bool pending, armed, touched, arm_pending, owner_quiesced, health_stopping; } ct_fe;
 };
 struct airoha_soc {
     int num_ppe;
@@ -81,11 +83,12 @@ struct airoha_eth {
     void *dev;
     struct airoha_qdma qdma[2];
     struct airoha_gdm_dev *pon;
-    bool ct_cpu_fallback;
+    bool ct_cpu_fallback, ct_ifc_cpu_port_failed;
+    bool ct_cpu_routes_ready, ct_cpu_ifc_disabled;
 };
 
 static int flow_offload_mutex = 1, ppe_lock;
-static unsigned int allocated, freed, gate_calls[4], auth_calls[8], fe_calls;
+static unsigned int allocated, freed, gate_calls[4], auth_calls[8], fe_calls, fe_arm_calls;
 static int fail_gate = -1, fail_auth = -1, fail_write = -1;
 static bool fail_alloc, fail_route, fail_fe, fail_release, fail_fe_release, busy_fe;
 static u32 caps, gate_epoch, gate_generation, auth_epoch, auth_generation;
@@ -99,6 +102,17 @@ static u64 attempted_generation;
 static unsigned int commits, stats_updates;
 static unsigned int revokes, restores;
 static int fail_stop;
+static bool gate_open_state;
+static void (*gate_reply_hook)(struct npu_gate_message *);
+static void (*auth_reply_hook)(struct npu_auth_message *);
+static void (*route_claim_hook)(struct airoha_eth *);
+static void (*before_free_hook)(void *);
+static void (*before_spin_lock_hook)(int *);
+#ifdef NPU_OWNER_HEALTH_TEST
+static int fail_revoke;
+static unsigned int route_revokes;
+static void (*route_revoke_hook)(struct airoha_eth *);
+#endif
 
 static u32 airoha_ppe_get_total_sram_num_entries(struct airoha_ppe *ppe)
 {
@@ -120,10 +134,26 @@ static void airoha_ppe_foe_flow_stats_update(struct airoha_ppe *ppe, struct airo
 
 #include "commit_entry.inc"
 
-static void spin_lock_bh(int *lock) { CHECK(!*lock); *lock = 1; }
+static void spin_lock_bh(int *lock)
+{
+    CHECK(!*lock);
+    if (before_spin_lock_hook)
+        before_spin_lock_hook(lock);
+    CHECK(!*lock);
+    *lock = 1;
+}
 static void spin_unlock_bh(int *lock) { CHECK(*lock == 1); *lock = 0; }
 static void mutex_lock(int *lock) { CHECK(!*lock); *lock = 1; }
 static void mutex_unlock(int *lock) { CHECK(*lock == 1); *lock = 0; }
+#ifdef NPU_OWNER_HEALTH_TEST
+static int mutex_trylock(int *lock)
+{
+    if (*lock)
+        return 0;
+    *lock = 1;
+    return 1;
+}
+#endif
 static void *kzalloc(size_t bytes, int flags)
 {
     CHECK(!ppe_lock && flow_offload_mutex);
@@ -135,6 +165,8 @@ static void *kzalloc(size_t bytes, int flags)
 static void kfree(void *pointer)
 {
     CHECK(!ppe_lock && flow_offload_mutex && pointer);
+    if (before_free_hook)
+        before_free_hook(pointer);
     freed++;
     free(pointer);
 }
@@ -164,8 +196,29 @@ static int airoha_bank1_routes_claim(struct airoha_eth *eth, const void *owner)
     eth->ct_bank1_routes.ready = !fail_route;
     eth->ct_bank1_routes.pon_open = false;
     eth->ct_bank1_routes.revoked = false;
+    if (route_claim_hook)
+        route_claim_hook(eth);
     return fail_route ? -EIO : 0;
 }
+#ifdef NPU_OWNER_HEALTH_TEST
+static int airoha_bank1_routes_revoke(struct airoha_eth *eth, const void *owner)
+{
+    CHECK((ppe_lock || flow_offload_mutex) && !eth->ct_route_lock);
+    spin_lock_bh(&eth->ct_route_lock);
+    if (eth->ct_bank1_routes.owner != owner) {
+        spin_unlock_bh(&eth->ct_route_lock);
+        return -ESTALE;
+    }
+    route_revokes++;
+    eth->ct_bank1_routes.pon_open = false;
+    eth->ct_bank1_routes.ready = false;
+    eth->ct_bank1_routes.revoked = true;
+    spin_unlock_bh(&eth->ct_route_lock);
+    if (route_revoke_hook)
+        route_revoke_hook(eth);
+    return fail_revoke;
+}
+#endif
 static int airoha_bank1_routes_release(struct airoha_eth *eth, const void *owner)
 {
     CHECK(flow_offload_mutex && !ppe_lock && eth->ct_bank1_routes.owner == owner);
@@ -217,6 +270,7 @@ static int airoha_ct_fe_owner_quiesce(struct airoha_ppe *ppe, const void *owner,
 static int airoha_ct_fe_owner_arm(struct airoha_ppe *ppe, const void *owner,
                                  u64 generation, u32 epoch)
 {
+    fe_arm_calls++;
     CHECK(ppe_lock && ppe->ct_fe.owner == owner && !ppe->ct_fe.pending);
     CHECK(generation == ppe->ct_fe.generation && epoch == ppe->ct_fe.epoch);
     ppe->ct_fe.owner_quiesced = false;
@@ -286,7 +340,12 @@ static void airoha_ppe_ct_regs(struct airoha_ppe *ppe, int bank, bool restore)
 int airoha_npu_gate_command(struct airoha_npu *npu, struct npu_gate_message *message)
 {
     unsigned int operation = message->w[GM_ABI_OP] >> 16;
-    CHECK(npu && !ppe_lock && flow_offload_mutex && operation < 4);
+    CHECK(npu && (ppe_lock || flow_offload_mutex) && operation < 4);
+#ifdef NPU_OWNER_HEALTH_TEST
+    CHECK(operation == GATE_QUERY ? (!ppe_lock && flow_offload_mutex) : ppe_lock);
+#else
+    CHECK(!ppe_lock && flow_offload_mutex);
+#endif
     gate_calls[operation]++;
     if ((int)operation == fail_gate)
         return -ETIMEDOUT;
@@ -302,14 +361,18 @@ int airoha_npu_gate_command(struct airoha_npu *npu, struct npu_gate_message *mes
     message->w[GM_STATE_GENERATION] = gate_generation;
     message->w[GM_AUTH_EPOCH] = auth_epoch;
     message->w[GM_AUTH_GENERATION] = auth_generation;
-    message->w[GM_CLOSED] = 1;
-    if (operation == GATE_OPEN) {
+    if (operation == GATE_OPEN)
+        gate_open_state = true;
+    else if (operation != GATE_QUERY)
+        gate_open_state = false;
+    message->w[GM_CLOSED] = !gate_open_state;
+    if (gate_open_state) {
         message->w[GM_CLOSED] = 0;
         message->w[GM_MASK] = GATE_PON2;
         message->w[GM_FE_ENABLED] = 1;
         message->w[GM_ER_FLAGS] = GATE_ER_BOUND;
         message->w[GM_AUTH_ENABLED] = published_enabled;
-        if (gate_change_generation)
+        if (operation == GATE_OPEN && gate_change_generation)
             bridge_generation++;
     }
     if (operation == GATE_QUIET) {
@@ -318,6 +381,8 @@ int airoha_npu_gate_command(struct airoha_npu *npu, struct npu_gate_message *mes
         message->w[GM_FE_QUIESCED] = 1;
         message->w[GM_DMA_IDLE] = 1;
     }
+    if (gate_reply_hook)
+        gate_reply_hook(message);
     return 0;
 }
 int airoha_npu_auth_command(struct airoha_npu *npu, struct npu_auth_message *message)
@@ -362,6 +427,8 @@ int airoha_npu_auth_command(struct airoha_npu *npu, struct npu_auth_message *mes
     message->w[AM_ENABLED] = published_enabled;
     if (auth_bad_echo)
         message->w[AM_RULE + 19] ^= 1;
+    if (auth_reply_hook)
+        auth_reply_hook(message);
     return 0;
 }
 
@@ -372,7 +439,8 @@ static void setup(struct airoha_eth *eth, struct airoha_ppe *ppe,
     *soc = (struct airoha_soc) { .num_ppe = 2 };
     *npu = (struct airoha_npu) { .present = 1 };
     *ppe = (struct airoha_ppe) { .eth = eth, .ct_host_ppe = true,
-                               .ct_restore_pending = true, .ct_pair_wired_epoch = 9 };
+                               .ct_restore_pending = true, .ct_pair_wired_epoch = 9,
+                               .ct_pair_wired_registered = true };
     ppe->ct_fe.epoch = 7;
     ppe->ct_fe.generation = 4;
     *eth = (struct airoha_eth) { .ppe = ppe, .soc = soc, .npu = npu,
@@ -381,7 +449,7 @@ static void setup(struct airoha_eth *eth, struct airoha_ppe *ppe,
     fail_alloc = fail_route = fail_fe = fail_release = fail_fe_release = busy_fe = false;
     memset(gate_calls, 0, sizeof(gate_calls));
     memset(auth_calls, 0, sizeof(auth_calls));
-    fe_calls = 0;
+    fe_calls = fe_arm_calls = 0;
     revokes = restores = 0;
     fail_stop = 0;
     caps = GATE_CAPS | GATE_CAP_PON2;
@@ -394,6 +462,17 @@ static void setup(struct airoha_eth *eth, struct airoha_ppe *ppe,
     auth_lose_ack = auth_bad_echo = auth_change_generation = false;
     auth_query_change_generation = false;
     fail_arm = arm_change_generation = gate_change_generation = route_change_generation = false;
+    gate_open_state = false;
+    gate_reply_hook = NULL;
+    auth_reply_hook = NULL;
+    route_claim_hook = NULL;
+    before_free_hook = NULL;
+    before_spin_lock_hook = NULL;
+#ifdef NPU_OWNER_HEALTH_TEST
+    fail_revoke = 0;
+    route_revokes = 0;
+    route_revoke_hook = NULL;
+#endif
 }
 
 static void check_closed(struct airoha_eth *eth)
@@ -411,6 +490,9 @@ static void check_closed(struct airoha_eth *eth)
 #include "return_test.inc"
 #include "admission_test.inc"
 #include "reopen_test.inc"
+#ifdef NPU_OWNER_HEALTH_TEST
+#include "health_test.inc"
+#endif
 
 static void check_binding(struct airoha_eth *eth)
 {
@@ -591,6 +673,9 @@ int main(void)
     check_returns();
     check_authorization();
     check_reopen();
+#ifdef NPU_OWNER_HEALTH_TEST
+    check_health();
+#endif
     printf("npu owner: %u checks passed\n", checks);
     return 0;
 }

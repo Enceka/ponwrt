@@ -67,7 +67,10 @@ def main():
     parser.add_argument('--case', help='Run one named test group')
     parser.add_argument('--reopen', action='store_true',
                         help='Apply 998 to --source through 996 and test PON reopening')
+    parser.add_argument('--invalidation', action='store_true',
+                        help='Also apply 999-z route revocation; implies --reopen')
     args = parser.parse_args()
+    args.reopen |= args.invalidation
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -96,6 +99,20 @@ def main():
                        output, 'apply', cwd=tree)
     if re.search(r'fuzz|offset|FAILED|reversed', patch_output, re.IGNORECASE):
         raise RuntimeError('patch must apply exactly to the input files:\n' + patch_output)
+    health_patch = None
+    health_bytes = None
+    if args.invalidation:
+        health_patch = patch.parent / '999-z-net-airoha-monitor-npu-owner-invalidation.patch'
+        health_bytes = health_patch.read_bytes()
+        marker = '--- a/' + str(DRIVER / added.name) + '\n'
+        route_patch = marker + re.split(r'^--- ', health_bytes.decode().split(marker, 1)[1],
+                                       maxsplit=1, flags=re.MULTILINE)[0]
+        result = subprocess.run(['patch', '--batch', '--forward', '--fuzz=0', '-p1'],
+                                input=route_patch, capture_output=True, text=True, cwd=tree)
+        (output / 'apply-invalidation.log').write_text(result.stdout + result.stderr)
+        if result.returncode or re.search(r'fuzz|offset|FAILED|reversed', result.stdout,
+                                          re.IGNORECASE):
+            raise RuntimeError('route invalidation must apply exactly: ' + result.stdout + result.stderr)
     modified = {name: (driver / name).read_bytes() for name in FILES + ('airoha_bank1_routes.h',)}
     header = modified['airoha_eth.h'].decode()
     layout = re.search(r'^struct airoha_bank1_routes \{\n.*?^\};', header, re.MULTILINE | re.DOTALL)
@@ -126,6 +143,8 @@ def main():
              str(tests / 'routes_test.c'), '-o', str(output / 'routes_test')]
     if args.reopen:
         build.insert(1, '-DTEST_PON_REOPEN')
+    if args.invalidation:
+        build.insert(1, '-DTEST_OWNER_INVALIDATION')
     run(build, output, 'build')
     environment = dict(os.environ)
     environment['ASAN_OPTIONS'] = 'halt_on_error=1:abort_on_error=1'
@@ -161,6 +180,13 @@ def main():
             'lose_previous_wan_role': ('route_functions.inc',
                 'set_bit(AIROHA_DEV_F_WAN, &dev->flags);', ''),
         }
+        if args.invalidation:
+            targets.update({
+                'revoke_foreign_owner': ('airoha_bank1_routes.h',
+                    'eth->ct_bank1_routes.owner == owner ?', 'true ?'),
+                'skip_atomic_route_revoke': ('airoha_bank1_routes.h',
+                    'airoha_bank1_routes_revoke_locked(eth) : -ESTALE', '0 : -ESTALE'),
+            })
         for name, (filename, before, after) in targets.items():
             target = (output if filename.endswith('.inc') else driver) / filename
             original = target.read_text()
@@ -168,7 +194,8 @@ def main():
                 raise RuntimeError('missing mutation target: ' + name)
             target.write_text(original.replace(before, after))
             run(build, output, name + '-build')
-            attempt = subprocess.run([str(output / 'routes_test'), 'reopen'],
+            group = 'invalidation' if name in ('revoke_foreign_owner', 'skip_atomic_route_revoke') else 'reopen'
+            attempt = subprocess.run([str(output / 'routes_test'), group],
                 capture_output=True, text=True, cwd=output, env=environment)
             (output / (name + '.log')).write_text(attempt.stdout + attempt.stderr)
             target.write_text(original)
@@ -178,15 +205,19 @@ def main():
         run(build, output, 'build-final')
     if patch.read_bytes() != patch_bytes:
         raise RuntimeError('991 changed during testing; rerun against the completed patch')
+    if health_patch and health_patch.read_bytes() != health_bytes:
+        raise RuntimeError('999-z changed during testing; rerun against the completed patch')
     report = {
         'passed': True, 'case': args.case or 'all', 'source': str(args.source.resolve()),
         'compiler': version.splitlines()[0], 'sanitizers': ['address', 'undefined'],
         'sanitize_recover': False, 'patch_sha256': digest(patch_bytes),
+        'invalidation_patch_sha256': digest(health_bytes) if health_bytes else None,
         'base_sha256': {name: digest(data) for name, data in originals.items()},
         'source_sha256': {name: digest(data) for name, data in modified.items()},
         'extracted_sha256': {name: digest(data.encode()) for name, data in extracted.items()},
         'test_sha256': {name: digest((tests / name).read_bytes())
-                        for name in ('verify.py', 'routes_test.c', 'reopen_test.inc')},
+                        for name in ('verify.py', 'routes_test.c', 'reopen_test.inc',
+                                     'invalidation_test.inc')},
         'result': result, 'mutations': mutations,
     }
     report_path.write_text(json.dumps(report, indent=2) + '\n')

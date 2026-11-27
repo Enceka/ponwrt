@@ -31,6 +31,8 @@ static void setup_return(struct return_fixture *fixture)
     er_caps = ER_CAPS | ER_CAP_SOURCES;
     er_state = er_fault = er_last_epoch = 0;
     er_frees = er_fallbacks = er_cancels = 0;
+    er_reply_hook = NULL;
+    work_cancel_hook = NULL;
     memset(er_calls, 0, sizeof(er_calls));
     CHECK(airoha_ppe_npu_owner_claim_locked(&fixture->eth, 4) == 0);
 }
@@ -57,13 +59,20 @@ static void check_return_binding(struct return_fixture *fixture)
               (service == 0 || service == 0x1001 || service == 0xffff));
     CHECK(!airoha_npu_return_binding(path, lower, &config, 0x1001));
     CHECK(!airoha_npu_return_binding(path, lower, &config, ER_SERVICE_VALID | 0x10001));
-    CHECK(!airoha_npu_return_binding(path, &other, &config, ER_SERVICE_VALID));
     for (unsigned int field = 0; field < 6; ++field) {
         u32 *words = (u32 *)&config;
         words[field] ^= 1;
         CHECK(!airoha_npu_return_binding(path, lower, &config, ER_SERVICE_VALID));
         words[field] ^= 1;
     }
+    CHECK(!airoha_npu_return_binding(path, &other, &config, ER_SERVICE_VALID));
+#ifdef NPU_OWNER_HEALTH_TEST
+    CHECK(path->owner->invalidated);
+    CHECK(airoha_ppe_npu_owner_renew_locked(&fixture->eth, 4) == 0);
+    CHECK(airoha_ppe_npu_return_prepare_locked(&fixture->eth, &fixture->dev, 8) == 0);
+    path = fixture->ppe.ct_npu_owner->return_path;
+    config = path->config;
+#endif
     for (unsigned int state = 0; state < 9; ++state) {
         switch (state) {
         case 0: fixture->dev.pon_update_blocked = true; break;
@@ -86,6 +95,12 @@ static void check_return_binding(struct return_fixture *fixture)
         lower->running = lower->carrier = true;
         bridge_generation = 4;
         fixture->eth.ct_cpu_fallback = false;
+#ifdef NPU_OWNER_HEALTH_TEST
+        CHECK(airoha_ppe_npu_owner_renew_locked(&fixture->eth, 4) == 0);
+        CHECK(airoha_ppe_npu_return_prepare_locked(&fixture->eth, &fixture->dev, 8) == 0);
+        path = fixture->ppe.ct_npu_owner->return_path;
+        config = path->config;
+#endif
     }
     CHECK(airoha_npu_return_binding(path, lower, &config, ER_SERVICE_VALID));
 }
@@ -96,6 +111,7 @@ static void check_returns(void)
     struct airoha_npu_owner *owner;
     struct airoha_npu_return *path;
     u32 epoch;
+    unsigned int binding_binds, binding_stops, binding_unbinds, binding_frees, binding_cancels;
 
     for (unsigned int scenario = 0; scenario < 20; ++scenario) {
         int expected = -EOPNOTSUPP;
@@ -146,13 +162,19 @@ static void check_returns(void)
     CHECK(airoha_ppe_npu_return_prepare_locked(&fixture.eth, &fixture.dev, 16) == -ESTALE);
     CHECK(er_calls[ER_BIND] == 1);
     check_return_binding(&fixture);
+    binding_binds = er_calls[ER_BIND];
+    binding_stops = er_calls[ER_STOP];
+    binding_unbinds = er_calls[ER_UNBIND];
+    binding_frees = er_frees;
+    binding_cancels = er_cancels;
     epoch = owner->txn.id.epoch;
     CHECK(airoha_ppe_npu_owner_close_locked(&fixture.eth) == 0);
     CHECK(owner->txn.id.epoch == epoch + 1 && !owner->epoch_dirty);
-    CHECK(er_calls[ER_STOP] == 1 && er_calls[ER_UNBIND] == 1 && er_frees == 1);
-    CHECK(er_cancels == 1 && !owner->return_path);
+    CHECK(er_calls[ER_STOP] == binding_stops + 1 &&
+          er_calls[ER_UNBIND] == binding_unbinds + 1 && er_frees == binding_frees + 1);
+    CHECK(er_cancels == binding_cancels + 1 && !owner->return_path);
     CHECK(airoha_ppe_npu_return_prepare_locked(&fixture.eth, &fixture.dev, 8) == 0);
-    CHECK(owner->return_path->epoch == epoch + 1 && er_calls[ER_BIND] == 2);
+    CHECK(owner->return_path->epoch == epoch + 1 && er_calls[ER_BIND] == binding_binds + 1);
     release_return(&fixture);
 
     for (unsigned int scenario = 0; scenario < 3; ++scenario) {

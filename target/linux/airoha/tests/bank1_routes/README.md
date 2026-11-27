@@ -89,3 +89,15 @@ GDM/guard/fallback/native/PON路由逻辑均执行真实driver代码。
 release前owner负责完成gate/FE quiet并撤销旧FOE。guard只检查bank1 FLOW_CFG/BUSY并
 恢复路由，不重新查询协议；失败后owner及desired仍需保留供重试。模块保持未自动启用。
 本测试只生成本机host产物，不访问设备、不修改原source、Git索引或其他测试目录。
+
+`--invalidation` 在 `--reopen` 基础上应用 `999-z` 的公开撤销入口。
+入口允许持 `ppe_lock`、未持 flow mutex 的通知路径调用，内部只获取 route lock。
+测试检查 foreign owner 零写入、关闭后禁止直接重开、desired 快照保留，以及四个
+GDM 的逐笔丢写和读回错误。失败保持 revoked，后续撤销可以重试；显式 claim
+负责重新建立关闭态。运行时负对照覆盖错误 owner 和跳过实际路由关闭。
+
+```sh
+python3 target/linux/airoha/tests/bank1_routes/verify.py --invalidation \
+  --source /absolute/path/to/linux-after-996 \
+  --output /absolute/path/to/results/bank1-invalidation
+```

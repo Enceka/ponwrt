@@ -24,6 +24,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=tests / 'out')
     parser.add_argument('--cc', default=os.environ.get('CC', 'clang'))
+    parser.add_argument('--health', action='store_true',
+                        help='Apply the 999-z owner health extension and run its fault matrix')
     parser.add_argument('--source', type=Path, required=True,
                         help='Kernel tree with patches through 999 applied')
     args = parser.parse_args()
@@ -35,6 +37,8 @@ def main():
     patches = tests.parents[1] / 'patches-6.18'
     paths = {number: next(patches.glob(number + '-net-airoha-*.patch'))
              for number in ('988', '989', '990', '993', '994', '995', '996', '999')}
+    if args.health:
+        paths['999-z'] = patches / '999-z-net-airoha-monitor-npu-owner-invalidation.patch'
     inputs = {number: path.read_bytes() for number, path in paths.items()}
     sources = {}
     for name in (*helper.ABIS, 'airoha_npu_transaction.h'):
@@ -74,12 +78,37 @@ def main():
     sources[reopen_name] = helper.added_file(inputs['999'].decode(), reopen_name)
     publish_name = 'airoha_npu_auth_publish.h'
     sources[publish_name] = helper.added_file(inputs['995'].decode(), publish_name)
+    health_name = 'airoha_npu_health.h'
+    if args.health:
+        for name, data in sources.items():
+            (expected / name).write_bytes(data)
+        sections = re.split(r'(?=^--- )', inputs['999-z'].decode(), flags=re.MULTILINE)
+        for section in sections:
+            match = re.search(r'^\+\+\+ b/drivers/net/ethernet/airoha/(airoha_npu_\w+\.h)$',
+                              section, flags=re.MULTILINE)
+            if not match:
+                continue
+            name = match[1]
+            if name not in sources and not section.startswith('--- /dev/null\n'):
+                raise RuntimeError('health patch modifies an unknown header: ' + name)
+            if section.startswith('--- /dev/null\n'):
+                (expected / name).unlink(missing_ok=True)
+            applied = subprocess.run(['patch', '--batch', '--forward', '--fuzz=0', '-p1'], input=section,
+                                     cwd=output / 'expected', capture_output=True, text=True)
+            (output / ('apply-health-' + name + '.log')).write_text(
+                applied.stdout + applied.stderr)
+            if applied.returncode:
+                raise RuntimeError('cannot apply health header ' + name + ': ' +
+                                   applied.stdout + applied.stderr)
+            sources[name] = (expected / name).read_bytes()
+        if health_name not in sources:
+            raise RuntimeError('health patch does not add ' + health_name)
     driver = args.source.resolve() / 'drivers/net/ethernet/airoha'
     if (driver / owner_name).read_bytes() != sources[owner_name]:
-        raise RuntimeError('kernel owner differs from current 993/994/996/999')
+        raise RuntimeError('kernel owner differs from the selected owner patches')
     if (driver / return_name).read_bytes() != sources[return_name]:
-        raise RuntimeError('kernel return owner differs from current 994')
-    for name in (admission_name, publish_name, reopen_name):
+        raise RuntimeError('kernel return owner differs from the selected owner patches')
+    for name in (admission_name, publish_name, reopen_name, *((health_name,) if args.health else ())):
         if (driver / name).read_bytes() != sources[name]:
             raise RuntimeError('kernel admission source differs: ' + name)
     ppe_source = (driver / 'airoha_ppe.c').read_text()
@@ -99,6 +128,8 @@ def main():
                '-fno-sanitize-recover=all', '-fno-omit-frame-pointer',
                '-I', str(extracted), str(tests / 'owner_test.c'),
                '-o', str(output / 'owner_test')]
+    if args.health:
+        command.insert(1, '-DNPU_OWNER_HEALTH_TEST')
     helper.execute(command, output, 'build')
     environment = dict(os.environ, ASAN_OPTIONS='halt_on_error=1:abort_on_error=1',
                        UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
@@ -151,8 +182,91 @@ def main():
         'if (ppe->ct_npu_owner && ppe->ct_npu_owner->stop_completed)', 'if (false)')
     mutants['repeat_native_stop'] = (
         'if (ppe->ct_npu_owner && ppe->ct_npu_owner->native_stopped)', 'if (false)')
+    health_mutants = {}
+    if args.health:
+        health_mutants = {
+            'health_no_latch': (owner_name,
+                'WRITE_ONCE(owner->invalidated, true);', 'WRITE_ONCE(owner->invalidated, false);'),
+            'health_no_sequence': (owner_name,
+                'owner->invalidation_seq++;', 'owner->invalidation_seq += 0;'),
+            'health_skip_atomic_routes': (owner_name,
+                'error = airoha_bank1_routes_revoke(ppe->eth, owner);', 'error = 0;'),
+            'health_skip_atomic_gate': (owner_name,
+                'if (!owner->closed_ack) {', 'if (false) {'),
+            'health_use_unpublished_gate_identity': (owner_name,
+                'message.w[GM_EPOCH] = owner->gate_id.epoch;',
+                'message.w[GM_EPOCH] = owner->txn.id.epoch;'),
+            'health_gate_identity_after_send': (owner_name,
+                'owner->gate_id = owner->txn.id;', 'if (false) owner->gate_id = owner->txn.id;'),
+            'health_ignore_locked_gate_invalidation': (owner_name,
+                'if (opening && owner->invalidated)', 'if (opening && false)'),
+            'health_skip_retire_cancel': (owner_name,
+                'cancel_delayed_work_sync(&owner->health_work);', '(void)owner;'),
+            'health_skip_retiring_flag': (owner_name,
+                'owner->retiring = true;', 'owner->retiring = false;'),
+            'health_false_close_ack': (owner_name,
+                'error = airoha_npu_return_destroy(owner);\n\tif (!error) {',
+                'error = airoha_npu_return_destroy(owner);\n\tif (true) {'),
+            'health_skip_firmware_fault': (health_name,
+                'gate.w[GM_FAULT]', 'false'),
+            'health_skip_firmware_auth_count': (health_name,
+                'auth.w[AM_COUNT] != owner->auth_count', 'false'),
+            'health_skip_post_query_state': (health_name,
+                'return airoha_npu_owner_open_check(owner, id, NPU_TXN_OPEN);', 'return 0;'),
+            'health_skip_close': (health_name,
+                'error = airoha_ppe_npu_owner_close_locked(ppe->eth);', 'error = 0;'),
+            'health_skip_post_close_revoke': (health_name,
+                'route_error = airoha_bank1_routes_revoke(ppe->eth, owner);', 'route_error = 0;'),
+            'health_clear_new_pending': (health_name,
+                'owner->invalidation_seq == invalidation_seq)',
+                '(owner->invalidation_seq == invalidation_seq || owner->invalidated))'),
+            'health_clear_latch_on_close': (health_name,
+                'owner->close_pending = false;',
+                'owner->close_pending = owner->invalidated = false;'),
+            'health_no_periodic_retry': (health_name,
+                'schedule_delayed_work(&owner->health_work, msecs_to_jiffies(100));', '(void)owner;'),
+            'health_block_on_flow_mutex': (health_name,
+                'if (!mutex_trylock(&flow_offload_mutex))\n\t\tgoto requeue;',
+                'if (!mutex_trylock(&flow_offload_mutex)) {\n'
+                '\t\tmutex_lock(&flow_offload_mutex);\n\t\tgoto requeue;\n\t}'),
+            'health_renew_ignore_sequence': (admission_name,
+                'owner->invalidation_seq == invalidation_seq ?',
+                '(owner->invalidation_seq == invalidation_seq || owner->invalidated) ?'),
+            'health_renew_allow_saturated_sequence': (admission_name,
+                'invalidation_seq != U64_MAX &&', ''),
+            'health_renew_skip_route_claim': (admission_name,
+                'error = airoha_bank1_routes_claim(eth, owner);', 'error = 0;'),
+            'health_skip_pair_fault': (admission_name,
+                'ppe->ct_pair_failed ||', 'false ||'),
+            'health_skip_fe_health_stop': (admission_name,
+                'ppe->ct_fe.health_stopping ||', 'false ||'),
+            'health_skip_ifc_fault': (admission_name,
+                'READ_ONCE(ppe->eth->ct_ifc_cpu_port_failed)', 'false'),
+            'health_skip_mapping_latch': (return_name,
+                '!READ_ONCE(path->owner->invalidated) &&', ''),
+            'health_skip_bind_ack_race': (return_name,
+                'if (owner->invalidated)\n\t\t\terror = -ESTALE;',
+                'if (false)\n\t\t\terror = -ESTALE;'),
+            'health_keep_closed_ack_for_bind': (return_name,
+                'owner->closed_ack = false;', 'owner->closed_ack = true;'),
+            'health_notify_without_drain': (return_name,
+                '(owner->closed_ack ? 0 : -EAGAIN)', '(owner->closed_ack ? 0 : 0)'),
+            'health_skip_locked_fe_invalidation': (reopen_name,
+                'error = owner->invalidated ? -ESTALE :', 'error = false ? -ESTALE :'),
+            'health_skip_notifier_guard': (reopen_name,
+                ' || !owner->ppe->ct_pair_wired_registered', ''),
+            'health_skip_closed_cpu_fallback': (health_name,
+                'READ_ONCE(owner->ppe->eth->ct_cpu_fallback)', 'false'),
+            'health_skip_cpu_route_retry': (health_name,
+                'airoha_ct_cpu_fallback(ppe->eth);', '(void)ppe;'),
+            'health_repeat_completed_cpu_routes': (health_name,
+                '!READ_ONCE(ppe->eth->ct_cpu_routes_ready)', 'true'),
+        }
+        mutants.update({name: (before, after)
+                        for name, (_, before, after) in health_mutants.items()})
     for name, (before, after) in mutants.items():
-        target_name = ('stop_entry.inc' if name.startswith('repeat_') else
+        target_name = (health_mutants[name][0] if name in health_mutants else
+                       'stop_entry.inc' if name.startswith('repeat_') else
                        return_name if name in return_mutants else
                        reopen_name if name in reopen_mutants else
                        admission_name if name in admission_mutants else owner_name)
@@ -160,14 +274,16 @@ def main():
         if before not in original:
             raise RuntimeError('missing mutation target: ' + name)
         (extracted / target_name).write_text(original.replace(before, after))
-        helper.execute(command, output, name + '-build')
-        run = subprocess.run([str(output / 'owner_test')], capture_output=True,
-                             text=True, cwd=output, env=environment)
-        (output / (name + '.log')).write_text(run.stdout + run.stderr)
-        if run.returncode == 0 or 'CHECK failed:' not in run.stderr:
-            raise RuntimeError('mutation was not rejected by a runtime assertion: ' + name)
-        mutation_results[name] = 'caught'
-        (extracted / target_name).write_bytes(sources[target_name])
+        try:
+            helper.execute(command, output, name + '-build')
+            run = subprocess.run([str(output / 'owner_test')], capture_output=True,
+                                 text=True, cwd=output, env=environment)
+            (output / (name + '.log')).write_text(run.stdout + run.stderr)
+            if run.returncode == 0 or 'CHECK failed:' not in run.stderr:
+                raise RuntimeError('mutation was not rejected by a runtime assertion: ' + name)
+            mutation_results[name] = 'caught'
+        finally:
+            (extracted / target_name).write_bytes(sources[target_name])
     (extracted / owner_name).write_bytes(sources[owner_name])
     helper.execute(command, output, 'build-final')
     for number, path in paths.items():
@@ -175,14 +291,16 @@ def main():
             raise RuntimeError(number + ' changed during testing')
     sha256 = lambda data: hashlib.sha256(data).hexdigest()
     report = {
-        'passed': True, 'sanitizers': ['address', 'undefined'], 'result': result,
+        'passed': True, 'health': args.health,
+        'sanitizers': ['address', 'undefined'], 'result': result,
         'mutations': mutation_results,
         'patch_sha256': {number: sha256(data) for number, data in inputs.items()},
         'source_sha256': {name: sha256(data) for name, data in sources.items()},
         'test_sha256': {name: sha256((tests / name).read_bytes())
                         for name in ('verify.py', 'owner_test.c', 'return_types.h',
                                      'return_stubs.inc', 'return_test.inc', 'admission_test.inc',
-                                     'reopen_test.inc')},
+                                     'reopen_test.inc',
+                                     *(('health_test.inc',) if args.health else ()))},
     }
     report_path.write_text(json.dumps(report, indent=2) + '\n')
     print(result)

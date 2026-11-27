@@ -66,6 +66,63 @@ python3 target/linux/airoha/tests/npu_owner/verify.py \
   --output /absolute/path/to/results/npu-owner
 ```
 
+Add `--health` for a kernel tree with
+`999-z-net-airoha-monitor-npu-owner-invalidation.patch` applied:
+
+```sh
+python3 target/linux/airoha/tests/npu_owner/verify.py --health \
+  --source /absolute/path/to/owner-source-health \
+  --output /absolute/path/to/results/npu-owner-health
+```
+
+Omitting `--health` keeps the original `999` regression mode. The health mode
+reconstructs the added and changed production headers from `999-z`, applies
+them with zero patch fuzz, and compares them byte for byte with the supplied
+tree before compiling. Each run records the selected patch and source hashes.
+
+`999-z` embeds a delayed health worker and a monotonic invalidation sequence
+in the owner. An atomic invalidation holds `ppe_lock`, latches admission off,
+revokes the owned routes and synchronously sends GATE CLOSE with the last
+submitted gate identity. The owner, transaction phase and exposed ER DMA stay
+allocated until the complete close succeeds. `closed_ack` becomes true only
+after transaction drain and ER destruction; preparation clears it before
+BIND. Notifications return `-EAGAIN` while that drain is outstanding. A
+device-specific notification targets the pinned PON lower, and a NULL device
+targets the whole owner.
+
+The worker uses `mutex_trylock` on the flow mutex and retries every 100 ms.
+An OPEN owner queries GATE and AUTH, checking mapping, FE state, route state,
+qualification and notifier registration both before and after the replies.
+It leaves ARM and OPEN commands unchanged during healthy polling. Failures
+trigger the complete close and a final route revocation; failure retains
+`close_pending` for retry. A concurrent invalidation also keeps close pending
+until a later pass closes the new sequence. A successful worker close keeps
+the invalidation latch set. Explicit renewal completes close, reclaims closed
+routes, and clears the latch only when the generation and invalidation sequence
+still match. A saturated sequence remains latched.
+
+CPU fallback with unfinished route or IFC shutdown is retried even when the
+owner is already closed and its ring has been retired. Successful recovery
+stops repeating those MMIO operations while periodic health monitoring remains
+scheduled. The tests cover both operations unfinished and each partial state.
+
+Retirement releases the route and FE ownership, detaches the owner under
+`ppe_lock`, marks it retiring, and synchronously cancels its work before free.
+The workqueue stub exercises a worker entering during that cancellation while
+the flow mutex is held. Failed releases leave the owner and work available
+for retry. ER mapping changes synchronously invalidate admission, while a
+bad per-packet service or configuration is dropped without changing ownership.
+
+The health matrix injects firmware status and query failures, mapping and FE
+health changes, notifier withdrawal, every close transaction boundary, ER
+STOP/UNBIND failures and route revocation failures. It checks retained DMA,
+exact epoch advancement, notification status, no repeated close after success,
+and invalidations during queries, BIND, renewal, and the lock windows before
+FE ARM and GATE OPEN. Runtime negative controls independently remove the
+latch, sequence, synchronous closure, health checks, retry, renewal fences or
+retirement cancellation and must fail an executable assertion. Both modes use
+ASan and UBSan.
+
 The runner extracts the production owner and transaction headers from the
 patches, applies the return-owner extension, checks both applied files byte
 for byte, and extracts the actual

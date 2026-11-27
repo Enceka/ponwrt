@@ -33,7 +33,9 @@ struct work_struct { int unused; };
 struct delayed_work {
     struct work_struct work;
     void (*function)(struct work_struct *);
-    bool pending;
+    bool pending, running;
+    unsigned long delay;
+    unsigned int scheduled, cancelled;
 };
 struct airoha_qdma { int index; };
 struct airoha_gdm_port { int id, sport; };

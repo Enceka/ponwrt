@@ -3,6 +3,9 @@ static bool er_allocation_failure, er_bound, er_lose_ack;
 static u32 er_caps, er_state, er_fault, er_last_epoch;
 static struct er_config er_live_config;
 static unsigned int er_calls[4], er_frees, er_fallbacks, er_cancels;
+static void (*er_reply_hook)(struct er_message *);
+static void (*work_cancel_hook)(struct delayed_work *);
+static void airoha_npu_return_fault_work(struct work_struct *work);
 
 static bool airoha_is_valid_gdm_dev(struct airoha_eth *eth, struct airoha_gdm_dev *dev)
 {
@@ -14,23 +17,48 @@ static int er_get_sport(struct airoha_gdm_port *port, int nbq)
     return port->sport;
 }
 
-static void schedule_delayed_work(struct delayed_work *work, unsigned int delay)
+static bool schedule_delayed_work(struct delayed_work *work, unsigned long delay)
 {
-    CHECK(delay == 100);
+    CHECK(work->function && delay == 100);
+    if (work->pending)
+        return false;
     work->pending = true;
+    work->delay = delay;
+    work->scheduled++;
+    return true;
 }
 
-static void cancel_delayed_work_sync(struct delayed_work *work)
+static bool cancel_delayed_work_sync(struct delayed_work *work)
 {
+    bool pending = work->pending;
+
     CHECK(flow_offload_mutex && !ppe_lock);
+    CHECK(work->function && !work->running);
+    if (work_cancel_hook)
+        work_cancel_hook(work);
     work->pending = false;
-    er_cancels++;
+    work->cancelled++;
+    if (work->function == airoha_npu_return_fault_work)
+        er_cancels++;
+    return pending;
+}
+
+static inline void test_run_delayed_work(struct delayed_work *work)
+{
+    CHECK(work->pending && work->function && !work->running);
+    work->pending = false;
+    work->running = true;
+    work->function(&work->work);
+    CHECK(work->running);
+    work->running = false;
 }
 
 static int airoha_ct_cpu_fallback(struct airoha_eth *eth)
 {
     er_fallbacks++;
     eth->ct_cpu_fallback = true;
+    if (!er_fallback_error)
+        eth->ct_cpu_routes_ready = eth->ct_cpu_ifc_disabled = true;
     return er_fallback_error;
 }
 
@@ -62,6 +90,8 @@ int airoha_npu_er_command(struct airoha_npu *npu, struct er_message *message)
     message->w[9] = er_caps;
     message->w[10] = er_state;
     message->w[12] = er_fault;
+    if (er_reply_hook)
+        er_reply_hook(message);
     return 0;
 }
 
