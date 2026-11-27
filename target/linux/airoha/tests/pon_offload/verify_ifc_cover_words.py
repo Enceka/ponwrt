@@ -8,6 +8,7 @@ import shutil
 import subprocess
 
 from verify_ifc_tuple_packet import PacketOracle
+from verify_ifc_service import U32_MAX, sif_matches
 
 
 HARNESS = r'''
@@ -21,6 +22,7 @@ HARNESS = r'''
 typedef uint32_t u32;
 typedef uint16_t u16;
 #define BIT(index) (UINT32_C(1) << (index))
+#define U32_MAX UINT32_MAX
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86dd
 #include "airoha_ct_pon_ifc_words.h"
@@ -103,16 +105,18 @@ def cover_case(path, row, row_type, ring, candidate):
     stock = PacketOracle(path)
     for name, offset in SYMBOLS.items():
         assert stock.names[name] - stock.text == offset
-    set_field(stock, row, row_type, 14, 4, 4)
+    set_field(stock, row, row_type, 14, 4, U32_MAX)
     tcam = read_tcam(stock, row)
-    assert tcam == [(4, 4)] + [(0, 0)] * 7 + [(row_type << 6, 0xc0)]
+    assert tcam == [(4, U32_MAX)] + [(0, 0)] * 7 + [(row_type << 6, 0xc0)]
     shadows = [stock.names[name] + row * 0x74 for name in ('ifc_rule_key', 'ifc_rule_mask')]
     for address in shadows:
         stock.cpu.mem_write(address, bytes(0x74))
     offset = (8, 0x2c)[row_type]
     stock.call('ifc_read_rule', row, shadows[0] + offset, shadows[1] + offset)
     stock.call('ifc_get_field_sif', stock.DATA)
-    assert stock.get(stock.DATA + 28, '<II') == (4, 4)
+    assert stock.get(stock.DATA + 28, '<II') == (4, U32_MAX)
+    for source in range(32):
+        assert sif_matches(*tcam[0], source) == (source == 2)
     stock.force_cpu(row, 1, ring)
     action = read_action(stock, row)
     expected = [word for page in tcam + action for word in page]
@@ -122,7 +126,7 @@ def cover_case(path, row, row_type, ring, candidate):
     assert disabled == [action[0], action[1], (0x50000000, 0, 0)]
     assert read_tcam(stock, row) == tcam
     return dict(row=row, type=row_type, ring=ring, tcam=tcam, action=action,
-                disabled_action=disabled, sif_getter=[4, 4], candidate=candidate,
+                disabled_action=disabled, sif_getter=[4, U32_MAX], candidate=candidate,
                 stub_calls=dict(stock.stub_calls))
 
 
@@ -143,12 +147,39 @@ def type2_cases(path, candidates):
             wildcard = typed[:8] + [(0, 0)]
             wildcard_hit = all(not ((word ^ key) & mask)
                                for word, (key, mask) in zip(packet, wildcard))
-            assert wildcard_hit == bool(value & 4)
+            assert wildcard_hit == (value == 4)
+            legacy_wildcard = [(4, 4)] + wildcard[1:]
+            legacy_hit = all(not ((word ^ key) & mask)
+                             for word, (key, mask) in zip(packet, legacy_wildcard))
+            assert legacy_hit == bool(value & 4)
         records.append(dict(field=5, natural_type=2, address_low_word=value, pages=pages,
-                            typed_cover_match=False, wildcard_type_match=bool(value & 4)))
+                            typed_cover_match=False, wildcard_type_match=value == 4,
+                            legacy_wildcard_type_match=bool(value & 4)))
     stock = PacketOracle(path)
-    set_field(stock, 56, 2, 14, 4, 4)
+    set_field(stock, 56, 2, 14, 4, U32_MAX)
     assert stock.rows == {}
+    return records
+
+
+def sif_cases(path):
+    stock = PacketOracle(path)
+    records = []
+    for row_type in (0, 1):
+        for selected in range(32):
+            for name, key, mask in (('only', 1 << selected, U32_MAX),
+                                    ('absent', 0, 1 << selected),
+                                    ('legacy', 1 << selected, 1 << selected)):
+                set_field(stock, 56, row_type, 14, key, mask)
+                pages = read_tcam(stock, 56)
+                assert pages[0] == (key, mask)
+                assert pages[8] == (row_type << 6, 0xc0)
+                accepted = [source for source in range(32) if sif_matches(*pages[0], source)]
+                expected = [selected] if name == 'only' else (
+                    [source for source in range(32) if source != selected]
+                    if name == 'absent' else list(range(32)))
+                assert accepted == expected
+                records.append(dict(type=row_type, selected=selected, profile=name,
+                                    page0=pages[0], accepted_sources=accepted))
     return records
 
 
@@ -188,16 +219,20 @@ def main():
     path = args.stock_dir / 'ifc.ko'
     records = [cover_case(path, *case, words) for case, words in zip(cases, candidates)]
     regressions = type2_cases(path, candidates[:4])
+    source_vectors = sif_cases(path)
     report = dict(passed=True, cover_vectors=len(records), word_comparisons=27 * len(records),
                   invalid_checks=167, type2_address_vectors=len(regressions), type2_sif_no_write=True,
+                  cover_source_checks=len(records) * 32, sif_checks=len(source_vectors) * 32,
+                  sif_model='SPORT-indexed key/mask bit', sif_mask=U32_MAX,
                   stock_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                   header_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
                   script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   symbols={name: hex(offset) for name, offset in SYMBOLS.items()},
                   compile_command=command, sanitizers=['address', 'undefined'],
                   execution='process-local Unicorn and native pure encoder',
-                  predicate_model='Python ternary comparison for type2 exclusion only',
-                  priority='not modeled', vectors=records, type2=regressions)
+                  predicate_model='SPORT-indexed SIF for types0/1; ternary address comparison for type2',
+                  priority='not modeled', vectors=records, type2=regressions,
+                  sif_vectors=source_vectors)
     (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps({key: report[key] for key in
                       ('passed', 'cover_vectors', 'word_comparisons', 'invalid_checks',

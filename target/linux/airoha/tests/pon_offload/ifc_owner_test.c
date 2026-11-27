@@ -13,6 +13,7 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 #define BIT(index) (UINT32_C(1) << (index))
+#define U32_MAX UINT32_MAX
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86dd
 #include "airoha_ct_pon_ifc_owner.h"

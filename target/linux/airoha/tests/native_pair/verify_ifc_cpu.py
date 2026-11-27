@@ -21,6 +21,9 @@ pre=r'''
 #include <string.h>
 #include <errno.h>
 #include <arpa/inet.h>
+#ifndef EUCLEAN
+#define EUCLEAN 117
+#endif
 typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;
 #define BIT(n) (1u<<(n))
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
@@ -89,7 +92,7 @@ static bool flow_rule_match_key(struct flow_rule*r,int k){return r->encap==k;}
 static void flow_rule_match_basic(struct flow_rule*r,struct flow_match_basic*m){static struct basic a,b;a.n_proto=r->proto_mask;b.n_proto=r->proto;m->mask=&a;m->key=&b;}
 static void flow_rule_match_meta(struct flow_rule*r,struct flow_match_meta*m){static struct meta a,b;a.ingress_ifindex=r->ingress_mask;b.ingress_ifindex=r->ingress;m->mask=&a;m->key=&b;}
 '''
-pre+=rule+'\nstruct airoha_ppe {struct airoha_eth *eth;bool ct_host_ppe,ct_stopping,ct_native_pairs;struct {bool health_stopping;int health_work;} ct_fe;'+ifc+'};\n'
+pre+=rule+'\nstruct airoha_ppe {struct airoha_eth *eth;bool ct_host_ppe,ct_stopping,ct_native_pairs,ct_pon_ifc_route_owned;struct {bool health_stopping;int health_work;} ct_fe;'+ifc+'};\n'
 pre+=r'''
 static u32 regs[0x10000/4],table[3][64][9][3],saved[3][64][9][3];
 static unsigned writes,reads,fail_write,fail_read,fail_mode,fail_from,reg_failure,reg_errors;
@@ -272,25 +275,26 @@ static void restored(void){
  assert(!ct_ifc_pending(&ppe));assert(regs[0x200/4]==0&&regs[0x1f4/4]==0xf7ffffff&&regs[0x220/4]==0xaabbccdd);
  assert(!memcmp(table,saved,sizeof table));assert(!eth.ct_route_lock&&!eth.ifc_port_lock&&!rcu);
 }
-static bool matches(unsigned row,u32*words){
+static bool matches(unsigned row,u32*words,unsigned sport){
  if(!(table[2][row][2][0]&BIT(31)))return false;
- for(unsigned p=0;p<9;p++)if((words[p]^table[0][row][p][0])&table[0][row][p][1])return false;
+ if(!(table[0][row][0][0]&BIT(sport))&&(table[0][row][0][1]&BIT(sport)))return false;
+ for(unsigned p=1;p<9;p++)if((words[p]^table[0][row][p][0])&table[0][row][p][1])return false;
  return true;
 }
 static void classifier(void){
  for(unsigned et=0;et<65536;et++)for(unsigned enc=0;enc<8;enc++){
   u32 words[9]={BIT(24),0,0,0,0,et,0,((enc&1)?BIT(5):0)|((enc&2)?BIT(4):0)|((enc&4)?BIT(10):0),0};
-  bool cpu=false;for(unsigned r=32;r<=50;r++)cpu|=matches(r,words);
+  bool cpu=false;for(unsigned r=32;r<=50;r++)cpu|=matches(r,words,24);
   bool native=(et==0x800||et==0x86dd)&&!enc;
   assert(cpu==!native);classifier_cases++;
  }
  for(unsigned source=0;source<32;source++)for(unsigned et=0;et<65536;et+=257){
   u32 words[9]={BIT(source),0,0,0,0,et,0,BIT(5)|BIT(4)|BIT(10),0};
-  bool cpu=false;for(unsigned r=32;r<=50;r++)cpu|=matches(r,words);assert(cpu==(source==24));classifier_cases++;
+  bool cpu=false;for(unsigned r=32;r<=50;r++)cpu|=matches(r,words,source);assert(cpu==(source==24));classifier_cases++;
  }
  for(unsigned typ=1;typ<4;typ++)for(unsigned enc=0;enc<8;enc++)for(unsigned et=0;et<65536;et+=257){
   u32 words[9]={BIT(24),0,0,0,0,et,0,((enc&1)?BIT(5):0)|((enc&2)?BIT(4):0)|((enc&4)?BIT(10):0),typ<<6};
-  for(unsigned r=32;r<=50;r++)assert(!matches(r,words));classifier_cases++;
+  for(unsigned r=32;r<=50;r++)assert(!matches(r,words,24));classifier_cases++;
  }
  for(unsigned r=32;r<=50;r++){
   assert(table[2][r][0][0]==0&&table[2][r][0][1]==0);
@@ -352,4 +356,20 @@ for mode in ('claim-without-flow-lock','update-without-flow-lock'):
  (b/(mode+'.stderr.txt')).write_text(tested.stderr)
  assert tested.returncode==-signal.SIGABRT and 'flow_offload_mutex' in tested.stderr,(mode,tested.returncode,tested.stderr)
  lock_checks.append(mode)
-report=json.loads(r.stdout);report.update(lock_assertions=lock_checks,sanitizers=['address','undefined'],sources={n:hashlib.sha256((h/n).read_bytes()).hexdigest() for n in ('airoha_ct_ifc.h','airoha_ct_ifc_cpu.h','airoha_ct_cpu_fallback.h','airoha_eth.h','airoha_eth.c')});(b/'report.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report,indent=2))
+mutations=[]
+cpu_header=(h/'airoha_ct_ifc_cpu.h').read_text()
+for name,previous,replacement in (
+ ('cpu_partial_sif_mask','words[1] = U32_MAX;','words[1] = XSI_ETH_VIP_PORT_MASK;'),
+ ('cpu_wrong_source','words[0] = XSI_ETH_VIP_PORT_MASK;','words[0] = BIT(2);')):
+ assert previous in cpu_header,name
+ directory=b/'mutations'/name;directory.mkdir(parents=True,exist_ok=True)
+ for artifact in b.iterdir():
+  if artifact.is_file() and artifact.suffix in ('.h','.c','.inc'):shutil.copyfile(artifact,directory/artifact.name)
+ (directory/'airoha_ct_ifc_cpu.h').write_text(cpu_header.replace(previous,replacement,1))
+ subprocess.run(['clang','-O1','-g','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unused-function','-fsanitize=address,undefined','-fno-sanitize-recover=all','-I'+str(directory),str(directory/'test.c'),'-o',str(directory/'test')],check=True)
+ tested=subprocess.run([str(directory/'test')],capture_output=True,text=True)
+ (directory/'stderr.txt').write_text(tested.stderr)
+ assert tested.returncode==-signal.SIGABRT and 'assert' in tested.stderr.lower(),(name,tested.stderr)
+ assert not any(marker in tested.stderr for marker in ('AddressSanitizer','runtime error:')),tested.stderr
+ mutations.append(dict(name=name,caught_runtime=True,assertion=tested.stderr.strip()))
+report=json.loads(r.stdout);report.update(sif_match_model='SPORT-indexed key/mask bit',sif_mutations=mutations,lock_assertions=lock_checks,sanitizers=['address','undefined'],sources={n:hashlib.sha256((h/n).read_bytes()).hexdigest() for n in ('airoha_ct_ifc.h','airoha_ct_ifc_cpu.h','airoha_ct_cpu_fallback.h','airoha_eth.h','airoha_eth.c')});(b/'report.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report,indent=2))

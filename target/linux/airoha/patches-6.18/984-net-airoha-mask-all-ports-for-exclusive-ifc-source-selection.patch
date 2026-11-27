@@ -1,0 +1,51 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: mask all ports for exclusive IFC source selection
+
+The classifier selects the SIF key and mask bit using the incoming source
+port. A one-bit mask leaves every other source unqualified. Use a complete
+mask with one selected key bit for LAN1 producers, LAN1 CPU guards and
+optical service/cover rows so they cannot intercept another source.
+
+--- a/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_words.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_words.h
+@@ -17,7 +17,7 @@
+ 
+ 	*row = (struct airoha_ct_pon_ifc_words) {
+ 		.tcam = {
+-			[0] = { BIT(2), BIT(2) },
++			[0] = { BIT(2), U32_MAX },
+ 			[4] = { 0, BIT(short_lut) },
+ 			[5] = { protocol, 0xffff },
+ 			[7] = { (u32)service << 16, 0xffff0430 },
+@@ -39,7 +39,7 @@
+ 		return -EINVAL;
+ 	*row = (struct airoha_ct_pon_ifc_words) {
+ 		.tcam = {
+-			[0] = { BIT(2), BIT(2) },
++			[0] = { BIT(2), U32_MAX },
+ 			[8] = { type << 6, 0xc0 },
+ 		},
+ 		.action = {
+--- a/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
+@@ -193,7 +193,7 @@
+ 		 * from the CPU guards, independently of TCAM row priority.
+ 		 */
+ 		tcam[0][0] = XSI_ETH_VIP_PORT_MASK;
+-		tcam[0][1] = XSI_ETH_VIP_PORT_MASK;
++		tcam[0][1] = U32_MAX;
+ 		tcam[4][0] = 0;
+ 		tcam[4][1] = BIT(ppe->ct_ifc.rule[r].lut_index);
+ 		tcam[5][0] = r ? 0x86dd : 0x0800;
+--- a/drivers/net/ethernet/airoha/airoha_ct_ifc_cpu.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_ifc_cpu.h
+@@ -35,7 +35,8 @@
+ 
+ 	words[0] = words[1] = 0;
+ 	if (page == 0) {
+-		words[0] = words[1] = XSI_ETH_VIP_PORT_MASK;
++		words[0] = XSI_ETH_VIP_PORT_MASK;
++		words[1] = U32_MAX;
+ 	} else if (page == 8) {
+ 		/* Type0 supplies EtherType plus VLAN0/VLAN1/PPPoE presence. */
+ 		words[1] = CT_IFC_TCAM_TYPE_MASK;

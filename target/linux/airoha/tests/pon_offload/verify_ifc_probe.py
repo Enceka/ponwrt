@@ -112,11 +112,17 @@ def main():
         assert result['cover_route_faults'] == 12 and result['cover_io_faults'] == 144
         assert result['cover_publish_faults'] == 2630
         assert result['source_cases'] == 186 and result['source_faults'] == 2340
+        assert result['sif_match_cases'] == 6400
         results.append(dict(mode=mode, **result))
     assert {key: value for key, value in results[0].items() if key != 'mode'} == {
         key: value for key, value in results[1].items() if key != 'mode'}
 
     mutations = [
+        ('service_partial_sif_mask', 'header:airoha_ct_pon_ifc_words.h',
+         '[0] = { BIT(2), U32_MAX }', '[0] = { BIT(2), BIT(2) }'),
+        ('cover_partial_sif_mask', 'header:airoha_ct_pon_ifc_words.h',
+         '[0] = { BIT(2), U32_MAX },\n\t\t\t[8]',
+         '[0] = { BIT(2), BIT(2) },\n\t\t\t[8]'),
         ('source_missing_cover_guard', 'airoha_ct_pon_ifc_source_set',
          '!(ppe->ct_pon_ifc_cover & BIT(1))', 'false'),
         ('source_ignores_native_active', 'airoha_ct_pon_ifc_source_set',

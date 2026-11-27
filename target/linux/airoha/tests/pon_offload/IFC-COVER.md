@@ -9,9 +9,9 @@ From `build/ponwrt`:
 
 ```sh
 /usr/bin/python3 -B target/linux/airoha/tests/pon_offload/verify_ifc_cover_words.py \
-  --source tmp/ifc-cover-982/source \
+  --source tmp/ifc-sif-984/source \
   --stock-dir ../stage2/zip/root/lib/modules \
-  --output tmp/ifc-cover-982/stock-cover
+  --output tmp/ifc-sif-984/stock-cover
 ```
 
 The output directory must be new. The runner requires Python with Unicorn
@@ -29,12 +29,54 @@ zero, including GEM/service, EtherType, VLAN/PPPoE and LUT predicates.
 
 | Cover type | page0 key/mask | page8 key/mask |
 | --- | --- | --- |
-| type0 | `00000004/00000004` | `00000000/000000c0` |
-| type1 | `00000004/00000004` | `00000040/000000c0` |
+| type0 | `00000004/U32_MAX` | `00000000/000000c0` |
+| type1 | `00000004/U32_MAX` | `00000040/000000c0` |
 
-SIF setter values are raw 32-bit words. SPORT2 uses `BIT(2)` in this
-source bitmap. The receive metadata's SPORT field is a separate numeric
-five-bit value; it contains 2, rather than 4, for source2.
+SIF selects one key/mask bit using the numeric five-bit SPORT value:
+
+```text
+sif_match = ((key >> SPORT) & 1) || !((mask >> SPORT) & 1)
+```
+
+It does not compare an entire one-hot packet word against page0. SPORT2
+is numeric 2; its allowed-source bit is `BIT(2)`. A full 32-bit mask makes
+every source significant, so `key=BIT(2), mask=U32_MAX` admits only SPORT2.
+
+The previous `4/4` source-only claim was wrong. For SPORT2 the selected
+key bit is 1; for every other source the selected mask bit is 0, a wildcard.
+Thus `4/4` admits all 32 sources. Earlier original setter/readback tests
+verified these stored words while the Python source predicate incorrectly
+used full-word ternary comparison. The tests now separate SPORT-indexed
+SIF from the other fields' ternary comparisons.
+
+## SIF board confirmation and original initialization
+
+On boot `b0743a03-8269-4061-b560-db7beb37a7c6`, service 0x2134 IPv4 packets
+returned with SPORT2 during both 32-step sweeps. The tested slot sent to
+RX2 and the retained cover to RX4:
+
+| Profile | page0 key/mask | N=2 | Other 31 values of N |
+| --- | --- | --- | --- |
+| only N | `BIT(N)/U32_MAX` | RX2 | RX4 |
+| absent N | `0/BIT(N)` | RX4 | RX2 |
+
+Both complete reports were read and all 64 observations checked against
+this table. Evidence paths, relative to the enclosing workspace:
+
+- `build/pon-sif-983-v2-board/sif-only/report.json`
+- `build/pon-sif-983-v2-board/sif-absent/report.json`
+
+The preceding `BIT(N)/BIT(N)` sweep returned every packet through RX2,
+as the indexed-bit model predicts. The 64 paired observations above use
+one physical source while varying the selected rule bit. The local
+regressions expand the model to all 32 numeric source values.
+
+Original `ifc_rule_init_en7581@0x212e8` has nine explicit field14 calls
+to `ifc_set_rule_para`; every call passes mask `U32_MAX`. Five use key 4
+(calls 0x2176c, 0x21814, 0x21998, 0x21ac0, 0x21b80), three use key 0x011f0000
+(0x214b4, 0x21588, 0x21a40), and one uses key 0x000f0000 (0x216b0).
+These multi-source keys are allowed-source sets. `ifc_set_rule_para@0x1ffc`,
+the SIF setter and the hardware writer preserve the supplied key/mask.
 
 For both types the enabled forceCPU action is:
 
@@ -116,8 +158,13 @@ Sixteen vectors cover rows56..59, types0/1 and rings2/4. Each compares all
 27 candidate words against complete original `ifc_read_rule` and
 `ifc_read_act` output: 432 word comparisons. Each case also clears the
 software shadows, reads the row into its proper type-specific layout,
-executes the original SIF getter and checks `(4,4)`. Every case exercises
+executes the original SIF getter and checks `(4,U32_MAX)`. Every case exercises
 the disabled forceCPU action and verifies unchanged TCAM contents.
+Each cover is checked against all 32 sources, totaling 512 source checks.
+Another 192 original-setter/readback profiles cover both types, every
+selected bit, and only/absent/legacy masks; each profile checks all 32
+sources, totaling 6,144 indexed SIF comparisons. The generated C harness
+defines kernel `U32_MAX` as the standard `UINT32_MAX`.
 
 The generated C harness checks 167 invalid calls: null output plus invalid
 ring/type combinations across rings0..32/UINT_MAX and types0/1/2/3/UINT_MAX.
@@ -147,9 +194,11 @@ packet-type availability and live source-to-CPU routing are board tests.
 
 The runner naturally classifies field5 as type2 and reads back four
 destination words: 0, 4, 0x12345678 and 0xffffffff. Both typed cover masks
-exclude all these type2 keys. Removing the page8 mask instead matches the
-type2 keys whose destination bit2 is set. That wildcard would interpret
-the same page0 bit as address data. An additional original SIF call with
+exclude all these type2 keys. Removing the page8 mask from the corrected
+full-mask row instead matches destination word 4. The retained regression
+for the old 4/4 wildcard matches destination words with bit2 set. Both
+cases interpret page0 as address data in type2, rather than a SIF source
+selection. An additional original SIF call with
 type2 produces no TCAM writes. The candidate rejects type2 without
 changing output.
 

@@ -7,6 +7,14 @@ from pathlib import Path
 from stock_oracle import Module, R
 
 
+U32_MAX = (1 << 32) - 1
+
+
+def sif_matches(key, mask, source):
+    assert 0 <= source < 32
+    return bool((key >> source) & 1) or not bool((mask >> source) & 1)
+
+
 class Classifier(Module):
     ctrl, data = 0xbfb50204, 0xbfb50210
 
@@ -57,11 +65,11 @@ class Classifier(Module):
         assert self.rows[2,row,2] == ((enabled << 31) | (1 << 30),)
 
     def configure(self, row, gem, etype, reverse):
-        fields = [('sif', 4, 4), ('etype', etype, 65535), ('VLan0VLD', 0, 1),
+        fields = [('sif', 4, U32_MAX), ('etype', etype, 65535), ('VLan0VLD', 0, 1),
                   ('VLan1VLD', 0, 1), ('isPPPoE', 0, 1), ('GEM_LLID', gem, 65535)]
         for args in (reversed(fields) if reverse else fields):
             self.field(row, *args)
-        expected = {0: (4,4), 5: (etype,65535), 7: (gem << 16,0xffff0430), 8: (0,0xc0)}
+        expected = {0: (4,U32_MAX), 5: (etype,65535), 7: (gem << 16,0xffff0430), 8: (0,0xc0)}
         for i in range(9):
             assert self.rows[0,row,i] == expected.get(i, (0,0)), (row,i,self.rows[0,row,i])
 
@@ -77,9 +85,37 @@ class Classifier(Module):
     def matches(self, row, gem, etype, source=2, encap=0, lut_hits=0):
         if not self.rows[2,row,2][0] & (1 << 31):
             return False
-        packet = {0: 1 << source, 4: lut_hits, 5: etype, 7: gem << 16 | encap}
+        if not sif_matches(*self.rows[0, row, 0], source):
+            return False
+        packet = {4: lut_hits, 5: etype, 7: gem << 16 | encap}
         return all(not ((packet.get(i, 0) ^ key) & mask)
-                   for i in range(9) for key, mask in [self.rows[0,row,i]])
+                   for i in range(1, 9) for key, mask in [self.rows[0,row,i]])
+
+
+def check_sif(path):
+    stock = Classifier(path)
+    stock.configure(56, 0x2134, 0x0800, False)
+    stock.force_cpu(56, 1, 2)
+    checked = 0
+    for selected in range(32):
+        for name, key, mask in (('only', 1 << selected, U32_MAX),
+                                ('absent', 0, 1 << selected),
+                                ('legacy', 1 << selected, 1 << selected)):
+            stock.field(56, 'sif', key, mask)
+            stock.call('ifc_read_rule', 56, stock.DATA + 0x1000, stock.DATA + 0x1100)
+            assert stock.get(stock.DATA + 0x1020, '<I') == (key,)
+            assert stock.get(stock.DATA + 0x1120, '<I') == (mask,)
+            for source in range(32):
+                expected = source == selected if name == 'only' else (
+                    source != selected if name == 'absent' else True)
+                assert stock.matches(56, 0x2134, 0x0800, source) == expected
+                checked += 1
+    for key in (0, 0x011f0000, 0x000f0000, U32_MAX):
+        stock.field(56, 'sif', key, U32_MAX)
+        for source in range(32):
+            assert stock.matches(56, 0x2134, 0x0800, source) == bool(key & (1 << source))
+            checked += 1
+    return checked
 
 
 def check_cpu_rings(path):
@@ -115,7 +151,10 @@ def check_cpu_rings(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--stock-dir', required=True, type=Path)
+    parser.add_argument('--output', type=Path)
     args = parser.parse_args()
+    if not __debug__:
+        parser.error('assertions are required; omit -O')
     m = Classifier(args.stock_dir / 'ifc.ko')
     a, b = 54, 55
     checked = 0
@@ -146,9 +185,15 @@ def main():
         m.steer(a, 6, 1)
         assert m.matches(a, 0x2135, etype) and not m.matches(a, 0x2134, etype)
         assert m.matches(b, 0xa134, etype)
-    print(json.dumps(dict(module=m.sha256, ternary_checks=checked, families=2,
+    report = dict(module=m.sha256, ternary_checks=checked, families=2,
                           cpu_ring_service_checks=check_cpu_rings(args.stock_dir / 'ifc.ko'),
-                          row_replace=True, mmio='emulated')))
+                          sif_checks=check_sif(args.stock_dir / 'ifc.ko'),
+                          sif_model='SPORT-indexed key/mask bit',
+                          row_replace=True, mmio='emulated')
+    if args.output:
+        args.output.mkdir(parents=True, exist_ok=False)
+        (args.output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps(report))
 
 
 if __name__ == '__main__':

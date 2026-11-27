@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 
 import argparse
@@ -26,7 +27,7 @@ pre = pre.replace('u32 ct_pair_token,ct_wlan_epoch', '''struct { u32 tcam[2][9][
 pre = pre.replace('struct airoha_eth {', 'struct airoha_ppe; struct airoha_qdma {int id;}; struct airoha_soc {int num_ppe;}; struct airoha_eth {struct airoha_ppe*ppe; struct airoha_soc*soc;struct airoha_qdma qdma[2];int ct_route_lock,ifc_port_lock;u32 ct_ifc_port_mask,ifc_port_desired;u16 ct_cpu_route_mask[4];bool ct_ifc_cpu_port_failed,ct_ifc_pon_ready,ct_ordinary_full_test;bool ct_cpu_fallback,ct_cpu_ifc_disabled,ct_cpu_routes_ready,ct_cpu_wlan_gated;')
 pre = pre.replace('struct airoha_eth {', 'struct airoha_eth {bool ct_ifc_command_pending;')
 pre = pre.replace('struct airoha_gdm_dev {', 'struct airoha_gdm_dev {struct airoha_qdma*qdma;')
-pre = pre.replace('bool ct_native_pairs,', 'bool ct_bridge_failed;bool ct_native_pairs,')
+pre = pre.replace('bool ct_native_pairs,', 'bool ct_pon_ifc_route_owned;bool ct_bridge_failed;bool ct_native_pairs,')
 pre = pre.replace('bool ct_native_pairs,', 'bool ct_pair_close_pending;bool ct_native_pairs,')
 pre = pre.replace('static int mock_send(', 'static int original_mock_send(')
 pre = pre.replace('static int airoha_ppe_ct_bridge_fail_closed(struct airoha_ppe*p){assert(ppe_lock);p->ct_stopping=true;failclosed++;return stop_error;}', '')
@@ -169,7 +170,8 @@ static unsigned classifier_cases;
 static bool matches(unsigned r,unsigned source,unsigned family,unsigned encap,unsigned short_hit){
  u32 words[9]={};words[0]=BIT(source);words[4]=short_hit?BIT(31-r):0;words[5]=family==4?0x800:family==6?0x86dd:0x806;
  words[7]=((encap&1)?BIT(5):0)|((encap&2)?BIT(4):0)|((encap&4)?BIT(10):0);
- for(unsigned p=0;p<9;p++)if((words[p]^ifc_table[0][54+r][p][0])&ifc_table[0][54+r][p][1])return false;
+ if(!(ifc_table[0][54+r][0][0]&BIT(source))&&(ifc_table[0][54+r][0][1]&BIT(source)))return false;
+ for(unsigned p=1;p<9;p++)if((words[p]^ifc_table[0][54+r][p][0])&ifc_table[0][54+r][p][1])return false;
  return true;
 }
 static void classifier_verify(void){
@@ -393,6 +395,29 @@ p = subprocess.run([str(B/'test')], capture_output=True, text=True)
 (B/'exit-status.json').write_text(json.dumps({'returncode':p.returncode})+'\n')
 p.check_returncode()
 report = json.loads(p.stdout)
+mutations = []
+native = (B/'airoha_ct_fe_native.h').read_text()
+for name, previous, replacement in (
+        ('native_partial_sif_mask', 'tcam[0][1] = U32_MAX;',
+         'tcam[0][1] = XSI_ETH_VIP_PORT_MASK;'),
+        ('native_wrong_source', 'tcam[0][0] = XSI_ETH_VIP_PORT_MASK;',
+         'tcam[0][0] = BIT(2);')):
+    assert previous in native, name
+    directory = B/'mutations'/name
+    directory.mkdir(parents=True, exist_ok=True)
+    for artifact in B.iterdir():
+        if artifact.is_file() and artifact.suffix in ('.h', '.inc', '.c'):
+            shutil.copyfile(artifact, directory/artifact.name)
+    (directory/'airoha_ct_fe_native.h').write_text(native.replace(previous, replacement, 1))
+    subprocess.run(['clang', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
+                    '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
+                    '-I'+str(directory), str(directory/'test.c'), '-o', str(directory/'test')], check=True)
+    tested = subprocess.run([str(directory/'test')], capture_output=True, text=True)
+    (directory/'stderr.txt').write_text(tested.stderr)
+    assert tested.returncode == -signal.SIGABRT and 'assert' in tested.stderr.lower(), (name, tested.stderr)
+    assert not any(marker in tested.stderr for marker in ('AddressSanitizer', 'runtime error:')), tested.stderr
+    mutations.append(dict(name=name, caught_runtime=True, assertion=tested.stderr.strip()))
+report.update(sif_match_model='SPORT-indexed key/mask bit', sif_mutations=mutations)
 report.update(sanitizers=['address', 'undefined'], source_sha256={name: hashlib.sha256((a.header if name=='airoha_ct_fe_native.h' else H/name).read_bytes()).hexdigest() for name in ('airoha_ct_native_pair.h', 'airoha_ct_fe_native.h', 'airoha_ct_pair_policy.h', 'airoha_ct_cpu_fallback.h', 'airoha_eth.c', 'airoha_ppe.c')})
 (B/'source3-verification.json').write_text(json.dumps(report, indent=2)+'\n')
 print(json.dumps(report, indent=2))

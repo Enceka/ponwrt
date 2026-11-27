@@ -174,6 +174,12 @@ static unsigned int store_dispatch_cases, store_stop_cases, store_pending_cases;
 static unsigned int cover_cases, cover_tamper_cases, cover_route_faults, cover_io_faults;
 static unsigned int cover_publish_faults;
 static unsigned int source_cases, source_faults;
+static unsigned int sif_match_cases;
+
+static bool sif_matches(u32 key, u32 mask, unsigned int sport)
+{
+	return (key & BIT(sport)) || !(mask & BIT(sport));
+}
 
 static unsigned int page_words(unsigned int bank, unsigned int page)
 {
@@ -1124,7 +1130,7 @@ static void prepare_cover(struct fixture *fixture, unsigned int slot)
 			assert(mock.table[0][row][page][0] ==
 			       (page == 0 ? BIT(2) : page == 8 ? family << 6 : 0));
 			assert(mock.table[0][row][page][1] ==
-			       (page == 0 ? BIT(2) : page == 8 ? 0xc0 : 0));
+			       (page == 0 ? UINT32_MAX : page == 8 ? 0xc0 : 0));
 		}
 		for (unsigned int page = 0; page < 3; page++)
 			for (unsigned int word = 0; word < page_words(2, page); word++)
@@ -1523,6 +1529,13 @@ static void source_sweep(unsigned int mode)
 		assert(fixture.ppe.ct_pon_ifc.active == 15 && fixture.ppe.ct_pon_ifc.dirty == 15);
 		assert(!fixture.ppe.ct_pon_ifc_services[0] && !fixture.ppe.ct_pon_ifc_services[1]);
 		for (unsigned int row = 0; row < 2; row++) {
+			for (unsigned int sport = 0; sport < 32; sport++) {
+				bool expected = mode == 0 || (mode == 1 ? sport != source : sport == source);
+
+				assert(sif_matches(mock.table[0][56 + row][0][0],
+						   mock.table[0][56 + row][0][1], sport) == expected);
+				sif_match_cases++;
+			}
 			for (unsigned int page = 0; page < 9; page++) {
 				assert(mock.table[0][56 + row][page][0] ==
 				       (page == 0 ? (mode == 1 ? 0 : BIT(source)) : page == 8 ? row << 6 : 0));
@@ -1588,6 +1601,34 @@ static void source_sweep(unsigned int mode)
 		source_cases++;
 		cases++;
 	}
+}
+
+static void optical_sif_matches(void)
+{
+	struct fixture fixture;
+
+	prepare(&fixture);
+	for (unsigned int row = 56; row < 60; row++)
+		for (unsigned int sport = 0; sport < 32; sport++) {
+			assert(mock.table[0][row][0][1] == UINT32_MAX);
+			assert(sif_matches(mock.table[0][row][0][0], mock.table[0][row][0][1], sport) ==
+			       (sport == 2));
+			sif_match_cases++;
+		}
+	for (unsigned int slot = 0; slot < 2; slot++) {
+		char command[16];
+
+		snprintf(command, sizeof(command), "cover %u", slot);
+		assert(store(&fixture, command) == (ssize_t)strlen(command));
+	}
+	for (unsigned int row = 56; row < 60; row++)
+		for (unsigned int sport = 0; sport < 32; sport++) {
+			assert(sif_matches(mock.table[0][row][0][0], mock.table[0][row][0][1], sport) ==
+			       (sport == 2));
+			sif_match_cases++;
+		}
+	assert(store(&fixture, "off") == 3);
+	check_restored(&fixture);
 }
 
 static void source_invalid_api(void)
@@ -1686,6 +1727,7 @@ int main(int argc, char **argv)
 	cover_route_failures();
 	cover_shutdown_order();
 	cover_publication_failures();
+	optical_sif_matches();
 	source_invalid_api();
 	for (unsigned int mode = 0; mode < 3; mode++) {
 		source_sweep(mode);
@@ -1697,11 +1739,11 @@ int main(int argc, char **argv)
 	       "\"sport_cases\":%u,\"sport_close_cases\":%u,\"store_dispatch_cases\":%u,"
 	       "\"store_stop_cases\":%u,\"store_pending_cases\":%u,"
 	       "\"cover_cases\":%u,\"cover_tamper_cases\":%u,\"cover_route_faults\":%u,\"cover_io_faults\":%u,"
-	       "\"cover_publish_faults\":%u,\"source_cases\":%u,\"source_faults\":%u}\n",
+	       "\"cover_publish_faults\":%u,\"source_cases\":%u,\"source_faults\":%u,\"sif_match_cases\":%u}\n",
 	       cases, transport_faults, blocked_retries, dependency_faults, readback_faults,
 	       scope_cases, fallback_stop_cases, rejected_set_retries, sport_cases, sport_close_cases,
 	       store_dispatch_cases, store_stop_cases, store_pending_cases,
 	       cover_cases, cover_tamper_cases, cover_route_faults, cover_io_faults, cover_publish_faults,
-	       source_cases, source_faults);
+	       source_cases, source_faults, sif_match_cases);
 	return 0;
 }
