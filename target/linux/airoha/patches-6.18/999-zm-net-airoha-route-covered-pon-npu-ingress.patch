@@ -1,0 +1,190 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: route covered PON ingress through PPE classification
+
+The PON NPU rules need the PPE2 ingress route to reach the classifier.
+Install and audit the existing WAN CPU cover rows behind the NPU rules
+before opening that route. Verify the WAN receiver separately from the
+owned selector state. Open source scope before selecting PPE2 and restore
+CPU selectors before closing scope during claim or revocation.
+
+--- a/drivers/net/ethernet/airoha/airoha_bank1_routes.h
++++ b/drivers/net/ethernet/airoha/airoha_bank1_routes.h
+@@ -75,9 +75,9 @@
+ 	routes->pon_open = false;
+ 	routes->revoked = true;
+ 	routes->ready = false;
++	route_error = airoha_bank1_routes_write_all(eth, true);
+ 	error = airoha_bank1_scope_locked(eth, false);
+-	route_error = airoha_bank1_routes_write_all(eth, true);
+-	return error ?: route_error;
++	return route_error ?: error;
+ }
+ 
+ int airoha_bank1_routes_revoke(struct airoha_eth *eth, const void *owner)
+@@ -126,9 +126,9 @@
+ 	routes->pon_open = false;
+ 	routes->revoked = false;
+ 	routes->ready = false;
++	route_error = airoha_bank1_routes_write_all(eth, true);
+ 	error = airoha_bank1_scope_locked(eth, false);
+-	route_error = airoha_bank1_routes_write_all(eth, true);
+-	if (!error)
++	if (route_error)
+ 		error = route_error;
+ 	routes->ready = !error;
+ unlock:
+@@ -180,9 +180,9 @@
+ 		goto unlock;
+ 	}
+ 	routes->pon_open = true;
+-	error = airoha_bank1_routes_write_all(eth, true);
++	error = airoha_bank1_scope_locked(eth, true);
+ 	if (!error)
+-		error = airoha_bank1_scope_locked(eth, true);
++		error = airoha_bank1_routes_write_all(eth, true);
+ 	if (error)
+ 		airoha_bank1_routes_revoke_locked(eth);
+ unlock:
+@@ -206,7 +206,7 @@
+ 		goto unlock;
+ 	}
+ 	if ((airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)) & GENMASK(15, 0)) !=
+-	    FE_PSE_PORT_CDM2 * 0x1111 ||
++	    (opened ? FE_PSE_PORT_PPE2 : FE_PSE_PORT_CDM2) * 0x1111 ||
+ 	    airoha_ct_gdm_cpu_locked(eth, AIROHA_GDM2_IDX) != FE_PSE_PORT_CDM2) {
+ 		error = -EXDEV;
+ 		goto unlock;
+--- a/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
+@@ -116,6 +116,7 @@
+ 					    u32 cfg, bool guarded)
+ {
+ 	u16 mask = eth->ct_cpu_route_mask[id - 1];
++	bool pon_classify = false;
+ 	int cpu = 0, err = 0;
+ 
+ 	lockdep_assert_held(&eth->ct_route_lock);
+@@ -127,6 +128,9 @@
+ 			cpu = airoha_ct_gdm_cpu_locked(eth, id);
+ 			if (eth->ct_bank1_routes.pon_open && cpu != FE_PSE_PORT_CDM2)
+ 				err = cpu < 0 ? cpu : -EXDEV;
++			pon_classify = eth->ct_bank1_routes.pon_open && cpu == FE_PSE_PORT_CDM2 &&
++				!eth->ct_cpu_route_mask[id - 1] && !eth->ct_cpu_fallback &&
++				!eth->ct_ifc_cpu_port_failed;
+ 		} else
+ 			for (shift = 0; shift < 16; shift += 4)
+ 				if (((cfg >> shift) & 0xf) == FE_PSE_PORT_PPE2)
+@@ -140,7 +144,7 @@
+ 				err = cpu == -ENODEV ? 0 : cpu;
+ 			cpu = FE_PSE_PORT_DROP;
+ 		}
+-		cfg = airoha_ct_cpu_selectors(cfg, mask, cpu);
++		cfg = airoha_ct_cpu_selectors(cfg, mask, pon_classify ? FE_PSE_PORT_PPE2 : cpu);
+ 	}
+ 	/* The ordinary ABI3 image has no optical service. GDM2 is wired to
+ 	 * WAN QDMA1. Keep PPE destinations on its CPU receiver even across
+--- a/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_cpu.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_cpu.h
+@@ -257,7 +257,7 @@
+ 	return available >= needed ? 0 : -ENOSPC;
+ }
+ 
+-static bool airoha_ct_pon_ifc_route_ready(struct airoha_ppe *ppe)
++static bool airoha_ct_pon_ifc_receiver_ready(struct airoha_ppe *ppe)
+ {
+ 	struct airoha_eth *eth = ppe->eth;
+ 	struct airoha_gdm_port *port = eth->ports[AIROHA_GDM2_IDX - 1];
+@@ -288,7 +288,14 @@
+ 	    wan->q_rx[2].ndesc <= 0 || wan->q_rx[4].ndesc <= 0)
+ 		return false;
+ 	map = airoha_fe_rr(eth, REG_SP_DFT_CPORT(0));
+-	return __field_get(SP_CPORT_MASK(2), map) == FE_PSE_PORT_CDM2 &&
++	return __field_get(SP_CPORT_MASK(2), map) == FE_PSE_PORT_CDM2;
++}
++
++static bool airoha_ct_pon_ifc_route_ready(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++
++	return airoha_ct_pon_ifc_receiver_ready(ppe) &&
+ 	       (airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)) & GENMASK(15, 0)) ==
+ 	       FE_PSE_PORT_CDM2 * 0x1111;
+ }
+--- a/drivers/net/ethernet/airoha/airoha_npu_ingress.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_ingress.h
+@@ -43,7 +43,7 @@
+                          const struct airoha_ct_pon_ifc_io *io,
+                          const unsigned int short_lut[2])
+ {
+-	struct airoha_ct_pon_ifc_words expected[2];
++	struct airoha_ct_pon_ifc_words expected[4];
+ 	unsigned int index, page;
+ 	u32 actual[3];
+ 	int error;
+@@ -53,12 +53,14 @@
+ 	error = airoha_npu_ingress_rows(expected, short_lut);
+ 	if (error)
+ 		return error;
+-	if (!owner->saved_valid || owner->active != 3 || owner->dirty != 3)
++	airoha_ct_pon_ifc_cover_encode(&expected[2], 4, 0);
++	airoha_ct_pon_ifc_cover_encode(&expected[3], 4, 1);
++	if (!owner->saved_valid || owner->active != 15 || owner->dirty != 15)
+ 		return -ESTALE;
+ 	error = airoha_ct_pon_ifc_sync(owner, io);
+ 	if (error)
+ 		return error;
+-	for (index = 0; index < 2; ++index) {
++	for (index = 0; index < 4; ++index) {
+ 		for (page = 0; page < 9; ++page) {
+ 			error = io->read(io->ctx, 0, AIROHA_CT_PON_IFC_ROW_BASE + index,
+ 			                 page, actual, 2);
+@@ -91,7 +93,7 @@
+                            const struct airoha_ct_pon_ifc_io *io,
+                            const unsigned int short_lut[2])
+ {
+-	struct airoha_ct_pon_ifc_words rows[2];
++	struct airoha_ct_pon_ifc_words rows[4];
+ 	int error;
+ 
+ 	if (!airoha_ct_pon_ifc_io_valid(owner, io))
+@@ -99,14 +101,18 @@
+ 	error = airoha_npu_ingress_rows(rows, short_lut);
+ 	if (error)
+ 		return error;
+-	if ((owner->dirty | owner->active) & ~3)
++	airoha_ct_pon_ifc_cover_encode(&rows[2], 4, 0);
++	airoha_ct_pon_ifc_cover_encode(&rows[3], 4, 1);
++	if ((owner->dirty | owner->active) & ~15)
+ 		return -EBUSY;
+ 	if (!owner->saved_valid) {
+ 		error = airoha_ct_pon_ifc_snapshot(owner, io);
+ 		if (error)
+ 			return error;
+ 	}
+-	error = airoha_ct_pon_ifc_publish(owner, io, 0, rows);
++	error = airoha_ct_pon_ifc_publish(owner, io, 1, &rows[2]);
++	if (!error)
++		error = airoha_ct_pon_ifc_publish(owner, io, 0, rows);
+ 	if (error)
+ 		return error;
+ 	return airoha_npu_ingress_check(owner, io, short_lut);
+@@ -118,7 +124,7 @@
+ {
+ 	if (!airoha_ct_pon_ifc_io_valid(owner, io))
+ 		return -EINVAL;
+-	if ((owner->dirty | owner->active) & ~3)
++	if ((owner->dirty | owner->active) & ~15)
+ 		return -EBUSY;
+ 	return airoha_ct_pon_ifc_restore(owner, io);
+ }
+--- a/drivers/net/ethernet/airoha/airoha_npu_ingress_owner.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_ingress_owner.h
+@@ -71,7 +71,7 @@
+ 	if (ppe->ct_npu_owner != owner || owner->invalidated || !ppe->ct_ifc.cfg_owned ||
+ 	    !ppe->ct_host_ppe || ppe->ct_stopping || ppe->eth->ct_cpu_fallback ||
+ 	    ppe->eth->ct_ifc_cpu_port_failed || airoha_ct_pon_ifc_busy(ppe) ||
+-	    !airoha_ct_pon_ifc_route_ready(ppe))
++	    !airoha_ct_pon_ifc_receiver_ready(ppe))
+ 		return -ESHUTDOWN;
+ 	error = airoha_ct_pon_ifc_sync(&owner->ingress, io);
+ 	if (error)

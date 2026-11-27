@@ -40,6 +40,7 @@ struct iphdr { u8 bytes[20]; };
 
 struct airoha_eth {
 	bool ct_cpu_fallback, ct_ifc_cpu_port_failed, closed, receiver_ready;
+	bool selector_cpu;
 	void *dev;
 	u32 udf;
 };
@@ -64,6 +65,7 @@ static struct {
 	struct airoha_ppe ppe;
 	struct airoha_npu_owner owner;
 	u32 tcam[64][9][3], action[64][3][3], lut[32][2];
+	u32 original_tcam[4][9][3], original_action[4][3][3];
 	unsigned int commands, writes, fail_at, drop_at, corrupt_at;
 	bool pending, drain_fails;
 	bool normalize_tcam, allow_tcam_shape;
@@ -113,7 +115,7 @@ static int airoha_ct_fe_table(struct airoha_ppe *ppe, unsigned int bank,
 		location = state.action[row][page];
 	}
 	if (write) {
-		CHECK(state.eth.closed && row >= 56 && row < 58);
+		CHECK(state.eth.closed && row >= 56 && row < 60);
 		CHECK(state.owner.ingress.saved_valid && state.owner.ingress.dirty);
 		++state.writes;
 	}
@@ -154,9 +156,14 @@ static bool airoha_ct_pon_ifc_busy(struct airoha_ppe *ppe)
 	return ppe->legacy_busy;
 }
 
-static bool airoha_ct_pon_ifc_route_ready(struct airoha_ppe *ppe)
+static bool airoha_ct_pon_ifc_receiver_ready(struct airoha_ppe *ppe)
 {
 	return ppe->eth->receiver_ready;
+}
+
+static bool airoha_ct_pon_ifc_route_ready(struct airoha_ppe *ppe)
+{
+	return airoha_ct_pon_ifc_receiver_ready(ppe) && ppe->eth->selector_cpu;
 }
 
 static int airoha_bank1_routes_check(struct airoha_eth *eth,
@@ -178,6 +185,7 @@ static void initialize(void)
 	state.ppe.ct_npu_owner = &state.owner;
 	state.ppe.ct_host_ppe = state.ppe.ct_ifc.cfg_owned = true;
 	state.eth.closed = state.eth.receiver_ready = true;
+	state.eth.selector_cpu = true;
 	for (unsigned int family = 0; family < 2; ++family) {
 		unsigned int slot = 31 - family, row = CT_IFC_RULE(family);
 
@@ -194,8 +202,15 @@ static void initialize(void)
 		state.action[row][2][0] = CT_IFC_ACTION_ENABLE | CT_IFC_ACTION_STOP |
 			CT_IFC_ACTION_FORCE_CPU;
 	}
-	for (unsigned int row = 56; row < 60; ++row)
-		state.tcam[row][0][0] = row;
+	for (unsigned int row = 56; row < 60; ++row) {
+		for (unsigned int page = 0; page < 9; ++page)
+			state.tcam[row][page][0] = row << 16 | page;
+		for (unsigned int page = 0; page < 3; ++page)
+			for (unsigned int word = 0; word < ct_ifc_action_words[page]; ++word)
+				state.action[row][page][word] = 0x23450000 | row << 8 | page << 4 | word;
+	}
+	memcpy(state.original_tcam, &state.tcam[56], sizeof(state.original_tcam));
+	memcpy(state.original_action, &state.action[56], sizeof(state.original_action));
 	++scenarios;
 }
 
@@ -205,16 +220,14 @@ static void restored(void)
 	CHECK(!state.owner.ingress.saved_valid && !state.owner.ingress.pending &&
 	      !state.owner.ingress.active && !state.owner.ingress.dirty);
 	CHECK(!state.ppe.ct_pon_ifc.pending && !state.ppe.ct_pon_ifc.saved_valid);
-	for (unsigned int row = 56; row < 60; ++row) {
-		CHECK(state.tcam[row][0][0] == row);
-		CHECK(!state.action[row][2][0]);
-	}
+	CHECK(!memcmp(&state.tcam[56], state.original_tcam, sizeof(state.original_tcam)));
+	CHECK(!memcmp(&state.action[56], state.original_action, sizeof(state.original_action)));
 }
 
 static unsigned int prepare_success(void)
 {
 	CHECK(!airoha_npu_owner_ingress_prepare(&state.owner));
-	CHECK(state.owner.ingress.active == 3 && state.owner.ingress.dirty == 3);
+	CHECK(state.owner.ingress.active == 15 && state.owner.ingress.dirty == 15);
 	CHECK(!state.owner.ingress.pending && !state.ppe.ct_pon_ifc.pending);
 	return state.commands;
 }
@@ -335,6 +348,43 @@ static void owner_guards(void)
 	restored();
 }
 
+static void receiver_and_cover_health(void)
+{
+	initialize();
+	prepare_success();
+	state.eth.closed = state.eth.selector_cpu = false;
+	CHECK(!airoha_ct_pon_ifc_route_ready(&state.ppe));
+	CHECK(airoha_ct_pon_ifc_receiver_ready(&state.ppe));
+	CHECK(!airoha_npu_owner_ingress_check(&state.owner));
+	state.eth.receiver_ready = false;
+	state.commands = 0;
+	CHECK(airoha_npu_owner_ingress_check(&state.owner) == -ESHUTDOWN);
+	CHECK(!state.commands && state.owner.ingress.active == 15);
+	state.eth.closed = true;
+	restored();
+	for (unsigned int row = 58; row < 60; ++row)
+		for (unsigned int field = 0; field < 8; ++field) {
+			initialize();
+			prepare_success();
+			state.eth.closed = state.eth.selector_cpu = false;
+			switch (field) {
+			case 0: state.tcam[row][1][0] ^= U32_MAX; break;
+			case 1: state.tcam[row][1][1] ^= 1; break;
+			case 2: state.tcam[row][0][0] ^= BIT(2); break;
+			case 3: state.tcam[row][8][0] ^= BIT(6); break;
+			case 4: state.action[row][1][2] ^= BIT(10); break;
+			case 5: state.action[row][2][0] ^= BIT(28); break;
+			case 6: state.action[row][2][0] ^= BIT(31); break;
+			case 7: state.action[row][2][0] ^= BIT(30); break;
+			}
+			CHECK(airoha_npu_owner_ingress_check(&state.owner) == (field ? -EUCLEAN : 0));
+			CHECK(state.owner.ingress.active == 15 && state.owner.ingress.dirty == 15);
+			CHECK(!state.owner.ingress.pending && !state.ppe.ct_pon_ifc.pending);
+			state.eth.closed = true;
+			restored();
+		}
+}
+
 static void exact_readback(void)
 {
 	u32 words[2] = { 0, U32_MAX };
@@ -361,10 +411,12 @@ static void exact_readback(void)
 static void masked_put_readback(void)
 {
 	const unsigned int short_lut[2] = { 31, 30 };
-	struct airoha_ct_pon_ifc_words rows[2];
+	struct airoha_ct_pon_ifc_words rows[4];
 
 	CHECK(!airoha_npu_ingress_rows(rows, short_lut));
-	for (unsigned int row = 0; row < 2; ++row)
+	airoha_ct_pon_ifc_cover_encode(&rows[2], 4, 0);
+	airoha_ct_pon_ifc_cover_encode(&rows[3], 4, 1);
+	for (unsigned int row = 0; row < 4; ++row)
 		for (unsigned int bank = 0; bank <= 2; bank += 2)
 			for (unsigned int page = 0; page < (bank ? 3 : 9); ++page) {
 				const u32 *words = bank ? rows[row].action[page] : rows[row].tcam[page];
@@ -376,7 +428,7 @@ static void masked_put_readback(void)
 
 						initialize();
 						state.owner.ingress.saved_valid = true;
-						state.owner.ingress.dirty = 3;
+						state.owner.ingress.dirty = 15;
 						state.owner.diag_lower = bit & 1 ? &state : NULL;
 						state.read_xor[word] = BIT(bit);
 						spin_lock_bh(&ppe_lock);
@@ -416,7 +468,7 @@ static void normalized_owner_lifecycle(void)
 	const u32 patterns[] = { U32_MAX, 0, 0xa5a5a5a5 };
 
 	for (unsigned int pattern = 0; pattern < 3; ++pattern) {
-		u32 saved[4][9][3], actual[2];
+		u32 actual[2];
 
 		initialize();
 		state.normalize_tcam = true;
@@ -439,16 +491,14 @@ static void normalized_owner_lifecycle(void)
 		state.eth.closed = true;
 		prepare_success();
 		CHECK(!state.diagnostic_logs && !state.owner.ingress.pending);
-		memcpy(saved, &state.tcam[56], sizeof(saved));
 		CHECK(!airoha_npu_owner_ingress_restore(&state.owner));
 		CHECK(!state.owner.ingress.saved_valid && !state.owner.ingress.dirty &&
 		      !state.owner.ingress.active && !state.owner.ingress.pending);
-		for (unsigned int row = 56; row < 58; ++row) {
-			CHECK(!state.action[row][2][0]);
+		for (unsigned int row = 56; row < 60; ++row) {
 			for (unsigned int page = 0; page < 9; ++page)
 				CHECK(state.tcam[row][page][0] == patterns[pattern] && !state.tcam[row][page][1]);
 		}
-		CHECK(!memcmp(&state.tcam[58], saved + 2, 2 * sizeof(saved[0])));
+		CHECK(!memcmp(&state.action[56], state.original_action, sizeof(state.original_action)));
 		CHECK(!airoha_npu_owner_ingress_restore(&state.owner));
 		CHECK(!state.ppe.ct_pon_ifc.pending && !ppe_lock);
 	}
@@ -461,6 +511,7 @@ int main(void)
 	transport_faults();
 	dependency_drift();
 	owner_guards();
+	receiver_and_cover_health();
 	exact_readback();
 	printf("{\"passed\":true,\"scenarios\":%u,\"checks\":%u,\"transport_faults\":%u,"
 	       "\"ignored_key_bits\":%u,\"rejected_key_bits\":%u,\"rejected_mask_bits\":%u,"

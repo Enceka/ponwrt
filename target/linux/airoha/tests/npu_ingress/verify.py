@@ -136,12 +136,23 @@ def main():
         'ignore_tcam_mask': ('actual[1] != expected[index].tcam[page][1] ||', 'false ||'),
         'ignore_tcam_key': ('((actual[0] ^ expected[index].tcam[page][0]) & actual[1])', '0'),
         'skip_action_audit': ('memcmp(actual, expected[index].action[page], count * sizeof(u32))', '0'),
-        'skip_second_row_audit': ('index < 2', 'index < 1'),
+        'skip_cover_audit': ('index < 4', 'index < 2'),
+        'skip_cover_publish': ('airoha_ct_pon_ifc_publish(owner, io, 1, &rows[2])', '0'),
+        'reverse_publish_order': ('airoha_ct_pon_ifc_publish(owner, io, 1, &rows[2]);\n'
+                                  '\tif (!error)\n\t\terror = airoha_ct_pon_ifc_publish(owner, io, 0, rows);',
+                                  'airoha_ct_pon_ifc_publish(owner, io, 0, rows);\n'
+                                  '\tif (!error)\n\t\terror = airoha_ct_pon_ifc_publish(owner, io, 1, &rows[2]);'),
+        'wrong_cover_ring': ('airoha_ct_pon_ifc_cover_encode(&rows[2], 4, 0)',
+                             'airoha_ct_pon_ifc_cover_encode(&rows[2], 2, 0)'),
+        'wrong_cover_type': ('airoha_ct_pon_ifc_cover_encode(&rows[3], 4, 1)',
+                             'airoha_ct_pon_ifc_cover_encode(&rows[3], 4, 0)'),
+        'leave_cover_on_restore': ('return airoha_ct_pon_ifc_restore(owner, io);',
+                                   'return airoha_ct_pon_ifc_withdraw(owner, io, 0);'),
         'lose_audit_pending': ('owner->pending = true;', 'owner->pending = false;'),
         'ignore_publish_error': ('if (error)\n\t\treturn error;\n\treturn airoha_npu_ingress_check',
                                  'if (error)\n\t\treturn 0;\n\treturn airoha_npu_ingress_check'),
         'skip_final_audit': ('return airoha_npu_ingress_check(owner, io, short_lut);', 'return 0;'),
-        'reuse_peer_rows': ('if ((owner->dirty | owner->active) & ~3)', 'if (false)'),
+        'allow_foreign_rows': ('if ((owner->dirty | owner->active) & ~15)', 'if (false)'),
     }
     caught = {}
     for name, (before, after) in mutants.items():

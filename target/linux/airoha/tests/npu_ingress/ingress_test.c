@@ -20,6 +20,7 @@ typedef uint32_t u32;
 
 static unsigned int checks, scenarios, injected_faults;
 static unsigned int ignored_key_bits, rejected_key_bits, rejected_mask_bits, rejected_action_bits;
+static unsigned int cpu_cover_packets;
 #define CHECK(condition) do { \
 	++checks; \
 	if (!(condition)) { \
@@ -34,8 +35,8 @@ struct host {
 	struct airoha_ct_pon_ifc_io io;
 	struct airoha_ct_pon_ifc_words hardware[4], original[4];
 	unsigned int commands, puts, reads, drains, fail_at, drain_failures;
-	u16 dependencies[2];
-	u8 closed, target;
+	u16 dependencies[4];
+	u8 closed, target, completed;
 	bool restoring, busy, delayed, finish_on_failed_drain;
 	bool normalize_tcam;
 	u32 unused_key_pattern;
@@ -65,18 +66,22 @@ static int transfer(struct host *host, unsigned int bank, unsigned int row,
 
 	CHECK(!host->busy);
 	if (write) {
-		CHECK(row < 58 && host->owner.saved_valid && (host->owner.dirty & BIT(row - 56)));
+		u8 pair = host->restoring ? host->target : row < 58 ? 3 : 12;
+
+		CHECK(host->owner.saved_valid && (host->owner.dirty & BIT(row - 56)));
 		CHECK(host->target & BIT(row - 56));
-		CHECK(!host->owner.active);
+		CHECK(!(host->owner.active & pair));
+		if (!host->restoring && row < 58)
+			CHECK((host->completed & 12) == 12);
 		if (bank != 2 || page != 2) {
-			CHECK(host->closed == host->target);
-			for (unsigned int index = 0; index < 2; ++index)
-				if (host->target & BIT(index))
+			CHECK((host->closed & pair) == pair);
+			for (unsigned int index = 0; index < 4; ++index)
+				if (pair & BIT(index))
 					CHECK(!(host->hardware[index].action[2][0] & BIT(31)));
 		} else if (words[0]) {
-			CHECK(host->closed == host->target);
-			for (unsigned int index = 0; index < 2; ++index)
-				if (host->target & BIT(index))
+			CHECK((host->closed & pair) == pair);
+			for (unsigned int index = 0; index < 4; ++index)
+				if (pair & BIT(index))
 					CHECK(host->dependencies[index] == 0x7ff);
 			CHECK(host->restoring == !(words[0] & BIT(31)));
 		}
@@ -109,6 +114,8 @@ static int transfer(struct host *host, unsigned int bank, unsigned int row,
 			host->dependencies[row - 56] |= BIT(9 + page);
 		else if (!words[0])
 			host->closed |= BIT(row - 56);
+		else if (words[0] & BIT(31))
+			host->completed |= BIT(row - 56);
 	}
 	return 0;
 }
@@ -157,10 +164,10 @@ static void operation(struct host *host, bool restoring)
 	host->commands = host->puts = host->reads = host->drains = 0;
 	host->fail_at = host->drain_failures = 0;
 	host->fault = NO_FAULT;
-	host->closed = 0;
-	host->dependencies[0] = host->dependencies[1] = 0;
+	host->closed = host->completed = 0;
+	memset(host->dependencies, 0, sizeof(host->dependencies));
 	host->restoring = restoring;
-	host->target = restoring ? host->owner.dirty : 3;
+	host->target = restoring ? host->owner.dirty : 15;
 	host->finish_on_failed_drain = false;
 }
 
@@ -181,9 +188,8 @@ static void initialize(struct host *host)
 	memcpy(host->original, host->hardware, sizeof(host->original));
 }
 
-static void unchanged_peer(const struct host *host)
+static void unchanged_snapshot(const struct host *host)
 {
-	CHECK(!memcmp(host->hardware + 2, host->original + 2, 2 * sizeof(host->hardware[0])));
 	if (host->owner.saved_valid)
 		CHECK(!memcmp(host->owner.saved, host->original, sizeof(host->original)));
 }
@@ -192,9 +198,10 @@ static void prepare_ok(struct host *host, bool initial)
 {
 	operation(host, false);
 	CHECK(!airoha_npu_ingress_prepare(&host->owner, &host->io, short_lut));
-	CHECK(host->puts == 26 && host->reads == (initial ? 72 : 24));
-	CHECK(host->owner.active == 3 && host->owner.dirty == 3 && !host->owner.pending);
-	unchanged_peer(host);
+	CHECK(host->puts == 52 && host->reads == (initial ? 96 : 48));
+	CHECK(host->owner.active == 15 && host->owner.dirty == 15 && !host->owner.pending);
+	CHECK(host->completed == 15);
+	unchanged_snapshot(host);
 }
 
 static void restore_ok(struct host *host)
@@ -240,8 +247,8 @@ static void invalid_inputs(void)
 		CHECK(airoha_npu_ingress_restore(&host.owner, &invalid_io) == -EINVAL);
 	}
 	for (unsigned int field = 0; field < 2; ++field) {
-		if (field == 0) host.owner.dirty = 4;
-		else { host.owner.dirty = 0; host.owner.active = 4; }
+		if (field == 0) host.owner.dirty = 16;
+		else { host.owner.dirty = 0; host.owner.active = 16; }
 		CHECK(airoha_npu_ingress_prepare(&host.owner, &host.io, short_lut) == -EBUSY);
 		CHECK(airoha_npu_ingress_restore(&host.owner, &host.io) == -EBUSY);
 	}
@@ -261,7 +268,7 @@ static void audit_words(void)
 
 	initialize(&host);
 	prepare_ok(&host, true);
-	for (unsigned int row = 0; row < 2; ++row)
+	for (unsigned int row = 0; row < 4; ++row)
 		for (unsigned int bank = 0; bank <= 2; bank += 2)
 			for (unsigned int page = 0; page < (bank ? 3 : 9); ++page)
 				for (unsigned int word = 0; word < (bank ? airoha_ct_pon_ifc_action_words[page] : 2); ++word)
@@ -274,7 +281,7 @@ static void audit_words(void)
 						*location ^= BIT(bit);
 						CHECK(airoha_npu_ingress_check(&host.owner, &host.io, short_lut) ==
 						      (significant ? -EUCLEAN : 0));
-						CHECK(host.owner.active == 3 && host.owner.dirty == 3 && !host.owner.pending);
+						CHECK(host.owner.active == 15 && host.owner.dirty == 15 && !host.owner.pending);
 						if (bank) ++rejected_action_bits;
 						else if (word) ++rejected_mask_bits;
 						else if (significant) ++rejected_key_bits;
@@ -282,10 +289,10 @@ static void audit_words(void)
 						*location ^= BIT(bit);
 						++scenarios;
 					}
-	CHECK(host.puts == 26);
+	CHECK(host.puts == 52);
 	operation(&host, false);
 	CHECK(!airoha_npu_ingress_check(&host.owner, &host.io, short_lut));
-	CHECK(host.reads == 24 && !host.puts);
+	CHECK(host.reads == 48 && !host.puts);
 	prepare_ok(&host, false);
 	restore_ok(&host);
 }
@@ -293,7 +300,7 @@ static void audit_words(void)
 static void fault_sweep(void)
 {
 	for (unsigned int stage = 0; stage < 4; ++stage) {
-		unsigned int positions = stage == 0 ? 98 : stage == 1 ? 50 : stage == 2 ? 24 : 26;
+		unsigned int positions = stage == 0 ? 148 : stage == 1 ? 100 : stage == 2 ? 48 : 52;
 
 		for (unsigned int position = 1; position <= positions; ++position)
 			for (unsigned int mode = BEFORE_EFFECT; mode <= DELAYED_EFFECT; ++mode)
@@ -315,7 +322,7 @@ static void fault_sweep(void)
 						result = airoha_npu_ingress_prepare(&host.owner, &host.io, short_lut);
 					CHECK(result == (mode == DELAYED_EFFECT ? -ETIMEDOUT : -EIO));
 					CHECK(host.commands == position && host.owner.pending);
-					unchanged_peer(&host);
+					unchanged_snapshot(&host);
 					saved = host.owner;
 					for (unsigned int failed = 0; failed < 2; ++failed) {
 						operation(&host, recovery || stage == 3);
@@ -338,7 +345,7 @@ static void fault_sweep(void)
 
 static void audit_restore(void)
 {
-	for (unsigned int row = 0; row < 2; ++row)
+	for (unsigned int row = 0; row < 4; ++row)
 		for (unsigned int bank = 0; bank <= 2; bank += 2)
 			for (unsigned int page = 0; page < (bank ? 3 : 9); ++page)
 				for (unsigned int word = 0; word < (bank ? airoha_ct_pon_ifc_action_words[page] : 2); ++word) {
@@ -352,8 +359,8 @@ static void audit_restore(void)
 					*location ^= BIT(31);
 					CHECK(airoha_npu_ingress_check(&host.owner, &host.io, short_lut) ==
 					      (bank || word || (host.hardware[row].tcam[page][1] & BIT(31)) ? -EUCLEAN : 0));
-					CHECK(host.owner.active == 3 && host.owner.dirty == 3 && !host.owner.pending);
-					unchanged_peer(&host);
+					CHECK(host.owner.active == 15 && host.owner.dirty == 15 && !host.owner.pending);
+					unchanged_snapshot(&host);
 					restore_ok(&host);
 					++scenarios;
 				}
@@ -388,6 +395,67 @@ static void normalized_readback(void)
 	}
 }
 
+static int classify(const struct host *host, const u32 key[9])
+{
+	for (unsigned int row = 0; row < 4; ++row) {
+		bool match = !!(host->hardware[row].action[2][0] & BIT(31));
+
+		for (unsigned int page = 0; page < 9; ++page)
+			if ((key[page] ^ host->hardware[row].tcam[page][0]) &
+			    host->hardware[row].tcam[page][1])
+				match = false;
+		if (match)
+			return row;
+	}
+	return -1;
+}
+
+static void cpu_protection(void)
+{
+	const struct { u32 protocol, encapsulation, hits, type; int row; } packets[] = {
+		{ ETH_P_IP, 0, 0, 0, 0 }, { ETH_P_IPV6, 0, 0, 0, 1 },
+		{ ETH_P_IP, 0, BIT(31), 0, 2 }, { ETH_P_IPV6, 0, BIT(30), 0, 2 },
+		{ 0x0806, 0, 0, 0, 2 }, { 0x8864, 0, 0, 0, 2 },
+		{ ETH_P_IP, 0x10, 0, 0, 2 }, { ETH_P_IPV6, 0x400, 0, 0, 2 },
+		{ ETH_P_IP, 0, 0, 1, 3 }, { 0, 0x430, U32_MAX, 1, 3 },
+	};
+	struct host host;
+
+	initialize(&host);
+	prepare_ok(&host, true);
+	for (unsigned int row = 2; row < 4; ++row) {
+		CHECK(host.hardware[row].tcam[0][0] == BIT(2) &&
+		      host.hardware[row].tcam[0][1] == U32_MAX);
+		CHECK(host.hardware[row].tcam[8][0] == (row - 2) << 6 &&
+		      host.hardware[row].tcam[8][1] == 0xc0);
+		CHECK(!host.hardware[row].action[0][0] && !host.hardware[row].action[0][1]);
+		CHECK(!host.hardware[row].action[1][0] && !host.hardware[row].action[1][1]);
+		CHECK(host.hardware[row].action[1][2] == 4 << 10);
+		CHECK(host.hardware[row].action[2][0] == (BIT(31) | BIT(30) | BIT(28)));
+	}
+	for (unsigned int source = 0; source < 32; ++source)
+		for (unsigned int packet = 0; packet < sizeof(packets) / sizeof(packets[0]); ++packet) {
+			u32 key[9] = { BIT(source), 0xffff, 0, 0, packets[packet].hits,
+				packets[packet].protocol, 0, packets[packet].encapsulation, packets[packet].type << 6 };
+
+			CHECK(classify(&host, key) == (source == 2 ? packets[packet].row : -1));
+			++cpu_cover_packets;
+		}
+	for (unsigned int row = 0; row < 4; ++row) {
+		unsigned int commands = host.commands;
+
+		host.owner.active ^= BIT(row);
+		CHECK(airoha_npu_ingress_check(&host.owner, &host.io, short_lut) == -ESTALE);
+		host.owner.active ^= BIT(row);
+		host.owner.dirty ^= BIT(row);
+		CHECK(airoha_npu_ingress_check(&host.owner, &host.io, short_lut) == -ESTALE);
+		host.owner.dirty ^= BIT(row);
+		CHECK(host.commands == commands);
+	}
+	restore_ok(&host);
+	++scenarios;
+}
+
 static void emit_words(void)
 {
 	for (unsigned int family = 0; family < 2; ++family)
@@ -412,13 +480,14 @@ int main(int argc, char **argv)
 	}
 	invalid_inputs();
 	normalized_readback();
+	cpu_protection();
 	audit_words();
 	audit_restore();
 	fault_sweep();
 	printf("{\"passed\":true,\"scenarios\":%u,\"checks\":%u,\"transport_faults\":%u,"
 	       "\"ignored_key_bits\":%u,\"rejected_key_bits\":%u,\"rejected_mask_bits\":%u,"
-	       "\"rejected_action_bits\":%u,\"normalization_patterns\":3}\n",
+	       "\"rejected_action_bits\":%u,\"normalization_patterns\":3,\"cpu_cover_packets\":%u}\n",
 	       scenarios, checks, injected_faults, ignored_key_bits, rejected_key_bits,
-	       rejected_mask_bits, rejected_action_bits);
+	       rejected_mask_bits, rejected_action_bits, cpu_cover_packets);
 	return 0;
 }

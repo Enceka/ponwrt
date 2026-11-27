@@ -1,0 +1,48 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: retain PON classifier coverage until CPU route is verified
+
+If CPU route writes fail or their readback is uncertain, retain the
+source scope and classifier rows for retry. Keep global IFC enabled when
+an owned PON route still fails during CPU fallback. A successful retry
+can then close the scope and complete the normal retirement sequence.
+
+--- a/drivers/net/ethernet/airoha/airoha_bank1_routes.h
++++ b/drivers/net/ethernet/airoha/airoha_bank1_routes.h
+@@ -76,8 +76,10 @@
+ 	routes->revoked = true;
+ 	routes->ready = false;
+ 	route_error = airoha_bank1_routes_write_all(eth, true);
++	if (route_error)
++		return route_error;
+ 	error = airoha_bank1_scope_locked(eth, false);
+-	return route_error ?: error;
++	return error;
+ }
+ 
+ int airoha_bank1_routes_revoke(struct airoha_eth *eth, const void *owner)
+@@ -127,9 +129,11 @@
+ 	routes->revoked = false;
+ 	routes->ready = false;
+ 	route_error = airoha_bank1_routes_write_all(eth, true);
++	if (route_error) {
++		error = route_error;
++		goto unlock;
++	}
+ 	error = airoha_bank1_scope_locked(eth, false);
+-	if (route_error)
+-		error = route_error;
+ 	routes->ready = !error;
+ unlock:
+ 	spin_unlock_bh(&eth->ct_route_lock);
+--- a/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
+@@ -249,7 +249,8 @@
+ 			      eth->ct_bank1_routes.desired[id - 1];
+ 		eth->ct_cpu_route_mask[id - 1] |= airoha_ct_ppe_selectors(cfg);
+ 		ret = airoha_ct_gdm_route_locked(eth, id, cfg);
+-		if (id == AIROHA_GDM2_IDX && eth->ppe->ct_pon_ifc_route_owned && ret)
++		if (id == AIROHA_GDM2_IDX &&
++		    (eth->ppe->ct_pon_ifc_route_owned || eth->ct_bank1_routes.owner) && ret)
+ 			optical_pending = true;
+ 		if (ret && !err)
+ 			err = ret;

@@ -1,5 +1,20 @@
 # Bank1 GDM route guard host 回归
 
+`999-zm` 为 PON NPU 入口先安装四行分类规则，再开放 SPORT2 scope 和
+GDM2 的 PPE2 选择器；关闭时先恢复 CPU 选择器。`999-zo` 在 CPU 写入或
+读回失败时保留 scope 和分类器，待重试成功后继续清理。
+
+```sh
+python3 target/linux/airoha/tests/bank1_routes/verify_covered.py \
+  --source /absolute/path/to/linux-after-zo \
+  --output "$PWD/target/linux/airoha/tests/bank1_routes/out/covered-zo" \
+  --negative-controls
+```
+
+该入口精确重放到 `999-zo`，运行 20 个场景及两个负对照，覆盖正常开关、
+claim/revoke/fallback 的丢写与损坏读回，以及恢复重试。负对照在六个故障
+分支核验 scope 或 IFC 被过早撤销时测试确实失败。
+
 `998` 加入持有 owner 的 PON 重开接口，仅开放 GDM2；其它 GDM 的 PPE2
 选择器继续送实际 CPU 接收队列。普通镜像、CPU 回退、冲突接收端和撤销状态
 均阻止重开。修改路由或发布新 QDMA 之前先关闭 PON，失败保留旧映射；

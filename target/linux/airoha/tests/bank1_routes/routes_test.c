@@ -52,6 +52,11 @@ typedef struct { bool held; } spinlock_t;
 #define REG_PPE_PPE_FLOW_CFG(bank) (40 + (bank))
 #define PPE_GLO_CFG_EN_MASK BIT(0)
 #define PPE_GLO_CFG_BUSY_MASK BIT(1)
+#ifdef TEST_PON_COVERED
+#define REG_PPE_TB_CFG(bank) (44 + (bank))
+#define PPE_TB_CFG_SEARCH_MISS_MASK GENMASK(5, 4)
+#define FIELD_GET(mask, value) (((value) & (mask)) >> __builtin_ctz(mask))
+#endif
 #define REG_CNTR_VAL(index) (index)
 #define NETIF_F_LRO BIT(0)
 #define ETH_P_IP 0x0800
@@ -326,6 +331,11 @@ static bool airoha_ct_pon_ifc_tuple_busy(struct airoha_ppe *target) { return fal
 static int airoha_ct_pon_ifc_dependencies(struct airoha_ppe *target) { return 0; }
 static int airoha_ct_pon_ifc_tuple_check(struct airoha_ppe *target) { return 0; }
 static void airoha_ct_pon_ifc_fault(struct airoha_ppe *target) { ++legacy_faults; }
+#ifdef TEST_PON_COVERED
+static bool covered_diagnostic;
+static bool airoha_ppe_npu_diag_active(struct airoha_ppe *target, const void *owner)
+{ return covered_diagnostic && target == &ppe && owner == &owner_token; }
+#endif
 #include "airoha_ct_ifc_command.h"
 #include "airoha_ct_cpu_fallback.h"
 #include "airoha_bank1_routes.h"
@@ -851,6 +861,8 @@ static void test_selectors(void)
 #ifdef TEST_OWNER_INVALIDATION
 #include "invalidation_test.inc"
 #endif
+#elif defined(TEST_PON_COVERED)
+#include "covered_test.inc"
 #else
 #include "ingress_test.inc"
 #endif
@@ -858,7 +870,17 @@ static void test_selectors(void)
 int main(int argc, char **argv)
 {
 	static const struct { const char *name; void (*run)(void); } groups[] = {
-#ifdef TEST_PON_INGRESS
+#ifdef TEST_PON_COVERED
+		{ "covered-normal", test_covered_normal },
+		{ "covered-open-fault", test_covered_open_fault },
+		{ "covered-recovery", test_covered_recovery },
+		{ "covered-claim-drop", test_covered_claim_drop },
+		{ "covered-claim-readback", test_covered_claim_readback },
+		{ "covered-revoke-drop", test_covered_revoke_drop },
+		{ "covered-revoke-readback", test_covered_revoke_readback },
+		{ "covered-fallback-drop", test_covered_fallback_drop },
+		{ "covered-fallback-readback", test_covered_fallback_readback },
+#elif defined(TEST_PON_INGRESS)
 		{ "ingress", test_ingress },
 #else
 		{ "basic", test_basic }, { "parameters", test_parameters },

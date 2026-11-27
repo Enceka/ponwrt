@@ -122,6 +122,8 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/patches-6.18/999-zj-net-airoha-check-resident-npu-suppliers.patch \
   target/linux/airoha/patches-6.18/999-zk-net-airoha-add-ram-pon-npu-return-diagnostic.patch \
   target/linux/airoha/patches-6.18/999-zl-net-airoha-mask-unused-pon-tcam-readback.patch \
+  target/linux/airoha/patches-6.18/999-zm-net-airoha-route-covered-pon-npu-ingress.patch \
+  target/linux/airoha/patches-6.18/999-zo-net-airoha-retain-pon-coverage-on-route-failure.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config,NATIVE_PAIRS.md} \
   target/linux/airoha/tests/native_pair/*.{py,c} \
   target/linux/airoha/tests/native_pair/fixtures/*.inc \
