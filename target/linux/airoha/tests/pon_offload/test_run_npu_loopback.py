@@ -89,6 +89,7 @@ class BoardFixture:
         self.ring = False
         self.ipv6 = '0'
         self.service = None
+        self.alt_service = None
         self.epoch = 6
         self.generation = 11
         self.consumed = 0
@@ -96,11 +97,17 @@ class BoardFixture:
         self.last_er = None
 
     def diag(self):
+        bank1_tb = '83c0cfa4' if self.owner else '83c0cfb4'
+        bank0_flow = ('00002000' if self.learn_mode and self.ring else '0000b200')
+        bank0_tb = '83c0cfb4'
         state = dict(owner=int(self.owner), diagnostic=int(self.owner), qualified=0,
                      policy=0, fallback=0, route_owner=int(self.owner), fe_owner=int(self.owner),
-                     flow=('00002000' if self.learn_mode and self.ring else '00000000') if self.owner else '00003200',
-                     tb='83c0cfb4', learn_mode=int(self.learn_mode),
-                     next_row=0 if self.learn_mode and self.ring else 8192,
+                     flow='00000000' if self.owner else '00003200',
+                     tb=bank1_tb,
+                     bank0_flow=bank0_flow, bank0_tb=bank0_tb,
+                     learn_mode=int(self.learn_mode),
+                     next_row=8192,
+                     bank0_next_row=0 if self.learn_mode and self.ring else 8192,
                      scope='01000004' if self.ring else '01000000', ingress=int(self.ring),
                      ports='01000004' if self.ring else '01000000',
                      gdm2='07f08888' if self.ring else '07f05555',
@@ -123,15 +130,15 @@ class BoardFixture:
                          consumed=consumed, dropped=0, fault=0,
                          observed_produced=consumed, observed_consumed=consumed, frame_bytes=128)
             if self.last_er:
-                sequence, kind = self.last_er
+                sequence, kind, er_service = self.last_er
                 frame = bytearray(128)
                 offset = 14 + (40 if kind == 'ipv6' else 20) + 8
                 struct.pack_into('>5I', frame, offset, 0x4354504e, sequence,
                                  123, int(kind == 'ipv6'), 128)
                 buffer = 0x44000000 + 64 + 8 * 64 + ((self.consumed - 1) & 7) * 2048
                 descriptor = [0x80000080, self.epoch, self.consumed, 2,
-                              self.generation, 0x80000000 | self.service, buffer, 0,
-                              128, 0x00e00000 | self.service, 7, 0, 0x05dc7fff, 6 << 28, 2, 0]
+                              self.generation, 0x80000000 | er_service, buffer, 0,
+                              128, 0x00e00000 | er_service, 7, 0, 0x05dc7fff, 6 << 28, 2, 0]
                 state.update(er_desc='/'.join(f'{word:08x}' for word in descriptor),
                              er_frame=frame.hex())
             if self.ring and self.consumed and self.identity_fault:
@@ -147,7 +154,7 @@ class BoardFixture:
         last = self.sent[-1] if self.sent else {}
         msg1 = 2 << 21
         if self.learn_mode and last.get('path') == 'auth':
-            msg1 |= 0x2135 if self.learn_fault == 'hash' else 0x2134
+            msg1 |= 0x0459 if self.learn_fault == 'hash' else 0x0458
         text = (f'retained={state} controller={state} opened={state} saved={state} '
                 f'error=0 pending=0 sequence={sequence} received={sequence} '
                 f'rx_sequence={sequence} rx_msg0={(self.service or 0) << 14:08x} '
@@ -174,21 +181,28 @@ class BoardFixture:
             elif value.startswith('map '):
                 assert self.prepared and not self.owner
                 self.service = int(value.split()[1])
-            elif value.startswith(('send-current ', 'send-fixed ')):
+                self.alt_service = None
+            elif value.startswith('map-pair '):
+                assert self.prepared and not self.owner
+                parts = value.split()
+                self.service, self.alt_service = int(parts[1]), int(parts[2])
+            elif value.startswith(('send-current ', 'send-fixed ', 'send-fixed-alt ')):
                 assert self.prepared and self.owner and 0 <= self.service <= 65535
                 kind = value.split()[1]
                 assert kind in ('ipv4', 'ipv6')
                 fixed = value.startswith('send-fixed ')
-                variant = int(value.split()[2]) if fixed else 0
+                alt = value.startswith('send-fixed-alt ')
+                variant = int(value.split()[2]) if (fixed or alt) else 0
                 matched = self.auth_mode and self.ring and fixed and kind == 'ipv4' and variant == 0
                 if matched and self.learn_mode:
                     self.learned = True
                 path = 'auth' if matched else 'er' if self.ring else 'cpu'
-                self.sent.append(dict(service=self.service, kind=kind,
+                packet_service = self.alt_service if alt else self.service
+                self.sent.append(dict(service=packet_service, kind=kind,
                                       sequence=len(self.sent) + 1, path=path, fixed=fixed, variant=variant))
                 if self.ring and not matched:
                     self.consumed += 1
-                    self.last_er = (len(self.sent), kind)
+                    self.last_er = (len(self.sent), kind, packet_service)
                     self.pending_reads = self.observation_delay
                 elif not self.ring and self.closed_drift:
                     self.consumed += 1
@@ -246,13 +260,11 @@ class BoardFixture:
         elif command == 'cat /sys/kernel/debug/ppe/entries':
             if self.learned and self.learn_fault != 'missing':
                 state = 'BND' if self.learn_fault == 'bound' else 'UNB'
-                tuples = ['192.0.2.1:49152->192.0.2.2:49153', '192.0.2.2:49152->192.0.2.2:49153',
-                          '192.0.2.1:49152->192.0.2.3:49153', '192.0.2.1:49153->192.0.2.2:49153',
-                          '192.0.2.1:49152->192.0.2.2:49154']
+                original = '192.0.2.1:49152->192.0.2.2:49153'
                 if self.learn_fault == 'tuple':
-                    tuples[0] = '192.0.2.3:49152->192.0.2.2:49153'
-                text = ''.join(f'{0x2134 + index:05x} {state} IPv4 5T orig={original} ib1=00000000\n'
-                               for index, original in enumerate(tuples))
+                    original = '192.0.2.3:49152->192.0.2.2:49153'
+                row = 0x2458 if self.learn_fault == 'bank1' else 0x0458
+                text = f'{row:05x} {state} IPv4 5T orig={original} ib1=00000000\n'
         elif command == 'cat ' + runner.PROBE + 'status':
             assert self.loaded
             text = self.probe()
@@ -514,12 +526,12 @@ class RunnerTests(unittest.TestCase):
         board = BoardFixture()
         report = self.invoke(board, learn=True)
         self.assertTrue(report['passed'])
-        self.assertEqual([row['hash'] for row in report['learned_rows']], [0x2134, 0x2134])
+        self.assertEqual([row['hash'] for row in report['learned_rows']], [0x0458, 0x0458])
         self.assertEqual([row['service'] for row in report['learned_rows']], [0, 0x8000])
         self.assert_restored(board)
 
     def test_learning_rejects_missing_wrong_or_retained_rows(self):
-        for fault in ('missing', 'tuple', 'bound', 'retained', 'hash'):
+        for fault in ('missing', 'tuple', 'bound', 'retained', 'hash', 'bank1'):
             with self.subTest(fault=fault):
                 board = BoardFixture(learn_fault=fault)
                 with self.assertRaises(ValueError):

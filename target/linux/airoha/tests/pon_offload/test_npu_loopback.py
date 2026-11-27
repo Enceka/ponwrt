@@ -18,7 +18,7 @@ class PacketTests(unittest.TestCase):
                      auth_inflight=0, gate_mask=4, gate_closed=0, gate_fault=0,
                      gate_error=0, auth_error=0, er_error=0, er_fault=0,
                      packets=count, consumed=count, dropped=0, fault=0,
-                     flow='00000000', scope='01000004', ports='01000004',
+                     flow='00000000', tb='83c0cfa4', scope='01000004', ports='01000004',
                      gdm2='07f08888', epoch=7, generation=11,
                      gate_epoch=7, gate_generation=11, auth_epoch=7, auth_generation=11,
                      er_desc='/'.join(f'{word:08x}' for word in desc), er_frame=frame.hex(),
@@ -41,7 +41,7 @@ class PacketTests(unittest.TestCase):
         faults = dict(qualified=1, policy=1, invalidated=1, auth_count=1, gate_mask=1,
                       route_owner=0, fe_owner=0, ingress=0, phase=14,
                       consumed=17, observed_produced=17, packets=17, dropped=1, fault=1,
-                      flow='00003200', scope='01000000', ports='01000000',
+                      flow='00003200', tb='83c0cfb4', scope='01000000', ports='01000000',
                       gdm2='07f05555', epoch=8, generation=12,
                       gate_epoch=8, gate_generation=12, auth_epoch=8, auth_generation=12)
         for name, value in faults.items():
