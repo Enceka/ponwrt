@@ -1,0 +1,54 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: retain PON bank0 ownership through retirement
+
+Keep host bank0 insertion and bound commits excluded while a PON learning
+owner holds the bank. Link loss, controller updates and retirement can stop
+forwarding before drain or restore completes; those transitions must retain
+the exclusion until the owner releases its bank state.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -29,6 +29,8 @@
+ DEFINE_MUTEX(flow_offload_mutex);
+ static DEFINE_SPINLOCK(ppe_lock);
+ 
++static bool airoha_ppe_npu_bank0_owned(struct airoha_ppe *ppe);
++
+ /* qdma_dev_hqos_init() controls WAN channel remapping with this bit. */
+ #define AIROHA_PON_QDMA_HQOS_CFG	0x0090
+ #define AIROHA_PON_QDMA_HQOS_EN	BIT(31)
+@@ -947,7 +949,7 @@
+ 	if (ppe->ct_npu_owner &&
+ 	    ((hash >= PPE_SRAM_NUM_ENTRIES && hash < 2 * PPE_SRAM_NUM_ENTRIES) ||
+ 	     (hash < PPE_SRAM_NUM_ENTRIES &&
+-	      airoha_ppe_npu_diag_flow(ppe, ppe->ct_npu_owner))) &&
++	      airoha_ppe_npu_bank0_owned(ppe))) &&
+ 	    FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, e->ib1) == AIROHA_FOE_STATE_BIND)
+ 		return -EBUSY;
+ 
+@@ -1701,7 +1703,7 @@
+ 	    (hash >= airoha_ppe_get_total_sram_num_entries(ppe) ||
+ 	     (ppe->ct_npu_owner &&
+ 	      (hash >= PPE_SRAM_NUM_ENTRIES ||
+-	       airoha_ppe_npu_diag_flow(ppe, ppe->ct_npu_owner)))))
++	       airoha_ppe_npu_bank0_owned(ppe)))))
+ 		goto unlock;
+ 	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 	if (!hwe)
+--- a/drivers/net/ethernet/airoha/airoha_npu_owner.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_owner.h
+@@ -37,6 +37,14 @@
+ 	struct airoha_er_observation diag_observation;
+ };
+ 
++static bool airoha_ppe_npu_bank0_owned(struct airoha_ppe *ppe)
++{
++	struct airoha_npu_owner *owner = ppe->ct_npu_owner;
++
++	lockdep_assert_held(&ppe_lock);
++	return owner && (owner->bank0_saved || owner->diag_learn);
++}
++
+ bool airoha_ppe_npu_diag_active(struct airoha_ppe *ppe, const void *token)
+ {
+ 	struct airoha_npu_owner *owner = ppe->ct_npu_owner;
