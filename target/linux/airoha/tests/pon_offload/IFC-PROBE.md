@@ -115,3 +115,32 @@ These host runs used ASan/UBSan. AArch64 Ethernet and PPE objects and the full
 RAM kernel built successfully. Current remaining work is real optical
 ingress generation/observation, service-qualified PPE lookup and egress,
 then same-source recovery/sysupgrade validation and reversible flashing.
+
+## Next ingress and tuple work
+
+The stock investigation identified GDM2 loopback and special-tag configuration
+as the next no-fiber ingress experiment. Relevant stock FE symbols are
+`fe_api_set_loopback_enable` at `0x7df8`, `fe_api_set_loopback_mode` at `0x7e68`,
+`fe_set_gdm2_sptag_for_loopback` at `0x2620`, and its command-0x87 wrapper at
+`0x9b18`. `fe_show_gdm_sptag_info` at `0x2278` names its selector source
+`pkt flow idx`. The open connection is TX GEM/LLID through that special tag
+to the GDM2 RX parser. The ordinary Ethernet WAN loopback currently disables
+GDM2 IFC and redirects to GDM3/4; a dedicated RAM experiment must explicitly
+preserve SPORT2 scope and restore every changed route/tag/loopback register.
+
+For tuple admission, use independent shared LUT predicates with the type0
+service row. Its page4 key is the required tuple hit mask `T`; the mask is
+`T | BIT(short_lut)`. Basic IPv4 address/protocol/port matching requires five
+LUT entries and IPv6 requires eleven. There are 32 entries, including the
+two existing short guards. Validity, fragmentation, extension headers and
+other owners must be accounted for before allocation. Withdraw consumer
+actions before releasing their last LUT references.
+
+The next offline check should execute the stock full-packet parser, then
+the LUT parser and combined type0 hit mask. Cover incorrect service,
+individual tuple fields, undersized packets, IPv4 fragmentation and IPv6
+extension headers before enabling PPE forwarding. Stock `ifc_set_lut1_rules`
+is at `0x1261c`; `ifc_lut1_rule_parser` is at `0x1da84` in the existing
+`build/private-ram-trials/ct230-ipv6/ifc.dis` investigation. Cross-type chains
+remain a separate path because the SINF branch at `0x2b34..0x2bc4` changes
+the parser's type and stop selection.
