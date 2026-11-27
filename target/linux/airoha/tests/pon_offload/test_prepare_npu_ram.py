@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 import prepare_npu_ram as subject
+from pack_npu_ram import verified_kernel
 
 
 class PreparationTests(unittest.TestCase):
@@ -53,6 +54,16 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(len(archive) % 512, 0)
         self.loader, self.archive = loader, archive
         self.assertEqual(self.prepare()[2]['changed_entries'], [])
+
+    def test_kernel_transfer_truncation(self):
+        original = b'kernel-with-complete-initramfs' + bytes(59400)
+        expected = subject.sha256(original)
+        kernel = self.payload / 'Image'
+        kernel.write_bytes(original)
+        self.assertEqual(verified_kernel(kernel, expected), original)
+        kernel.write_bytes(original[:-59400])
+        with self.assertRaisesRegex(ValueError, 'transfer identity'):
+            verified_kernel(kernel, expected)
 
     def test_mismatched_acceptance(self):
         for field, value in [('passed', False), ('elf_sha256', '0' * 64)]:
