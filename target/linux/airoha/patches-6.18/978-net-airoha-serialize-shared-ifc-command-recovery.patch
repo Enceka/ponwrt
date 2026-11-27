@@ -1,0 +1,124 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: serialize shared IFC command recovery
+
+Use one atomic command transport for ordinary, native and optical IFC
+owners. Preserve a timed-out command until its completion is observed;
+subsequent owners must wait before changing either data or control words.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_ifc_command.h
+@@ -0,0 +1,37 @@
++#ifndef AIROHA_CT_IFC_COMMAND_H
++#define AIROHA_CT_IFC_COMMAND_H
++
++static int airoha_ct_ifc_command(struct airoha_eth *eth, unsigned int bank,
++				unsigned int index, unsigned int page, bool write,
++				u32 *words, unsigned int count)
++{
++	u32 command = (index << 16) | (page << 8) | (bank << 4) | (write ? 3 : 1);
++	u32 status;
++	unsigned int word;
++	int err;
++
++	lockdep_assert_held(&ppe_lock);
++	if (eth->ct_ifc_command_pending) {
++		err = read_poll_timeout_atomic(airoha_fe_rr, status, status & CT_IFC_DONE,
++					       2, 1000, false, eth, CT_IFC_CONTROL);
++		if (err)
++			return err;
++		eth->ct_ifc_command_pending = false;
++	}
++	if (write)
++		for (word = 0; word < count; word++)
++			airoha_fe_wr(eth, CT_IFC_DATA(word), words[word]);
++	eth->ct_ifc_command_pending = true;
++	airoha_fe_wr(eth, CT_IFC_CONTROL, command);
++	err = read_poll_timeout_atomic(airoha_fe_rr, status, status & CT_IFC_DONE,
++				       2, 1000, false, eth, CT_IFC_CONTROL);
++	if (err)
++		return err;
++	eth->ct_ifc_command_pending = false;
++	if (!write)
++		for (word = 0; word < count; word++)
++			words[word] = airoha_fe_rr(eth, CT_IFC_DATA(word));
++	return 0;
++}
++
++#endif
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -867,6 +867,7 @@
+ 	spinlock_t ct_route_lock;
+ 	u16 ct_cpu_route_mask[AIROHA_MAX_NUM_GDM_PORTS];
+ 	bool ct_ifc_cpu_port_failed;
++	bool ct_ifc_command_pending;
+ 	bool ct_ordinary_full_test;
+ 	bool ct_cpu_fallback;
+ 	bool ct_cpu_ifc_disabled;
+--- a/drivers/net/ethernet/airoha/airoha_ct_ifc.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_ifc.h
+@@ -76,27 +76,14 @@
++#include "airoha_ct_ifc_command.h"
++
+ static int ct_ifc_access(struct airoha_eth *eth, unsigned int bank,
+ 			 unsigned int index, unsigned int page, bool write,
+ 			 u32 *words, unsigned int count)
+ {
+-	u32 command = (index << 16) | (page << 8) | (bank << 4) | 1;
+-	unsigned int word;
+-	u32 status;
+ 	int err;
+ 
+-	if (write) {
+-		for (word = 0; word < count; word++)
+-			airoha_fe_wr(eth, CT_IFC_DATA(word), words[word]);
+-		command |= BIT(1);
+-	}
+-	airoha_fe_wr(eth, CT_IFC_CONTROL, command);
+-	err = read_poll_timeout(airoha_fe_rr, status, status & CT_IFC_DONE,
+-				2, 1000, false, eth, CT_IFC_CONTROL);
+-	if (err) {
+-		dev_warn(eth->dev, "CT IFC command %08x timed out: %08x\n", command, status);
+-		return err;
+-	}
+-	if (!write)
+-		for (word = 0; word < count; word++)
+-			words[word] = airoha_fe_rr(eth, CT_IFC_DATA(word));
+-	return 0;
++	spin_lock_bh(&ppe_lock);
++	err = airoha_ct_ifc_command(eth, bank, index, page, write, words, count);
++	spin_unlock_bh(&ppe_lock);
++	return err;
+ }
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
+@@ -4,25 +4,12 @@
+ #define CT_FE_NATIVE_ROW 54
+ 
++#include "airoha_ct_ifc_command.h"
++
+ static int airoha_ct_fe_table(struct airoha_ppe *ppe, unsigned int bank,
+ 			      unsigned int index, unsigned int page, bool write,
+ 			      u32 *words, unsigned int count)
+ {
+-	struct airoha_eth *eth = ppe->eth;
+-	u32 command = (index << 16) | (page << 8) | (bank << 4) | (write ? 3 : 1);
+-	u32 status;
+-	unsigned int i;
+-	int err;
+-
+ 	lockdep_assert_held(&ppe_lock);
+-	if (write)
+-		for (i = 0; i < count; i++)
+-			airoha_fe_wr(eth, CT_IFC_DATA(i), words[i]);
+-	airoha_fe_wr(eth, CT_IFC_CONTROL, command);
+-	err = read_poll_timeout_atomic(airoha_fe_rr, status, status & CT_IFC_DONE,
+-				       2, 1000, false, eth, CT_IFC_CONTROL);
+-	if (!err && !write)
+-		for (i = 0; i < count; i++)
+-			words[i] = airoha_fe_rr(eth, CT_IFC_DATA(i));
+-	return err;
++	return airoha_ct_ifc_command(ppe->eth, bank, index, page, write, words, count);
+ }
+ 

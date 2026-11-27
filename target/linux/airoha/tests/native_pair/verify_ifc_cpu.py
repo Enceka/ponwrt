@@ -66,7 +66,7 @@ struct airoha_gdm_dev {unsigned nbq;struct airoha_gdm_port*port;struct airoha_qd
 struct airoha_soc {struct {u32(*get_vip_port)(struct airoha_gdm_port*,unsigned);int(*get_sport)(struct airoha_gdm_port*,unsigned);}ops;};
 struct airoha_ppe;
 struct airoha_eth {struct airoha_gdm_port *ports[4];struct airoha_soc*soc;struct airoha_qdma qdma[2];struct airoha_ppe*ppe;void*dev;
- int ct_route_lock,ifc_port_lock;bool ct_cpu_fallback,ct_ifc_cpu_port_failed,ct_ifc_pon_ready;
+ int ct_route_lock,ifc_port_lock;bool ct_cpu_fallback,ct_ifc_cpu_port_failed,ct_ifc_pon_ready,ct_ifc_command_pending;
  bool ct_ordinary_full_test,ct_cpu_routes_ready,ct_cpu_ifc_disabled;
  u16 ct_cpu_route_mask[4];u32 ct_ifc_port_mask,ifc_port_desired;};
 static int flow_offload_mutex=1,ppe_lock,rcu;
@@ -123,6 +123,7 @@ static void airoha_fe_wr(struct airoha_eth*e,u32 reg,u32 value){
 static void airoha_fe_rmw(struct airoha_eth*e,u32 reg,u32 mask,u32 value){airoha_fe_wr(e,reg,(airoha_fe_rr(e,reg)&~mask)|value);}
 static void airoha_fe_clear(struct airoha_eth*e,u32 reg,u32 mask){airoha_fe_rmw(e,reg,mask,0);}
 #define read_poll_timeout(op,val,cond,delay,timeout,sleep,e,reg) ({(val)=op(e,reg);(cond)?0:-ETIMEDOUT;})
+#define read_poll_timeout_atomic read_poll_timeout
 '''
 pre+='#include "airoha_ct_cpu_fallback.h"\n'
 s=(h/'airoha_eth.c').read_text();pre+=function(s,'static void airoha_ifc_update_ports(')+'\n'+function(s,'int airoha_ifc_scope_ports(')+'\n'
@@ -307,18 +308,20 @@ int main(int argc,char**argv){
  reset();airoha_ppe_ct_ifc_start(&ppe);assert(ppe.ct_ifc.cfg_owned&&regs[0x200/4]==1);unsigned install_writes=writes,install_reads=reads;
  assert(install_writes==254);classifier();assert(!airoha_ppe_ct_ifc_stop(&ppe));unsigned restore_writes=writes-install_writes;restored();cases++;
  for(unsigned mode=0;mode<3;mode++)for(unsigned at=1;at<=install_writes;at++){
-  reset();fail_write=at;fail_mode=mode;airoha_ppe_ct_ifc_start(&ppe);assert(!ppe.ct_ifc.cfg_owned);restored();cases++;
+  reset();fail_write=at;fail_mode=mode;airoha_ppe_ct_ifc_start(&ppe);assert(!ppe.ct_ifc.cfg_owned);
+  regs[0x204/4]|=BIT(31);fail_write=0;assert(!airoha_ppe_ct_ifc_stop(&ppe));restored();cases++;
  }
  for(unsigned at=1;at<=install_reads;at++){
-  reset();fail_read=at;airoha_ppe_ct_ifc_start(&ppe);assert(!ppe.ct_ifc.cfg_owned);restored();cases++;
+  reset();fail_read=at;airoha_ppe_ct_ifc_start(&ppe);assert(!ppe.ct_ifc.cfg_owned);
+  regs[0x204/4]|=BIT(31);fail_read=0;assert(!airoha_ppe_ct_ifc_stop(&ppe));restored();cases++;
  }
  for(unsigned mode=0;mode<3;mode++)for(unsigned at=1;at<=restore_writes;at++){
   reset();airoha_ppe_ct_ifc_start(&ppe);fail_write=writes+at;fail_mode=mode;assert(airoha_ppe_ct_ifc_stop(&ppe)<0);assert(ct_ifc_pending(&ppe)&&!regs[0x200/4]);
-  fail_write=0;assert(!airoha_ppe_ct_ifc_stop(&ppe));restored();cases++;
+  fail_write=0;regs[0x204/4]|=BIT(31);assert(!airoha_ppe_ct_ifc_stop(&ppe));restored();cases++;
  }
  for(unsigned at=1;at<=install_writes;at++){
   reset();fail_from=at;fail_mode=1;airoha_ppe_ct_ifc_start(&ppe);assert(!ppe.ct_ifc.cfg_owned&&!regs[0x200/4]&&ct_ifc_pending(&ppe));
-  fail_from=0;assert(!airoha_ppe_ct_ifc_stop(&ppe));restored();cases++;
+  fail_from=0;regs[0x204/4]|=BIT(31);assert(!airoha_ppe_ct_ifc_stop(&ppe));restored();cases++;
  }
  for(unsigned at=0;at<64;at++){
   reset();table[2][at][2][0]|=BIT(31);airoha_ppe_ct_ifc_start(&ppe);assert(!writes&&!ppe.ct_ifc.cfg_owned&&!ct_ifc_pending(&ppe));cases++;
@@ -338,7 +341,7 @@ int main(int argc,char**argv){
  printf("{\"passed\":true,\"lifecycle_cases\":%lu,\"scope_cases\":%lu,\"classifier_cases\":%lu,\"install_writes\":%u,\"install_reads\":%u,\"restore_writes\":%u}\n",lifecycle_cases,cases-lifecycle_cases,classifier_cases,install_writes,install_reads,restore_writes);
 }
 '''
-for name in ('airoha_ct_ifc.h','airoha_ct_ifc_cpu.h','airoha_ct_cpu_fallback.h'):shutil.copy(h/name,b/name)
+for name in ('airoha_ct_ifc.h','airoha_ct_ifc_cpu.h','airoha_ct_cpu_fallback.h','airoha_ct_ifc_command.h'):shutil.copy(h/name,b/name)
 (b/'test.c').write_text(pre+main)
 subprocess.run(['clang','-O1','-g','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unused-function','-fsanitize=address,undefined','-I'+str(b),str(b/'test.c'),'-o',str(b/'test')],check=True)
 r=subprocess.run([str(b/'test')],capture_output=True,text=True);(b/'stdout.txt').write_text(r.stdout);(b/'stderr.txt').write_text(r.stderr)
