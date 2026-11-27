@@ -128,6 +128,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/patches-6.18/999-zp-net-airoha-decode-pon-er-service-from-fe-word1.patch \
   target/linux/airoha/patches-6.18/999-zq-net-airoha-add-nonempty-pon-auth-diagnostic.patch \
   target/linux/airoha/patches-6.18/999-zr-net-airoha-add-pon-ppe-learning-diagnostic.patch \
+  target/linux/airoha/patches-6.18/999-zs-net-airoha-set-ppe1-gdm2-default-cpu-port.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config,NATIVE_PAIRS.md} \
   target/linux/airoha/tests/native_pair/*.{py,c} \
   target/linux/airoha/tests/native_pair/fixtures/*.inc \

@@ -1,0 +1,34 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: program PPE1 default CPU port for GDM2
+
+Match stock SetGdmaFwd by programming the GDM2 default CPU port (CDM2)
+on PPE1 (bank 0) alongside PPE2 (bank 1). Authorized PON frames reinjected
+by NPU into PPE1 (PSE 4) then miss cleanly to WAN QDMA1 instead of CDM1.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -257,6 +257,8 @@
+ 				 airoha_ppe_is_enabled(eth, 1);
+ 			fport = airoha_get_fe_port(dev);
+ 			airoha_ppe_set_cpu_port(dev, ppe_id, fport);
++			if (ppe_id && fport == AIROHA_GDM2_IDX)
++				airoha_ppe_set_cpu_port(dev, 0, fport);
+ 			airoha_ppe_set_xmit_frame_size(dev);
+ 		}
+ 	}
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2952,7 +2952,12 @@
+ 	synchronize_rcu();
+ 
+ 	ppe_id = !airoha_is_lan_gdm_dev(dev) && airoha_ppe_is_enabled(eth, 1);
+-	airoha_ppe_set_cpu_port(dev, ppe_id, airoha_get_fe_port(dev));
++	{
++		u8 fport = airoha_get_fe_port(dev);
++		airoha_ppe_set_cpu_port(dev, ppe_id, fport);
++		if (ppe_id && fport == AIROHA_GDM2_IDX)
++			airoha_ppe_set_cpu_port(dev, 0, fport);
++	}
+ 
+ 	/* Seed qos_stats baselines with the new QDMA block's current
+ 	 * counter values to avoid a spurious spike on the first stats
