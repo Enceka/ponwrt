@@ -116,3 +116,28 @@ python3 verify_metadata.py --source /path/to/candidate/linux \
 HQoS 的适用条件已单独核对：`PpeSetPortInfo` 在 HIR `0xc/0xe/0xf/0x10` 查询 group `0x12`（LAN）和 `0x11`（WAN）的 command `0x9c`；原厂 `.data` 分派表此项是 `qdma_get_hqos_en()`。getter 在 `qdmaLanHqosMode` / `qdmaWanHqosMode == 1` 时返回 1，初始 `.bss` 值均为 0。工具实际执行两个 dispatcher 及 getter，验证初始关闭和显式启用两种状态，整个调用无需 helper 桩。PON 使用 WAN 查询结果：启用或 hook 返回 -1 时，T-CONT 0–15 的 FOE channel 加 16，NBQ 保留原 T-CONT；16–31 保持原 channel。HIR `0xa` 不做这两个查询。`stock-chip-layouts.json` 保存每项的原始 80 字节 FOE。原厂 `qdma_dev_hqos_init()` 将此开关写入 QDMA `base+0x90` bit31；未来启用重建 HQoS 时需同步支持这个 channel 变换，当前元数据差分采用原厂初始关闭配置。
 
 覆盖包括映射替换、删除、重建后重新分类的输入序列。并发 FOE 撤销、checked invalidation、quiesce/drain 和 CT PON admission 由本目录其它生命周期工具验收。光链路 O5/DBA、OLT 与线侧加密在光口验收阶段执行。
+
+## NPU 控制与双来源回送（2026-11-27）
+
+`988` 提供 AUTH36、ER35、GATE37 的内核传输接口，支持旧 LAN 能力 7 与
+LAN/PON 双来源能力 15。全零 ER QUERY 保留能力发现用途；所有修改操作校验
+source、不可变回显、状态与保留字段。`tests/npu_transaction_transport/` 在
+两种字节序下各通过 1,657 项检查，并捕获八项协议校验变异。
+
+`989` 为 SPORT24 和 SPORT2 分别维护 DMA 回送队列、NAPI、timer、lower 引用
+与统计。PON 描述符校验完整 16-bit service，并在 RCU 中核对当前映射。
+STOP/UNBIND 失败保留 handle 和 DMA，成功排空解绑后释放；reset 释放需匹配
+完整配置。`tests/eth_return/` 的两种字节序各通过 107 个 ASan/UBSan 用例。
+
+988/989 在 Linux 6.18.60 上完成 AArch64 驱动编译、模块 modpost/link 和完整
+vmlinux 链接。模块检查使用独立内核树，将基线中同一驱动的 17 个 built-in
+导出移出外部模块测试的符号清单，保留其余依赖；完整 vmlinux 检查恢复原清单。
+模块检查仅保留两个已有的 MODULE_DESCRIPTION 缺失警告，vmlinux 编译无警告。
+`hg5585f-ct/prepare-overlay.sh` 已包含这两项补丁及测试，生成内容经 SHA256SUMS
+逐文件校验。验收产物位于工作区 `build/pon-er-consumer-20261127/`。
+
+NPU 固件对应的双来源实现已经进入 `an7581-npu-firmware` 主仓库，两个队列
+共享 FE/channel7 停止与故障边界，各自维护 epoch、consumer 和 producer。
+下一步接入内核关闭/重开事务、native FE 共享所有权和 PON 映射更新，完成
+同 tuple 跨 LAN/PON 的硬件查表隔离后再开放 PON PPE 准入并做实板验收。
+当前设备沿用之前通过验收的 RAM 镜像。
