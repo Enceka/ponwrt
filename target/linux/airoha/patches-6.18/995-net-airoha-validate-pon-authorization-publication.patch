@@ -1,0 +1,174 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: validate PON authorization publication
+
+Add a header-only PON AUTH publisher using the existing AUTH36 mailbox
+ABI. Validate the entire canonical rule set, identities and firmware
+tuple/token/row uniqueness before BEGIN, then ADD each rule and ARM.
+Require immutable echoes and exact successful state at every boundary.
+
+The caller serializes publication, retains immutable rules, establishes
+the closed and drained owner state, and closes and advances the epoch
+after any failure. The helper never retries or opens GATE/FE.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_auth_publish.h
+@@ -0,0 +1,159 @@
++#ifndef AIROHA_NPU_AUTH_PUBLISH_H
++#define AIROHA_NPU_AUTH_PUBLISH_H
++
++#ifdef __KERNEL__
++#include <linux/errno.h>
++#include <linux/string.h>
++#else
++#include <errno.h>
++#include <string.h>
++#endif
++#include "npu_auth_mailbox_abi.h"
++
++#define AIROHA_NPU_AUTH_RULE_WORDS 32u
++#define AIROHA_NPU_AUTH_MAX_RULES 32u
++#define AIROHA_NPU_AUTH_FOE_ROWS 8192u
++
++struct airoha_npu_auth_rule {
++	auth_u32 raw[AIROHA_NPU_AUTH_RULE_WORDS];
++};
++
++_Static_assert(sizeof(struct airoha_npu_auth_rule) == 128,
++	       "PON authorization rule is 32 words");
++
++static inline int
++airoha_npu_auth_rules_validate(auth_u32 epoch, auth_u32 generation,
++			       const struct airoha_npu_auth_rule *rules,
++			       auth_u32 count)
++{
++	auth_u32 index, previous, word;
++
++	if (!epoch || !generation || !rules || !count ||
++	    count > AIROHA_NPU_AUTH_MAX_RULES)
++		return -EINVAL;
++	for (index = 0; index < count; ++index) {
++		const auth_u32 *raw = rules[index].raw;
++		const auth_u32 *key = raw + 9;
++		auth_u32 ppp_protocol;
++
++		if (raw[0] != AUTH_MBOX_ABI || raw[1] != epoch || !raw[2] ||
++		    raw[3] != 1u || raw[4] >= AIROHA_NPU_AUTH_FOE_ROWS ||
++		    raw[5] != 4u || raw[6] != 2u || raw[7] > 0xffffu ||
++		    raw[8] != generation || (key[1] != 6u && key[1] != 17u))
++			return -EINVAL;
++		switch (key[0]) {
++		case 4:
++			for (word = 1; word < 4; ++word)
++				if (key[2 + word] || key[6 + word])
++					return -EINVAL;
++			ppp_protocol = 0x21u;
++			break;
++		case 6:
++			ppp_protocol = 0x57u;
++			break;
++		default:
++			return -EINVAL;
++		}
++		if (key[11] > 2u || key[14] > 0xffffu)
++			return -EINVAL;
++		for (word = 0; word < key[11]; ++word) {
++			switch (key[12 + word] >> 16) {
++			case 0x8100:
++			case 0x88a8:
++				break;
++			default:
++				return -EINVAL;
++			}
++		}
++		for (word = key[11]; word < 2; ++word)
++			if (key[12 + word])
++				return -EINVAL;
++		if (!key[14])
++			ppp_protocol = 0;
++		if (key[15] != ppp_protocol ||
++		    (((key[16] >> 24) | (key[17] >> 8)) & 1u) ||
++		    !(key[16] | (key[17] >> 16)) ||
++		    !((key[17] & 0xffffu) | key[18]))
++			return -EINVAL;
++		for (word = 28; word < AIROHA_NPU_AUTH_RULE_WORDS; ++word)
++			if (raw[word])
++				return -EINVAL;
++		for (previous = 0; previous < index; ++previous) {
++			const auth_u32 *other = rules[previous].raw;
++
++			if (raw[2] == other[2] || raw[4] == other[4] ||
++			    !memcmp(key, other + 9, 11u * sizeof(auth_u32)))
++				return -EEXIST;
++		}
++	}
++	return 0;
++}
++
++static inline int
++airoha_npu_auth_publish_step(auth_u32 epoch, auth_u32 generation,
++			     auth_u32 op, const struct airoha_npu_auth_rule *rule,
++			     auth_u32 count,
++			     int (*command)(void *, struct npu_auth_message *),
++			     void *ctx)
++{
++	struct npu_auth_message message = {
++		.w = {
++			[AM_MAGIC] = AUTH_MBOX_MAGIC,
++			[AM_ABI_OP] = AUTH_MBOX_ABI | (op << 16),
++			[AM_BYTES] = AUTH_MBOX_BYTES,
++			[AM_EPOCH] = epoch,
++			[AM_GENERATION] = generation,
++			[AM_RULE_COUNT] = op == AUTH_MBOX_ADD ? 1u : 0u,
++			[AM_STATUS] = (auth_u32)-115,
++		},
++	};
++	struct npu_auth_message request;
++	int error;
++
++	if (rule)
++		memcpy(message.w + AM_RULE, rule->raw, sizeof(rule->raw));
++	request = message;
++	error = command(ctx, &message);
++	if (error)
++		return error < 0 ? error : -EPROTO;
++	if (memcmp(message.w, request.w, AM_STATUS * sizeof(auth_u32)) ||
++	    message.w[AM_STATUS] ||
++	    message.w[AM_CAPS] != AUTH_MBOX_CAPS ||
++	    message.w[AM_STATE_EPOCH] != epoch ||
++	    message.w[AM_STATE_GENERATION] != generation ||
++	    message.w[AM_COUNT] != count || message.w[AM_INFLIGHT] ||
++	    message.w[AM_ENABLED] != (op == AUTH_MBOX_ARM ? 1u : 0u) ||
++	    message.w[AM_RESERVED2])
++		return -EPROTO;
++	return 0;
++}
++
++static inline int
++airoha_npu_auth_publish(auth_u32 epoch, auth_u32 generation,
++			const struct airoha_npu_auth_rule *rules, auth_u32 count,
++			int (*command)(void *, struct npu_auth_message *), void *ctx)
++{
++	auth_u32 index;
++	int error;
++
++	if (!command)
++		return -EINVAL;
++	error = airoha_npu_auth_rules_validate(epoch, generation, rules, count);
++	if (error)
++		return error;
++	error = airoha_npu_auth_publish_step(epoch, generation, AUTH_MBOX_BEGIN,
++					     0, 0, command, ctx);
++	if (error)
++		return error;
++	for (index = 0; index < count; ++index) {
++		error = airoha_npu_auth_publish_step(epoch, generation, AUTH_MBOX_ADD,
++						     &rules[index], index + 1,
++						     command, ctx);
++		if (error)
++			return error;
++	}
++	return airoha_npu_auth_publish_step(epoch, generation, AUTH_MBOX_ARM,
++					    0, count, command, ctx);
++}
++
++#endif
