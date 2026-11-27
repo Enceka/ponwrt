@@ -24,7 +24,7 @@ def main():
     parser.add_argument('--output', type=Path, default=tests / 'out')
     parser.add_argument('--cc', default=os.environ.get('CC', 'clang'))
     parser.add_argument('--source', type=Path, required=True,
-                        help='Kernel tree with patches through 994 applied')
+                        help='Kernel tree with patches through 996 applied')
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -33,7 +33,7 @@ def main():
         report_path.unlink()
     patches = tests.parents[1] / 'patches-6.18'
     paths = {number: next(patches.glob(number + '-*.patch'))
-             for number in ('988', '989', '990', '993', '994')}
+             for number in ('988', '989', '990', '993', '994', '995', '996')}
     inputs = {number: path.read_bytes() for number, path in paths.items()}
     sources = {}
     for name in (*helper.ABIS, 'airoha_npu_transaction.h'):
@@ -46,21 +46,29 @@ def main():
     expected.mkdir(parents=True, exist_ok=True)
     (expected / owner_name).write_bytes(sources[owner_name])
     return_patch = inputs['994'].decode()
-    owner_patch = '--- a/drivers/net/ethernet/airoha/' + owner_name + '\n'
-    owner_patch += return_patch.split(owner_patch, 1)[1].split('--- /dev/null', 1)[0]
-    applied = subprocess.run(['patch', '--batch', '-p1'], input=owner_patch,
-                             cwd=output / 'expected', capture_output=True, text=True)
-    (output / 'apply-994.log').write_text(applied.stdout + applied.stderr)
-    if applied.returncode:
-        raise RuntimeError('cannot apply 994 owner: ' + applied.stdout + applied.stderr)
+    for number in ('994', '996'):
+        owner_patch = '--- a/drivers/net/ethernet/airoha/' + owner_name + '\n'
+        owner_patch += inputs[number].decode().split(owner_patch, 1)[1].split('--- /dev/null', 1)[0]
+        applied = subprocess.run(['patch', '--batch', '-p1'], input=owner_patch,
+                                 cwd=output / 'expected', capture_output=True, text=True)
+        (output / ('apply-' + number + '.log')).write_text(applied.stdout + applied.stderr)
+        if applied.returncode:
+            raise RuntimeError('cannot apply ' + number + ' owner: ' + applied.stdout + applied.stderr)
     sources[owner_name] = (expected / owner_name).read_bytes()
     return_name = 'airoha_npu_return.h'
     sources[return_name] = helper.added_file(return_patch, return_name)
+    admission_name = 'airoha_npu_admission.h'
+    sources[admission_name] = helper.added_file(inputs['996'].decode(), admission_name)
+    publish_name = 'airoha_npu_auth_publish.h'
+    sources[publish_name] = helper.added_file(inputs['995'].decode(), publish_name)
     driver = args.source.resolve() / 'drivers/net/ethernet/airoha'
     if (driver / owner_name).read_bytes() != sources[owner_name]:
-        raise RuntimeError('kernel owner differs from current 993/994')
+        raise RuntimeError('kernel owner differs from current 993/994/996')
     if (driver / return_name).read_bytes() != sources[return_name]:
         raise RuntimeError('kernel return owner differs from current 994')
+    for name in (admission_name, publish_name):
+        if (driver / name).read_bytes() != sources[name]:
+            raise RuntimeError('kernel admission source differs: ' + name)
     ppe_source = (driver / 'airoha_ppe.c').read_text()
     sources['commit_entry.inc'] = route_helper.extract_function(
         ppe_source, 'airoha_ppe_foe_commit_entry').encode()
@@ -99,6 +107,15 @@ def main():
         'return_reuse_retiring': ('smp_store_release(&path->bound, false);', ''),
     }
     mutants.update(return_mutants)
+    admission_mutants = {
+        'auth_repeat_publish': (' || owner->auth_attempted)', ')'),
+        'ignore_auth_service': ('ER_SERVICE_VALID | rules[index].raw[7]', 'ER_SERVICE_VALID'),
+        'ignore_post_auth_generation': ('if (!error)\n\t\terror = airoha_npu_owner_return_ready(owner, &owner->txn.id);', ''),
+        'ignore_auth_state': ('message.w[AM_COUNT] != owner->auth_count', 'false'),
+        'ignore_ready_query_race': ('return airoha_npu_owner_return_ready(owner, id);', 'return 0;'),
+        'renew_before_retiring': ('error = airoha_ppe_npu_owner_close_locked(eth);\n\tif (error)\n\t\treturn error;', 'error = 0;'),
+    }
+    mutants.update(admission_mutants)
     mutation_results = {}
     mutants['repeat_restored_stop'] = (
         'if (ppe->ct_npu_owner && ppe->ct_npu_owner->stop_completed)', 'if (false)')
@@ -106,7 +123,8 @@ def main():
         'if (ppe->ct_npu_owner && ppe->ct_npu_owner->native_stopped)', 'if (false)')
     for name, (before, after) in mutants.items():
         target_name = ('stop_entry.inc' if name.startswith('repeat_') else
-                       return_name if name in return_mutants else owner_name)
+                       return_name if name in return_mutants else
+                       admission_name if name in admission_mutants else owner_name)
         original = sources[target_name].decode()
         if before not in original:
             raise RuntimeError('missing mutation target: ' + name)
@@ -132,7 +150,7 @@ def main():
         'source_sha256': {name: sha256(data) for name, data in sources.items()},
         'test_sha256': {name: sha256((tests / name).read_bytes())
                         for name in ('verify.py', 'owner_test.c', 'return_types.h',
-                                     'return_stubs.inc', 'return_test.inc')},
+                                     'return_stubs.inc', 'return_test.inc', 'admission_test.inc')},
     }
     report_path.write_text(json.dumps(report, indent=2) + '\n')
     print(result)

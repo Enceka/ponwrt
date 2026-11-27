@@ -24,6 +24,7 @@
 
 struct device;
 struct airoha_eth;
+int airoha_ppe_npu_owner_close_locked(struct airoha_eth *eth);
 struct er_config;
 struct er_message;
 struct airoha_er;

@@ -14,8 +14,9 @@ phase, original bank1 registers, and exact attempted identity for retry.
 
 While claimed, new bank1 BIND publications return `-EBUSY`. Bank0 and row
 invalidation keep their existing paths. The claim is explicit; boot and normal
-PON updates do not claim automatically. PON qualification and reopen callbacks
-remain disabled pending source/service admission and return-ring integration.
+PON updates do not claim automatically. PON qualification and the hardware
+reopen callbacks remain disabled; service admission and return preparation
+below are explicit internal operations.
 
 `994` adds a PON return consumer owned by the same transaction. Preparation
 requires a live GDM2/WAN lower, a valid GPON service table and the current
@@ -30,11 +31,22 @@ teardown retains the consumer and resumes without repeatedly advancing its
 epoch. Preparation reserves the final epoch for closing and retirement.
 This remains an internal explicit entry; optical qualification is unchanged.
 
-Run against a kernel source tree containing patches through `994`:
+`995` validates and publishes complete PON AUTH sets. `996` connects it to
+the closed owner: every service must belong to the pinned return mapping,
+the FE and ring identities must match, and generation is checked again after
+ARM. Any attempted publication consumes the admission attempt until close
+completes; malformed inputs send no AUTH command. READY checks current AUTH
+count and identity, then checks generation again after the QUERY reply.
+The renew entry fully closes the old identity and destroys its return ring
+before beginning a new generation. Failed old or new close stages preserve
+their attempted identity on retry. Hardware qualification and the remaining
+reopen callbacks still gate activation.
+
+Run against a kernel source tree containing patches through `996`:
 
 ```sh
 python3 target/linux/airoha/tests/npu_owner/verify.py \
-  --source /absolute/path/to/linux-after-994 \
+  --source /absolute/path/to/linux-after-996 \
   --output /absolute/path/to/results/npu-owner
 ```
 
@@ -55,7 +67,10 @@ retention, generation truncation, premature release, and repeated native or
 hardware restoration. Return ownership adds capability failures, uncertain
 BIND outcomes, mapping changes, all 65,536 GEM values, exact configuration
 checks, shutdown ordering, fault-work retries and epoch exhaustion. The
-combined suite passes 73,069 checks and eleven runtime mutants. The return
+authorization tests cover lost BEGIN/ADD/ARM replies, a generation change
+during publication or READY query, failed close retries, generation renewal
+and aborting a partial reopen. The combined suite passes 76,139 checks and
+seventeen runtime mutants. The return
 consumer's NAPI/DMA implementation is tested separately by `eth_return`;
 this suite injects its allocation, bind and teardown boundaries.
 

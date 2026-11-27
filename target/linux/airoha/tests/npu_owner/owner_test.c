@@ -60,11 +60,12 @@ struct airoha_ppe {
     bool ct_host_ppe, ct_restore_pending;
     bool ct_native_pairs, ct_pair_policy_allowed, ct_stopping, ct_owns_sram;
     bool ct_pon_ifc_route_owned;
+    bool ct_pon_qualified;
     u32 ct_pair_token;
     struct { u32 regs[2], glo; } ct_saved[2];
     u32 ct_pair_wired_epoch;
     struct { const void *owner; u32 epoch; u64 generation;
-             bool pending, armed, touched, arm_pending; } ct_fe;
+             bool pending, armed, touched, arm_pending, owner_quiesced; } ct_fe;
 };
 struct airoha_soc {
     int num_ppe;
@@ -75,7 +76,7 @@ struct airoha_eth {
     struct airoha_npu *npu;
     struct airoha_soc *soc;
     int ct_route_lock;
-    struct { const void *owner; } ct_bank1_routes;
+    struct { const void *owner; bool ready; } ct_bank1_routes;
     u32 regs[6];
     void *dev;
     struct airoha_qdma qdma[2];
@@ -88,6 +89,9 @@ static unsigned int allocated, freed, gate_calls[4], auth_calls[8], fe_calls;
 static int fail_gate = -1, fail_auth = -1, fail_write = -1;
 static bool fail_alloc, fail_route, fail_fe, fail_release, fail_fe_release, busy_fe;
 static u32 caps, gate_epoch, gate_generation, auth_epoch, auth_generation;
+static u32 published_count, published_enabled;
+static bool auth_lose_ack, auth_bad_echo, auth_change_generation;
+static bool auth_query_change_generation;
 static u64 bridge_generation;
 static u32 attempted_epoch;
 static u64 attempted_generation;
@@ -156,6 +160,7 @@ static int airoha_bank1_routes_claim(struct airoha_eth *eth, const void *owner)
 {
     CHECK(flow_offload_mutex && !ppe_lock && owner);
     eth->ct_bank1_routes.owner = owner;
+    eth->ct_bank1_routes.ready = !fail_route;
     return fail_route ? -EIO : 0;
 }
 static int airoha_bank1_routes_release(struct airoha_eth *eth, const void *owner)
@@ -164,6 +169,7 @@ static int airoha_bank1_routes_release(struct airoha_eth *eth, const void *owner
     if (fail_release)
         return -EIO;
     eth->ct_bank1_routes.owner = NULL;
+    eth->ct_bank1_routes.ready = false;
     return 0;
 }
 static int airoha_ct_fe_owner_claim(struct airoha_ppe *ppe, const void *owner)
@@ -189,6 +195,7 @@ static int airoha_ct_fe_owner_quiesce(struct airoha_ppe *ppe, const void *owner,
     ppe->ct_fe.epoch = epoch;
     ppe->ct_fe.generation = generation;
     ppe->ct_fe.pending = false;
+    ppe->ct_fe.owner_quiesced = true;
     return 0;
 }
 static int airoha_ct_fe_owner_release(struct airoha_ppe *ppe, const void *owner)
@@ -197,6 +204,7 @@ static int airoha_ct_fe_owner_release(struct airoha_ppe *ppe, const void *owner)
     if (fail_fe_release)
         return -EIO;
     ppe->ct_fe.owner = NULL;
+    ppe->ct_fe.owner_quiesced = false;
     return 0;
 }
 
@@ -278,18 +286,43 @@ int airoha_npu_auth_command(struct airoha_npu *npu, struct npu_auth_message *mes
     unsigned int operation = message->w[AM_ABI_OP] >> 16;
     CHECK(npu && !ppe_lock && flow_offload_mutex && operation < 8);
     auth_calls[operation]++;
-    if ((int)operation == fail_auth)
+    if ((int)operation == fail_auth && !auth_lose_ack)
         return -ETIMEDOUT;
     CHECK(gate_calls[GATE_CLOSE]);
     if (operation == AUTH_MBOX_DISARM) {
         CHECK(message->w[AM_EPOCH] == auth_epoch);
         CHECK(message->w[AM_GENERATION] == auth_generation);
-    } else
+        published_enabled = 0;
+    } else if (operation == AUTH_MBOX_BEGIN) {
+        CHECK(message->w[AM_EPOCH] > auth_epoch);
+        auth_epoch = message->w[AM_EPOCH];
+        auth_generation = message->w[AM_GENERATION];
+        published_count = published_enabled = 0;
+    } else if (operation == AUTH_MBOX_ADD) {
+        CHECK(message->w[AM_EPOCH] == auth_epoch && !published_enabled);
+        CHECK(message->w[AM_GENERATION] == auth_generation);
+        published_count++;
+    } else if (operation == AUTH_MBOX_ARM) {
+        CHECK(message->w[AM_EPOCH] == auth_epoch && published_count);
+        CHECK(message->w[AM_GENERATION] == auth_generation);
+        published_enabled = 1;
+        if (auth_change_generation)
+            bridge_generation++;
+    } else {
         CHECK(operation == AUTH_MBOX_QUERY);
+        if (auth_query_change_generation)
+            bridge_generation++;
+    }
+    if ((int)operation == fail_auth)
+        return -ETIMEDOUT;
     message->w[AM_STATUS] = 0;
     message->w[AM_CAPS] = AUTH_MBOX_CAPS;
     message->w[AM_STATE_EPOCH] = auth_epoch;
     message->w[AM_STATE_GENERATION] = auth_generation;
+    message->w[AM_COUNT] = published_count;
+    message->w[AM_ENABLED] = published_enabled;
+    if (auth_bad_echo)
+        message->w[AM_RULE + 19] ^= 1;
     return 0;
 }
 
@@ -318,6 +351,9 @@ static void setup(struct airoha_eth *eth, struct airoha_ppe *ppe,
     auth_epoch = 21;
     auth_generation = 19;
     bridge_generation = 4;
+    published_count = published_enabled = 0;
+    auth_lose_ack = auth_bad_echo = auth_change_generation = false;
+    auth_query_change_generation = false;
 }
 
 static void check_closed(struct airoha_eth *eth)
@@ -333,6 +369,7 @@ static void check_closed(struct airoha_eth *eth)
 }
 
 #include "return_test.inc"
+#include "admission_test.inc"
 
 static void check_binding(struct airoha_eth *eth)
 {
@@ -511,6 +548,7 @@ int main(void)
     }
     CHECK(allocated == freed);
     check_returns();
+    check_authorization();
     printf("npu owner: %u checks passed\n", checks);
     return 0;
 }
