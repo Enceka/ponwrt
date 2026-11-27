@@ -28,6 +28,8 @@ def main():
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if not __debug__:
+        parser.error('assertion-based verification requires Python without -O')
     headers = args.source.resolve() / 'drivers/net/ethernet/airoha'
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -48,13 +50,29 @@ def main():
             'airoha_ct_pon_ifc_route_open', 'airoha_ct_pon_ifc_cpu_stop',
             'airoha_ct_pon_ifc_cpu_publish',
             'airoha_ct_pon_ifc_cpu_set', 'airoha_ct_pon_ifc_cpu_clear',
+            'airoha_ct_pon_ifc_repair_work',
             'airoha_ct_pon_ifc_source_set',
             'ct_pon_cpu_probe_store'],
     }
     complete = ['airoha_ct_pon_ifc_words.h', 'airoha_ct_pon_ifc_owner.h',
                 'airoha_ct_ifc_command.h']
+    pool_headers = ['airoha_ct_ifc_tuple_words.h', 'airoha_ct_ifc_tuple_pool.h']
+    pool_available = all((headers / name).is_file() for name in pool_headers)
+    if pool_available:
+        complete += pool_headers
     sources = {name: (headers / name).read_text() for name in list(selections) + complete + ['airoha_eth.h']}
+    optical = sources['airoha_ct_pon_ifc_cpu.h']
+    tuple_available = bool(re.search(r'\bairoha_ct_pon_ifc_cpu_tuple\(', optical))
+    if tuple_available:
+        assert pool_available, 'tuple probe requires the 980 and 985 headers'
+        additions = re.findall(r'(?m)^static (?:int|bool|void|u32|struct \w+)\s+'
+                               r'(airoha_ct_pon_ifc_tuple_\w+|airoha_ct_pon_ifc_rows_check|'
+                               r'airoha_ct_pon_ifc_cpu_tuple)\(', optical)
+        selections['airoha_ct_pon_ifc_cpu.h'] += additions
+        selections['airoha_ct_pon_ifc_cpu.h'].sort(key=lambda name: optical.index(function(optical, name)))
     constants = '\n'.join(re.findall(r'(?m)^#define CT_IFC_.*$', sources['airoha_ct_ifc.h'])) + '\n'
+    constants += f'#define PROBE_HAVE_TUPLE_POOL {int(pool_available)}\n'
+    constants += f'#define PROBE_HAVE_TUPLE {int(tuple_available)}\n'
     guards = re.search(r'static const struct \{\s*u16 udf, min, max;.*?ct_ifc_guard\[\] = \{.*?\n\};',
                        sources['airoha_ct_ifc.h'], re.S)
     actions = re.search(r'static const u8 ct_ifc_action_words\[\] = .*?;', sources['airoha_ct_ifc.h'])
@@ -71,6 +89,8 @@ def main():
         function(sources[name], selected) for name, names in selections.items() for selected in names)
     test = output / 'verify_ifc_probe.c'
     shutil.copyfile(Path(__file__).with_suffix('.c'), test)
+    tuple_test = output / 'verify_ifc_probe_tuple.c'
+    shutil.copyfile(Path(__file__).with_name(tuple_test.name), tuple_test)
 
     def run(name, code, sanitized, overrides=None, arguments=()):
         directory = output / name
@@ -116,6 +136,22 @@ def main():
         results.append(dict(mode=mode, **result))
     assert {key: value for key, value in results[0].items() if key != 'mode'} == {
         key: value for key, value in results[1].items() if key != 'mode'}
+    tuple_results = []
+    if tuple_available:
+        for mode in ('plain', 'sanitized'):
+            tested = run('tuple-' + mode, extracted, mode == 'sanitized', arguments=('tuple',))
+            tested.check_returncode()
+            result = json.loads(tested.stdout)
+            assert result['passed'] and result['tuple_cases']
+            for counter in ('tuple_transport_faults', 'tuple_blocked_retries', 'tuple_orphan_faults',
+                            'tuple_release_faults', 'tuple_readback_faults', 'tuple_tamper_cases',
+                            'tuple_guard_cases', 'tuple_late_consumer_faults', 'tuple_capacity_cases',
+                            'tuple_saved_cleared_faults', 'tuple_recovery_faults', 'tuple_input_cases',
+                            'tuple_ownership_cases', 'tuple_failed_drain_cases', 'tuple_worker_cases'):
+                assert result[counter] > 0, counter
+            tuple_results.append(dict(mode=mode, **result))
+        assert {key: value for key, value in tuple_results[0].items() if key != 'mode'} == {
+            key: value for key, value in tuple_results[1].items() if key != 'mode'}
 
     mutations = [
         ('service_partial_sif_mask', 'header:airoha_ct_pon_ifc_words.h',
@@ -156,7 +192,8 @@ def main():
         ('route_skips_action_audit', 'airoha_ct_pon_ifc_route_open',
          'if (memcmp(actual, expected.action[page],', 'if (false && memcmp(actual, expected.action[page],'),
         ('route_partial_cover_returns_success', 'airoha_ct_pon_ifc_route_open',
-         'err = -ESHUTDOWN;\n\t\t\tgoto out;', 'err = 0;\n\t\t\tgoto out;'),
+         'if ((ppe->ct_pon_ifc.active & (3 << (slot * 2))) != (3 << (slot * 2))) {\n\t\t\terr = -ESHUTDOWN;',
+         'if ((ppe->ct_pon_ifc.active & (3 << (slot * 2))) != (3 << (slot * 2))) {\n\t\t\terr = 0;'),
         ('route_skips_cfg_owned', 'airoha_ct_pon_ifc_route_open',
          '!ppe->ct_ifc.cfg_owned ||', 'false ||'),
         ('route_skips_exact_scope', 'airoha_ct_pon_ifc_route_open',
@@ -239,6 +276,63 @@ def main():
          'eth->ct_ifc_port_mask = scope;',
          'eth->ifc_port_desired = scope;\n\t\teth->ct_ifc_port_mask = scope;'),
     ]
+    tuple_mutations = [
+        ('tuple_busy_only_mode', 'airoha_ct_pon_ifc_tuple_busy',
+         'return ppe->ct_pon_ifc_tuple || pool->pending || pool->reserved || pool->dirty ||\n'
+         '\t       pool->leases || pool->releasing || ppe->ct_pon_ifc_lease[0].count ||\n'
+         '\t       ppe->ct_pon_ifc_lease[1].count;',
+         '(void)pool; return ppe->ct_pon_ifc_tuple;'),
+        ('tuple_overwrite_live_leases', 'airoha_ct_pon_ifc_cpu_publish',
+         'if (!slot && airoha_ct_pon_ifc_tuple_busy(ppe))', 'if (false)'),
+        ('tuple_no_combined_capacity', 'airoha_ct_pon_ifc_cpu_tuple',
+         'err = airoha_ct_pon_ifc_tuple_space(ppe, words);',
+         'err = ((void)airoha_ct_pon_ifc_tuple_space, 0);'),
+        ('tuple_second_family_skipped', 'airoha_ct_pon_ifc_cpu_tuple',
+         'for (family = 0; family < 2; family++) {', 'for (family = 0; family < 1; family++) {'),
+        ('tuple_fixed_short_index', 'airoha_ct_pon_ifc_tuple_rows',
+         'unsigned int short_lut = ppe->ct_ifc.rule[family].lut_index;',
+         'unsigned int short_lut = 31 - family;'),
+        ('tuple_loses_slot31', 'airoha_ct_pon_ifc_tuple_rows',
+         'u32 mask = ppe->ct_pon_ifc_lease[family].mask;',
+         'u32 mask = ppe->ct_pon_ifc_lease[family].mask & ~BIT(31);'),
+        ('tuple_short_positive', 'airoha_ct_pon_ifc_tuple_rows',
+         'rows[family].tcam[4][0] = mask;', 'rows[family].tcam[4][0] = mask | BIT(short_lut);'),
+        ('tuple_route_skips_check', 'airoha_ct_pon_ifc_route_open',
+         'err = airoha_ct_pon_ifc_tuple_check(ppe);',
+         'err = ((void)airoha_ct_pon_ifc_tuple_check, 0);'),
+        ('tuple_route_skips_short_dependency', 'airoha_ct_pon_ifc_route_open',
+         'err = airoha_ct_pon_ifc_dependencies(ppe);', 'err = 0;'),
+        ('tuple_skips_cover_check', 'airoha_ct_pon_ifc_cpu_tuple',
+         'err = airoha_ct_pon_ifc_rows_check(ppe, 1, rows);', 'err = 0;'),
+        ('tuple_lut_data1_not_checked', 'airoha_ct_pon_ifc_tuple_check',
+         'if (memcmp(actual, words[family].lut[index], sizeof(actual)))',
+         'if (actual[0] != words[family].lut[index][0])'),
+        ('tuple_consumer_key_not_checked', 'airoha_ct_pon_ifc_rows_check',
+         '((actual[0] ^ rows[family].tcam[page][0]) & actual[1])', 'false'),
+        ('tuple_consumer_mask_not_checked', 'airoha_ct_pon_ifc_rows_check',
+         'actual[1] != rows[family].tcam[page][1]', 'false'),
+        ('tuple_consumer_action_not_checked', 'airoha_ct_pon_ifc_rows_check',
+         'if (memcmp(actual, rows[family].action[page],',
+         'if (false && memcmp(actual, rows[family].action[page],'),
+        ('tuple_release_skips_orphans', 'airoha_ct_pon_ifc_tuple_release',
+         'err = airoha_ct_ifc_pool_recover(pool, &io);', 'err = 0;'),
+        ('tuple_release_only_first_lease', 'airoha_ct_pon_ifc_tuple_release',
+         'for (family = 0; family < 2; family++)', 'for (family = 0; family < 1; family++)'),
+        ('tuple_stop_returns_with_pool', 'airoha_ct_pon_ifc_cpu_stop',
+         '!airoha_ct_pon_ifc_tuple_busy(ppe))', 'true)'),
+        ('tuple_clear_releases_after_failed_withdraw', 'airoha_ct_pon_ifc_cpu_clear',
+         'if (!err && !slot && airoha_ct_pon_ifc_tuple_busy(ppe))',
+         'if (!slot && airoha_ct_pon_ifc_tuple_busy(ppe))'),
+        ('tuple_stop_releases_after_failed_restore', 'airoha_ct_pon_ifc_cpu_stop',
+         'if (!err && airoha_ct_pon_ifc_tuple_busy(ppe))',
+         'if (airoha_ct_pon_ifc_tuple_busy(ppe))'),
+        ('tuple_worker_ignores_stopping', 'airoha_ct_pon_ifc_repair_work',
+         'if (!READ_ONCE(ppe->ct_pon_ifc_work_stopping))', 'if (true)'),
+        ('tuple_worker_skips_reschedule', 'airoha_ct_pon_ifc_repair_work',
+         'schedule_delayed_work(&ppe->ct_pon_ifc_work, msecs_to_jiffies(100));', '((void)0);'),
+        ('tuple_drain_clears_failed_pending', 'header:airoha_ct_ifc_tuple_pool.h',
+         'if (!err)\n\t\tpool->pending = false;', 'pool->pending = false;'),
+    ] if tuple_available else []
 
     def negative(specification):
         name, selected, old, new = specification
@@ -256,7 +350,8 @@ def main():
             command_header = sources['airoha_ct_ifc_command.h']
             assert old in command_header, name
             overrides['airoha_ct_ifc_command.h'] = command_header.replace(old, new, 1)
-        tested = run('mutations/' + name, code, True, overrides)
+        arguments = ('tuple',) if name.startswith('tuple_') else ()
+        tested = run('mutations/' + name, code, True, overrides, arguments)
         assert tested.returncode == -signal.SIGABRT, (name, tested.returncode, tested.stderr)
         assert 'assert' in tested.stderr.lower() and 'failed' in tested.stderr.lower(), (name, tested.stderr)
         assert not any(marker in tested.stderr for marker in
@@ -265,23 +360,26 @@ def main():
                     returncode=tested.returncode, assertion=tested.stderr.strip())
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        rejected = list(executor.map(negative, mutations))
+        rejected = list(executor.map(negative, mutations + tuple_mutations))
     stuck = []
     for mode in ('plain', 'sanitized'):
         tested = run('stuck-route-' + mode, extracted, mode == 'sanitized', arguments=('stuck-route',))
         stuck.append(dict(mode=mode, passed=tested.returncode == 0,
                           returncode=tested.returncode, stdout=tested.stdout, stderr=tested.stderr))
     passed = all(result['passed'] for result in stuck)
-    report = dict(passed=passed, modes=results, stuck_route=stuck, runtime_mutations=rejected,
+    report = dict(passed=passed, modes=results, tuple_modes=tuple_results,
+                  stuck_route=stuck, runtime_mutations=rejected,
                   extracted_functions=selections, source=str(args.source.resolve()),
                   source_sha256={name: hashlib.sha256(text.encode()).hexdigest() for name, text in sources.items()},
                   extracted_sha256=hashlib.sha256(extracted.encode()).hexdigest(),
                   test_sha256=hashlib.sha256(test.read_bytes()).hexdigest(),
+                  tuple_test_sha256=hashlib.sha256(tuple_test.read_bytes()).hexdigest(),
                   stubs=['MMIO and command completion', 'lock and RCU assertions',
                          'work scheduling and netdev state'],
                   sanitizers=['address', 'undefined'])
     (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
-    print(json.dumps(dict(passed=passed, modes=results, stuck_route=stuck, runtime_mutations=len(rejected),
+    print(json.dumps(dict(passed=passed, modes=results, tuple_modes=tuple_results,
+                          stuck_route=stuck, runtime_mutations=len(rejected),
                           report=str(output / 'report.json')), indent=2))
     assert passed, 'owned CPU route must be acknowledged before disabling IFC; see stuck-route logs'
 

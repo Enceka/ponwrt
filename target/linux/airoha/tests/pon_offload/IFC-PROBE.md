@@ -169,6 +169,16 @@ source probes return `-EBUSY` while tuple ownership remains. Status appends
 The board runner's `--exact-tuple --tuple-variants --cover-slot 1 --special-tag`
 matrix requires two packets on RX2 and eighteen on RX4.
 
+The 2026-11-27 host run passed 6,915 existing cases and 2,226 tuple cases in
+both plain and ASan/UBSan builds, with all 78 runtime mutants caught (22 use
+the tuple entry point). The tuple matrix includes 1,605 command faults,
+3,210 blocked retries, 63 partial second-family acquisitions, 196 failed
+releases, 301 additional recovery failures and 98 retries after consumer
+restoration has cleared `saved_valid`. Twelve cases apply a delayed hardware
+write while drain still times out; four execute the production repair worker
+without RTNL and check rescheduling and shutdown. Evidence:
+`build/pon-ifc-tuple-987-test-final/report.json` in the enclosing workspace.
+
 The stock investigation identified GDM2 loopback and special-tag configuration
 as the next no-fiber ingress experiment. Relevant stock FE symbols are
 `fe_api_set_loopback_enable` at `0x7df8`, `fe_api_set_loopback_mode` at `0x7e68`,

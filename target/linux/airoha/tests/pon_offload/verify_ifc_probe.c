@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,12 +51,16 @@ typedef uint32_t u32;
 struct iphdr { u8 bytes[20]; };
 #include "probe_constants.inc"
 #include "airoha_ct_pon_ifc_owner.h"
+#if PROBE_HAVE_TUPLE_POOL
+#include "airoha_ct_ifc_tuple_pool.h"
+#endif
 
 struct lock { bool held; unsigned int rank; };
 static struct lock ppe_lock = { .rank = 1 }, flow_offload_mutex;
 static struct lock *lock_stack[3];
 static unsigned int lock_depth;
 static bool rtnl;
+static bool worker_context;
 static unsigned int rcu_depth;
 #define lockdep_assert_held(lock) assert((lock)->held)
 #define ASSERT_RTNL() assert(rtnl)
@@ -77,8 +82,8 @@ static void rcu_read_lock(void) { rcu_depth++; }
 static void rcu_read_unlock(void) { assert(rcu_depth); rcu_depth--; }
 static void rtnl_lock(void) { assert(!rtnl); rtnl = true; }
 static void rtnl_unlock(void) { assert(rtnl && !flow_offload_mutex.held); rtnl = false; }
-static void mutex_lock(struct lock *lock) { assert(rtnl && !lock->held); lock->held = true; }
-static void mutex_unlock(struct lock *lock) { assert(rtnl && lock->held); lock->held = false; }
+static void mutex_lock(struct lock *lock) { assert((rtnl || worker_context) && !lock->held); lock->held = true; }
+static void mutex_unlock(struct lock *lock) { assert((rtnl || worker_context) && lock->held); lock->held = false; }
 struct device { struct airoha_eth *data; };
 struct device_attribute { unsigned int unused; };
 static void *dev_get_drvdata(struct device *dev) { return dev->data; }
@@ -107,7 +112,10 @@ static int kstrtouint(const char *text, unsigned int base, unsigned int *value)
 	*value = parsed;
 	return 0;
 }
-struct work { unsigned int scheduled; };
+struct work_struct { unsigned int unused; };
+struct work { struct work_struct work; unsigned int scheduled; };
+#define container_of(pointer, type, member) ((type *)((char *)(pointer) - offsetof(type, member)))
+#define to_delayed_work(item) container_of(item, struct work, work)
 static void schedule_delayed_work(struct work *work, unsigned int delay)
 {
 	assert(delay == 0 || delay == 100);
@@ -133,6 +141,11 @@ struct airoha_eth {
 struct airoha_ppe {
 	struct airoha_eth *eth;
 	struct airoha_ct_pon_ifc_owner ct_pon_ifc;
+#if PROBE_HAVE_TUPLE_POOL
+	struct airoha_ct_ifc_pool ct_pon_ifc_pool;
+	struct airoha_ct_ifc_pool_lease ct_pon_ifc_lease[2];
+	bool ct_pon_ifc_tuple;
+#endif
 	struct { bool cfg_owned; struct { u32 lut_index; bool lut_dirty; } rule[2]; } ct_ifc;
 	struct { bool health_stopping, active; struct work health_work; } ct_fe;
 	struct work ct_pon_ifc_work;
@@ -148,6 +161,9 @@ enum fault { NONE, BEFORE, AFTER, DEFERRED, READBACK };
 struct simulation {
 	u32 table[3][64][9][3], registers[0x900 / 4];
 	u32 original[4][2][9][3], command;
+	u32 original_lut[32][2];
+	struct { u32 command, words[3]; } trace[4096];
+	unsigned int trace_count;
 	unsigned int commands, data_writes, control_writes, fail_at, port_writes, table_writes;
 	unsigned int port_fail_first, port_fail_last, gate_clears;
 	unsigned int route_reads;
@@ -156,6 +172,8 @@ struct simulation {
 	enum fault route_fault;
 	bool route_read_error, cpu_route_stuck, enforce_cpu_before_table, cpu_acknowledged;
 	bool audit_route_open, enforce_cpu_before_gate, source_publish;
+	bool tuple_watch;
+	bool complete_without_done;
 	enum fault fault;
 	bool busy, release, late, gate_stuck, route_drop, require_gate_closed;
 };
@@ -194,6 +212,10 @@ static void complete_command(void)
 	unsigned int count = page_words(bank, page);
 
 	assert(bank < 3 && page < (bank == 0 ? 9U : bank == 1 ? 1U : 3U));
+	if (mock.tuple_watch && bank == 1 && (mock.command & BIT(1))) {
+		assert(!(mock.table[2][56][2][0] & BIT(31)));
+		assert(!(mock.table[2][57][2][0] & BIT(31)));
+	}
 	for (unsigned int word = 0; word < count; word++) {
 		if (mock.command & BIT(1))
 			mock.table[bank][row][page][word] = mock.registers[CT_IFC_DATA(word) / 4];
@@ -225,6 +247,10 @@ static u32 airoha_fe_rr(struct airoha_eth *eth, unsigned int address)
 		}
 	}
 	if (address == CT_IFC_CONTROL) {
+		if (mock.busy && mock.late && mock.complete_without_done) {
+			complete_command();
+			mock.complete_without_done = false;
+		}
 		if (mock.busy && mock.release) {
 			if (mock.late)
 				complete_command();
@@ -260,6 +286,11 @@ static void airoha_fe_wr(struct airoha_eth *eth, unsigned int address, u32 value
 			       FE_PSE_PORT_CDM2 * 0x1111U);
 		}
 		mock.commands++;
+		assert(mock.trace_count < ARRAY_SIZE(mock.trace));
+		mock.trace[mock.trace_count].command = value;
+		for (unsigned int word = 0; word < 3; word++)
+			mock.trace[mock.trace_count].words[word] = mock.registers[CT_IFC_DATA(word) / 4];
+		mock.trace_count++;
 		mock.control_writes++;
 		mock.command = value;
 		if (mock.commands == mock.fail_at) {
@@ -334,12 +365,13 @@ static void initialize(struct fixture *fixture)
 {
 	memset(fixture, 0, sizeof(*fixture));
 	memset(&mock, 0, sizeof(mock));
-	assert(!ppe_lock.held && !rcu_depth && !lock_depth);
+	assert(!ppe_lock.held && !rcu_depth && !lock_depth && !worker_context);
 	flow_offload_mutex.held = rtnl = true;
 	fixture->eth.ppe = &fixture->ppe;
 	fixture->eth.ct_route_lock.rank = 2;
 	fixture->eth.ifc_port_lock.rank = 3;
 	fixture->ppe.eth = &fixture->eth;
+	(void)airoha_ct_pon_ifc_repair_work;
 	fixture->eth.soc = &fixture->soc;
 	fixture->soc.ops.get_sport = airoha_en7581_get_sport;
 	fixture->port.id = AIROHA_GDM2_IDX;
@@ -373,6 +405,8 @@ static void initialize(struct fixture *fixture)
 		mock.table[2][row][1][2] = CT_IFC_CPU_RX_RING << 10;
 		mock.table[2][row][2][0] = CT_IFC_ACTION_ENABLE | CT_IFC_ACTION_STOP | CT_IFC_ACTION_FORCE_CPU;
 	}
+	for (unsigned int slot = 0; slot < 32; slot++)
+		memcpy(mock.original_lut[slot], mock.table[1][slot][0], sizeof(mock.original_lut[slot]));
 	for (unsigned int row = 56; row < 60; row++)
 		for (unsigned int bank = 0; bank <= 2; bank += 2)
 			for (unsigned int page = 0; page < (bank ? 3U : 9U); page++)
@@ -385,6 +419,7 @@ static void initialize(struct fixture *fixture)
 
 static void reset_counts(void)
 {
+	mock.trace_count = 0;
 	mock.commands = mock.data_writes = mock.control_writes = mock.table_writes = 0;
 	mock.port_writes = mock.fail_at = mock.route_reads = mock.gate_clears = 0;
 	mock.fault = NONE;
@@ -411,6 +446,19 @@ static void check_shadow(const struct fixture *fixture)
 
 static void check_restored(const struct fixture *fixture)
 {
+#if PROBE_HAVE_TUPLE_POOL
+	assert(!fixture->ppe.ct_pon_ifc_tuple);
+	assert(!fixture->ppe.ct_pon_ifc_pool.pending && !fixture->ppe.ct_pon_ifc_pool.reserved &&
+	       !fixture->ppe.ct_pon_ifc_pool.dirty && !fixture->ppe.ct_pon_ifc_pool.leases &&
+	       !fixture->ppe.ct_pon_ifc_pool.releasing);
+	for (unsigned int family = 0; family < 2; family++) {
+		const struct airoha_ct_ifc_pool_lease empty = {};
+		assert(!memcmp(&fixture->ppe.ct_pon_ifc_lease[family], &empty, sizeof(empty)));
+	}
+	for (unsigned int slot = 0; slot < 32; slot++) {
+		assert(!fixture->ppe.ct_pon_ifc_pool.refs[slot]);
+	}
+#endif
 	assert(!fixture->ppe.ct_pon_ifc.saved_valid && !fixture->ppe.ct_pon_ifc.dirty &&
 	       !fixture->ppe.ct_pon_ifc.active && !fixture->ppe.ct_pon_ifc.pending);
 	assert(!fixture->eth.ct_ifc_pon_ready && !fixture->ppe.ct_pon_ifc_services[0] &&
@@ -1688,9 +1736,19 @@ static void source_publish_failures(unsigned int encoding)
 			}
 }
 
+#if PROBE_HAVE_TUPLE
+#include "verify_ifc_probe_tuple.c"
+#endif
+
 int main(int argc, char **argv)
 {
 	if (argc == 2) {
+#if PROBE_HAVE_TUPLE
+		if (!strcmp(argv[1], "tuple")) {
+			tuple_tests();
+			return 0;
+		}
+#endif
 		assert(!strcmp(argv[1], "stuck-route"));
 		cover_stuck_shutdown();
 		puts("{\"passed\":true,\"stuck_route_cases\":1}");
