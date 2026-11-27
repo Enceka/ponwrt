@@ -37,6 +37,14 @@ def generate(directory):
 };''')
     fixture = replace_once(fixture,
         'static void msleep(unsigned int milliseconds) { assert(milliseconds == 20); }\n', '')
+    fixture = replace_once(fixture,
+        'static void eth_random_addr(u8 *address) { memset(address, 0x22, 6); }',
+        '''static unsigned int random_mac_calls;
+static void eth_random_addr(u8 *address)
+{
+    memset(address, 0x22, 6);
+    address[5] = ++random_mac_calls;
+}''')
     fixture = replace_once(fixture, '\tbegin_calls++;',
         '\tbegin_calls++;\n\tdevice.pon_update_blocked = true;')
     fixture = replace_once(fixture, '\tmapped_service = mapping_service;',
@@ -50,7 +58,8 @@ def generate(directory):
     constants = '\n'.join(re.findall(r'(?m)^#define PROBE_.*$', source))
     constants += '\n' + enum.group() + '\n'
     names = ['marker_offset', 'receive', 'write_verified', 'mapping', 'map_service',
-             'mapping_current', 'restore', 'transmit', 'transmit_current', 'command_write']
+             'mapping_current', 'restore', 'transmit', 'transmit_current_mode',
+             'transmit_current', 'command_write']
     receiver = re.search(r'(?ms)^static rx_handler_result_t receive\(.*?^}', source)
     assert receiver
     production = ''.join(receiver.group() + '\n' if name == 'receive' else
@@ -103,8 +112,24 @@ def main():
             ('mapping-service', 'table->entries[0].tag == tag',
              '!((table->entries[0].tag ^ tag) & ~AIROHA_PON_QDMA_GEM_MASK)'),
             ('mapping-count', 'table->count == 1', 'table->count >= 1'),
-            ('rx-timeout', 'if (!err && READ_ONCE(received_sequence) != sequence)',
-             'err = 0;\n\tif (false && READ_ONCE(received_sequence) != sequence)'),
+            ('rx-timeout', 'if (!err && wait_rx && READ_ONCE(received_sequence) != sequence)',
+             'err = 0;\n\tif (false && wait_rx && READ_ONCE(received_sequence) != sequence)'),
+            ('fixed-random', 'ether_addr_copy(ethernet->h_source, fixed_source);',
+             'eth_random_addr(ethernet->h_source);'),
+            ('fixed-source', 'fixed_source[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 1 }',
+             'fixed_source[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 2 }'),
+            ('fixed-destination', 'ether_addr_copy(ethernet->h_dest, probe_netdev->dev_addr);',
+             'ether_addr_copy(ethernet->h_dest, fixed_source);'),
+            ('fixed-variant', 'transmit(PROBE_CURRENT_SERVICE, kind, variant)',
+             'transmit(PROBE_CURRENT_SERVICE, kind, variant & PROBE_FIXED_MAC)'),
+            ('tx-waits-rx', 'if (!err && wait_rx)\n', 'if (!err)\n'),
+            ('tx-skips-completion', 'atomic_read, pending, !pending, 1000, 100000,',
+             'atomic_read, pending, true, 1000, 100000,'),
+            ('fixed-mapping', 'if (!mapping_current())', 'if (false)'),
+            ('fixed-extra-token', 'wait_name, &trailing) == 3', 'wait_name, &trailing) >= 3'),
+            ('fixed-variant-text', "&& !variant_word[1] &&", '&&'),
+            ('fixed-nul', 'if (memchr(command, 0, length))', 'if (false)'),
+            ('fixed-sequence-wrap', 'if (sequence == (u32)~0U)', 'if (false)'),
         ]
         for name, before, after in mutations:
             (directory / 'loopback_production.inc').write_text(replace_once(production, before, after))

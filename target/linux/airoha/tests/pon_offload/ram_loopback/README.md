@@ -173,8 +173,83 @@ python3 target/linux/airoha/tests/pon_offload/run_loopback_probe.py \
 ```
 
 Omit `--run` for preflight only. Omit `--special-tag` for the control run.
-PON PPE qualification stays closed throughout. The final module exposes
-only `prepare`, `send <decimal-service> [kind [variant]]` and `restore`.
+PON PPE qualification stays closed throughout. The module exposes
+`prepare`, `map <service>`, `send <decimal-service> [kind [variant]]`,
+`send-current <ipv4|ipv6>`, `send-fixed <ipv4|ipv6> <0..4> <rx|tx>` and
+`restore`.
+
+## Fixed-MAC packets on the current mapping
+
+```text
+send-fixed <ipv4|ipv6> <variant 0..4> <rx|tx>
+```
+
+Each command submits one 128-byte Ethernet frame using the current service
+mapping. The source MAC is `02:00:00:00:00:01`; the destination is the current
+`probe_netdev->dev_addr` of `pon0`. Both families use UDP source port 49152 and
+destination port 49153. IPv4 addresses are `192.0.2.1` to `192.0.2.2`; IPv6
+addresses are `2001:db8::1` to `2001:db8::2`.
+
+| Variant | Tuple change |
+| --- | --- |
+| 0 | Baseline tuple |
+| 1 | Source address low word +1 |
+| 2 | Destination address low word +1 |
+| 3 | UDP source port 49153 |
+| 4 | UDP destination port 49154 |
+
+For the first RAM `start-auth <service>` diagnostic, map that service before
+starting the session. `send-fixed ipv4 0 rx` supplies the exact AUTH tuple;
+variants 1 through 4 supply one-field mismatches on the same service, such
+as `send-fixed ipv4 1 rx`. `send-fixed ipv6 0 rx` supplies a family mismatch
+for an IPv4-only AUTH rule.
+Both CPU and ER returns delivered to `pon0` can satisfy `rx`. Inspect the
+diagnostic ER counters and QDMA receive counters to distinguish those paths.
+Use `tx` when testing an output that does not return through `pon0`.
+The sender preserves the diagnostic's FLOW/no_learn settings. AUTH setup,
+PSE8/ER routing and later PPE learning remain kernel diagnostic operations.
+
+`rx` waits up to 100 ms for TX completion and then up to 100 ms for the
+matching sequence/cookie/kind/length RX marker. `tx` waits up to 100 ms for
+TX completion and returns without an RX requirement, for ER or LAN egress
+checks. A matching RX that arrives during the TX wait can still be recorded;
+RX arriving after the command returns follows the normal receive path.
+For example, `send-fixed ipv6 3 tx` sends one IPv6 source-port mismatch.
+Inspect egress counters or capture the packet at the LAN endpoint when
+testing a LAN route.
+
+The command accepts exactly four tokens, with case-sensitive family/mode
+and a single variant digit `0` through `4`. Extra arguments, signed or
+multi-digit variants, embedded NULs, and writes of 64 bytes or more return
+`-EINVAL`. Whitespace and a trailing newline are accepted. The existing
+sequence, per-module cookie and 130-byte maximum frame bound are retained;
+current-mapping commands return `-EOVERFLOW` at sequence `0xffffffff`.
+
+The prepared interface must be open and its single-service mapping, carrier
+and update state must still match. Drift returns `-ESTALE` before submission.
+An existing NPU owner is allowed; no mapping transaction or owner change is
+performed. `map`, ordinary `send` and `restore` keep their owner guards.
+`send` and `send-current` retain random source MACs, and `send-current`
+continues to wait for RX. Status adds `tx_fixed` and `tx_wait_rx`; `tx_variant`
+remains the tuple variant 0 through 4.
+
+Run the production-function host tests locally:
+
+```sh
+python3 -B /Volumes/Workspace/5585f/build/ponwrt/target/linux/airoha/tests/pon_offload/ram_loopback/verify_commands.py
+```
+
+The runner extracts the actual command parser, mapping checks, transmitter
+and RX functions from `ct_pon_loopback.c`. Plain and ASan/UBSan runs cover
+60 fixed packets across both families, all five variants, both wait modes
+and services 0/0x8000/0xffff. Tests verify the emitted MAC/IP/UDP/marker bytes,
+mapping preservation under an owner, 13 mapping drift cases for each sender,
+strict parsing, allocation/TX failures, separate TX/RX deadlines, sequence
+exhaustion and legacy random-MAC behavior. Seventeen mutation controls must
+fail assertions, including changed MACs, lost variants, skipped TX waits,
+unwanted RX waits and relaxed parser/mapping guards. Kernel dependencies,
+including checksum helpers and device queues, use local stubs; build the
+module against the matching RAM kernel before board testing.
 
 ## Packet kinds
 

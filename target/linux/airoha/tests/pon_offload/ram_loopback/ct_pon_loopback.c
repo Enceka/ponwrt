@@ -22,6 +22,7 @@
 #define PROBE_MARKER_BYTES 20
 #define PROBE_MAX_BYTES 130
 #define PROBE_CURRENT_SERVICE (~0U)
+#define PROBE_FIXED_MAC BIT(8)
 #undef airoha_fe_rr
 #undef airoha_fe_wr
 #define airoha_fe_rr(eth, reg) readl((eth)->fe_regs + (reg))
@@ -34,6 +35,7 @@ static struct airoha_gdm_dev *probe_dev;
 static bool retained, controller, opened, handler;
 static bool registers_saved;
 static bool configured, sent_current;
+static bool sent_fixed, sent_wait_rx;
 static u32 mapped_service;
 static u32 saved_ifc_desired, saved_vip;
 static u32 saved_registers[10];
@@ -442,6 +444,7 @@ static int prepare(void)
 
 static int transmit(unsigned int service, unsigned int kind, unsigned int variant)
 {
+	const u8 fixed_source[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 1 };
 	struct sk_buff *skb;
 	struct ethhdr *ethernet;
 	struct iphdr *ipv4;
@@ -450,10 +453,13 @@ static int transmit(unsigned int service, unsigned int kind, unsigned int varian
 	u8 *payload, *frame;
 	unsigned int length, network = ETH_HLEN, transport, udp_length;
 	__be16 protocol = htons(ETH_P_IP);
+	bool fixed_mac = variant & PROBE_FIXED_MAC;
 	int pending, err;
 
+	variant &= ~PROBE_FIXED_MAC;
 	if (!retained || !opened ||
 	    (service > U16_MAX && service != PROBE_CURRENT_SERVICE) || kind >= PROBE_KIND_COUNT ||
+	    (fixed_mac && (service != PROBE_CURRENT_SERVICE || kind > PROBE_IPV6)) ||
 	    variant > 4 || (variant && kind != PROBE_IPV4 && kind != PROBE_IPV6))
 		return -EINVAL;
 	if (service != PROBE_CURRENT_SERVICE) {
@@ -470,7 +476,10 @@ static int transmit(unsigned int service, unsigned int kind, unsigned int varian
 	frame = skb_put_zero(skb, length);
 	ethernet = (struct ethhdr *)frame;
 	ether_addr_copy(ethernet->h_dest, probe_netdev->dev_addr);
-	eth_random_addr(ethernet->h_source);
+	if (fixed_mac)
+		ether_addr_copy(ethernet->h_source, fixed_source);
+	else
+		eth_random_addr(ethernet->h_source);
 	if (kind == PROBE_VLAN) {
 		protocol = htons(ETH_P_8021Q);
 		put_unaligned_be16(37, frame + network);
@@ -570,26 +579,36 @@ marker:
 	return err;
 }
 
-static int transmit_current(unsigned int kind)
+static int transmit_current_mode(unsigned int kind, unsigned int variant, bool wait_rx)
 {
 	bool waiting;
 	int err;
 
-	if (!retained || !opened || (kind != PROBE_IPV4 && kind != PROBE_IPV6))
+	if (!retained || !opened || (kind != PROBE_IPV4 && kind != PROBE_IPV6) ||
+	    (variant & ~PROBE_FIXED_MAC) > 4)
 		return -EINVAL;
 	if (!mapping_current())
 		return -ESTALE;
+	if (sequence == (u32)~0U)
+		return -EOVERFLOW;
 	sent_current = true;
-	err = transmit(PROBE_CURRENT_SERVICE, kind, 0);
-	if (!err)
+	sent_fixed = !!(variant & PROBE_FIXED_MAC);
+	sent_wait_rx = wait_rx;
+	err = transmit(PROBE_CURRENT_SERVICE, kind, variant);
+	if (!err && wait_rx)
 		err = read_poll_timeout(smp_load_acquire, waiting, !waiting,
 					1000, 100000, false, &awaiting);
 	smp_store_release(&awaiting, false);
-	if (!err && READ_ONCE(received_sequence) != sequence)
+	if (!err && wait_rx && READ_ONCE(received_sequence) != sequence)
 		err = -EPROTO;
 	if (err)
 		synchronize_net();
 	return err;
+}
+
+static int transmit_current(unsigned int kind)
+{
+	return transmit_current_mode(kind, 0, true);
 }
 
 static int status_show(struct seq_file *file, void *unused)
@@ -608,6 +627,7 @@ static int status_show(struct seq_file *file, void *unused)
 		kind_names[READ_ONCE(sent_kind)], READ_ONCE(sent_length),
 		kind_names[READ_ONCE(received_kind)], READ_ONCE(received_length));
 	seq_printf(file, "tx_variant=%u\n", READ_ONCE(sent_variant));
+	seq_printf(file, "tx_fixed=%u tx_wait_rx=%u\n", sent_fixed, sent_wait_rx);
 	seq_printf(file, "configured=%u mapped_service=%u tx_current=%u npu_owner=%u\n",
 		configured, mapped_service, sent_current,
 		!!READ_ONCE(eth->ppe->ct_npu_owner));
@@ -633,10 +653,13 @@ static ssize_t command_write(struct file *file, const char __user *buffer,
 			      size_t length, loff_t *offset)
 {
 	char command[64], operation[16] = {}, kind_name[16] = "ipv4", variant_word[16], trailing;
+	char wait_name[16];
 	unsigned int service, kind, variant = 0;
 	int err, fields;
 
 	if (!length || length >= sizeof(command) || copy_from_user(command, buffer, length))
+		return -EINVAL;
+	if (memchr(command, 0, length))
 		return -EINVAL;
 	command[length] = 0;
 	mutex_lock(&probe_lock);
@@ -657,6 +680,18 @@ static ssize_t command_write(struct file *file, const char __user *buffer,
 			else if (!strcmp(kind_name, "ipv6"))
 				err = transmit_current(PROBE_IPV6);
 		}
+	} else if (!strcmp(operation, "send-fixed")) {
+		err = -EINVAL;
+		if (sscanf(command, "%*s %15s %15s %15s %c", kind_name, variant_word,
+			   wait_name, &trailing) == 3 &&
+		    variant_word[0] >= '0' && variant_word[0] <= '4' && !variant_word[1] &&
+		    (!strcmp(wait_name, "rx") || !strcmp(wait_name, "tx"))) {
+			variant = PROBE_FIXED_MAC | (variant_word[0] - '0');
+			if (!strcmp(kind_name, "ipv4"))
+				err = transmit_current_mode(PROBE_IPV4, variant, !strcmp(wait_name, "rx"));
+			else if (!strcmp(kind_name, "ipv6"))
+				err = transmit_current_mode(PROBE_IPV6, variant, !strcmp(wait_name, "rx"));
+		}
 	} else {
 		err = -EINVAL;
 		fields = sscanf(command, "send %u %15s %15s %c", &service, kind_name, variant_word, &trailing);
@@ -668,6 +703,7 @@ static ssize_t command_write(struct file *file, const char __user *buffer,
 						err = -EBUSY;
 					else {
 						sent_current = false;
+						sent_fixed = sent_wait_rx = false;
 						err = transmit(service, kind, variant);
 					}
 					break;
