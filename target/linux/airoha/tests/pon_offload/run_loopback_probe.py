@@ -159,8 +159,12 @@ def main():
             cases += [
                 (0x2134, ('clear 0', 'route'), True, 'ipv4', 0, 4),
                 (0x2134, ('tuple 0 0x2134', 'route'), True, 'ipv4', 0, 2),
-                (0x2134, ('clear 1',), False, 'ipv4', 0, 0),
+                (0x2134, ('clear 1',), False, 'ipv4', 0, 2),
+                (0x2134, (), False, 'ipv6', 0, 2),
+                (0xa134, (), False, 'ipv4', 0, 0),
+                (0x2134, (), False, 'ipv6', 1, 0),
                 (0x2134, ('clear 0',), False, 'ipv4', 0, 0),
+                (0x2134, (), False, 'ipv6', 0, 0),
             ]
         for index, (service, commands, routed, kind, variant, expected_ring) in enumerate(cases):
             label = 'send-' + str(index)

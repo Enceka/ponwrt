@@ -147,14 +147,14 @@ class BoardFixture:
                     fields = value.split()
                     packet = (int(fields[1]), fields[2] if len(fields) > 2 else 'ipv4',
                               int(fields[3]) if len(fields) > 3 else 0)
-                    if not self.routed:
-                        ring = 0
-                    elif self.cover_slot == 0:
+                    if self.cover and self.cover_slot == 0:
                         ring = 2
                     elif self.classified and packet[0] == 0x2134 and (not self.exact or packet[2] == 0):
-                        ring = 2
+                        ring = 2 + 2 * (self.cover_slot ^ 1)
+                    elif self.cover:
+                        ring = 2 + 2 * self.cover_slot
                     else:
-                        ring = 4
+                        ring = 0
                     ring = self.ring_overrides.get(len(self.sent), ring)
                     self.sent.append(packet)
                     self.heads[ring] += 1
@@ -258,21 +258,29 @@ class LoopbackRunnerTests(unittest.TestCase):
         self.assertTrue(report['commands_completed'])
         self.assertTrue(report['numbered_packets_returned'])
         self.assertTrue(report['service_preserved'])
-        expected_rings = [2] + [4] * 9 + [2] + [4] * 9 + [4, 2, 0, 0]
-        self.assertEqual(len(board.sent), 24)
-        self.assertEqual(board.sent[20:], [(0x2134, 'ipv4', 0)] * 4)
+        expected_rings = [2] + [4] * 9 + [2] + [4] * 9 + [4, 2, 2, 2, 0, 0, 0, 0]
+        self.assertEqual(len(board.sent), 28)
+        self.assertEqual(board.sent[20:], [(0x2134, 'ipv4', 0)] * 3 +
+                         [(0x2134, 'ipv6', 0), (0xa134, 'ipv4', 0),
+                          (0x2134, 'ipv6', 1), (0x2134, 'ipv4', 0), (0x2134, 'ipv6', 0)])
         self.assertEqual([item['expected_ring'] for item in report['observations']], expected_rings)
         self.assertEqual([item['changed_rings'] for item in report['observations']],
                          [[ring] for ring in expected_rings])
         self.assertEqual([item['transitions'] for item in report['observations'][20:]],
-                         [['clear 0', 'route'], ['tuple 0 0x2134', 'route'], ['clear 1'], ['clear 0']])
+                         [['clear 0', 'route'], ['tuple 0 0x2134', 'route'],
+                          ['clear 1'], [], [], [], ['clear 0'], []])
         for packet_index, pool in ((20, board.pool_clean),
                                    (21, 'tuple=1 pool=00003fff pool_pending=0 leases=2'),
                                    (22, 'tuple=1 pool=00003fff pool_pending=0 leases=2'),
-                                   (23, board.pool_clean)):
+                                   (26, board.pool_clean)):
             state = (self.output / f'send-{packet_index}-transition-0-state.stdout').read_text()
             self.assertIn(pool, state)
             self.assertIn(pool, report['observations'][packet_index]['state'])
+        for packet_index in range(22, 26):
+            self.assertIn('tuple=1 pool=00003fff pool_pending=0 leases=2',
+                          report['observations'][packet_index]['state'])
+            self.assertIn('routed=0', report['observations'][packet_index]['state'])
+        self.assertIn(board.pool_clean, report['observations'][27]['state'])
         self.assert_restored(board)
 
     def test_wide_service_eight_packet_withdrawal(self):
@@ -289,7 +297,8 @@ class LoopbackRunnerTests(unittest.TestCase):
                 self.assert_restored(board)
 
     def test_each_wrong_withdrawal_destination_fails_and_restores(self):
-        for packet_index, wrong_ring in ((20, 2), (21, 4), (22, 2), (23, 4)):
+        for packet_index, wrong_ring in ((20, 2), (21, 4), (22, 0), (23, 0),
+                                        (24, 2), (25, 2), (26, 4), (27, 2)):
             with self.subTest(packet=packet_index):
                 board = BoardFixture(ring_overrides={packet_index: wrong_ring})
                 with self.assertRaisesRegex(AssertionError, 'expected RX'):
@@ -309,7 +318,7 @@ class LoopbackRunnerTests(unittest.TestCase):
             ('clear 1', 1, 'pool=00003fff', 'pool=00000000', 22),
             ('clear 1', 1, 'pool=00003fff', 'pool=00007ffe', 22),
             ('clear 1', 1, 'leases=2', 'leases=0', 22),
-            ('clear 0', 2, 'pool=00000000', 'pool=00000001', 23),
+            ('clear 0', 2, 'pool=00000000', 'pool=00000001', 26),
         ]
         for command, occurrence, original, replacement, packet_count in mutations:
             with self.subTest(command=command, occurrence=occurrence, field=original):
@@ -333,7 +342,7 @@ class LoopbackRunnerTests(unittest.TestCase):
 
     def test_withdrawal_transition_command_failures_restore(self):
         failures = [('clear 0', 1, 20), ('route', 2, 20), ('tuple 0 0x2134', 2, 21),
-                    ('route', 3, 21), ('clear 1', 1, 22), ('clear 0', 2, 23)]
+                    ('route', 3, 21), ('clear 1', 1, 22), ('clear 0', 2, 26)]
         for command, occurrence, packet_count in failures:
             with self.subTest(command=command, occurrence=occurrence):
                 board = BoardFixture(fail_command='echo ' + shlex.quote(command) + ' > ' + CLASSIFIER,
@@ -349,7 +358,7 @@ class LoopbackRunnerTests(unittest.TestCase):
                 board = BoardFixture(fail_command=command)
                 with self.assertRaises(subprocess.CalledProcessError):
                     self.invoke(board, EXACT_OPTIONS + ['--withdraw-cycle'])
-                self.assertEqual(len(board.sent), 24)
+                self.assertEqual(len(board.sent), 28)
                 self.assertTrue(board.loaded)
                 self.assertTrue(board.prepared)
                 self.assertNotIn('rmmod ct_pon_loopback', board.commands)

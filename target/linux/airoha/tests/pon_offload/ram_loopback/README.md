@@ -192,16 +192,27 @@ PON PPE qualification stays closed. Exact mode uses the existing `off`,
 after a packet mismatch or classifier-command failure. It cannot combine
 with `--packet-matrix` or `--sif-sweep`.
 
-Add `--withdraw-cycle` to exact mode for a 24-packet withdrawal/reinstall
+Add `--withdraw-cycle` to exact mode for a 28-packet withdrawal/reinstall
 matrix. The original 20 packets still require two RX2 and 18 RX4 returns.
-Four IPv4 baseline packets follow, all using service 0x2134 and variant 0:
+Eight packets follow to check removal, reinstallation and partial withdrawal:
 
-| Transition before send | Expected ring | Tuple pool after transition |
-| --- | --- | --- |
-| `clear 0`, `route` | RX4 | `tuple=0 pool=00000000 pool_pending=0 leases=0` |
-| `tuple 0 0x2134`, `route` | RX2 | 14 occupied slots, two leases, no pending command |
-| `clear 1` | RX0 | Same pool mask and two leases retained |
-| `clear 0` | RX0 | Entire tuple pool released |
+| Transition before send | Packet | Expected ring | Tuple pool after transition |
+| --- | --- | --- | --- |
+| `clear 0`, `route` | IPv4, service 0x2134, variant 0 | RX4 | Entire tuple pool released |
+| `tuple 0 0x2134`, `route` | IPv4, service 0x2134, variant 0 | RX2 | 14 occupied slots, two leases, no pending command |
+| `clear 1` | IPv4, service 0x2134, variant 0 | RX2 | Same pool mask and two leases retained |
+| None | IPv6, service 0x2134, variant 0 | RX2 | Retained |
+| None | IPv4, service 0xa134, variant 0 | RX0 | Retained |
+| None | IPv6, service 0x2134, variant 1 | RX0 | Retained |
+| `clear 0` | IPv4, service 0x2134, variant 0 | RX0 | Entire tuple pool released |
+| None | IPv6, service 0x2134, variant 0 | RX0 | Released |
+
+`clear 1` removes only the cover. Slot0's exact tuple consumer and its leases
+remain active. `routed=0` records restoration of the GDM2 default destination
+to CPU5; enabled IFC consumers still select their CPU ring. Both matching
+families therefore use RX2, while service and tuple misses use default RX0.
+The final `clear 0` removes the remaining consumer and releases its leases,
+after which both baseline families use RX0.
 
 The runner reads back pool ownership after every transition, before the
 next command or packet, and checks it again on every packet observation.
@@ -221,7 +232,7 @@ python3 target/linux/airoha/tests/pon_offload/run_loopback_probe.py \
   --run --special-tag --cover-slot 1 --tuple-variants --exact-tuple --require-native
 ```
 
-Add `--withdraw-cycle` to the invocation above for the 24-packet matrix.
+Add `--withdraw-cycle` to the invocation above for the 28-packet matrix.
 
 ```sh
 python3 -B -m unittest discover -s target/linux/airoha/tests/pon_offload \
@@ -231,7 +242,7 @@ python3 -B -m unittest discover -s target/linux/airoha/tests/pon_offload \
 The host self-check simulates SSH responses without contacting a board.
 It covers exact and wide ring expectations, rejected option combinations,
 preflight-only operation, per-field misses, incorrect baseline/service
-routing, the 24-packet exact and eight-packet wide-service withdrawal
+routing, the 28-packet exact and eight-packet wide-service withdrawal
 matrices, pool release/reacquisition/retention, and cleanup after transition
 or observation failures. Failed withdrawal/restoration retains the module
 and the per-command evidence for recovery.
