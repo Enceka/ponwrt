@@ -1,0 +1,356 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: start rebuilt NPU after provider binding
+
+Prepare rebuilt firmware during probe and start it once from a bound
+provider. Hold device locks through lookup and activation, retain startup
+errors, and reject unsupported resident configurations and probing Ethernet
+consumers before exposing NPU resources. Preserve legacy startup selection.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -834,15 +834,20 @@
+ 	regmap_clear_bits(npu->regmap, REG_IRQ_RXDONE(q), NPU_IRQ_RX_MASK(q));
+ }
+ 
++#include "airoha_npu_start.h"
++
+ struct airoha_npu *airoha_npu_get(struct device *dev)
+ {
+ 	struct platform_device *pdev;
+ 	struct device_node *np;
+ 	struct airoha_npu *npu;
++	bool resident, consumer_locked = false;
++	int err;
+ 
+ 	np = of_parse_phandle(dev->of_node, "airoha,npu", 0);
+ 	if (!np)
+ 		return ERR_PTR(-ENODEV);
++	resident = of_property_read_bool(np, "airoha,connac2-rebuilt-ram-lab");
+ 
+ 	pdev = of_find_device_by_node(np);
+ 
+@@ -853,16 +858,45 @@
+ 	}
+ 	of_node_put(np);
+ 
++	if (resident && of_device_is_compatible(dev->of_node, "airoha,en7581-eth")) {
++		if (!device_trylock(dev)) {
++			npu = ERR_PTR(-EPROBE_DEFER);
++			goto error_pdev_put;
++		}
++		consumer_locked = true;
++		if (!device_is_bound(dev)) {
++			npu = ERR_PTR(-EPROBE_DEFER);
++			goto error_pdev_put;
++		}
++		if (!airoha_npu_resident_device(dev)) {
++			npu = ERR_PTR(-EOPNOTSUPP);
++			goto error_pdev_put;
++		}
++	}
++
+ 	if (!try_module_get(THIS_MODULE)) {
+ 		dev_err(dev, "failed to get the device driver module\n");
+ 		npu = ERR_PTR(-ENODEV);
+ 		goto error_pdev_put;
+ 	}
+ 
++	if (!device_trylock(&pdev->dev)) {
++		npu = ERR_PTR(-EPROBE_DEFER);
++		goto error_module_put;
++	}
++	if (!device_is_bound(&pdev->dev)) {
++		npu = ERR_PTR(-EPROBE_DEFER);
++		goto error_device_unlock;
++	}
+ 	npu = platform_get_drvdata(pdev);
+ 	if (!npu) {
+ 		npu = ERR_PTR(-ENODEV);
+-		goto error_module_put;
++		goto error_device_unlock;
++	}
++	err = airoha_npu_start_bound(npu);
++	if (err) {
++		npu = ERR_PTR(err);
++		goto error_device_unlock;
+ 	}
+ 
+ 	if (!device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_SUPPLIER)) {
+@@ -870,14 +904,21 @@
+ 			"failed to create device link to consumer %s\n",
+ 			dev_name(dev));
+ 		npu = ERR_PTR(-EINVAL);
+-		goto error_module_put;
+-	}
+-
++		goto error_device_unlock;
++	}
++
++	device_unlock(&pdev->dev);
++	if (consumer_locked)
++		device_unlock(dev);
+ 	return npu;
+ 
++error_device_unlock:
++	device_unlock(&pdev->dev);
+ error_module_put:
+ 	module_put(THIS_MODULE);
+ error_pdev_put:
++	if (consumer_locked)
++		device_unlock(dev);
+ 	platform_device_put(pdev);
+ 
+ 	return npu;
+@@ -936,7 +977,10 @@
+ 	struct resource res;
+ 	void __iomem *base;
+ 	int i, irq, err;
+-	u32 val;
++
++	if (of_property_read_bool(dev->of_node, "airoha,connac2-rebuilt-ram-lab") &&
++	    !airoha_npu_resident_device(dev))
++		return -EOPNOTSUPP;
+ 
+ 	base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(base))
+@@ -948,6 +992,8 @@
+ 
+ 	npu = &instance->npu;
+ 	npu->dev = dev;
++	instance->deferred_start = of_property_read_bool(dev->of_node,
++						       "airoha,connac2-rebuilt-ram-lab");
+ 	mutex_init(&instance->er.lock);
+ 	npu->ops.ppe_init = airoha_npu_ppe_init;
+ 	npu->ops.ppe_deinit = airoha_npu_ppe_deinit;
+@@ -1025,58 +1071,9 @@
+ 			return -ENOMEM;
+ 	}
+ 
+-	err = airoha_npu_run_firmware(dev, base, &res);
+-	if (err)
+-		return err;
+-
+-	err = devm_add_action_or_reset(dev, airoha_npu_wlan_short_guard_clear, npu);
+-	if (err)
+-		return err;
+-	WRITE_ONCE(npu->wlan_short_guard_verified, airoha_npu_is_connac2_ct(dev));
+-
+-	regmap_write(npu->regmap, REG_CR_NPU_MIB(10),
+-		     res.start + NPU_EN7581_FIRMWARE_RV32_MAX_SIZE);
+-	regmap_write(npu->regmap, REG_CR_NPU_MIB(11), 0x40000); /* SRAM 256K */
+-	regmap_write(npu->regmap, REG_CR_NPU_MIB(12), 0);
+-	regmap_write(npu->regmap, REG_CR_NPU_MIB(21), 1);
+-	msleep(100);
+-
+-	/* setting booting address */
+-	for (i = 0; i < NPU_NUM_CORES; i++) {
+-		err = regmap_write(npu->regmap, REG_CR_BOOT_BASE(i), res.start);
+-		if (err)
+-			return err;
+-	}
+-	usleep_range(1000, 2000);
+-
+-	/* enable NPU cores */
+-	err = regmap_write(npu->regmap, REG_CR_BOOT_CONFIG, 0xff);
+-	if (err)
+-		return err;
+-	err = regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER, 0x1);
+-	if (err)
+-		return err;
+-	msleep(100);
+-
+-	if (airoha_npu_is_connac2_ct(dev)) {
+-		if (of_property_read_bool(dev->of_node, "airoha,connac2-rebuilt-ram-lab"))
+-			dev_info(dev, "verified rebuilt Connac2 RAM firmware\n");
+-		else
+-			dev_info(dev, "verified Connac2 firmware 1456-50\n");
+-		err = airoha_npu_connac2_init_pool(npu);
+-		if (err)
+-			dev_warn(dev, "Connac2 packet pool unavailable: %d\n", err);
+-		else {
+-			dev_info(dev, "Connac2 packet pool registered\n");
+-			smp_store_release(&npu->wlan_short_guard_started, true);
+-			if (airoha_npu_wlan_short_guard_ready(npu))
+-				dev_info(dev, "CT WLAN short-frame/DS guard ready: Ethernet < 72 or nonzero DS to host\n");
+-		}
+-	} else if (!airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
+-					    &val, sizeof(val), GFP_KERNEL)) {
+-		dev_info(dev, "NPU fw version: %0d.%d\n",
+-			 (val >> 16) & 0xffff, val & 0xffff);
+-	}
++	err = airoha_npu_prepare_firmware(npu, base, &res);
++	if (err)
++		return err;
+ 
+ 	platform_set_drvdata(pdev, npu);
+ 
+@@ -1086,9 +1083,13 @@
+ static void airoha_npu_shutdown(struct platform_device *pdev)
+ {
+ 	struct airoha_npu *npu = platform_get_drvdata(pdev);
+-
+-	if (npu)
+-		airoha_npu_wlan_short_guard_clear(npu);
++	struct airoha_npu_instance *instance;
++
++	if (!npu)
++		return;
++	instance = container_of(npu, struct airoha_npu_instance, npu);
++	instance->stopping = true;
++	airoha_npu_wlan_short_guard_clear(npu);
+ }
+ 
+ static struct platform_driver airoha_npu_driver = {
+--- a/drivers/net/ethernet/airoha/airoha_npu_er_provider.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_er_provider.h
+@@ -17,6 +17,11 @@
+ 	struct airoha_npu npu;
+ 	struct airoha_npu_er_provider er;
+ 	bool transport_quarantined;
++	u32 boot_address;
++	int start_error;
++	bool deferred_start;
++	bool start_attempted;
++	bool stopping;
+ };
+ 
+ static struct airoha_npu_er_exposure *
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_start.h
+@@ -0,0 +1,136 @@
++#ifndef AIROHA_NPU_START_H
++#define AIROHA_NPU_START_H
++
++static bool airoha_npu_fixed_node(struct device_node *node)
++{
++	struct device_node *ancestor;
++
++	if (!node)
++		return false;
++	for (ancestor = of_node_get(node); ancestor;
++	     ancestor = of_get_next_parent(ancestor)) {
++		if (of_node_check_flag(ancestor, OF_DYNAMIC) ||
++		    of_node_check_flag(ancestor, OF_DETACHED) ||
++		    !of_device_is_available(ancestor)) {
++			of_node_put(ancestor);
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool airoha_npu_resident_device(struct device *dev)
++{
++	return IS_BUILTIN(CONFIG_NET_AIROHA) &&
++	       IS_BUILTIN(CONFIG_NET_AIROHA_NPU) &&
++	       IS_BUILTIN(CONFIG_COMMON_CLK_EN7523) &&
++	       !IS_ENABLED(CONFIG_OF_DYNAMIC) && !IS_ENABLED(CONFIG_OF_OVERLAY) &&
++	       !IS_ENABLED(CONFIG_KEXEC) && !IS_ENABLED(CONFIG_KEXEC_FILE) &&
++	       dev->driver && !dev->driver->owner && dev->driver->suppress_bind_attrs &&
++	       airoha_npu_fixed_node(dev->of_node);
++}
++
++static int airoha_npu_boot(struct airoha_npu *npu)
++{
++	struct airoha_npu_instance *instance =
++		container_of(npu, struct airoha_npu_instance, npu);
++	struct device *dev = npu->dev;
++	u32 val;
++	int index, err;
++
++	err = regmap_write(npu->regmap, REG_CR_NPU_MIB(10),
++			   instance->boot_address + NPU_EN7581_FIRMWARE_RV32_MAX_SIZE);
++	if (err)
++		return err;
++	err = regmap_write(npu->regmap, REG_CR_NPU_MIB(11), 0x40000);
++	if (err)
++		return err;
++	err = regmap_write(npu->regmap, REG_CR_NPU_MIB(12), 0);
++	if (err)
++		return err;
++	err = regmap_write(npu->regmap, REG_CR_NPU_MIB(21), 1);
++	if (err)
++		return err;
++	msleep(100);
++	for (index = 0; index < NPU_NUM_CORES; index++) {
++		err = regmap_write(npu->regmap, REG_CR_BOOT_BASE(index), instance->boot_address);
++		if (err)
++			return err;
++	}
++	usleep_range(1000, 2000);
++	err = regmap_write(npu->regmap, REG_CR_BOOT_CONFIG, 0xff);
++	if (err)
++		return err;
++	err = regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER, 1);
++	if (err)
++		return err;
++	msleep(100);
++	if (airoha_npu_is_connac2_ct(dev)) {
++		if (instance->deferred_start)
++			dev_info(dev, "starting bound rebuilt Connac2 firmware\n");
++		else
++			dev_info(dev, "verified Connac2 firmware 1456-50\n");
++		err = airoha_npu_connac2_init_pool(npu);
++		if (err) {
++			dev_warn(dev, "Connac2 packet pool unavailable: %d\n", err);
++			if (instance->deferred_start)
++				return err;
++		} else {
++			dev_info(dev, "Connac2 packet pool registered\n");
++			smp_store_release(&npu->wlan_short_guard_started, true);
++			if (airoha_npu_wlan_short_guard_ready(npu))
++				dev_info(dev, "CT WLAN short-frame/DS guard ready: Ethernet < 72 or nonzero DS to host\n");
++		}
++	} else if (!airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
++					    &val, sizeof(val), GFP_KERNEL)) {
++		dev_info(dev, "NPU fw version: %0d.%d\n",
++			 (val >> 16) & 0xffff, val & 0xffff);
++	}
++	return 0;
++}
++
++static int airoha_npu_prepare_firmware(struct airoha_npu *npu,
++				      void __iomem *base, struct resource *res)
++{
++	struct airoha_npu_instance *instance =
++		container_of(npu, struct airoha_npu_instance, npu);
++	int err;
++
++	err = airoha_npu_run_firmware(npu->dev, base, res);
++	if (err)
++		return err;
++	err = devm_add_action_or_reset(npu->dev, airoha_npu_wlan_short_guard_clear, npu);
++	if (err)
++		return err;
++	WRITE_ONCE(npu->wlan_short_guard_verified, airoha_npu_is_connac2_ct(npu->dev));
++	instance->boot_address = res->start;
++	return instance->deferred_start ? 0 : airoha_npu_boot(npu);
++}
++
++static int airoha_npu_start_bound(struct airoha_npu *npu)
++{
++	struct airoha_npu_instance *instance =
++		container_of(npu, struct airoha_npu_instance, npu);
++	int err;
++
++	device_lock_assert(npu->dev);
++	if (!device_is_bound(npu->dev))
++		return -EPROBE_DEFER;
++	if (instance->stopping || READ_ONCE(instance->transport_quarantined))
++		return -ESHUTDOWN;
++	if (!instance->deferred_start)
++		return 0;
++	if (!airoha_npu_resident_device(npu->dev))
++		return -EOPNOTSUPP;
++	if (instance->start_attempted)
++		return instance->start_error;
++	instance->start_attempted = true;
++	instance->start_error = -EINPROGRESS;
++	err = airoha_npu_boot(npu);
++	if (err)
++		airoha_npu_wlan_short_guard_clear(npu);
++	instance->start_error = err;
++	return err;
++}
++
++#endif
