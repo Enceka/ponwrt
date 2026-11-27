@@ -174,11 +174,41 @@ arguments fail with `-EINVAL`. Status reports `tx_variant` for each send.
 
 Use `--tuple-variants --cover-slot 1 --special-tag --require-native` to
 exercise both families, all five variants and both service IDs: 20 packets
-in total. This validates packet generation and the current service classifier;
+in total. This retains the wide service classifier regression;
 every variant of service 0x2134 selects RX2, while service 0xa134 selects RX4.
-Exact tuple classifier integration will add per-field miss expectations.
 The runner checks returned kind, marker, service, source, receive ring and
 native policy, then withdraws the classifier and restores the module.
+
+Add `--exact-tuple` for the kernel987 exact classifier. It requires
+`--tuple-variants --cover-slot 1 --special-tag` and uses `cover 1`,
+`tuple 0 0x2134`, then `route`. Slot0 matches the fixed IPv4/IPv6 UDP
+tuples above and the complete service ID; slot1 provides the typed PON
+CPU cover. Only service 0x2134 with variant 0 selects RX2: two packets,
+one per family. The other 18 packets select RX4, including every changed
+address/port and every service 0xa134 packet. The runner records
+`exact_tuple` and each packet's `expected_ring` in `report.json`.
+PON PPE qualification stays closed. Exact mode uses the existing `off`,
+`restore`, ten-register verification and module-unload sequence, including
+after a packet mismatch or classifier-command failure. It cannot combine
+with `--withdraw-cycle`, `--packet-matrix` or `--sif-sweep`.
+
+```sh
+python3 target/linux/airoha/tests/pon_offload/run_loopback_probe.py \
+  --pin /absolute/path/to/known-hosts --boot BOOT_UUID \
+  --module /absolute/path/to/matching-kernel987/ct_pon_loopback.ko \
+  --sha256 MODULE_SHA256 --output /absolute/path/to/new-evidence-directory \
+  --run --special-tag --cover-slot 1 --tuple-variants --exact-tuple --require-native
+
+python3 -B -m unittest discover -s target/linux/airoha/tests/pon_offload \
+  -p test_run_loopback_probe.py -v
+```
+
+The host self-check simulates SSH responses without contacting a board.
+It covers exact and wide ring expectations, rejected option combinations,
+preflight-only operation, per-field misses, incorrect baseline/service
+routing, and withdrawal/restoration after command or observation failures.
+Build the external module against the running kernel987 source/configuration
+before the board run.
 
 On 2026-11-27, all 20 tuple-variant packets passed on RAM kernel984, boot
 `986bed54-e67d-4baa-ac06-0627f74789a2`. Every returned sequence, cookie,

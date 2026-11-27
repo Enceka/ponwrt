@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Exercise the loopback runner with bounded, local SSH fixtures."""
+import contextlib
+import hashlib
+import importlib.util
+import io
+import json
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+RUNNER_PATH = Path(__file__).with_name('run_loopback_probe.py')
+SPEC = importlib.util.spec_from_file_location('loopback_runner', RUNNER_PATH)
+RUNNER = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(RUNNER)
+PROBE = '/sys/kernel/debug/ct_pon_loopback/'
+CLASSIFIER = '/sys/bus/platform/devices/1fb50000.ethernet/ct_pon_cpu_probe'
+POLICY = '/sys/bus/platform/devices/1fb50000.ethernet/ct_native_pair_policy'
+CONFIG = '/sys/kernel/debug/ppe/config'
+IPV6 = '/proc/sys/net/ipv6/conf/pon0/disable_ipv6'
+BOOT = '986bed54-e67d-4baa-ac06-0627f74789a2'
+CLEAN = 'saved=0 dirty=00 active=00 pending=0 scope=01000000 ready=0\n'
+HEALTH = 'ct_cpu_fallback: 0 healthy\ngeneration=49 allowed=1 failed=0\n'
+
+
+class BoardFixture:
+    def __init__(self, exact=True, ring_overrides=None, corrupt=None, fail_command=None):
+        self.exact = exact
+        self.ring_overrides = ring_overrides or {}
+        self.corrupt = corrupt
+        self.fail_command = fail_command
+        self.commands = []
+        self.sent = []
+        self.heads = {0: 7, 2: 11, 4: 19}
+        self.loaded = False
+        self.prepared = False
+        self.routed = False
+        self.cover = False
+        self.classified = False
+        self.ipv6 = '0'
+
+    def classifier_status(self):
+        if not self.cover and not self.classified:
+            return CLEAN + 'service0=0 service1=0 ppe=0 errors=0 cover=00 routed=0\n'
+        return ('saved=1 dirty=00 active=03 pending=0 scope=01000000 ready=1\n'
+                'service0=8500 service1=0 ppe=0 errors=0 cover=02 routed=' +
+                str(int(self.routed)) + '\n')
+
+    def status(self):
+        sequence = len(self.sent)
+        service, kind, variant = self.sent[-1] if self.sent else (0, 'ipv4', 0)
+        state = int(self.prepared)
+        result = (f'retained={state} controller={state} opened={state} saved={state} error=0 pending=0 '
+                  f'sequence={sequence} received={sequence} rx_sequence={sequence} '
+                  f'rx_msg0={service << 14:08x} rx_msg1={2 << 21:08x}\n'
+                  f'tx_kind={kind} tx_length=128 rx_kind={kind} rx_length=114\n'
+                  f'tx_variant={variant}\n')
+        result += ''.join(f'{0x1700 + 4 * index:04x}={0x12340000 + index:08x} saved=00000000\n'
+                          for index in range(10))
+        result += ''.join(f'rx{ring} head={head} tail=0 queued=0\n'
+                          for ring, head in self.heads.items())
+        return result
+
+    def run(self, command_line, *, input, capture_output, timeout):
+        if command_line[0] != 'ssh' or not capture_output or timeout != 25:
+            raise AssertionError('unexpected subprocess invocation')
+        guard = ('set -eu; test "$(cat /proc/sys/kernel/random/boot_id)" = ' + BOOT +
+                 '; test "$(wc -l </proc/mtd)" = 1; ')
+        if not command_line[-1].startswith(guard):
+            raise AssertionError('missing boot/MTD guard')
+        command = command_line[-1][len(guard):]
+        self.commands.append(command)
+        if command == self.fail_command:
+            return subprocess.CompletedProcess(command_line, 1, b'', b'injected command failure\n')
+        result = ''
+        if command.startswith('cat /sys/kernel/debug/gpio; '):
+            result = 'ram-pon-tx-disable out hi\nstate DOWN\n' + self.classifier_status() + HEALTH
+        elif command == 'cat ' + IPV6:
+            result = self.ipv6 + '\n'
+        elif command.startswith('test ! -d /sys/module/ct_pon_loopback; cat > '):
+            if self.loaded or input != b'host-fixture-module':
+                raise AssertionError('unexpected upload')
+        elif command.startswith('test "$(sha256sum /tmp/ct_pon_loopback.ko '):
+            self.loaded = True
+        elif command == 'rmmod ct_pon_loopback':
+            if self.prepared or self.routed or self.cover or self.classified:
+                raise AssertionError('module unloaded before withdrawal/restoration')
+            self.loaded = False
+        elif command.startswith('echo '):
+            parts = shlex.split(command)
+            if len(parts) != 4 or parts[2] != '>':
+                raise AssertionError('expected one write per command')
+            value, destination = parts[1], parts[3]
+            if destination == IPV6:
+                self.ipv6 = value
+            elif destination == CLASSIFIER:
+                if value == 'cover 1':
+                    self.cover = True
+                elif value in ('tuple 0 0x2134', 'set 0 0x2134'):
+                    if not self.cover:
+                        raise AssertionError('consumer installed before cover')
+                    self.classified = True
+                elif value == 'route':
+                    if not self.cover or not self.classified:
+                        raise AssertionError('route enabled before both consumers')
+                    self.routed = True
+                elif value == 'off':
+                    self.routed = self.cover = self.classified = False
+                else:
+                    raise AssertionError('unexpected classifier command: ' + value)
+            elif destination == PROBE + 'command':
+                if value == 'prepare':
+                    self.prepared = True
+                elif value == 'restore':
+                    if self.routed or self.cover or self.classified:
+                        raise AssertionError('restored before classifier withdrawal')
+                    self.prepared = False
+                elif value.startswith('send '):
+                    if not self.loaded or not self.prepared or not self.routed:
+                        raise AssertionError('send before route preparation')
+                    _, service, kind, variant = value.split()
+                    packet = (int(service), kind, int(variant))
+                    if self.exact:
+                        ring = 2 if packet in ((0x2134, 'ipv4', 0), (0x2134, 'ipv6', 0)) else 4
+                    else:
+                        ring = 2 if packet[0] == 0x2134 else 4
+                    ring = self.ring_overrides.get(len(self.sent), ring)
+                    self.sent.append(packet)
+                    self.heads[ring] += 1
+                else:
+                    raise AssertionError('unexpected module command: ' + value)
+            else:
+                raise AssertionError('unexpected write destination: ' + destination)
+        elif command.startswith('cat ' + PROBE + 'status'):
+            result = self.status()
+            if 'cat ' + CLASSIFIER in command:
+                result += self.classifier_status()
+            if 'cat ' + CONFIG in command:
+                result += HEALTH
+            if 'cat ' + POLICY in command and self.corrupt:
+                result = self.corrupt(len(self.sent) - 1, result)
+        elif command == 'cat ' + CLASSIFIER + '; cat ' + CONFIG:
+            result = self.classifier_status() + HEALTH
+        elif command.startswith('cat ' + CONFIG + '; cat ' + CLASSIFIER):
+            result = self.classifier_status() + HEALTH
+        else:
+            raise AssertionError('unexpected remote command: ' + command)
+        return subprocess.CompletedProcess(command_line, 0, result.encode(), b'')
+
+
+class LoopbackRunnerTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='loopback-runner-test-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.module = self.root / 'module.ko'
+        self.module.write_bytes(b'host-fixture-module')
+        self.sha256 = hashlib.sha256(self.module.read_bytes()).hexdigest()
+        self.invocations = 0
+
+    def invoke(self, board, options=None):
+        self.invocations += 1
+        self.output = self.root / ('evidence-' + str(self.invocations))
+        args = ['--pin', str(self.root / 'known-hosts'), '--boot', BOOT,
+                '--module', str(self.module), '--sha256', self.sha256,
+                '--output', str(self.output)]
+        if options is None:
+            options = ['--run', '--special-tag', '--cover-slot', '1',
+                       '--tuple-variants', '--exact-tuple', '--require-native']
+        with mock.patch.object(sys, 'argv', [str(RUNNER_PATH)] + args + options), \
+                mock.patch.object(RUNNER.subprocess, 'run', side_effect=board.run), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            RUNNER.main()
+        return json.loads((self.output / 'report.json').read_text()) if (self.output / 'report.json').exists() else None
+
+    def assert_restored(self, board):
+        self.assertFalse(board.loaded)
+        self.assertFalse(board.prepared)
+        self.assertFalse(board.routed)
+        self.assertFalse(board.cover)
+        self.assertFalse(board.classified)
+        self.assertEqual(board.ipv6, '0')
+        withdrawal = board.commands.index('echo off > ' + CLASSIFIER)
+        restoration = board.commands.index('echo restore > ' + PROBE + 'command')
+        unload = board.commands.index('rmmod ct_pon_loopback')
+        ipv6_restore = board.commands.index('echo 0 > ' + IPV6)
+        self.assertLess(withdrawal, restoration)
+        self.assertLess(restoration, unload)
+        self.assertLess(unload, ipv6_restore)
+        self.assertTrue(json.loads((self.output / 'report.json').read_text())['registers_restored'])
+
+    def test_exact_tuple_twenty_packets(self):
+        board = BoardFixture()
+        report = self.invoke(board)
+        self.assertTrue(report['exact_tuple'])
+        self.assertTrue(report['commands_completed'])
+        self.assertTrue(report['numbered_packets_returned'])
+        self.assertTrue(report['service_preserved'])
+        self.assertEqual(len(board.sent), 20)
+        self.assertEqual(set(board.sent), {(service, family, variant)
+                                          for service in (0x2134, 0xa134)
+                                          for family in ('ipv4', 'ipv6') for variant in range(5)})
+        self.assertEqual([item['expected_ring'] for item in report['observations']],
+                         [2] + [4] * 9 + [2] + [4] * 9)
+        self.assertEqual([item['changed_rings'] for item in report['observations']],
+                         [[2]] + [[4]] * 9 + [[2]] + [[4]] * 9)
+        self.assertIn("echo 'tuple 0 0x2134' > " + CLASSIFIER, board.commands)
+        self.assertNotIn("echo 'set 0 0x2134' > " + CLASSIFIER, board.commands)
+        self.assert_restored(board)
+
+    def test_wide_service_regression(self):
+        board = BoardFixture(exact=False)
+        report = self.invoke(board, ['--run', '--special-tag', '--cover-slot', '1',
+                                     '--tuple-variants', '--require-native'])
+        self.assertFalse(report['exact_tuple'])
+        self.assertEqual([item['changed_rings'] for item in report['observations']], [[2], [4]] * 10)
+        self.assertEqual([item['expected_ring'] for item in report['observations']], [2, 4] * 10)
+        self.assertIn("echo 'set 0 0x2134' > " + CLASSIFIER, board.commands)
+        self.assertNotIn("echo 'tuple 0 0x2134' > " + CLASSIFIER, board.commands)
+        self.assert_restored(board)
+
+    def test_each_wrong_tuple_destination_fails_and_restores(self):
+        for packet_index in range(20):
+            with self.subTest(packet=packet_index):
+                board = BoardFixture(ring_overrides={packet_index: 4 if packet_index in (0, 10) else 2})
+                with self.assertRaisesRegex(AssertionError, 'expected RX'):
+                    self.invoke(board)
+                self.assertEqual(len(board.sent), packet_index + 1)
+                report = json.loads((self.output / 'report.json').read_text())
+                self.assertNotIn('commands_completed', report)
+                self.assertEqual(len(report['observations']), packet_index + 1)
+                self.assert_restored(board)
+
+    def test_packet_identity_and_health_failures_restore(self):
+        mutations = [
+            ('received=1 ', 'received=0 '),
+            ('rx_sequence=1 ', 'rx_sequence=0 '),
+            ('tx_variant=0\n', 'tx_variant=1\n'),
+            ('tx_kind=ipv4 ', 'tx_kind=ipv6 '),
+            ('rx_kind=ipv4 ', 'rx_kind=ipv6 '),
+            ('routed=1\n', 'routed=0\n'),
+            ('ct_cpu_fallback: 0 ', 'ct_cpu_fallback: 1 '),
+            ('allowed=1 failed=0', 'allowed=0 failed=0'),
+            ('allowed=1 failed=0', 'allowed=1 failed=1'),
+        ]
+        for original, replacement in mutations:
+            with self.subTest(field=original):
+                board = BoardFixture(corrupt=lambda index, status: status.replace(original, replacement))
+                with self.assertRaises(AssertionError):
+                    self.invoke(board)
+                self.assertEqual(len(board.sent), 1)
+                self.assert_restored(board)
+
+    def test_service_and_source_mismatches_fail(self):
+        for original, replacement in [('rx_msg0=084d0000', 'rx_msg0=284d0000'),
+                                      ('rx_msg1=00400000', 'rx_msg1=00200000')]:
+            with self.subTest(field=original):
+                board = BoardFixture(corrupt=lambda index, status: status.replace(original, replacement))
+                with self.assertRaisesRegex(AssertionError, 'special tag service mismatch'):
+                    self.invoke(board)
+                self.assertFalse(json.loads((self.output / 'report.json').read_text())['service_preserved'])
+                self.assert_restored(board)
+
+    def test_command_failure_withdraws_and_restores(self):
+        for command in ("echo 'tuple 0 0x2134' > " + CLASSIFIER,
+                        'echo route > ' + CLASSIFIER,
+                        "echo 'send 8500 ipv4 0' > " + PROBE + 'command'):
+            with self.subTest(command=command):
+                board = BoardFixture(fail_command=command)
+                with self.assertRaises((subprocess.CalledProcessError, RuntimeError)):
+                    self.invoke(board)
+                self.assert_restored(board)
+
+    def test_failed_withdrawal_retains_module(self):
+        board = BoardFixture(fail_command='echo off > ' + CLASSIFIER)
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.invoke(board)
+        self.assertTrue(board.loaded)
+        self.assertTrue(board.prepared)
+        self.assertNotIn('echo restore > ' + PROBE + 'command', board.commands)
+        self.assertNotIn('rmmod ct_pon_loopback', board.commands)
+
+    def test_preflight_does_not_write(self):
+        board = BoardFixture()
+        report = self.invoke(board, ['--special-tag', '--cover-slot', '1',
+                                     '--tuple-variants', '--exact-tuple', '--require-native'])
+        self.assertIsNone(report)
+        self.assertEqual(len(board.commands), 1)
+        self.assertTrue(board.commands[0].startswith('cat /sys/kernel/debug/gpio; '))
+        self.assertEqual(board.sent, [])
+
+    def test_invalid_options_stop_before_ssh(self):
+        options = [
+            ['--exact-tuple'],
+            ['--exact-tuple', '--special-tag', '--cover-slot', '1'],
+            ['--exact-tuple', '--tuple-variants', '--special-tag'],
+            ['--exact-tuple', '--tuple-variants', '--special-tag', '--cover-slot', '0'],
+            ['--exact-tuple', '--tuple-variants', '--cover-slot', '1'],
+        ]
+        options += [['--exact-tuple', '--tuple-variants', '--special-tag', '--cover-slot', '1', experiment]
+                    for experiment in ('--withdraw-cycle', '--packet-matrix', '--sif-sweep')]
+        for combination in options:
+            with self.subTest(options=combination):
+                board = BoardFixture()
+                with self.assertRaises(SystemExit) as error:
+                    self.invoke(board, combination)
+                self.assertEqual(error.exception.code, 2)
+                self.assertEqual(board.commands, [])
+                self.assertFalse(self.output.exists())
+
+    def test_optimized_python_is_rejected(self):
+        result = subprocess.run([sys.executable, '-B', '-O', str(RUNNER_PATH)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('Run without -O', result.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main()

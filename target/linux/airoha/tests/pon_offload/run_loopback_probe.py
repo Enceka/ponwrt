@@ -29,6 +29,8 @@ def main():
     parser.add_argument('--packet-matrix', action='store_true')
     parser.add_argument('--require-native', action='store_true')
     parser.add_argument('--tuple-variants', action='store_true')
+    parser.add_argument('--exact-tuple', action='store_true',
+                        help='Use kernel987 tuple classification with --tuple-variants --cover-slot 1')
     args = parser.parse_args()
     if args.cover_slot is not None and not args.special_tag:
         parser.error('--cover-slot requires --special-tag')
@@ -40,6 +42,8 @@ def main():
         parser.error('--packet-matrix requires --cover-slot 1 without other experiments')
     if args.tuple_variants and (args.cover_slot != 1 or args.withdraw_cycle or args.sif_sweep or args.packet_matrix):
         parser.error('--tuple-variants requires --cover-slot 1 without other experiments')
+    if args.exact_tuple and (not args.tuple_variants or args.cover_slot != 1):
+        parser.error('--exact-tuple requires --tuple-variants and --cover-slot 1')
     uuid.UUID(args.boot)
     blob = args.module.read_bytes()
     assert hashlib.sha256(blob).hexdigest() == args.sha256
@@ -79,7 +83,8 @@ def main():
     assert re.search(policy_pattern, before, re.M)
     report = {'boot': args.boot, 'module_sha256': args.sha256, 'special_tag': args.special_tag,
               'cover_slot': args.cover_slot, 'sif_sweep': args.sif_sweep,
-              'tuple_variants': args.tuple_variants, 'require_native': args.require_native,
+              'tuple_variants': args.tuple_variants, 'exact_tuple': args.exact_tuple,
+              'require_native': args.require_native,
               'observations': []}
     if not args.run:
         print(json.dumps({'preflight': True, 'output': str(output)}))
@@ -102,7 +107,8 @@ def main():
             write('classify-b', classifier, 'set 1 0xa134')
         else:
             write('cover', classifier, 'cover ' + str(args.cover_slot))
-            write('classify-a', classifier, 'set ' + str(args.cover_slot ^ 1) + ' 0x2134')
+            classify_command = 'tuple' if args.exact_tuple else 'set'
+            write('classify-a', classifier, classify_command + ' ' + str(args.cover_slot ^ 1) + ' 0x2134')
             write('route', classifier, 'route')
         remote('classified', 'cat ' + classifier + '; cat /sys/kernel/debug/ppe/config')
         cases = [(service, (), True) for service in (0x2134, 0xa134, 0x2134)]
@@ -161,7 +167,11 @@ def main():
                 assert numbered_return and 'routed=' + str(int(routed)) in observed
                 assert len(changed_rings) == 1, 'expected a covered WAN CPU receive ring'
                 if args.tuple_variants:
-                    assert changed_rings == ([2] if service == 0x2134 else [4])
+                    expected_ring = 2 if service == 0x2134 and (not args.exact_tuple or variant == 0) else 4
+                    report['observations'][-1]['expected_ring'] = expected_ring
+                    assert changed_rings == [expected_ring], (kind + ' variant ' + str(variant) +
+                                                              ' service ' + hex(service) +
+                                                              ' expected RX' + str(expected_ring))
                     assert 'tx_variant=' + str(variant) in observed
                     assert 'tx_kind=' + kind in observed and 'rx_kind=' + kind in observed
                 elif args.packet_matrix:
