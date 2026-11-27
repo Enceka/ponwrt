@@ -1,0 +1,51 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: publish EPON registration identity
+
+Carry the registered LLID alongside its channel in the published EPON
+tag. Keep the existing channel and validity encoding and publish through
+the PON configuration transaction. Invalid mappings clear the whole tag.
+
+The line controller and host driver must be rebuilt together for the new
+four-argument configure_epon interface.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -651,6 +651,7 @@
+ };
+ 
+ #define AIROHA_PON_QDMA_GEM_MASK	GENMASK(15, 0)
++#define AIROHA_PON_QDMA_LLID_MASK	GENMASK(15, 0)
+ #define AIROHA_PON_QDMA_TCONT_MASK	GENMASK(20, 16)
+ #define AIROHA_PON_QDMA_PBIT_MASK	GENMASK(28, 21)
+ #define AIROHA_PON_QDMA_EPON		BIT(30)
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -4660,6 +4660,6 @@
+ 
+ int airoha_eth_pon_configure_epon(struct net_device *netdev, u8 channel,
+-				  bool valid)
++				  u16 llid, bool valid)
+ {
+ 	struct airoha_gdm_dev *dev;
+ 	u32 value = 0;
+@@ -4673,7 +4673,8 @@
+ 		return -ERANGE;
+ 	if (valid)
+ 		value = AIROHA_PON_QDMA_VALID | AIROHA_PON_QDMA_EPON |
+-			FIELD_PREP(AIROHA_PON_QDMA_TCONT_MASK, channel);
++			FIELD_PREP(AIROHA_PON_QDMA_TCONT_MASK, channel) |
++			FIELD_PREP(AIROHA_PON_QDMA_LLID_MASK, llid);
+ 
+ 	return airoha_eth_pon_commit_config(dev, NULL, value);
+ }
+--- a/include/linux/airoha-eth.h
++++ b/include/linux/airoha-eth.h
+@@ -96,7 +96,7 @@
+ 	struct net_device *netdev, const struct airoha_pon_flow_config *flows,
+ 	unsigned int count);
+ int airoha_eth_pon_configure_epon(struct net_device *netdev, u8 channel,
+-				  bool valid);
++				  u16 llid, bool valid);
+ int airoha_eth_pon_get_datapath_stats(
+ 	struct net_device *netdev, struct airoha_pon_datapath_stats *stats);
+ /* Send control_netdev frames through the pon_netdev QDMA ring. */
