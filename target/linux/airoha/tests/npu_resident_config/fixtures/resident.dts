@@ -1,0 +1,67 @@
+/dts-v1/;
+
+/ {
+	compatible = "fiberhome,hg5585f-ct", "airoha,an7581", "airoha,en7581";
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		npu_binary: npu-binary@84000000 {
+			reg = <0 0x84000000 0 0xa00000>;
+			no-map;
+		};
+		npu_ba: npu-ba@92980000 {
+			reg = <0 0x92980000 0 0x80000>;
+			no-map;
+		};
+		npu_pkt: npu-pkt@92a00000 {
+			reg = <0 0x92a00000 0 0x600000>;
+			no-map;
+		};
+		npu_host: npu-host-rx@93000000 {
+			reg = <0 0x93000000 0 0x380000>;
+			no-map;
+		};
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		chip_scu: syscon@1fa20000 {
+			compatible = "airoha,en7581-chip-scu", "syscon";
+			reg = <0 0x1fa20000 0 0x388>;
+		};
+		scuclk: clock-controller@1fb00000 {
+			compatible = "airoha,en7581-scu", "syscon";
+			reg = <0 0x1fb00000 0 0x970>;
+			#clock-cells = <1>;
+			#reset-cells = <1>;
+			airoha,chip-scu = <&chip_scu>;
+		};
+		npu: npu@1e900000 {
+			compatible = "airoha,en7581-npu";
+			reg = <0 0x1e900000 0 0x313000>;
+			status = "okay";
+			airoha,connac2-rebuilt-ram-lab;
+			memory-region = <&npu_binary>, <&npu_ba>, <&npu_pkt>, <&npu_host>;
+			memory-region-names = "binary", "ba", "connac2-pkt", "connac2-host-rx";
+		};
+		eth: ethernet@1fb50000 {
+			compatible = "airoha,en7581-eth";
+			reg = <0 0x1fb50000 0 0x2600>, <0 0x1fb54000 0 0x2000>,
+			      <0 0x1fb56000 0 0x2000>;
+			reg-names = "fe", "qdma0", "qdma1";
+			status = "okay";
+			airoha,npu = <&npu>;
+			resets = <&scuclk 0>, <&scuclk 1>, <&scuclk 2>;
+			reset-names = "fe", "pdma", "qdma";
+		};
+	};
+};
