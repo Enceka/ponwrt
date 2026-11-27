@@ -16,6 +16,13 @@ typedef uint64_t u64;
 typedef uint32_t __le32;
 typedef uint64_t dma_addr_t;
 typedef int64_t ktime_t;
+typedef struct { bool held; } spinlock_t;
+
+static inline void spin_lock_init(spinlock_t *lock) { lock->held = false; }
+static inline void spin_lock_bh(spinlock_t *lock) { assert(!lock->held); lock->held = true; }
+static inline void spin_unlock_bh(spinlock_t *lock) { assert(lock->held); lock->held = false; }
+
+#define min_t(type, left, right) ((type)(left) < (type)(right) ? (type)(left) : (type)(right))
 
 #define EIO 5
 #define ENOMEM 12

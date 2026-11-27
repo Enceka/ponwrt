@@ -51,6 +51,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=tests / 'out')
     parser.add_argument('--cc', default=os.environ.get('CC', 'clang'))
+    parser.add_argument('--source', type=Path,
+                        help='Patched kernel tree whose complete ER consumer is tested')
     parser.add_argument('--firmware', type=Path,
                         default=repo.parents[1] / 'an7581-npu-firmware',
                         help='Firmware tree whose include/npu_eth_return_abi.h is checked')
@@ -74,7 +76,8 @@ def main():
     extracted.mkdir(exist_ok=True)
     sources = {}
     for name in ('airoha_eth_return.c', 'airoha_eth_return.h'):
-        sources[name] = added_file(consumer, DRIVER + name).encode()
+        sources[name] = ((args.source / DRIVER / name).read_bytes() if args.source else
+                         added_file(consumer, DRIVER + name).encode())
     abi_name = 'npu_eth_return_abi.h'
     firmware_abi = (args.firmware / 'include' / abi_name).read_bytes()
     abi_marker = '--- /dev/null\n+++ b/' + DRIVER + abi_name + '\n'
@@ -86,6 +89,10 @@ def main():
     else:
         sources[abi_name] = firmware_abi
         abi_origin = str(args.firmware / 'include' / abi_name)
+    if args.source:
+        if (args.source / DRIVER / abi_name).read_bytes() != firmware_abi:
+            raise RuntimeError('input kernel ER ABI differs from firmware')
+        abi_origin = str(args.source / DRIVER / abi_name)
     for name, contents in sources.items():
         (extracted / name).write_bytes(contents)
     linux = output / 'stubs/linux'
@@ -98,6 +105,8 @@ def main():
              '-fno-omit-frame-pointer', '-I', str(output / 'stubs'),
              '-I', str(tests), '-I', str(extracted), str(tests / 'consumer_test.c')]
     environment = dict(os.environ)
+    if b'airoha_er_enable_observation' in sources['airoha_eth_return.c']:
+        build.append('-DTEST_OBSERVATION')
     environment['ASAN_OPTIONS'] = 'halt_on_error=1:abort_on_error=1'
     environment['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
     modes = {}

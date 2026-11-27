@@ -1,0 +1,570 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: add isolated PON NPU return diagnostics
+
+Allow an explicitly selected RAM diagnostic to send PON frames through
+an empty AUTH table and back through Ethernet Return. Keep optical flow
+qualification closed and bank1 learning disabled throughout the session.
+Bind the session to its netdevice and controller; retain ownership until
+close and register restoration finish. Capture ER evidence only on request.
+
+--- a/drivers/net/ethernet/airoha/airoha_bank1_routes.h
++++ b/drivers/net/ethernet/airoha/airoha_bank1_routes.h
+@@ -139,11 +139,13 @@
+ int airoha_bank1_routes_open(struct airoha_eth *eth, const void *owner)
+ {
+ 	struct airoha_bank1_routes *routes;
++	bool diagnostic;
+ 	int error;
+ 
+ 	if (!eth || !eth->ppe || !owner)
+ 		return -EINVAL;
+ 	lockdep_assert_held(&flow_offload_mutex);
++	diagnostic = airoha_ppe_npu_diag_active(eth->ppe, owner);
+ 	routes = &eth->ct_bank1_routes;
+ 	spin_lock_bh(&eth->ct_route_lock);
+ 	if (routes->owner != owner || !routes->ready || routes->revoked) {
+@@ -154,7 +156,7 @@
+ 		error = -EACCES;
+ 		goto unlock;
+ 	}
+-	if (!eth->ppe->ct_pon_qualified || eth->ct_ordinary_full_test) {
++	if ((!eth->ppe->ct_pon_qualified && !diagnostic) || eth->ct_ordinary_full_test) {
+ 		error = -EOPNOTSUPP;
+ 		goto unlock;
+ 	}
+@@ -169,7 +171,11 @@
+ 		goto unlock;
+ 	}
+ 	if (!(airoha_fe_rr(eth, REG_PPE_GLO_CFG(1)) & PPE_GLO_CFG_EN_MASK) ||
+-	    !airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1))) {
++	    (diagnostic ?
++	     airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) ||
++	     FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, airoha_fe_rr(eth, REG_PPE_TB_CFG(1))) != 2 ||
++	     (airoha_fe_rr(eth, REG_PPE_GLO_CFG(1)) & PPE_GLO_CFG_BUSY_MASK) :
++	     !airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)))) {
+ 		error = -EIO;
+ 		goto unlock;
+ 	}
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -1001,6 +1001,7 @@
+ int airoha_bank1_routes_ingress_ready(struct airoha_eth *eth, const void *owner);
+ int airoha_bank1_routes_check(struct airoha_eth *eth, const void *owner, bool opened);
+ int airoha_ct_cpu_fallback(struct airoha_eth *eth);
++bool airoha_ppe_npu_diag_active(struct airoha_ppe *ppe, const void *token);
+ int airoha_ppe_npu_owner_claim_locked(struct airoha_eth *eth, u64 generation);
+ int airoha_ppe_npu_owner_close_locked(struct airoha_eth *eth);
+ int airoha_ppe_npu_return_prepare_locked(struct airoha_eth *eth,
+--- a/drivers/net/ethernet/airoha/airoha_eth_return.c
++++ b/drivers/net/ethernet/airoha/airoha_eth_return.c
+@@ -17,6 +17,9 @@
+ 	u32 consumed, fault_reason;
+ 	bool enabled, protocol_error;
+ 	u64 packets, bytes, dropped, polls, empty_polls;
++	spinlock_t observation_lock;
++	bool observation_enabled;
++	struct airoha_er_observation observation;
+ };
+ 
+ static __le32 *er_ctrl(struct airoha_er *ring)
+@@ -100,6 +103,16 @@
+ 					       &ring->config, snapshot[ER_D_SERVICE])) {
+ 			++ring->dropped;
+ 		} else if ((skb = napi_alloc_skb(napi, size + NET_IP_ALIGN))) {
++			if (READ_ONCE(ring->observation_enabled)) {
++				spin_lock_bh(&ring->observation_lock);
++				memcpy(ring->observation.descriptor, snapshot, sizeof(snapshot));
++				ring->observation.produced = produced;
++				ring->observation.consumed = sequence;
++				ring->observation.frame_bytes = min_t(u32, size, sizeof(ring->observation.frame));
++				memset(ring->observation.frame, 0, sizeof(ring->observation.frame));
++				memcpy(ring->observation.frame, payload, ring->observation.frame_bytes);
++				spin_unlock_bh(&ring->observation_lock);
++			}
+ 			skb_reserve(skb, NET_IP_ALIGN);
+ 			skb_put_data(skb, payload, size);
+ 			skb->dev = ring->lower;
+@@ -169,6 +182,7 @@
+ 	ring->lower = lower;
+ 	ring->ops = ops;
+ 	ring->ctx = ctx;
++	spin_lock_init(&ring->observation_lock);
+ 	ring->config = (struct er_config) {
+ 		.bytes = er_bytes(count), .epoch = epoch, .count = count,
+ 		.sport = sport, .generation = generation,
+@@ -292,3 +306,15 @@
+ 	stats->consumed = READ_ONCE(ring->consumed);
+ 	stats->fault = READ_ONCE(ring->fault_reason);
+ }
++
++void airoha_er_observe(struct airoha_er *ring, struct airoha_er_observation *observation)
++{
++	spin_lock_bh(&ring->observation_lock);
++	*observation = ring->observation;
++	spin_unlock_bh(&ring->observation_lock);
++}
++
++void airoha_er_enable_observation(struct airoha_er *ring)
++{
++	WRITE_ONCE(ring->observation_enabled, true);
++}
+--- a/drivers/net/ethernet/airoha/airoha_eth_return.h
++++ b/drivers/net/ethernet/airoha/airoha_eth_return.h
+@@ -21,6 +21,11 @@
+ 	u32 consumed, fault;
+ };
+ 
++struct airoha_er_observation {
++	u32 descriptor[16], produced, consumed, frame_bytes;
++	u8 frame[128];
++};
++
+ int airoha_er_create(struct airoha_er **out, struct device *dma_dev,
+ 		    struct net_device *lower, u32 sport, u32 generation,
+ 		    u32 epoch, u32 count, bool enabled,
+@@ -28,5 +33,7 @@
+ int airoha_er_destroy(struct airoha_er **ring);
+ int airoha_er_retire_after_reset(struct airoha_er **ring);
+ void airoha_er_get_stats(struct airoha_er *ring, struct airoha_er_stats *stats);
++void airoha_er_observe(struct airoha_er *ring, struct airoha_er_observation *observation);
++void airoha_er_enable_observation(struct airoha_er *ring);
+ 
+ #endif
+--- a/drivers/net/ethernet/airoha/airoha_npu_admission.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_admission.h
+@@ -73,6 +73,8 @@
+ 	owner = eth->ppe->ct_npu_owner;
+ 	if (!owner || owner->txn.phase != NPU_TXN_CLOSED || owner->auth_attempted)
+ 		return -EBUSY;
++	if (owner->diag_lower)
++		return -EOPNOTSUPP;
+ 	error = airoha_npu_auth_rules_validate(owner->txn.id.epoch,
+ 					      owner->txn.id.generation, rules, count);
+ 	if (error)
+@@ -117,12 +119,14 @@
+ 	};
+ 	int error;
+ 
+-	if (!owner->ppe->ct_pon_qualified)
++	if (!owner->ppe->ct_pon_qualified &&
++	    !airoha_ppe_npu_diag_active(owner->ppe, owner))
+ 		return -EOPNOTSUPP;
+ 	error = airoha_npu_owner_return_ready(owner, id);
+ 	if (error)
+ 		return error;
+-	if (!owner->auth_attempted || !owner->auth_count)
++	if (!owner->auth_attempted || (!owner->auth_count &&
++	    !airoha_ppe_npu_diag_active(owner->ppe, owner)))
+ 		return -EACCES;
+ 	error = airoha_npu_owner_auth(owner, &message);
+ 	if (error)
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_diag.h
+@@ -0,0 +1,263 @@
++#ifndef AIROHA_NPU_DIAG_H
++#define AIROHA_NPU_DIAG_H
++
++static bool airoha_npu_diag_platform(struct airoha_ppe *ppe)
++{
++	static const char * const disabled[] = {
++		"/soc/nand-controller@1fa11000", "/soc/ethernet@1fb64000",
++	};
++	struct device_node *node;
++	unsigned int index;
++	u32 gpios[2];
++	bool valid;
++
++	if (!of_machine_is_compatible("fiberhome,hg5585f-ct") ||
++	    !of_property_read_bool(ppe->eth->dev->of_node, "airoha,connac2-pon-er-diagnostic") ||
++	    !of_property_read_bool(ppe->eth->dev->of_node, "airoha,connac2-ram-native-pairs") ||
++	    ppe->eth->ct_ordinary_full_test || ppe->ct_pon_qualified || ppe->ct_pair_policy_allowed)
++		return false;
++	for (index = 0; index < ARRAY_SIZE(disabled); ++index) {
++		node = of_find_node_by_path(disabled[index]);
++		valid = node && !of_device_is_available(node);
++		of_node_put(node);
++		if (!valid)
++			return false;
++	}
++	node = of_find_node_by_path("/soc/system-controller@1fbf0200/pinctrl/ram-tx-disable-hog");
++	valid = node && of_device_is_available(node) && of_property_read_bool(node, "gpio-hog") &&
++		of_property_read_bool(node, "output-high") &&
++		of_property_count_u32_elems(node, "gpios") == 2 &&
++		!of_property_read_u32_array(node, "gpios", gpios, ARRAY_SIZE(gpios)) &&
++		gpios[0] == 38 && !gpios[1];
++	of_node_put(node);
++	if (!valid)
++		return false;
++	for_each_compatible_node(node, NULL, "airoha,en7581-snand") {
++		if (of_device_is_available(node)) {
++			of_node_put(node);
++			return false;
++		}
++	}
++	return true;
++}
++
++static int airoha_npu_diag_start(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	struct airoha_npu_owner *owner;
++	struct airoha_gdm_dev *dev;
++	struct net_device *lower;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!airoha_npu_diag_platform(ppe))
++		return -EPERM;
++	if (ppe->ct_npu_owner || ppe->ct_pair_failed || ppe->ct_stopping ||
++	    eth->ct_cpu_fallback || eth->ct_ifc_cpu_port_failed ||
++	    eth->pon_update_owner || airoha_ct_pon_ifc_busy(ppe))
++		return -EBUSY;
++	lower = dev_get_by_name(&init_net, "pon0");
++	if (!lower)
++		return -ENODEV;
++	if (lower->dev.parent != eth->dev) {
++		error = -EXDEV;
++		goto put;
++	}
++	dev = netdev_priv(lower);
++	if (!airoha_is_valid_gdm_dev(eth, dev) || dev->port->id != AIROHA_GDM2_IDX || dev->nbq ||
++	    !test_bit(AIROHA_DEV_F_PON, &dev->flags) || !dev->pon_link_ops || !dev->pon_link_priv ||
++	    !netif_running(lower) || !netif_carrier_ok(lower) || dev->pon_update_blocked ||
++	    dev->pon_qdma_tag || !rcu_access_pointer(dev->pon_flow_table) ||
++	    rcu_access_pointer(dev->qdma) != &eth->qdma[1] || atomic_read(&dev->pon_tx_pending) ||
++	    !(airoha_fe_rr(eth, REG_GDM_LPBK_CFG(2)) & LPBK_EN_MASK)) {
++		error = -EBUSY;
++		goto put;
++	}
++	error = airoha_ppe_npu_owner_claim_locked(eth, br_flow_offload_generation());
++	owner = ppe->ct_npu_owner;
++	if (!owner)
++		goto put;
++	owner->diag_lower = lower;
++	owner->diag_controller = dev->pon_link_ops;
++	owner->diag_priv = dev->pon_link_priv;
++	if (error)
++		goto out;
++	error = airoha_ppe_npu_return_prepare_locked(eth, dev, 8);
++	if (error)
++		goto out;
++	airoha_er_enable_observation(owner->return_path->ring);
++	error = airoha_npu_owner_return_ready(owner, &owner->txn.id);
++	if (error)
++		goto out;
++	if (!airoha_ppe_npu_diag_active(ppe, owner)) {
++		error = -ESTALE;
++		goto out;
++	}
++	owner->auth_attempted = true;
++	owner->epoch_dirty = true;
++	error = airoha_npu_auth_publish_step(owner->txn.id.epoch, owner->txn.id.generation,
++			AUTH_MBOX_BEGIN, NULL, 0, airoha_npu_owner_auth, owner);
++	if (!error)
++		error = airoha_npu_auth_publish_step(owner->txn.id.epoch, owner->txn.id.generation,
++				AUTH_MBOX_ARM, NULL, 0, airoha_npu_owner_auth, owner);
++	if (!error)
++		error = airoha_ppe_npu_owner_open_locked(eth);
++out:
++	owner->txn.last_error = error;
++	return error;
++put:
++	dev_put(lower);
++	return error;
++}
++
++static void airoha_npu_diag_snapshot(struct airoha_npu_owner *owner)
++{
++	if (!owner->return_path || !owner->return_path->ring)
++		return;
++	airoha_er_get_stats(owner->return_path->ring, &owner->diag_stats);
++	airoha_er_observe(owner->return_path->ring, &owner->diag_observation);
++}
++
++static int airoha_npu_diag_close(struct airoha_ppe *ppe, bool release)
++{
++	struct airoha_npu_owner *owner = ppe->ct_npu_owner;
++	struct airoha_eth *eth = ppe->eth;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!owner)
++		return 0;
++	if (!owner->diag_lower)
++		return -EBUSY;
++	airoha_npu_diag_snapshot(owner);
++	error = airoha_ppe_npu_owner_close_locked(eth);
++	if (error || !release)
++		return error;
++	if (owner->return_path || !owner->closed_ack || !owner->bank1_saved ||
++	    !owner->bank1_host_retired || owner->bank1_next_row != PPE_SRAM_NUM_ENTRIES ||
++	    owner->ingress.saved_valid || owner->ingress.dirty ||
++	    owner->ingress.active || owner->ingress.pending)
++		return -EBUSY;
++	if (eth->ct_bank1_routes.owner) {
++		error = airoha_bank1_routes_release(eth, owner);
++		if (error)
++			return error;
++	}
++	spin_lock_bh(&ppe_lock);
++	airoha_fe_wr(eth, REG_PPE_TB_CFG(1), owner->bank1_tb);
++	if (airoha_fe_rr(eth, REG_PPE_TB_CFG(1)) != owner->bank1_tb) {
++		error = -EIO;
++	} else {
++		airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(1), owner->bank1_flow);
++		error = airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) == owner->bank1_flow ? 0 : -EIO;
++	}
++	spin_unlock_bh(&ppe_lock);
++	return error ?: airoha_npu_owner_retire_locked(ppe);
++}
++
++static int airoha_npu_diag_show(struct seq_file *stream, void *unused)
++{
++	struct airoha_ppe *ppe = stream->private;
++	struct airoha_eth *eth = ppe->eth;
++	struct airoha_npu_owner *owner;
++	struct airoha_npu *npu;
++	struct npu_gate_message gate = { .w = {
++		[GM_MAGIC] = GATE_MAGIC, [GM_ABI_OP] = GATE_ABI | GATE_QUERY << 16,
++		[GM_BYTES] = GATE_BYTES, [GM_STATUS] = (u32)-EINPROGRESS } };
++	struct npu_auth_message auth = { .w = {
++		[AM_MAGIC] = AUTH_MBOX_MAGIC, [AM_ABI_OP] = AUTH_MBOX_ABI | AUTH_MBOX_QUERY << 16,
++		[AM_BYTES] = AUTH_MBOX_BYTES, [AM_STATUS] = (u32)-EINPROGRESS } };
++	struct er_message er = { .w = { ER_MAGIC, ER_ABI | ER_QUERY << 16,
++		0, 0, 0, 0, 0, 0, (u32)-EINPROGRESS } };
++	int gate_error, auth_error, er_error;
++	unsigned int index;
++
++	mutex_lock(&flow_offload_mutex);
++	owner = ppe->ct_npu_owner;
++	seq_printf(stream, "owner=%u diagnostic=%u qualified=%u policy=%u fallback=%u route_owner=%u fe_owner=%u\n",
++		!!owner, owner && !!owner->diag_lower, ppe->ct_pon_qualified,
++		ppe->ct_pair_policy_allowed, eth->ct_cpu_fallback, !!eth->ct_bank1_routes.owner,
++		!!ppe->ct_fe.owner);
++	seq_printf(stream, "flow=%08x tb=%08x gdm2=%08x scope=%08x ports=%08x ingress=%u\n",
++		airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)), airoha_fe_rr(eth, REG_PPE_TB_CFG(1)),
++		airoha_fe_rr(eth, REG_GDM_FWD_CFG(2)), eth->ct_ifc_port_mask,
++		airoha_fe_rr(eth, REG_FE_IFC_PORT_EN), eth->ct_ifc_pon_ready);
++	npu = rcu_dereference_protected(eth->npu, lockdep_is_held(&flow_offload_mutex));
++	gate_error = npu ? airoha_npu_gate_command(npu, &gate) : -ENODEV;
++	auth_error = npu ? airoha_npu_auth_command(npu, &auth) : -ENODEV;
++	er_error = npu ? airoha_npu_er_command(npu, &er) : -ENODEV;
++	seq_printf(stream, "gate_error=%d gate_caps=%u gate_epoch=%u gate_generation=%u gate_mask=%u gate_closed=%u gate_quiet=%u gate_fault=%u\n",
++		gate_error, gate.w[GM_CAPS], gate.w[GM_STATE_EPOCH], gate.w[GM_STATE_GENERATION],
++		gate.w[GM_MASK], gate.w[GM_CLOSED], gate.w[GM_QUIET_ACK], gate.w[GM_FAULT]);
++	seq_printf(stream, "auth_error=%d auth_caps=%u auth_epoch=%u auth_generation=%u auth_count=%u auth_enabled=%u auth_inflight=%u er_error=%d er_caps=%u er_state=%u er_fault=%u\n",
++		auth_error, auth.w[AM_CAPS], auth.w[AM_STATE_EPOCH], auth.w[AM_STATE_GENERATION],
++		auth.w[AM_COUNT], auth.w[AM_ENABLED], auth.w[AM_INFLIGHT],
++		er_error, er.w[9], er.w[10], er.w[12]);
++	if (owner && owner->diag_lower) {
++		struct airoha_er_observation *observation = &owner->diag_observation;
++		struct airoha_er_stats *stats = &owner->diag_stats;
++
++		airoha_npu_diag_snapshot(owner);
++		seq_printf(stream, "phase=%u error=%d epoch=%u generation=%u invalidated=%u closed_ack=%u saved_flow=%08x saved_tb=%08x ring=%u\n",
++			owner->txn.phase, owner->txn.last_error, owner->txn.id.epoch, owner->txn.id.generation,
++			owner->invalidated, owner->closed_ack, owner->bank1_flow, owner->bank1_tb,
++			owner->return_path && !!owner->return_path->ring);
++		seq_printf(stream, "packets=%llu bytes=%llu dropped=%llu consumed=%u fault=%u observed_produced=%u observed_consumed=%u frame_bytes=%u\n",
++			stats->packets, stats->bytes, stats->dropped, stats->consumed, stats->fault,
++			observation->produced, observation->consumed, observation->frame_bytes);
++		seq_puts(stream, "er_desc=");
++		for (index = 0; index < ARRAY_SIZE(observation->descriptor); ++index)
++			seq_printf(stream, "%s%08x", index ? "/" : "", observation->descriptor[index]);
++		seq_puts(stream, "\ner_frame=");
++		for (index = 0; index < observation->frame_bytes; ++index)
++			seq_printf(stream, "%02x", observation->frame[index]);
++		seq_puts(stream, "\n");
++	}
++	mutex_unlock(&flow_offload_mutex);
++	return 0;
++}
++
++static int airoha_npu_diag_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, airoha_npu_diag_show, inode->i_private);
++}
++
++static ssize_t airoha_npu_diag_write(struct file *file, const char __user *buffer,
++				   size_t count, loff_t *offset)
++{
++	struct airoha_ppe *ppe = ((struct seq_file *)file->private_data)->private;
++	char command[16];
++	int error;
++
++	if (!count || count >= sizeof(command) || copy_from_user(command, buffer, count))
++		return -EINVAL;
++	command[count] = 0;
++	mutex_lock(&flow_offload_mutex);
++	if (sysfs_streq(command, "start"))
++		error = airoha_npu_diag_start(ppe);
++	else if (sysfs_streq(command, "close"))
++		error = airoha_npu_diag_close(ppe, false);
++	else if (sysfs_streq(command, "release"))
++		error = airoha_npu_diag_close(ppe, true);
++	else
++		error = -EINVAL;
++	mutex_unlock(&flow_offload_mutex);
++	return error ?: count;
++}
++
++static const struct file_operations airoha_npu_diag_fops = {
++	.owner = THIS_MODULE,
++	.open = airoha_npu_diag_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++	.write = airoha_npu_diag_write,
++};
++
++static void airoha_npu_diag_init(struct airoha_ppe *ppe)
++{
++	if (of_property_read_bool(ppe->eth->dev->of_node, "airoha,connac2-pon-er-diagnostic"))
++		debugfs_create_file("pon_npu_diag", 0600, ppe->debugfs_dir, ppe, &airoha_npu_diag_fops);
++}
++
++#endif
+--- a/drivers/net/ethernet/airoha/airoha_npu_ingress_owner.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_ingress_owner.h
+@@ -19,7 +19,7 @@
+ 					const u32 *words, unsigned int count)
+ {
+ 	struct airoha_npu_owner *owner = ctx;
+-	u32 copy[3], actual[3];
++	u32 copy[3] = {}, actual[3] = {};
+ 	int error;
+ 
+ 	if (!count || count > ARRAY_SIZE(copy))
+@@ -28,8 +28,13 @@
+ 	error = airoha_ct_fe_table(owner->ppe, bank, row, page, true, copy, count);
+ 	if (!error)
+ 		error = airoha_npu_owner_ingress_read(ctx, bank, row, page, actual, count);
+-	if (!error && memcmp(actual, words, count * sizeof(*words)))
++	if (!error && memcmp(actual, words, count * sizeof(*words))) {
++		if (owner->diag_lower)
++			dev_err(owner->ppe->eth->dev, "PON diagnostic IFC mismatch: bank=%u row=%u page=%u count=%u expected=%08x/%08x/%08x actual=%08x/%08x/%08x\n",
++				bank, row, page, count, copy[0], copy[1], copy[2],
++				actual[0], actual[1], actual[2]);
+ 		error = -EIO;
++	}
+ 	if (error)
+ 		owner->ingress.pending = true;
+ 	return error;
+--- a/drivers/net/ethernet/airoha/airoha_npu_owner.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_owner.h
+@@ -5,6 +5,7 @@
+ #include "airoha_npu_auth_publish.h"
+ #include "airoha_npu_bank1.h"
+ #include "airoha_npu_ingress.h"
++#include "airoha_eth_return.h"
+ 
+ struct airoha_npu_owner {
+ 	struct airoha_ppe *ppe;
+@@ -21,7 +22,32 @@
+ 	struct delayed_work health_work;
+ 	u64 invalidation_seq;
+ 	bool invalidated, close_pending, closed_ack, retiring;
++	struct net_device *diag_lower;
++	const struct airoha_pon_link_ops *diag_controller;
++	void *diag_priv;
++	struct airoha_er_stats diag_stats;
++	struct airoha_er_observation diag_observation;
+ };
++
++bool airoha_ppe_npu_diag_active(struct airoha_ppe *ppe, const void *token)
++{
++	struct airoha_npu_owner *owner = ppe->ct_npu_owner;
++	struct airoha_gdm_dev *dev;
++
++	if (!owner || owner != token || !owner->diag_lower || owner->retiring ||
++	    ppe->ct_pon_qualified || ppe->ct_pair_policy_allowed ||
++	    ppe->eth->ct_ordinary_full_test || owner->auth_count)
++		return false;
++	dev = netdev_priv(owner->diag_lower);
++	return dev->eth == ppe->eth && dev->port->id == AIROHA_GDM2_IDX && !dev->nbq &&
++	       dev->pon_link_ops == owner->diag_controller && dev->pon_link_priv == owner->diag_priv &&
++	       owner->diag_controller && owner->diag_priv &&
++	       !READ_ONCE(dev->pon_update_blocked) && netif_running(owner->diag_lower) &&
++	       netif_carrier_ok(owner->diag_lower) && !READ_ONCE(dev->pon_qdma_tag) &&
++	       rcu_access_pointer(dev->qdma) == &ppe->eth->qdma[1] &&
++	       of_property_read_bool(ppe->eth->dev->of_node, "airoha,connac2-pon-er-diagnostic") &&
++	       of_property_read_bool(ppe->eth->dev->of_node, "airoha,connac2-ram-native-pairs");
++}
+ 
+ #include "airoha_npu_ingress_owner.h"
+ 
+@@ -347,6 +373,8 @@
+ 	spin_unlock_bh(&ppe_lock);
+ 	if (!error) {
+ 		cancel_delayed_work_sync(&owner->health_work);
++		if (owner->diag_lower)
++			dev_put(owner->diag_lower);
+ 		kfree(owner);
+ 	}
+ 	return error;
+--- a/drivers/net/ethernet/airoha/airoha_npu_reopen.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_reopen.h
+@@ -5,10 +5,13 @@
+ 				      const struct airoha_npu_txn_identity *id,
+ 				      enum airoha_npu_txn_phase phase)
+ {
+-	if (!owner->ppe->ct_pon_qualified || !owner->ppe->ct_pair_wired_registered)
++	if ((!owner->ppe->ct_pon_qualified &&
++	     !airoha_ppe_npu_diag_active(owner->ppe, owner)) ||
++	    !owner->ppe->ct_pair_wired_registered)
+ 		return -EOPNOTSUPP;
+ 	if (!owner->bank1_saved || !owner->bank1_host_retired ||
+-	    !owner->auth_attempted || !owner->auth_count)
++	    !owner->auth_attempted || (!owner->auth_count &&
++	    !airoha_ppe_npu_diag_active(owner->ppe, owner)))
+ 		return -EACCES;
+ 	return airoha_npu_owner_return_state(owner, id, phase);
+ }
+@@ -24,6 +27,14 @@
+ 	error = airoha_npu_owner_open_check(owner, id, NPU_TXN_PPE_RESTORE);
+ 	if (error)
+ 		return error;
++	if (airoha_ppe_npu_diag_active(owner->ppe, owner)) {
++		status = airoha_fe_rr(eth, REG_PPE_GLO_CFG(1));
++		return owner->bank1_next_row == PPE_SRAM_NUM_ENTRIES &&
++		       (status & PPE_GLO_CFG_EN_MASK) && !(status & PPE_GLO_CFG_BUSY_MASK) &&
++		       !airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) &&
++		       FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, airoha_fe_rr(eth, REG_PPE_TB_CFG(1))) == 2 ?
++		       0 : -EIO;
++	}
+ 	if (!owner->bank1_flow)
+ 		return -EOPNOTSUPP;
+ 	spin_lock_bh(&ppe_lock);
+@@ -114,6 +125,13 @@
+ 	if (!error)
+ 		error = airoha_npu_owner_open_check(owner, &owner->txn.id, NPU_TXN_OPEN);
+ 	if (error) {
++		if (owner->diag_lower)
++			dev_err(eth->dev, "PON diagnostic open failed: phase=%u error=%d glo=%08x flow=%08x tb=%08x row=%u ingress=%u/%u/%u/%u\n",
++				owner->txn.phase, error, airoha_fe_rr(eth, REG_PPE_GLO_CFG(1)),
++				airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)),
++				airoha_fe_rr(eth, REG_PPE_TB_CFG(1)), owner->bank1_next_row,
++				owner->ingress.saved_valid, owner->ingress.dirty,
++				owner->ingress.active, owner->ingress.pending);
+ 		close_error = airoha_ppe_npu_owner_close_locked(eth);
+ 		if (close_error)
+ 			error = close_error;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -2762,6 +2762,7 @@
+ 
+ #include "airoha_ct_pair_banks.h"
+ #include "airoha_npu_owner.h"
++#include "airoha_npu_diag.h"
+ 
+ bool airoha_ppe_ct_requested(struct airoha_eth *eth)
+ {
+@@ -3678,6 +3679,8 @@
+ 
+ 	err = airoha_ppe_debugfs_init(ppe);
+ 	if (!err)
++		airoha_npu_diag_init(ppe);
++	if (!err)
+ 		err = airoha_ct_pair_policy_init(ppe);
+ 	if (!err) {
+ 		err = airoha_ct_pon_ifc_cpu_init(ppe);

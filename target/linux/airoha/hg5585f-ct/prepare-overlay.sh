@@ -119,13 +119,15 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/patches-6.18/999-zg-net-airoha-track-er-provider-exposure.patch \
   target/linux/airoha/patches-6.18/999-zh-net-airoha-quarantine-ambiguous-mailbox.patch \
   target/linux/airoha/patches-6.18/999-zi-net-airoha-start-rebuilt-npu-after-binding.patch \
+  target/linux/airoha/patches-6.18/999-zj-net-airoha-check-resident-npu-suppliers.patch \
+  target/linux/airoha/patches-6.18/999-zk-net-airoha-add-ram-pon-npu-return-diagnostic.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config,NATIVE_PAIRS.md} \
   target/linux/airoha/tests/native_pair/*.{py,c} \
   target/linux/airoha/tests/native_pair/fixtures/*.inc \
   target/linux/airoha/tests/station_activity/*.py \
   target/linux/airoha/tests/pon_offload/*.{py,c,h,inc,md} \
   target/linux/airoha/tests/pon_offload/service0/*.{py,c,md} \
-  target/linux/airoha/tests/pon_offload/ram_loopback/{*.c,*.md,Makefile} \
+  target/linux/airoha/tests/pon_offload/ram_loopback/{*.c,*.py,*.md,Makefile} \
   target/linux/airoha/tests/epon_identity/*.{py,c,md} \
   target/linux/airoha/tests/npu_transaction_transport/*.{py,c,md} \
   target/linux/airoha/tests/npu_transaction_core/*.{py,c,md} \
@@ -133,6 +135,8 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/tests/npu_mailbox/*.{py,c,md} \
   target/linux/airoha/tests/npu_start/*.{py,c,md} \
   target/linux/airoha/tests/npu_resident_config/*.{py,md} \
+  target/linux/airoha/tests/npu_resident_runtime/*.{py,c,md} \
+  target/linux/airoha/tests/npu_diag/*.{py,c,md} \
   target/linux/airoha/tests/npu_resident_config/fixtures/*.{config,dts} \
   target/linux/airoha/tests/bank1_routes/*.{py,c,inc,md} \
   target/linux/airoha/tests/npu_fe_owner/*.{py,c,inc,md} \

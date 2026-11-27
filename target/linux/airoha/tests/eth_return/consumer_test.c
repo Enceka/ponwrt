@@ -1311,11 +1311,55 @@ static void test_parameters(void)
 	}
 }
 
+#ifdef TEST_OBSERVATION
+static void test_observation(void)
+{
+	struct fixture fixture;
+	struct airoha_er_observation observation, previous;
+	u32 sequence, word;
+
+	begin("optional observation preserves accepted descriptor and frame across ring wrap");
+	initialize(&fixture, ER_PON);
+	CHECK(create(&fixture) == 0);
+	publish(&fixture, 1, 64, fixture.live_service);
+	CHECK(er_poll(&fixture.ring->napi, 8) == 1);
+	airoha_er_observe(fixture.ring, &observation);
+	CHECK(!observation.consumed && !observation.frame_bytes);
+	airoha_er_enable_observation(fixture.ring);
+	for (sequence = 2; sequence < 24; ++sequence) {
+		u32 size = sequence % 2 ? 1518 : 64;
+		u32 descriptor[16];
+		u8 expected[128] = {};
+
+		publish(&fixture, sequence, size, fixture.live_service);
+		for (word = 0; word < ARRAY_SIZE(descriptor); ++word)
+			descriptor[word] = le32_to_cpu(slot_for(fixture.ring, sequence)[word]);
+		memcpy(expected, payload_for(fixture.ring, sequence), size > 128 ? 128 : size);
+		CHECK(er_poll(&fixture.ring->napi, 8) == 1);
+		airoha_er_observe(fixture.ring, &observation);
+		CHECK(observation.produced == sequence && observation.consumed == sequence);
+		CHECK(observation.frame_bytes == (size > 128 ? 128 : size));
+		CHECK(!memcmp(observation.descriptor, descriptor, sizeof(descriptor)));
+		CHECK(!memcmp(observation.frame, expected, sizeof(expected)));
+	}
+	previous = observation;
+	fixture.live = false;
+	publish(&fixture, sequence, 128, fixture.live_service);
+	CHECK(er_poll(&fixture.ring->napi, 8) == 1);
+	airoha_er_observe(fixture.ring, &observation);
+	CHECK(!memcmp(&observation, &previous, sizeof(previous)));
+	destroy(&fixture);
+}
+#endif
+
 int main(void)
 {
 	size_t index;
 
 	test_parameters();
+#ifdef TEST_OBSERVATION
+	test_observation();
+#endif
 	test_allocation_failures();
 	test_two_handles_budget_and_wrap();
 	test_live_binding();
