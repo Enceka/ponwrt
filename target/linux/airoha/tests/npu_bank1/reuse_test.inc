@@ -3,16 +3,16 @@ static struct airoha_foe_entry protected_hardware[PPE_SRAM_NUM_ENTRIES];
 
 static void protect_reused_rows(void)
 {
-	memcpy(protected_shadow, &shadow[PPE_SRAM_NUM_ENTRIES], sizeof(protected_shadow));
-	memcpy(protected_hardware, &hardware[PPE_SRAM_NUM_ENTRIES], sizeof(protected_hardware));
+	memcpy(protected_shadow, &shadow[selected_hash(0)], sizeof(protected_shadow));
+	memcpy(protected_hardware, &hardware[selected_hash(0)], sizeof(protected_hardware));
 	fixture_setup = false;
 	operation = REUSE;
 }
 
 static void check_reused_rows(void)
 {
-	CHECK(!memcmp(protected_shadow, &shadow[PPE_SRAM_NUM_ENTRIES], sizeof(protected_shadow)));
-	CHECK(!memcmp(protected_hardware, &hardware[PPE_SRAM_NUM_ENTRIES], sizeof(protected_hardware)));
+	CHECK(!memcmp(protected_shadow, &shadow[selected_hash(0)], sizeof(protected_shadow)));
+	CHECK(!memcmp(protected_hardware, &hardware[selected_hash(0)], sizeof(protected_hardware)));
 	CHECK(!ppe_lock && !flow_offload_mutex && spin_acquires == spin_releases);
 }
 
@@ -34,7 +34,7 @@ static void set_wlan_destination(struct airoha_flow_table_entry *entry, unsigned
 
 static void test_cookie_reuse(void)
 {
-	const u32 hashes[] = { 8192, 12288, 16383 };
+	const u32 hashes[] = { selected_hash(0), selected_hash(4096), selected_hash(8191) };
 	const unsigned types[] = { PPE_PKT_TYPE_IPV4_HNAPT, PPE_PKT_TYPE_IPV6_ROUTE_5T };
 	const unsigned long cookies[] = { 0, 1, 0x100000000UL, ~0UL };
 	struct airoha_gdm_dev pon = { .flags = 1UL << AIROHA_DEV_F_PON }, lan = {};
@@ -71,6 +71,11 @@ static void test_cookie_reuse(void)
 					if (path >= 3)
 						CHECK(airoha_ppe_ct_wlan_entry(&original, 0, 17));
 					add_walk(entry);
+					add_walk(ERR_PTR(-EIO));
+					struct airoha_flow_table_entry before = *entry;
+					CHECK(retire() == -EIO && !spin_acquires && !frees);
+					check_entry(entry, before, false);
+					walk_count = 1;
 					CHECK(retire() == 0 && entry->hash == 0xffff);
 					hardware[hash] = shadow[hash] = original;
 					protect_reused_rows();
@@ -102,7 +107,7 @@ static void test_cookie_reuse(void)
 
 static void test_l2_reuse(void)
 {
-	const u32 hashes[] = { 0, 8192, 8191, 12288, 16383 };
+	const u32 hashes[] = { other_hash(0), selected_hash(0), other_hash(8191), selected_hash(4096), selected_hash(8191) };
 	for (unsigned rotation = 0; rotation < ARRAY_SIZE(hashes); rotation++) {
 		reset("l2-parent-stats-destroy-after-npu-row-reuse");
 		struct airoha_gdm_dev lan = {};
@@ -115,17 +120,27 @@ static void test_l2_reuse(void)
 			struct airoha_flow_table_entry *child = new_flow(hash, FLOW_TYPE_L2_SUBFLOW, index);
 			hlist_add_head(&child->l2_subflow_node, &parent->l2_flows);
 			originals[index] = child->data;
-			if (hash < 8192)
+			if (!in_selected_bank(hash))
 				hardware[hash] = shadow[hash] = child->data;
 		}
-		memcpy(bank0_shadow, shadow, sizeof(bank0_shadow));
-		memcpy(bank0_hardware, hardware, sizeof(bank0_hardware));
+		memcpy(other_shadow, &shadow[other_hash(0)], sizeof(other_shadow));
+		memcpy(other_hardware, &hardware[other_hash(0)], sizeof(other_hardware));
 		add_walk(parent);
+		add_walk(ERR_PTR(-ENOMEM));
+		CHECK(retire() == -ENOMEM && !spin_acquires && !frees);
+		check_hlist(&parent->l2_flows, ARRAY_SIZE(hashes));
+		check_hlist(&candidates, ARRAY_SIZE(hashes));
+		for (unsigned index = 0; index < ARRAY_SIZE(hashes); ++index) {
+			struct airoha_flow_table_entry *child = allocated[index + 1].entry;
+			CHECK(child && child->hash == hashes[(index + rotation) % ARRAY_SIZE(hashes)]);
+			CHECK(!memcmp(&child->data, &originals[index], sizeof(child->data)));
+		}
+		walk_count = 1;
 		CHECK(retire() == 0 && frees == 3 && allocated[0].entry == parent);
 		check_hlist(&parent->l2_flows, 2);
 		for (unsigned index = 0; index < ARRAY_SIZE(hashes); index++) {
 			u32 hash = hashes[(index + rotation) % ARRAY_SIZE(hashes)];
-			if (hash >= 8192)
+			if (in_selected_bank(hash))
 				hardware[hash] = shadow[hash] = originals[index];
 		}
 		protect_reused_rows();
@@ -143,8 +158,8 @@ static void test_l2_reuse(void)
 		CHECK(!candidates.first);
 		for (unsigned index = 0; index < allocation_count; index++)
 			CHECK(allocated[index].freed);
-		CHECK(!(hardware[0].ib1 & AIROHA_FOE_IB1_BIND_STATE));
-		CHECK(!(hardware[8191].ib1 & AIROHA_FOE_IB1_BIND_STATE));
+		CHECK(!(hardware[other_hash(0)].ib1 & AIROHA_FOE_IB1_BIND_STATE));
+		CHECK(!(hardware[other_hash(8191)].ib1 & AIROHA_FOE_IB1_BIND_STATE));
 		check_reused_rows();
 	}
 }

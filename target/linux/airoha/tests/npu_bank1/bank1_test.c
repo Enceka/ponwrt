@@ -22,8 +22,8 @@ static void reset(const char *name)
 		shadow[hash].ib1 ^= hash;
 		hardware[hash].ib1 ^= hash;
 	}
-	memcpy(bank0_shadow, shadow, sizeof(bank0_shadow));
-	memcpy(bank0_hardware, hardware, sizeof(bank0_hardware));
+	memcpy(other_shadow, &shadow[other_hash(0)], sizeof(other_shadow));
+	memcpy(other_hardware, &hardware[other_hash(0)], sizeof(other_hardware));
 	ppe = (struct airoha_ppe){ .eth = &eth, .foe = shadow, .ct_owns_sram = true };
 	eth.ppe = &ppe;
 	candidates = (struct hlist_head){};
@@ -41,10 +41,10 @@ static void reset(const char *name)
 	scenarios++;
 }
 
-static void bank0_unchanged(void)
+static void other_bank_unchanged(void)
 {
-	CHECK(!memcmp(bank0_shadow, shadow, sizeof(bank0_shadow)));
-	CHECK(!memcmp(bank0_hardware, hardware, sizeof(bank0_hardware)));
+	CHECK(!memcmp(other_shadow, &shadow[other_hash(0)], sizeof(other_shadow)));
+	CHECK(!memcmp(other_hardware, &hardware[other_hash(0)], sizeof(other_hardware)));
 }
 
 static void balanced(void)
@@ -55,7 +55,7 @@ static void balanced(void)
 	for (unsigned index = 0; index < allocation_count; index++)
 		if (allocated[index].entry)
 			CHECK(list_empty(&allocated[index].entry->gc_node));
-	bank0_unchanged();
+	other_bank_unchanged();
 }
 
 static int retire(void)
@@ -63,7 +63,7 @@ static int retire(void)
 	fixture_setup = false;
 	operation = RETIRE;
 	mutex_lock(&flow_offload_mutex);
-	int error = airoha_ppe_bank1_retire_flows(&ppe);
+	int error = selected_bank ? airoha_ppe_bank1_retire_flows(&ppe) : airoha_ppe_bank0_retire_flows(&ppe);
 	CHECK(flow_offload_mutex && !ppe_lock);
 	mutex_unlock(&flow_offload_mutex);
 	operation = IDLE;
@@ -78,7 +78,7 @@ static int clear_rows(u32 *cursor)
 	operation = CLEAR;
 	active_cursor = cursor;
 	mutex_lock(&flow_offload_mutex);
-	int error = airoha_ppe_bank1_clear_rows(&ppe, cursor);
+	int error = selected_bank ? airoha_ppe_bank1_clear_rows(&ppe, cursor) : airoha_ppe_bank0_clear_rows(&ppe, cursor);
 	CHECK(flow_offload_mutex && !ppe_lock);
 	mutex_unlock(&flow_offload_mutex);
 	active_cursor = NULL;
@@ -137,8 +137,9 @@ static void test_hash_and_old_cookies(void)
 	const u32 hashes[] = { 0, 1, 8191, 8192, 8193, 12288, 16383, 16384, 32767, 65535, UINT32_MAX };
 	const unsigned long cookies[] = { 0, 1, 0xffff, 0x100000000UL, 0x12345678abcdef01UL, ~0UL };
 	for (unsigned index = 0; index < ARRAY_SIZE(hashes); index++) {
-		bool in_bank1 = hashes[index] >= 8192 && hashes[index] < 16384;
-		CHECK(airoha_ppe_bank1_hash(hashes[index]) == in_bank1);
+		CHECK(airoha_ppe_bank_hash(hashes[index], selected_bank) == in_selected_bank(hashes[index]));
+		CHECK(airoha_ppe_bank1_hash(hashes[index]) == (hashes[index] >= 8192 && hashes[index] < 16384));
+		CHECK(airoha_ppe_bank0_hash(hashes[index]) == (hashes[index] < 8192));
 	}
 	for (unsigned cookie = 0; cookie < ARRAY_SIZE(cookies); cookie++) {
 		for (unsigned index = 0; index < ARRAY_SIZE(hashes); index++) {
@@ -157,13 +158,57 @@ static void test_hash_and_old_cookies(void)
 				struct airoha_flow_table_entry before = *entry;
 				add_walk(entry);
 				CHECK(retire() == 0);
-				check_entry(entry, before, hashes[index] >= 8192 && hashes[index] < 16384);
+				check_entry(entry, before, in_selected_bank(hashes[index]));
 				CHECK(!frees && spin_acquires == 1 && reschedules == 1);
 				before = *entry;
 				CHECK(retire() == 0);
 				check_entry(entry, before, false);
 			}
 		}
+	}
+}
+
+static void test_invalid_banks(void)
+{
+	const u32 banks[] = { 2, 3, 0x80000, 0x80000000, UINT32_MAX };
+	const u32 hashes[] = { 0, 8191, 8192, 16383, 16384, 65535, UINT32_MAX };
+	for (unsigned index = 0; index < ARRAY_SIZE(banks); ++index) {
+		reset("invalid-bank-no-walk-detach-or-clear");
+		struct airoha_flow_table_entry *entry = new_flow(selected_hash(0), FLOW_TYPE_L4, 1);
+		struct airoha_flow_table_entry *parent = new_flow(selected_hash(0), FLOW_TYPE_L2, 2);
+		struct airoha_flow_table_entry *child = new_flow(selected_hash(8191), FLOW_TYPE_L2_SUBFLOW, 3);
+		hlist_add_head(&child->l2_subflow_node, &parent->l2_flows);
+		struct airoha_flow_table_entry before = *entry, saved_parent = *parent, saved_child = *child;
+		add_walk(entry);
+		add_walk(parent);
+		for (unsigned position = 0; position < ARRAY_SIZE(hashes); ++position)
+			CHECK(!airoha_ppe_bank_hash(hashes[position], banks[index]));
+		fixture_setup = false;
+		operation = RETIRE;
+		mutex_lock(&flow_offload_mutex);
+		CHECK(airoha_ppe_bank_retire_flows(&ppe, banks[index]) == -EINVAL);
+		CHECK(!walk_calls && !walk_starts && !spin_acquires && !reschedules && !frees);
+		spin_lock_bh(&ppe_lock);
+		airoha_ppe_bank_detach_entry(entry, banks[index]);
+		airoha_ppe_bank_detach_entry(parent, banks[index]);
+		spin_unlock_bh(&ppe_lock);
+		CHECK(!memcmp(entry, &before, sizeof(before)));
+		CHECK(!memcmp(parent, &saved_parent, sizeof(saved_parent)));
+		CHECK(!memcmp(child, &saved_child, sizeof(saved_child)));
+		operation = CLEAR;
+		u32 cursor = PPE_SRAM_NUM_ENTRIES;
+		active_cursor = &cursor;
+		CHECK(airoha_ppe_bank_clear_rows(&ppe, banks[index], &cursor) == -EINVAL);
+		CHECK(cursor == PPE_SRAM_NUM_ENTRIES && !writes && !reads);
+		cursor = 0;
+		CHECK(airoha_ppe_bank_clear_rows(&ppe, banks[index], &cursor) == -EINVAL);
+		CHECK(!cursor && !writes && !reads && !reschedules && !frees);
+		CHECK(spin_acquires == 1 && !walk_calls);
+		active_cursor = NULL;
+		mutex_unlock(&flow_offload_mutex);
+		operation = IDLE;
+		balanced();
+		CHECK(retire() == 0 && entry->hash == 0xffff && frees == 1);
 	}
 }
 
@@ -178,7 +223,7 @@ static void test_resize_and_errors(void)
 			struct airoha_flow_table_entry *entries[3];
 			struct airoha_flow_table_entry before[3];
 			for (unsigned index = 0; index < 3; index++)
-				entries[index] = new_flow(index == 2 ? 8191 : 8192 + index, FLOW_TYPE_L4, index + 10);
+				entries[index] = new_flow(index == 2 ? other_hash(8191) : selected_hash(index), FLOW_TYPE_L4, index + 10);
 			for (unsigned index = 0; index < 3; index++)
 				before[index] = *entries[index];
 			for (unsigned index = 0; index <= 3; index++) {
@@ -222,10 +267,10 @@ static void check_hlist(struct hlist_head *head, unsigned expected)
 
 static void test_l2(void)
 {
-	const u32 hashes[] = { 8191, 8192, 12288, 16383, 0, 65535, 16384 };
+	const u32 hashes[] = { other_hash(8191), selected_hash(0), selected_hash(4096), selected_hash(8191), other_hash(0), 65535, 16384 };
 	for (unsigned order = 0; order < ARRAY_SIZE(hashes); order++) {
 		reset("l2-mixed-banks-parent-preserved-resize");
-		struct airoha_flow_table_entry *parent = new_flow(8192, FLOW_TYPE_L2, 0xabc);
+		struct airoha_flow_table_entry *parent = new_flow(selected_hash(0), FLOW_TYPE_L2, 0xabc);
 		struct airoha_flow_table_entry *empty = new_flow(65535, FLOW_TYPE_L2, 0xdef);
 		struct airoha_flow_table_entry *children[ARRAY_SIZE(hashes)];
 		struct airoha_flow_table_entry before[ARRAY_SIZE(hashes)];
@@ -246,9 +291,9 @@ static void test_l2(void)
 		CHECK(!memcmp(parent, &saved_parent, sizeof(saved_parent)));
 		CHECK(!memcmp(empty, &saved_empty, sizeof(saved_empty)));
 		for (unsigned index = 0; index < ARRAY_SIZE(hashes); index++) {
-			bool bank1 = before[index].hash >= 8192 && before[index].hash < 16384;
-			CHECK(allocated[index + 2].freed == bank1);
-			if (!bank1) {
+			bool retired = in_selected_bank(before[index].hash);
+			CHECK(allocated[index + 2].freed == retired);
+			if (!retired) {
 				CHECK(children[index]->l2_subflow_node.pprev);
 				before[index].l2_subflow_node = children[index]->l2_subflow_node;
 				check_entry(children[index], before[index], false);
@@ -264,8 +309,8 @@ static void test_l2(void)
 static void check_cleared(u32 start, u32 end)
 {
 	for (u32 row = start; row < end; row++) {
-		CHECK(!memcmp(&hardware[8192 + row], &zero_entry, sizeof(zero_entry)));
-		CHECK(!memcmp(&shadow[8192 + row], &zero_entry, sizeof(zero_entry)));
+		CHECK(!memcmp(&hardware[selected_hash(row)], &zero_entry, sizeof(zero_entry)));
+		CHECK(!memcmp(&shadow[selected_hash(row)], &zero_entry, sizeof(zero_entry)));
 	}
 }
 
@@ -331,18 +376,18 @@ static void test_clear_faults(void)
 				fault_row = positions[position];
 				corrupt_byte = byte;
 				u32 cursor = 0;
-				struct airoha_foe_entry original = hardware[8192 + fault_row];
+				struct airoha_foe_entry original = hardware[selected_hash(fault_row)];
 				CHECK(clear_rows(&cursor) == fault_error(kind) && cursor == fault_row);
 				CHECK(writes == fault_row + 1 && reads == fault_row + fault_has_read(kind));
 				CHECK(reschedules == fault_row && spin_acquires == writes);
 				check_cleared(0, fault_row);
 				if (kind == WRITE_ERROR || kind == WRITE_TIMEOUT || kind == WRITE_DROPPED_ACKED)
-					CHECK(!memcmp(&original, &hardware[8192 + fault_row], sizeof(original)));
+					CHECK(!memcmp(&original, &hardware[selected_hash(fault_row)], sizeof(original)));
 				else
-					CHECK(!memcmp(&zero_entry, &hardware[8192 + fault_row], sizeof(zero_entry)));
+					CHECK(!memcmp(&zero_entry, &hardware[selected_hash(fault_row)], sizeof(zero_entry)));
 				for (u32 row = fault_row + 1; row < 8192; row++) {
 					CHECK(!row_writes[row] && !row_reads[row]);
-					CHECK(hardware[8192 + row].data[79] == 0xa6 && shadow[8192 + row].data[79] == 0x39);
+					CHECK(hardware[selected_hash(row)].data[79] == 0xa6 && shadow[selected_hash(row)].data[79] == 0x39);
 				}
 				unsigned completed_writes = writes;
 				CHECK(clear_rows(&cursor) == fault_error(kind) && cursor == fault_row);
@@ -389,15 +434,18 @@ int main(void)
 {
 	scenario = "hash-boundaries";
 	CHECK(sizeof(struct airoha_foe_entry) == 80 && PPE_SRAM_NUM_ENTRIES == 8192);
-	test_hash_and_old_cookies();
-	test_resize_and_errors();
-	test_l2();
-	test_cookie_reuse();
-	test_l2_reuse();
-	test_clear_guards();
-	test_clear_faults();
-	test_multi_call_resume();
+	for (selected_bank = 0; selected_bank < 2; ++selected_bank) {
+		test_invalid_banks();
+		test_hash_and_old_cookies();
+		test_resize_and_errors();
+		test_l2();
+		test_cookie_reuse();
+		test_l2_reuse();
+		test_clear_guards();
+		test_clear_faults();
+		test_multi_call_resume();
+	}
 	cleanup();
-	printf("{\"scenarios\":%u,\"checks\":%lu,\"row_bytes\":80,\"bank_rows\":8192}\n", scenarios, checks);
+	printf("{\"scenarios\":%u,\"checks\":%lu,\"banks\":2,\"row_bytes\":80,\"bank_rows\":8192}\n", scenarios, checks);
 	return 0;
 }

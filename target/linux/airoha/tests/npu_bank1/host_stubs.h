@@ -31,6 +31,10 @@ typedef uint64_t u64;
 
 static unsigned long checks;
 static unsigned scenarios;
+static u32 selected_bank;
+static u32 selected_hash(u32 row) { return selected_bank * 8192u + row; }
+static u32 other_hash(u32 row) { return (selected_bank ^ 1u) * 8192u + row; }
+static bool in_selected_bank(u32 hash) { return hash / 8192u == selected_bank; }
 static const char *scenario;
 #define CHECK(expression) do { \
 	checks++; \
@@ -146,8 +150,8 @@ static struct airoha_eth eth;
 static struct airoha_ppe ppe;
 static struct airoha_foe_entry shadow[2 * PPE_SRAM_NUM_ENTRIES];
 static struct airoha_foe_entry hardware[2 * PPE_SRAM_NUM_ENTRIES];
-static struct airoha_foe_entry bank0_shadow[PPE_SRAM_NUM_ENTRIES];
-static struct airoha_foe_entry bank0_hardware[PPE_SRAM_NUM_ENTRIES];
+static struct airoha_foe_entry other_shadow[PPE_SRAM_NUM_ENTRIES];
+static struct airoha_foe_entry other_hardware[PPE_SRAM_NUM_ENTRIES];
 static const struct airoha_foe_entry zero_entry;
 static void *walk_items[128];
 static unsigned walk_count;
@@ -257,7 +261,7 @@ static void kfree(void *pointer)
 		CHECK(!allocated[index].freed);
 		if (operation == RETIRE) {
 			CHECK(ppe_lock && entry->type == FLOW_TYPE_L2_SUBFLOW);
-			CHECK(entry->hash >= PPE_SRAM_NUM_ENTRIES && entry->hash < 2 * PPE_SRAM_NUM_ENTRIES);
+			CHECK(in_selected_bank(entry->hash));
 		} else if (entry->type == FLOW_TYPE_L2_SUBFLOW) {
 			CHECK(ppe_lock && entry->hash == 0xffff);
 		} else {
@@ -293,8 +297,8 @@ static bool ack_unrelated_bits;
 static void check_access(struct airoha_ppe *target, u32 hash)
 {
 	CHECK(target == &ppe && operation == CLEAR && flow_offload_mutex && ppe_lock);
-	CHECK(hash >= PPE_SRAM_NUM_ENTRIES && hash < 2 * PPE_SRAM_NUM_ENTRIES);
-	CHECK(hash == PPE_SRAM_NUM_ENTRIES + locked_cursor);
+	CHECK(in_selected_bank(hash));
+	CHECK(hash == selected_hash(locked_cursor));
 	CHECK(*active_cursor == locked_cursor);
 }
 
@@ -305,7 +309,7 @@ static u32 make_ack(u32 hash, bool write)
 		control |= PPE_SRAM_CTRL_WR_MASK;
 	if (ack_unrelated_bits)
 		control |= PPE_SRAM_CTRL_DUAL_SUCESS_MASK | PPE_SRAM_WR_DUAL_DIRECTION_MASK;
-	if (hash != PPE_SRAM_NUM_ENTRIES + fault_row)
+	if (hash != selected_hash(fault_row))
 		return control;
 	if ((write && (fault == WRITE_ACK_MISSING || fault == LOST_WRITE_ACK_APPLIED)) ||
 	    (!write && fault == READ_ACK_MISSING))
@@ -326,8 +330,8 @@ static int airoha_ppe_foe_commit_sram_entry(struct airoha_ppe *target, u32 hash)
 	CHECK(!memcmp(&shadow[hash], &zero_entry, sizeof(zero_entry)));
 	transaction_stage = 1;
 	writes++;
-	row_writes[hash - PPE_SRAM_NUM_ENTRIES]++;
-	bool fail = hash == PPE_SRAM_NUM_ENTRIES + fault_row;
+	row_writes[hash - selected_hash(0)]++;
+	bool fail = hash == selected_hash(fault_row);
 	if (!fail || (fault != WRITE_ERROR && fault != WRITE_TIMEOUT && fault != WRITE_DROPPED_ACKED))
 		hardware[hash] = shadow[hash];
 	control_value = make_ack(hash, true);
@@ -342,7 +346,7 @@ static struct airoha_foe_entry *airoha_ppe_foe_get_entry_locked(struct airoha_pp
 {
 	if (operation == REUSE) {
 		CHECK(target == &ppe && flow_offload_mutex && ppe_lock);
-		CHECK(hash < PPE_SRAM_NUM_ENTRIES);
+		CHECK(hash < 2 * PPE_SRAM_NUM_ENTRIES && !in_selected_bank(hash));
 		reuse_reads++;
 		shadow[hash] = hardware[hash];
 		return &shadow[hash];
@@ -351,13 +355,13 @@ static struct airoha_foe_entry *airoha_ppe_foe_get_entry_locked(struct airoha_pp
 	CHECK(transaction_stage == 2 && !transaction_failed);
 	transaction_stage = 3;
 	reads++;
-	row_reads[hash - PPE_SRAM_NUM_ENTRIES]++;
-	if (hash == PPE_SRAM_NUM_ENTRIES + fault_row && fault == READ_TIMEOUT) {
+	row_reads[hash - selected_hash(0)]++;
+	if (hash == selected_hash(fault_row) && fault == READ_TIMEOUT) {
 		transaction_failed = true;
 		return NULL;
 	}
 	shadow[hash] = hardware[hash];
-	if (hash == PPE_SRAM_NUM_ENTRIES + fault_row && fault == READBACK_CORRUPT)
+	if (hash == selected_hash(fault_row) && fault == READBACK_CORRUPT)
 		shadow[hash].data[corrupt_byte] ^= 0x80;
 	control_value = make_ack(hash, false);
 	return &shadow[hash];
@@ -365,20 +369,20 @@ static struct airoha_foe_entry *airoha_ppe_foe_get_entry_locked(struct airoha_pp
 
 static u32 airoha_fe_rr(struct airoha_eth *target, u32 reg)
 {
-	CHECK(target == &eth && reg == REG_PPE_RAM_CTRL(1));
-	check_access(&ppe, PPE_SRAM_NUM_ENTRIES + locked_cursor);
+	CHECK(target == &eth && reg == REG_PPE_RAM_CTRL(selected_bank));
+	check_access(&ppe, selected_hash(locked_cursor));
 	CHECK(transaction_stage == 1 || transaction_stage == 3);
 	bool write = transaction_stage == 1;
 	if (write)
 		write_acks++;
 	else
 		read_acks++;
-	u32 expected = FIELD_PREP(PPE_SRAM_CTRL_ENTRY_MASK, PPE_SRAM_NUM_ENTRIES + locked_cursor) |
+	u32 expected = FIELD_PREP(PPE_SRAM_CTRL_ENTRY_MASK, selected_hash(locked_cursor)) |
 		       PPE_SRAM_CTRL_ACK_MASK | (write ? PPE_SRAM_CTRL_WR_MASK : 0);
 	u32 mask = PPE_SRAM_CTRL_ENTRY_MASK | PPE_SRAM_CTRL_ACK_MASK |
 		   PPE_SRAM_CTRL_WR_MASK | PPE_SRAM_CTRL_REQ_MASK;
 	transaction_failed = (control_value & mask) != expected;
-	if (!write && memcmp(&shadow[PPE_SRAM_NUM_ENTRIES + locked_cursor], &zero_entry, sizeof(zero_entry)))
+	if (!write && memcmp(&shadow[selected_hash(locked_cursor)], &zero_entry, sizeof(zero_entry)))
 		transaction_failed = true;
 	transaction_stage++;
 	return control_value;
@@ -439,7 +443,7 @@ static int airoha_ppe_foe_commit_entry(struct airoha_ppe *target,
 				    struct airoha_foe_entry *entry, u32 hash, bool wlan)
 {
 	CHECK(target == &ppe && operation == REUSE && flow_offload_mutex && ppe_lock && !wlan);
-	CHECK(hash < PPE_SRAM_NUM_ENTRIES);
+	CHECK(hash < 2 * PPE_SRAM_NUM_ENTRIES && !in_selected_bank(hash));
 	reuse_writes++;
 	hardware[hash] = shadow[hash] = *entry;
 	return 0;
@@ -461,7 +465,7 @@ static void airoha_ppe_foe_entry_get_stats(struct airoha_ppe *target, u32 hash,
 					struct airoha_foe_stats64 *stats)
 {
 	CHECK(target == &ppe && operation == REUSE && flow_offload_mutex && ppe_lock);
-	CHECK(hash < PPE_SRAM_NUM_ENTRIES);
+	CHECK(hash < 2 * PPE_SRAM_NUM_ENTRIES && !in_selected_bank(hash));
 	reuse_stats++;
 	*stats = (struct airoha_foe_stats64){ .bytes = 1000, .packets = 10 };
 }

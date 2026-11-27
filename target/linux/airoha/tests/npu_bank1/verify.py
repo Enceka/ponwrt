@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile production bank1 retirement and cookie reuse paths with fault injection."""
+"""Compile production dual-bank retirement and cookie reuse paths with fault injection."""
 
 import argparse
 from datetime import datetime
@@ -11,13 +11,18 @@ import re
 import resource
 import shlex
 import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'npu_ingress'))
+from source_binding import SourceBinding
 
 
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[4]
 DRIVER = Path('drivers/net/ethernet/airoha')
 HEADER = 'airoha_npu_bank1.h'
-PATCH = '999-zc-net-airoha-retire-host-bank1-before-npu-reuse.patch'
+PATCH = '999-zv-net-airoha-retire-host-bank0-before-npu-reuse.patch'
 REUSE_FUNCTIONS = (
     'airoha_ppe_foe_compare_entry',
     'airoha_ppe_foe_remove_flow',
@@ -55,24 +60,6 @@ def function(source, name):
     return source[start:end] + '\n'
 
 
-def new_header(patch):
-    lines = patch.splitlines(keepends=True)
-    marker = ('+++ b/' + str(DRIVER / HEADER) + '\n').encode()
-    if lines.count(marker) != 1:
-        raise ValueError('patch must contain exactly one bank1 header')
-    start = lines.index(marker)
-    if lines[start - 1] != b'--- /dev/null\n':
-        raise ValueError('bank1 header must be a newly added file')
-    match = re.fullmatch(rb'@@ -0,0 \+1,(\d+) @@\n', lines[start + 1])
-    if not match:
-        raise ValueError('expected complete new-file hunk')
-    count = int(match.group(1))
-    body = lines[start + 2:start + 2 + count]
-    if len(body) != count or any(not line.startswith(b'+') for line in body):
-        raise ValueError('invalid new-header hunk length or content')
-    return b''.join(line[1:] for line in body)
-
-
 def section(source, start, end):
     begin = source.index(start)
     return source[begin:source.index(end, begin)]
@@ -102,22 +89,31 @@ def mutants(header, ack, reuse):
     edits = {
         'include-bank0-boundary': ('header', 'hash >= PPE_SRAM_NUM_ENTRIES', 'hash >= PPE_SRAM_NUM_ENTRIES - 1'),
         'include-upper-boundary': ('header', 'hash < 2 * PPE_SRAM_NUM_ENTRIES', 'hash <= 2 * PPE_SRAM_NUM_ENTRIES'),
+        'include-bank0-upper-boundary': ('header', 'return hash < PPE_SRAM_NUM_ENTRIES;', 'return hash <= PPE_SRAM_NUM_ENTRIES;'),
+        'accept-invalid-hash-bank': ('header', 'return bank <= 1 &&', 'return true &&'),
+        'accept-invalid-retire-bank': ('header', 'if (bank > 1)', 'if (false)'),
+        'accept-invalid-clear-bank': ('header', 'if (bank > 1 ||', 'if (false ||'),
+        'swap-detach-bank': ('header', 'airoha_ppe_bank_detach_entry(entry, bank);', 'airoha_ppe_bank_detach_entry(entry, bank ^ 1u);'),
+        'bank0-retire-wrong-wrapper': ('header', 'return airoha_ppe_bank_retire_flows(ppe, 0);', 'return airoha_ppe_bank_retire_flows(ppe, 1);'),
+        'bank1-retire-wrong-wrapper': ('header', 'return airoha_ppe_bank_retire_flows(ppe, 1);', 'return airoha_ppe_bank_retire_flows(ppe, 0);'),
+        'bank0-clear-wrong-wrapper': ('header', 'return airoha_ppe_bank_clear_rows(ppe, 0, next_row);', 'return airoha_ppe_bank_clear_rows(ppe, 1, next_row);'),
+        'bank1-clear-wrong-wrapper': ('header', 'return airoha_ppe_bank_clear_rows(ppe, 1, next_row);', 'return airoha_ppe_bank_clear_rows(ppe, 0, next_row);'),
         'leave-candidate-linked': ('header', '\thlist_del_init(&entry->list);', '\t(void)entry;'),
         'retain-old-cookie-hash': ('header', 'entry->hash = 0xffff;', '(void)entry;'),
         'retain-old-ib1-state': ('header', 'entry->data.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;', '(void)entry;'),
         'leave-bridge-alive': ('header', 'entry->ct_bridge_dead = true;', 'entry->ct_bridge_dead = false;'),
-        'free-bank0-l2-child': ('header', 'if (!airoha_ppe_bank1_hash(subflow->hash))', 'if (false)'),
-        'leave-bank1-l2-child-linked': ('header', 'hlist_del_init(&subflow->l2_subflow_node);', '(void)subflow;'),
-        'leak-bank1-l2-child': ('header', 'kfree(subflow);', '(void)subflow;'),
+        'free-other-bank-l2-child': ('header', 'if (!airoha_ppe_bank_hash(subflow->hash, bank))', 'if (false)'),
+        'leave-selected-l2-child-linked': ('header', 'hlist_del_init(&subflow->l2_subflow_node);', '(void)subflow;'),
+        'leak-selected-l2-child': ('header', 'kfree(subflow);', '(void)subflow;'),
         'lose-resize-deduplication': ('header', 'if (list_empty(&entry->gc_node))', 'if (true)'),
         'treat-eagain-as-hard-error': ('header', 'if (PTR_ERR(entry) == -EAGAIN)', 'if (false)'),
         'ignore-hard-walk-error': ('header', 'error = PTR_ERR(entry);', 'error = 0;'),
         'retire-after-hard-walk-error': ('header', '\t\tif (error)\n\t\t\tcontinue;', '\t\tif (false)\n\t\t\tcontinue;'),
         'leave-gc-node-linked': ('header', 'list_del_init(&entry->gc_node);', '(void)entry;'),
-        'detach-without-ppe-lock': ('header', '\t\tspin_lock_bh(&ppe_lock);\n\t\tairoha_ppe_bank1_detach_entry(entry);', '\t\tairoha_ppe_bank1_detach_entry(entry);\n\t\tspin_lock_bh(&ppe_lock);'),
-        'reschedule-under-ppe-lock': ('header', '\t\tairoha_ppe_bank1_detach_entry(entry);\n\t\tspin_unlock_bh(&ppe_lock);', '\t\tairoha_ppe_bank1_detach_entry(entry);\n\t\tcond_resched();\n\t\tspin_unlock_bh(&ppe_lock);'),
+        'detach-without-ppe-lock': ('header', '\t\tspin_lock_bh(&ppe_lock);\n\t\tairoha_ppe_bank_detach_entry(entry, bank);', '\t\tairoha_ppe_bank_detach_entry(entry, bank);\n\t\tspin_lock_bh(&ppe_lock);'),
+        'reschedule-under-ppe-lock': ('header', '\t\tairoha_ppe_bank_detach_entry(entry, bank);\n\t\tspin_unlock_bh(&ppe_lock);', '\t\tairoha_ppe_bank_detach_entry(entry, bank);\n\t\tcond_resched();\n\t\tspin_unlock_bh(&ppe_lock);'),
         'ignore-sram-ownership': ('header', '!ppe->ct_owns_sram ||', 'false ||'),
-        'clear-bank0': ('header', 'u32 hash = PPE_SRAM_NUM_ENTRIES + *next_row;', 'u32 hash = *next_row;'),
+        'clear-other-bank': ('header', 'u32 base = bank * PPE_SRAM_NUM_ENTRIES;', 'u32 base = (bank ^ 1u) * PPE_SRAM_NUM_ENTRIES;'),
         'clear-only-ib1': ('header', 'memset(entry, 0, sizeof(*entry));', 'memset(entry, 0, sizeof(entry->ib1));'),
         'ignore-commit-error': ('header', 'error = airoha_ppe_foe_commit_sram_entry(ppe, hash);', '(void)airoha_ppe_foe_commit_sram_entry(ppe, hash);\n\t\terror = 0;'),
         'skip-write-ack': ('header', '!airoha_ppe_ct_sram_ack(ppe->eth, hash, true)', 'false'),
@@ -142,7 +138,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--patch', type=Path, default=REPOSITORY / 'target/linux/airoha/patches-6.18' / PATCH)
-    parser.add_argument('--output', type=Path, default=HERE / '_results' / datetime.now().strftime('%Y%m%d-%H%M%S'))
+    parser.add_argument('--output', type=Path, default=REPOSITORY.parent / 'npu-bank-tests' / datetime.now().strftime('%Y%m%d-%H%M%S'))
     parser.add_argument('--cc', default=os.environ.get('CC', 'clang'))
     args = parser.parse_args()
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -150,16 +146,21 @@ def main():
     driver = args.source.resolve() / DRIVER
     inputs = {driver / name: (driver / name).read_bytes() for name in
               (HEADER, 'airoha_ppe.c', 'airoha_eth.h', 'airoha_regs.h')}
-    inputs[args.patch.resolve()] = args.patch.read_bytes()
+    test_inputs = {path: path.read_bytes() for path in HERE.iterdir() if path.is_file()}
+    helper = HERE.parent / 'npu_ingress/source_binding.py'
+    helper_bytes = helper.read_bytes()
+    source = args.source.resolve()
+    if (output.is_relative_to(REPOSITORY) or output == source or
+            source.is_relative_to(output) or output.is_relative_to(source)):
+        parser.error('output must be new, outside ponwrt, and separate from source')
+    output.mkdir(parents=True, exist_ok=False)
+    binding = SourceBinding(args.patch.resolve().parent, output, args.patch.name)
+    binding.bind(driver, (HEADER,))
     header = inputs[driver / HEADER]
-    patch_header = new_header(inputs[args.patch.resolve()])
-    if header != patch_header:
-        raise ValueError('production header differs byte-for-byte from 999-zc added header')
     ppe = inputs[driver / 'airoha_ppe.c'].decode()
     ack = function(ppe, 'airoha_ppe_ct_sram_ack')
     reuse = '\n'.join(function(ppe, name) for name in REUSE_FUNCTIONS)
     types = production_types(inputs[driver / 'airoha_eth.h'].decode(), inputs[driver / 'airoha_regs.h'].decode())
-    output.mkdir(parents=True, exist_ok=False)
     temporary = output / 'tmp'
     temporary.mkdir()
     environment = dict(os.environ, TMPDIR=str(temporary),
@@ -179,7 +180,7 @@ def main():
     if version.returncode:
         raise RuntimeError(version.stderr)
     print(version.stdout.splitlines()[0], flush=True)
-    print('PASS byte-exact production header / 999-zc: ' + hashlib.sha256(header).hexdigest(), flush=True)
+    print('PASS byte-exact production patch chain through ' + args.patch.name + ': ' + hashlib.sha256(header).hexdigest(), flush=True)
 
     def build_run(label, sources):
         directory = output / label
@@ -214,15 +215,19 @@ def main():
     for path, content in inputs.items():
         if path.read_bytes() != content:
             raise RuntimeError('production input changed during run: ' + str(path))
+    binding.verify_unchanged()
+    assert helper.read_bytes() == helper_bytes, 'source-binding helper changed during run'
+    assert all(path.read_bytes() == data for path, data in test_inputs.items()), 'tests changed during run'
     report = {
         'passed': True, 'baseline': summary, 'sanitizers': ['address', 'undefined'],
         'header_byte_exact_to_patch': True,
+        'source_binding': binding.report(),
+        'source_binding_helper_sha256': hashlib.sha256(helper_bytes).hexdigest(),
         'inputs_sha256': {str(path): hashlib.sha256(content).hexdigest() for path, content in inputs.items()},
-        'tests_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-                         for path in HERE.iterdir() if path.is_file()},
+        'tests_sha256': {path.name: hashlib.sha256(data).hexdigest() for path, data in test_inputs.items()},
         'reuse_functions': list(REUSE_FUNCTIONS), 'negative_controls': detected,
         'compiler': version.stdout, 'commands': commands,
-        'scope': 'Unmodified production bank1 header, ACK validator, full stats/destroy functions and their selected callees; kernel containers, clock, locks, MMIO and statistics transport are host stubs. Owner integration and kernel build run separately.',
+        'scope': 'Unmodified production dual-bank retirement/clear header, ACK validator, full stats/destroy functions and their selected callees; kernel containers, clock, locks, MMIO and statistics transport are host stubs. Owner integration and kernel build run separately.',
     }
     (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     print('PASS ' + str(len(detected)) + ' runtime-assertion mutants; report: ' + str(output / 'report.json'))
