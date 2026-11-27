@@ -2,10 +2,10 @@
 
 Patches 976–979 connect the four-row optical owner to the shared classifier
 and expose `ct_pon_cpu_probe` only on the explicit RAM native-pair profile.
-The probe keeps PON PPE qualification at zero. Its current hardware milestone
-is publication and restoration of CPU classifier rows for two independent
-service IDs. Optical packet acceptance and service-isolated PPE forwarding
-are the next milestones.
+The probe keeps PON PPE qualification at zero. Hardware validation covers
+exact IPv4/IPv6 tuple classification, full service IDs, partial withdrawal
+and shared LUT release through GDM2 internal loopback. Full-packet admission
+and service-isolated PPE forwarding are the next milestones.
 
 ## Ownership and transport
 
@@ -20,8 +20,9 @@ apply the mask; action words require an exact match. Commands are serialized
 under `ppe_lock`. After timeout, ordinary, native and optical callers all
 wait for the outstanding command before writing data or control registers.
 An unresolved timeout keeps the saved rows and schedules recovery after
-closing forwarding admission. Route changes close the classifier before
-changing its CPU receiver.
+closing forwarding admission. Route changes restore the GDM2 default
+destination to CPU5 before modifying rows. Other active CPU consumers retain
+their ring selection until their own slot is withdrawn.
 
 The EN7581 `get_sport` callback maps GDM2 NBQ0 to SPORT2. The first board
 attempt exposed the previously missing case: the callback returned `-EINVAL`
@@ -44,7 +45,9 @@ off
 `set` replaces only its selected slot. Two active slots must use different
 nonzero 16-bit service IDs. `clear` restores that slot's original disabled
 rows. Clearing the final slot releases the optical scope and reservation;
-`off` restores both slots. Status includes saved/dirty/active masks, pending
+`off` restores both slots. `routed=0` records the default destination, while
+`active` records consumers that can still select a CPU receive ring.
+Status includes saved/dirty/active masks, pending
 I/O, scope, readiness, service IDs, PON PPE qualification and error count.
 
 `verify_ifc_probe_board.py` checks the pinned boot and empty MTD list before
@@ -143,8 +146,8 @@ kernel984 configuration without diagnostics.
 Evidence directories in the enclosing workspace are
 `build/pon-ifc-drain-986-before`, `build/pon-ifc-drain-986-command`,
 `build/pon-ifc-drain-986-probe-final` and `build/pon-ifc-drain-986-source`.
-Patch986 is ready for integration in the next RAM image; the current board
-continues to run kernel984.
+The subsequent kernel987 RAM image includes patch986; its board acceptance
+is recorded below.
 
 ### Tuple consumers
 
@@ -178,6 +181,48 @@ restoration has cleared `saved_valid`. Twelve cases apply a delayed hardware
 write while drain still times out; four execute the production repair worker
 without RTNL and check rescheduling and shutdown. Evidence:
 `build/pon-ifc-tuple-987-test-final/report.json` in the enclosing workspace.
+
+### Exact tuple board acceptance — 2026-11-27
+
+Kernel source includes patch987 from commit `6b8696d`. The board runner is
+commit `07abb9b`. Boot UUID: `1280c03a-f093-459c-aa1c-05524a5920e6`.
+
+FIT SHA-256:
+`1efc5d3058c3f0b3fc2703f97c1887c19679f875ab76a83a97b69aafb3522feb`.
+Kernel SHA-256:
+`d404f04c69eeee9ed88f21266030997f081687b350c2be5122ee189b67bc3746`.
+Loopback module SHA-256:
+`904ca8f531cb354d5f1c94f93078c11b216c1f3a9786873467bf61caeb14b313`.
+NPU code SHA-256:
+`76ed9c882c5bc7dc501be32d5408fe6bf5de8fd49919ab610ad0657254eadb7a`.
+
+The 28-packet exact tuple and withdrawal matrix passed with native policy
+enabled. The first 20 packets returned exactly two matches on RX2 and
+18 misses on RX4. Removing slot0 released both leases and sent its baseline
+packet to cover RX4. Reinstalling slot0 reacquired 14 predicates and sent
+the next baseline packet to RX2.
+
+Removing cover slot1 retained slot0 and its two leases: matching IPv4/IPv6
+packets still selected RX2, while a different service and a changed IPv6
+address selected default RX0. Removing slot0 then released the entire pool
+and returned both baseline families to RX0. The initial 24-packet run
+exposed a runner assumption that `routed=0` disabled retained consumers;
+the revised fixture and matrix exercise the independent consumer and
+default-route states. All 18 runner self-tests passed, including wrong-ring
+injections at each of the eight withdrawal/reinstall observations.
+
+The seven-type wide-service regression also passed all 14 packets: IPv4,
+IPv6, ARP, VLAN, PPPoE, fragment and short IPv4 with both service IDs.
+Both runs preserved packet identity, complete service and SPORT2; restored
+all ten saved registers; unloaded the loopback module; and left the tuple
+pool empty. Final state was `generation=49 allowed=1 failed=0`, PON `ppe=0`,
+CPU fallback zero and WED `state=3 irq_ready=1 error=0`. Direct HTTPS over
+Wi-Fi returned HTTP 200. NAND remained disabled and `/proc/mtd` empty.
+
+Evidence in the enclosing workspace:
+`build/pon-tuple-987-board/{sealed.json,exact-native-withdraw-v2/report.json,wide-native-packet-matrix/report.json,final-wifi/result.json,final-state.txt}`.
+The initial failed expectation and its successful cleanup remain in
+`build/pon-tuple-987-board/exact-native-withdraw/`.
 
 The stock investigation identified GDM2 loopback and special-tag configuration
 as the next no-fiber ingress experiment. Relevant stock FE symbols are
