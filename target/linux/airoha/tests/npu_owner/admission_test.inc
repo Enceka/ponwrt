@@ -64,8 +64,8 @@ static void check_authorization(void)
     published_enabled = 0;
     CHECK(airoha_npu_owner_ready(owner, &owner->txn.id) == -ESTALE);
     published_enabled = 1;
-    CHECK(airoha_npu_txn_open(&owner->txn, &airoha_npu_owner_ops, owner) == -EOPNOTSUPP);
-    CHECK(owner->txn.phase == NPU_TXN_PPE_RESTORE && !gate_calls[GATE_OPEN]);
+    CHECK(airoha_ppe_npu_owner_open_locked(&fixture.eth) == 0);
+    CHECK(owner->txn.phase == NPU_TXN_OPEN && gate_calls[GATE_OPEN]);
     epoch = owner->txn.id.epoch;
     CHECK(airoha_ppe_npu_owner_close_locked(&fixture.eth) == 0);
     CHECK(owner->txn.id.epoch == epoch + 1 && !owner->auth_attempted && !owner->auth_count);

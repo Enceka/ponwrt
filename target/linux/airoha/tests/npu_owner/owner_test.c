@@ -76,7 +76,7 @@ struct airoha_eth {
     struct airoha_npu *npu;
     struct airoha_soc *soc;
     int ct_route_lock;
-    struct { const void *owner; bool ready; } ct_bank1_routes;
+    struct { const void *owner; bool ready, pon_open, revoked; } ct_bank1_routes;
     u32 regs[6];
     void *dev;
     struct airoha_qdma qdma[2];
@@ -92,6 +92,7 @@ static u32 caps, gate_epoch, gate_generation, auth_epoch, auth_generation;
 static u32 published_count, published_enabled;
 static bool auth_lose_ack, auth_bad_echo, auth_change_generation;
 static bool auth_query_change_generation;
+static bool fail_arm, arm_change_generation, gate_change_generation, route_change_generation;
 static u64 bridge_generation;
 static u32 attempted_epoch;
 static u64 attempted_generation;
@@ -161,6 +162,8 @@ static int airoha_bank1_routes_claim(struct airoha_eth *eth, const void *owner)
     CHECK(flow_offload_mutex && !ppe_lock && owner);
     eth->ct_bank1_routes.owner = owner;
     eth->ct_bank1_routes.ready = !fail_route;
+    eth->ct_bank1_routes.pon_open = false;
+    eth->ct_bank1_routes.revoked = false;
     return fail_route ? -EIO : 0;
 }
 static int airoha_bank1_routes_release(struct airoha_eth *eth, const void *owner)
@@ -170,6 +173,18 @@ static int airoha_bank1_routes_release(struct airoha_eth *eth, const void *owner
         return -EIO;
     eth->ct_bank1_routes.owner = NULL;
     eth->ct_bank1_routes.ready = false;
+    return 0;
+}
+static int airoha_bank1_routes_open(struct airoha_eth *eth, const void *owner)
+{
+    CHECK(flow_offload_mutex && !ppe_lock && eth->ct_bank1_routes.owner == owner);
+    CHECK(eth->ct_bank1_routes.ready && !eth->ct_bank1_routes.revoked);
+    CHECK(eth->regs[REG_PPE_PPE_FLOW_CFG(1)] && gate_calls[GATE_OPEN]);
+    if (fail_route)
+        return -EIO;
+    eth->ct_bank1_routes.pon_open = true;
+    if (route_change_generation)
+        bridge_generation++;
     return 0;
 }
 static int airoha_ct_fe_owner_claim(struct airoha_ppe *ppe, const void *owner)
@@ -195,7 +210,23 @@ static int airoha_ct_fe_owner_quiesce(struct airoha_ppe *ppe, const void *owner,
     ppe->ct_fe.epoch = epoch;
     ppe->ct_fe.generation = generation;
     ppe->ct_fe.pending = false;
+    ppe->ct_fe.armed = ppe->ct_fe.arm_pending = false;
     ppe->ct_fe.owner_quiesced = true;
+    return 0;
+}
+static int airoha_ct_fe_owner_arm(struct airoha_ppe *ppe, const void *owner,
+                                 u64 generation, u32 epoch)
+{
+    CHECK(ppe_lock && ppe->ct_fe.owner == owner && !ppe->ct_fe.pending);
+    CHECK(generation == ppe->ct_fe.generation && epoch == ppe->ct_fe.epoch);
+    ppe->ct_fe.owner_quiesced = false;
+    ppe->ct_fe.arm_pending = true;
+    if (fail_arm)
+        return -ETIMEDOUT;
+    ppe->ct_fe.arm_pending = false;
+    ppe->ct_fe.armed = true;
+    if (arm_change_generation)
+        bridge_generation++;
     return 0;
 }
 static int airoha_ct_fe_owner_release(struct airoha_ppe *ppe, const void *owner)
@@ -262,7 +293,6 @@ int airoha_npu_gate_command(struct airoha_npu *npu, struct npu_gate_message *mes
     if (operation == GATE_QUERY)
         CHECK(!message->w[GM_EPOCH] && !message->w[GM_GENERATION]);
     else {
-        CHECK(operation != GATE_OPEN);
         gate_epoch = message->w[GM_EPOCH];
         gate_generation = message->w[GM_GENERATION];
     }
@@ -273,6 +303,15 @@ int airoha_npu_gate_command(struct airoha_npu *npu, struct npu_gate_message *mes
     message->w[GM_AUTH_EPOCH] = auth_epoch;
     message->w[GM_AUTH_GENERATION] = auth_generation;
     message->w[GM_CLOSED] = 1;
+    if (operation == GATE_OPEN) {
+        message->w[GM_CLOSED] = 0;
+        message->w[GM_MASK] = GATE_PON2;
+        message->w[GM_FE_ENABLED] = 1;
+        message->w[GM_ER_FLAGS] = GATE_ER_BOUND;
+        message->w[GM_AUTH_ENABLED] = published_enabled;
+        if (gate_change_generation)
+            bridge_generation++;
+    }
     if (operation == GATE_QUIET) {
         CHECK(fe_calls && !fail_fe);
         message->w[GM_QUIET_ACK] = 1;
@@ -354,6 +393,7 @@ static void setup(struct airoha_eth *eth, struct airoha_ppe *ppe,
     published_count = published_enabled = 0;
     auth_lose_ack = auth_bad_echo = auth_change_generation = false;
     auth_query_change_generation = false;
+    fail_arm = arm_change_generation = gate_change_generation = route_change_generation = false;
 }
 
 static void check_closed(struct airoha_eth *eth)
@@ -370,6 +410,7 @@ static void check_closed(struct airoha_eth *eth)
 
 #include "return_test.inc"
 #include "admission_test.inc"
+#include "reopen_test.inc"
 
 static void check_binding(struct airoha_eth *eth)
 {
@@ -549,6 +590,7 @@ int main(void)
     CHECK(allocated == freed);
     check_returns();
     check_authorization();
+    check_reopen();
     printf("npu owner: %u checks passed\n", checks);
     return 0;
 }

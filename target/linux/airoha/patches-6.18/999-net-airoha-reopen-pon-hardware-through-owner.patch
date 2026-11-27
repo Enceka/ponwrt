@@ -1,0 +1,262 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: reopen PON hardware through lifecycle owner
+
+Restore bank1, arm the exact FE identity, and open the owned PON route
+after authorization. Recheck the return mapping and generation across
+every stage and command wait. Close and retire failed public opens.
+Keep optical qualification disabled until flow isolation and reset retirement
+are connected.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -1007,6 +1007,7 @@
+ 					  const struct airoha_npu_auth_rule *rules,
+ 					  u32 count);
+ int airoha_ppe_npu_owner_renew_locked(struct airoha_eth *eth, u64 generation);
++int airoha_ppe_npu_owner_open_locked(struct airoha_eth *eth);
+ int airoha_ppe_ct_shutdown(struct airoha_eth *eth);
+ int airoha_ppe_ct_prepare(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+--- a/drivers/net/ethernet/airoha/airoha_npu_owner.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_owner.h
+@@ -21,11 +21,28 @@
+ 					 lockdep_is_held(&flow_offload_mutex));
+ }
+ 
++static int airoha_npu_owner_open_check(struct airoha_npu_owner *owner,
++				      const struct airoha_npu_txn_identity *id,
++				      enum airoha_npu_txn_phase phase);
++
+ static int airoha_npu_owner_gate(void *ctx, struct npu_gate_message *message)
+ {
++	struct airoha_npu_owner *owner = ctx;
+ 	struct airoha_npu *npu = airoha_npu_owner_provider(ctx);
+-
+-	return npu ? airoha_npu_gate_command(npu, message) : -ENODEV;
++	bool opening = message->w[GM_ABI_OP] >> 16 == GATE_OPEN;
++	int error;
++
++	if (!npu)
++		return -ENODEV;
++	if (opening) {
++		error = airoha_npu_owner_open_check(owner, &owner->txn.id, NPU_TXN_GATE_OPEN);
++		if (error)
++			return error;
++	}
++	error = airoha_npu_gate_command(npu, message);
++	if (!error && opening)
++		error = airoha_npu_owner_open_check(owner, &owner->txn.id, NPU_TXN_GATE_OPEN);
++	return error;
+ }
+ 
+ static int airoha_npu_owner_auth(void *ctx, struct npu_auth_message *message)
+@@ -90,11 +107,12 @@
+ static int airoha_npu_owner_ready(void *ctx,
+ 				  const struct airoha_npu_txn_identity *id);
+ 
+-static int airoha_npu_owner_open_unsupported(void *ctx,
+-					  const struct airoha_npu_txn_identity *id)
+-{
+-	return -EOPNOTSUPP;
+-}
++static int airoha_npu_owner_bank1_restore(void *ctx,
++					 const struct airoha_npu_txn_identity *id);
++static int airoha_npu_owner_fe_arm(void *ctx,
++				  const struct airoha_npu_txn_identity *id);
++static int airoha_npu_owner_routes_open(void *ctx,
++				       const struct airoha_npu_txn_identity *id);
+ 
+ static const struct airoha_npu_txn_ops airoha_npu_owner_ops = {
+ 	.gate = airoha_npu_owner_gate,
+@@ -103,13 +121,14 @@
+ 	.fe_quiesce = airoha_npu_owner_fe_quiesce,
+ 	.ppe_drain = airoha_npu_owner_bank1_drain,
+ 	.ready = airoha_npu_owner_ready,
+-	.ppe_restore = airoha_npu_owner_open_unsupported,
+-	.fe_arm = airoha_npu_owner_open_unsupported,
+-	.routes_open = airoha_npu_owner_open_unsupported,
++	.ppe_restore = airoha_npu_owner_bank1_restore,
++	.fe_arm = airoha_npu_owner_fe_arm,
++	.routes_open = airoha_npu_owner_routes_open,
+ };
+ 
+ #include "airoha_npu_return.h"
+ #include "airoha_npu_admission.h"
++#include "airoha_npu_reopen.h"
+ 
+ int airoha_ppe_npu_owner_close_locked(struct airoha_eth *eth)
+ {
+--- a/drivers/net/ethernet/airoha/airoha_npu_admission.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_admission.h
+@@ -1,8 +1,9 @@
+ #ifndef AIROHA_NPU_ADMISSION_H
+ #define AIROHA_NPU_ADMISSION_H
+ 
+-static int airoha_npu_owner_return_ready(struct airoha_npu_owner *owner,
+-					 const struct airoha_npu_txn_identity *id)
++static int airoha_npu_owner_return_state(struct airoha_npu_owner *owner,
++					 const struct airoha_npu_txn_identity *id,
++					 enum airoha_npu_txn_phase phase)
+ {
+ 	struct airoha_ppe *ppe = owner->ppe;
+ 	struct airoha_npu_return *path = owner->return_path;
+@@ -15,14 +16,28 @@
+ 	if (READ_ONCE(path->fault) || READ_ONCE(ppe->eth->ct_cpu_fallback))
+ 		return -EIO;
+ 	if (path->epoch != id->epoch || path->generation != id->generation ||
+-	    id->open_mask != GATE_PON2 ||
+-	    ppe->eth->ct_bank1_routes.owner != owner || !ppe->eth->ct_bank1_routes.ready)
++	    id->open_mask != GATE_PON2)
+ 		return -ESTALE;
+ 	spin_lock_bh(&ppe_lock);
+-	error = ppe->ct_fe.owner == owner && ppe->ct_fe.owner_quiesced &&
+-		!ppe->ct_fe.pending && !ppe->ct_fe.arm_pending && !ppe->ct_fe.armed &&
++	error = ppe->ct_fe.owner == owner && !ppe->ct_fe.pending &&
+ 		ppe->ct_fe.epoch == id->epoch && ppe->ct_fe.generation == id->generation ?
+ 		0 : -ESTALE;
++	if (!error && phase < NPU_TXN_FE_ARM &&
++	    (!ppe->ct_fe.owner_quiesced || ppe->ct_fe.arm_pending || ppe->ct_fe.armed))
++		error = -ESTALE;
++	if (!error && phase == NPU_TXN_FE_ARM &&
++	    !ppe->ct_fe.owner_quiesced && !ppe->ct_fe.arm_pending && !ppe->ct_fe.armed)
++		error = -ESTALE;
++	if (!error && phase > NPU_TXN_FE_ARM &&
++	    (!ppe->ct_fe.armed || ppe->ct_fe.arm_pending || ppe->ct_fe.owner_quiesced))
++		error = -ESTALE;
++	spin_lock_bh(&ppe->eth->ct_route_lock);
++	if (ppe->eth->ct_bank1_routes.owner != owner || !ppe->eth->ct_bank1_routes.ready ||
++	    ppe->eth->ct_bank1_routes.revoked ||
++	    (ppe->eth->ct_bank1_routes.pon_open && phase < NPU_TXN_ROUTES_OPEN) ||
++	    (!ppe->eth->ct_bank1_routes.pon_open && phase == NPU_TXN_OPEN))
++		error = -ESTALE;
++	spin_unlock_bh(&ppe->eth->ct_route_lock);
+ 	spin_unlock_bh(&ppe_lock);
+ 	if (error)
+ 		return error;
+@@ -30,6 +45,12 @@
+ 	error = airoha_npu_return_mapping(path, netdev_from_priv(path->dev)) ? 0 : -ESTALE;
+ 	rcu_read_unlock();
+ 	return error;
++}
++
++static int airoha_npu_owner_return_ready(struct airoha_npu_owner *owner,
++					 const struct airoha_npu_txn_identity *id)
++{
++	return airoha_npu_owner_return_state(owner, id, NPU_TXN_READY);
+ }
+ 
+ int airoha_ppe_npu_owner_authorize_locked(struct airoha_eth *eth,
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_reopen.h
+@@ -0,0 +1,111 @@
++#ifndef AIROHA_NPU_REOPEN_H
++#define AIROHA_NPU_REOPEN_H
++
++static int airoha_npu_owner_open_check(struct airoha_npu_owner *owner,
++				      const struct airoha_npu_txn_identity *id,
++				      enum airoha_npu_txn_phase phase)
++{
++	if (!owner->ppe->ct_pon_qualified)
++		return -EOPNOTSUPP;
++	if (!owner->bank1_saved || !owner->auth_attempted || !owner->auth_count)
++		return -EACCES;
++	return airoha_npu_owner_return_state(owner, id, phase);
++}
++
++static int airoha_npu_owner_bank1_restore(void *ctx,
++					 const struct airoha_npu_txn_identity *id)
++{
++	struct airoha_npu_owner *owner = ctx;
++	struct airoha_eth *eth = owner->ppe->eth;
++	u32 status;
++	int error;
++
++	error = airoha_npu_owner_open_check(owner, id, NPU_TXN_PPE_RESTORE);
++	if (error)
++		return error;
++	if (!owner->bank1_flow)
++		return -EOPNOTSUPP;
++	spin_lock_bh(&ppe_lock);
++	error = read_poll_timeout_atomic(airoha_fe_rr, status,
++					 !(status & PPE_GLO_CFG_BUSY_MASK),
++					 10, 100000, false, eth, REG_PPE_GLO_CFG(1));
++	if (error)
++		goto unlock;
++	if (!(status & PPE_GLO_CFG_EN_MASK)) {
++		error = -EIO;
++		goto unlock;
++	}
++	airoha_fe_wr(eth, REG_PPE_TB_CFG(1), owner->bank1_tb);
++	if (airoha_fe_rr(eth, REG_PPE_TB_CFG(1)) != owner->bank1_tb) {
++		error = -EIO;
++		goto unlock;
++	}
++	airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(1), owner->bank1_flow);
++	if (airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) != owner->bank1_flow)
++		error = -EIO;
++unlock:
++	spin_unlock_bh(&ppe_lock);
++	return error ?: airoha_npu_owner_open_check(owner, id, NPU_TXN_PPE_RESTORE);
++}
++
++static int airoha_npu_owner_fe_arm(void *ctx,
++				  const struct airoha_npu_txn_identity *id)
++{
++	struct airoha_npu_owner *owner = ctx;
++	int error;
++
++	error = airoha_npu_owner_open_check(owner, id, NPU_TXN_FE_ARM);
++	if (error)
++		return error;
++	spin_lock_bh(&ppe_lock);
++	error = airoha_ct_fe_owner_arm(owner->ppe, owner, id->generation, id->epoch);
++	spin_unlock_bh(&ppe_lock);
++	return error ?: airoha_npu_owner_open_check(owner, id, NPU_TXN_GATE_OPEN);
++}
++
++static int airoha_npu_owner_routes_open(void *ctx,
++				       const struct airoha_npu_txn_identity *id)
++{
++	struct airoha_npu_owner *owner = ctx;
++	int error;
++
++	error = airoha_npu_owner_open_check(owner, id, NPU_TXN_ROUTES_OPEN);
++	if (error)
++		return error;
++	error = airoha_npu_txn_gate(&owner->txn, &airoha_npu_owner_ops, owner, GATE_OPEN);
++	if (error)
++		return error;
++	error = airoha_bank1_routes_open(owner->ppe->eth, owner);
++	if (!error)
++		error = airoha_npu_owner_open_check(owner, id, NPU_TXN_ROUTES_OPEN);
++	if (error)
++		airoha_bank1_routes_claim(owner->ppe->eth, owner);
++	return error;
++}
++
++int airoha_ppe_npu_owner_open_locked(struct airoha_eth *eth)
++{
++	struct airoha_npu_owner *owner;
++	int error, close_error;
++
++	if (!eth || !eth->ppe)
++		return -EINVAL;
++	lockdep_assert_held(&flow_offload_mutex);
++	owner = eth->ppe->ct_npu_owner;
++	if (!owner || owner->txn.phase < NPU_TXN_CLOSED)
++		return -EBUSY;
++	error = airoha_npu_owner_open_check(owner, &owner->txn.id, owner->txn.phase);
++	if (!error)
++		error = airoha_npu_txn_open(&owner->txn, &airoha_npu_owner_ops, owner);
++	if (!error)
++		error = airoha_npu_owner_open_check(owner, &owner->txn.id, NPU_TXN_OPEN);
++	if (error) {
++		close_error = airoha_ppe_npu_owner_close_locked(eth);
++		if (close_error)
++			error = close_error;
++	}
++	owner->txn.last_error = error;
++	return error;
++}
++
++#endif

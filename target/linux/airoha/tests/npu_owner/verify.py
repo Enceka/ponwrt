@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 
@@ -24,7 +25,7 @@ def main():
     parser.add_argument('--output', type=Path, default=tests / 'out')
     parser.add_argument('--cc', default=os.environ.get('CC', 'clang'))
     parser.add_argument('--source', type=Path, required=True,
-                        help='Kernel tree with patches through 996 applied')
+                        help='Kernel tree with patches through 999 applied')
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -32,8 +33,8 @@ def main():
     if report_path.exists():
         report_path.unlink()
     patches = tests.parents[1] / 'patches-6.18'
-    paths = {number: next(patches.glob(number + '-*.patch'))
-             for number in ('988', '989', '990', '993', '994', '995', '996')}
+    paths = {number: next(patches.glob(number + '-net-airoha-*.patch'))
+             for number in ('988', '989', '990', '993', '994', '995', '996', '999')}
     inputs = {number: path.read_bytes() for number, path in paths.items()}
     sources = {}
     for name in (*helper.ABIS, 'airoha_npu_transaction.h'):
@@ -46,9 +47,10 @@ def main():
     expected.mkdir(parents=True, exist_ok=True)
     (expected / owner_name).write_bytes(sources[owner_name])
     return_patch = inputs['994'].decode()
-    for number in ('994', '996'):
+    for number in ('994', '996', '999'):
         owner_patch = '--- a/drivers/net/ethernet/airoha/' + owner_name + '\n'
-        owner_patch += inputs[number].decode().split(owner_patch, 1)[1].split('--- /dev/null', 1)[0]
+        owner_patch += re.split(r'^--- ', inputs[number].decode().split(owner_patch, 1)[1],
+                               maxsplit=1, flags=re.MULTILINE)[0]
         applied = subprocess.run(['patch', '--batch', '-p1'], input=owner_patch,
                                  cwd=output / 'expected', capture_output=True, text=True)
         (output / ('apply-' + number + '.log')).write_text(applied.stdout + applied.stderr)
@@ -59,14 +61,25 @@ def main():
     sources[return_name] = helper.added_file(return_patch, return_name)
     admission_name = 'airoha_npu_admission.h'
     sources[admission_name] = helper.added_file(inputs['996'].decode(), admission_name)
+    (expected / admission_name).write_bytes(sources[admission_name])
+    admission_patch = '--- a/drivers/net/ethernet/airoha/' + admission_name + '\n'
+    admission_patch += re.split(r'^--- ', inputs['999'].decode().split(admission_patch, 1)[1],
+                               maxsplit=1, flags=re.MULTILINE)[0]
+    applied = subprocess.run(['patch', '--batch', '-p1'], input=admission_patch,
+                             cwd=output / 'expected', capture_output=True, text=True)
+    if applied.returncode:
+        raise RuntimeError('cannot apply admission: ' + applied.stdout + applied.stderr)
+    sources[admission_name] = (expected / admission_name).read_bytes()
+    reopen_name = 'airoha_npu_reopen.h'
+    sources[reopen_name] = helper.added_file(inputs['999'].decode(), reopen_name)
     publish_name = 'airoha_npu_auth_publish.h'
     sources[publish_name] = helper.added_file(inputs['995'].decode(), publish_name)
     driver = args.source.resolve() / 'drivers/net/ethernet/airoha'
     if (driver / owner_name).read_bytes() != sources[owner_name]:
-        raise RuntimeError('kernel owner differs from current 993/994/996')
+        raise RuntimeError('kernel owner differs from current 993/994/996/999')
     if (driver / return_name).read_bytes() != sources[return_name]:
         raise RuntimeError('kernel return owner differs from current 994')
-    for name in (admission_name, publish_name):
+    for name in (admission_name, publish_name, reopen_name):
         if (driver / name).read_bytes() != sources[name]:
             raise RuntimeError('kernel admission source differs: ' + name)
     ppe_source = (driver / 'airoha_ppe.c').read_text()
@@ -116,6 +129,23 @@ def main():
         'renew_before_retiring': ('error = airoha_ppe_npu_owner_close_locked(eth);\n\tif (error)\n\t\treturn error;', 'error = 0;'),
     }
     mutants.update(admission_mutants)
+    reopen_mutants = {
+        'restore_wrong_bank': ('REG_PPE_TB_CFG(1)', 'REG_PPE_TB_CFG(0)'),
+        'ignore_restore_tb_readback': (
+            'airoha_fe_rr(eth, REG_PPE_TB_CFG(1)) != owner->bank1_tb', 'false'),
+        'ignore_restore_flow_readback': (
+            'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) != owner->bank1_flow', 'false'),
+        'skip_post_arm_generation': (
+            'return error ?: airoha_npu_owner_open_check(owner, id, NPU_TXN_GATE_OPEN);',
+            'return error;'),
+        'skip_post_route_generation': (
+            'if (!error)\n\t\terror = airoha_npu_owner_open_check(owner, id, NPU_TXN_ROUTES_OPEN);', ''),
+        'leave_failed_open_live': ('close_error = airoha_ppe_npu_owner_close_locked(eth);',
+                                 'close_error = 0;'),
+    }
+    mutants.update(reopen_mutants)
+    mutants['skip_post_gate_generation'] = (
+        'if (!error && opening)\n\t\terror = airoha_npu_owner_open_check(owner, &owner->txn.id, NPU_TXN_GATE_OPEN);', '')
     mutation_results = {}
     mutants['repeat_restored_stop'] = (
         'if (ppe->ct_npu_owner && ppe->ct_npu_owner->stop_completed)', 'if (false)')
@@ -124,6 +154,7 @@ def main():
     for name, (before, after) in mutants.items():
         target_name = ('stop_entry.inc' if name.startswith('repeat_') else
                        return_name if name in return_mutants else
+                       reopen_name if name in reopen_mutants else
                        admission_name if name in admission_mutants else owner_name)
         original = sources[target_name].decode()
         if before not in original:
@@ -150,7 +181,8 @@ def main():
         'source_sha256': {name: sha256(data) for name, data in sources.items()},
         'test_sha256': {name: sha256((tests / name).read_bytes())
                         for name in ('verify.py', 'owner_test.c', 'return_types.h',
-                                     'return_stubs.inc', 'return_test.inc', 'admission_test.inc')},
+                                     'return_stubs.inc', 'return_test.inc', 'admission_test.inc',
+                                     'reopen_test.inc')},
     }
     report_path.write_text(json.dumps(report, indent=2) + '\n')
     print(result)

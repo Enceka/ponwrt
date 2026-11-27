@@ -14,9 +14,9 @@ phase, original bank1 registers, and exact attempted identity for retry.
 
 While claimed, new bank1 BIND publications return `-EBUSY`. Bank0 and row
 invalidation keep their existing paths. The claim is explicit; boot and normal
-PON updates do not claim automatically. PON qualification and the hardware
-reopen callbacks remain disabled; service admission and return preparation
-below are explicit internal operations.
+PON updates do not claim automatically. PON qualification remains disabled;
+service admission, return preparation and reopening are explicit internal
+operations.
 
 `994` adds a PON return consumer owned by the same transaction. Preparation
 requires a live GDM2/WAN lower, a valid GPON service table and the current
@@ -39,14 +39,30 @@ completes; malformed inputs send no AUTH command. READY checks current AUTH
 count and identity, then checks generation again after the QUERY reply.
 The renew entry fully closes the old identity and destroys its return ring
 before beginning a new generation. Failed old or new close stages preserve
-their attempted identity on retry. Hardware qualification and the remaining
-reopen callbacks still gate activation.
+their attempted identity on retry.
 
-Run against a kernel source tree containing patches through `996`:
+`997` adds exact-identity FE ARM and reserves the final epoch for close.
+`998` reopens only GDM2 while keeping the bank1 route owner. `999` connects
+bank1 restoration, FE ARM, GATE OPEN and route opening. Every stage checks
+the current return mapping, generation, route ownership and fault state,
+including after waits and when resuming a partial open. Bank1 register
+restoration retains the original snapshot and checks each write; bank0
+is unchanged. Route opening revalidates the firmware gate before MMIO.
+
+`airoha_ppe_npu_owner_open_locked()` requires the flow mutex. Call it after
+claim/close, return preparation and authorization. Success retains the
+owner and return consumer. Failure starts the complete close transaction;
+a failed close preserves its phase and DMA resources for another close
+attempt. Normal activation remains gated by `ct_pon_qualified`. Atomic
+admission revocation, periodic owner health checks, cross-domain flow
+isolation and hardware-reset DMA retirement are the next activation
+prerequisites; boot and ordinary PON configuration still use existing paths.
+
+Run against a kernel source tree containing patches through `999`:
 
 ```sh
 python3 target/linux/airoha/tests/npu_owner/verify.py \
-  --source /absolute/path/to/linux-after-996 \
+  --source /absolute/path/to/linux-after-999 \
   --output /absolute/path/to/results/npu-owner
 ```
 
@@ -69,8 +85,10 @@ BIND outcomes, mapping changes, all 65,536 GEM values, exact configuration
 checks, shutdown ordering, fault-work retries and epoch exhaustion. The
 authorization tests cover lost BEGIN/ADD/ARM replies, a generation change
 during publication or READY query, failed close retries, generation renewal
-and aborting a partial reopen. The combined suite passes 76,139 checks and
-seventeen runtime mutants. The return
+and aborting a partial reopen. Reopen tests add register write failures,
+uncertain ARM, gate and route failures, generation changes during each
+operation, stage retries, and failed ER teardown after a rejected open.
+The report includes the check count and runtime mutation results. The return
 consumer's NAPI/DMA implementation is tested separately by `eth_return`;
 this suite injects its allocation, bind and teardown boundaries.
 
