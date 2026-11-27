@@ -180,6 +180,109 @@ to `generation=49 allowed=1 failed=0`. The stopping-state fault is covered
 by the extracted production tests; this board run checked the normal path.
 Evidence: `build/pon-cpu-probe-981.t_mqn98y/`.
 
+## Covered route experiment, 2026-11-27
+
+Patch 982 adds `cover SLOT` and `route` to the RAM probe. A cover occupies
+the slot's two owned rows, with explicit type0/type1 SPORT2 predicates and
+WAN CPU ring2 for slot0 or ring4 for slot1. `route` reads back all cover
+TCAM/action words, checks source-to-CPU mapping and receiver readiness,
+then changes GDM2 forwarding to PPE2 under the route lock. `set`, `cover`,
+`clear` and `off` first restore and acknowledge CPU forwarding. A failed
+CPU-route write retains classifier ownership and coverage for retry.
+The shared route-change and fallback paths preserve coverage until that
+acknowledgement, including persistent route-write failure.
+
+First board FIT SHA256:
+`a6fef919244975876b180438ce3a69c8c76adfac28d47911817e9f158d4d987f`.
+Boot UUID: `2d6c0192-8ca0-46bc-9eaf-1f93730f4f64`.
+Its initramfs matches all 1101 baseline entries. NAND and the optical
+controller remain disabled. Evidence: `build/pon-cover-982-board/`.
+
+With native policy disabled, numbered 128-byte IPv4/UDP packets produce:
+
+| Configuration | Service A (2134) | Service B (a134) |
+|---|---|---|
+| Cover rows56/57, A rows58/59 | RX2 | RX2 |
+| A rows56/57, cover rows58/59 | RX2 | RX4 |
+| A withdrawn, cover retained | RX4 | RX4 |
+| A republished, cover retained | RX2 | RX4 |
+| Cover withdrawn, CPU route restored | ordinary CPU RX0 | ordinary CPU RX0 |
+
+All three initial A/B/A packets in each slot arrangement and all eight
+withdrawal-cycle packets returned with the exact full service and SPORT2.
+The overlapping type0 rows select the lower numerical row. Ten GDM2
+registers were restored, the probe unloaded, and native failure remained
+clear in these runs. Logs: `cover-slot0`, `cover-slot1`, `withdraw-slot1`.
+
+Enabling native policy exposed a separate coexistence fault: the first
+PON packet did not return, and nativeFE health op6 reported EIO with
+sticky CPU fallback. The probe still withdrew and unloaded. Wi-Fi HTTPS
+returned 200 afterward. Logs: `withdraw-native-active` and
+`wifi-after-native-fallback`. The next experiment must resolve the actual
+SIF matching/routing interaction with active native rows54/55. PON PPE
+qualification remains closed. The covered CPU experiment currently
+establishes service selection and withdrawal with native policy disabled.
+
+The persistent route-write fault fix was added after this first FIT and
+is covered by the host/VM fault suite; it requires a subsequent RAM build.
+
+## Exclusive source masks and native coexistence
+
+Patch 983 supplied three bounded source diagnostics with native policy
+disabled and slot1 CPU coverage retained. Each publishes typed slot0
+rows selecting RX2, and the retained cover selects RX4. Numbered optical
+packets retain SPORT2 and service2134 throughout all 96 trials:
+
+| Command, N=0..31 | SIF key/mask | Observed RX2 |
+|---|---|---|
+| `source N` | `BIT(N)/BIT(N)` | all 32 values |
+| `absent N` | `0/BIT(N)` | every value except N=2 |
+| `only N` | `BIT(N)/U32_MAX` | only N=2 |
+
+Evidence: `build/pon-sif-983-board/sif-sweep` and
+`build/pon-sif-983-v2-board/{sif-only,sif-absent}`. The hardware indexes
+the SIF key/mask with SPORT; an unset mask bit admits that source. This
+explains both the native54/55 interception and the LAN CPU guard
+interception of PON ARP/VLAN/PPPoE packets. Patch 984 uses full source
+masks in optical service/cover rows, native LAN1 rows and LAN CPU guards.
+
+Final RAM FIT SHA256:
+`f43bdab3548a7c6f17098821df3b80368cb55d7b838840828ca531f636bd7f9d`.
+Boot UUID: `986bed54-e67d-4baa-ac06-0627f74789a2`.
+Kernel source: `/workdir/pon-sif-984`; all 1101 initramfs entries match
+the verified baseline. This build includes the persistent-write recovery
+fix, the source diagnostics and the exclusive masks. Loopback module SHA:
+`daad09ad304b9daca545f130e6394a7d4ef82c68e3f68684c2f6b6782654c1e8`.
+
+Native policy stayed `generation=49 allowed=1 failed=0` during the full
+14-packet matrix and eight-packet withdrawal cycle:
+
+| Packet kind | Service2134 | Servicea134 |
+|---|---|---|
+| IPv4, IPv6, IPv4 first fragment | RX2 service row | RX4 optical cover |
+| ARP, VLAN, PPPoE, short IPv4 | RX4 optical cover | RX4 optical cover |
+
+Every packet returned with its sequence, kind, cookie and full service ID.
+Deleting the service rows sent both services to RX4; republishing restored
+RX2 selection for service2134. Deleting the cover restored default CPU
+RX0 before retiring the rows. All ten saved GDM2 registers were restored,
+the module unloaded, and the classifier ended at
+`saved=0 dirty=00 active=00 pending=0 scope=01000000 ready=0 cover=00 routed=0`.
+Wi-Fi HTTPS returned 200 afterward. Evidence:
+`build/pon-sif-984-board/{native-packet-matrix,native-withdraw,final-wifi}`.
+
+Host and VM checks include 6915 probe cases, 6400 cross-source comparisons,
+56 runtime mutations, persistent-route recovery, 2110 owner cases and
+2100 injected owner faults. The actual native ingress header passed 3287
+cases; CPU guards passed 2485 lifecycle, 130 scope and 538624 classifier
+checks. Stock setter/readback suites cover both new exclusive source
+encodings and rejection of the old partial masks.
+
+PON PPE qualification remains closed. The next dataplane work is shared
+tuple allocation, fragment/length admission and service-qualified PPE
+lookup/egress. The fragment row above deliberately selects CPU; fragment
+admission must be resolved before publishing accelerated consumers.
+
 The full-packet stock oracle and pure tuple encoder are now separate
 reproducible artifacts. See `IFC-TUPLE-PACKET.md`, `IFC-TUPLE.md` and
 `IFC-FIELD-LAYOUT.md`. The field-layout audit corrected an invalid type0/
