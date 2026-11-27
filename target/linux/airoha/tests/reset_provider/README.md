@@ -32,3 +32,32 @@ Linux `-EIO/-EAGAIN/-ETIMEDOUT`，随后验证重试。
 
 这些测试验证 reset provider 的位操作和错误传播；NPU 硬件撤销、设备树接线及
 实际复位完成时序属于后续独立实现。
+
+## NPU DMA 访问撤销的硬件依据
+
+2026-11-27 核查采用原厂 SDK 镜像固定版本
+`32b5aa356c2406edef8806aaf75451ff0a5286f2`，只读取寄存器接口和控制流程。
+
+- [ecnt_gdma.c](https://github.com/lotusmomo/airoha_sdk/blob/32b5aa356c2406edef8806aaf75451ff0a5286f2/linux/arch/arm64/mach-econet/ecnt_gdma.c)
+  的 `WAIT_GDMA_DONE()` 等待通道 CT0 的 bit1 自然清零；通道步长为 `0x10`，
+  CT0 偏移 `0x08`，DONE 偏移 `0x204`，DONE 对应 bit 写一清除。
+  当前固件使用的 channel3 对应 `0x1fb30038.bit1` 和 `0x1fb30204.bit3`。
+- 本项目 `clk-en7523.c` 将 NPU reset 映射到 SCU `+0x830.bit9`，GDMA reset
+  映射到 `+0x834.bit14`；两个 master 分别管理断言状态。
+- [ecnt_npu.c](https://github.com/lotusmomo/airoha_sdk/blob/32b5aa356c2406edef8806aaf75451ff0a5286f2/linux/arch/arm64/mach-econet/ecnt_npu.c)
+  的 `host_set_npu_core_on_off()` 修改 core boot mask，再触发并固定延时。
+  `is_npu_dma_done()` 和 `is_npu_idle()` 读取固件 MIB9/MIB8；
+  `enable_npu_rbus_decoder()` 管理 L2C SRAM decoder。
+- 本项目固件 `src/eth_return.c` 同时存在 hart 直接写 DRAM 和独立 GDMA 路径。
+  reset fence 的完成条件须同时覆盖这两类访问和已经发出的总线写事务。
+
+后续硬件核实集中在三点：全部 harts 停止的新访问确认；GDMA abort/reset 的
+完成与 outstanding 状态；NPU→host DRAM bridge 的隔离与写缓冲排空条件。
+正常完成的 CT0 采样放在主动清位或 reset 之前，分别记录自然完成与强制停机。
+
+provider 实现应在 ER BIND 发出前登记 `dma/bytes/epoch/count/sport/generation`
+和分配、运行、reset 代次。超时保留曝光记录。正常退役沿用
+QUIESCE→STOP→消费完成→UNBIND；强制退役在硬件完成条件满足后才发布访问撤销。
+逐项 assert 保留已经成功的步骤，避免 bulk assert 失败回滚。
+待硬件条件补齐期间保留 ring、ctx 和 provider 生命周期，走 CPU fallback；
+remove 路径同步处理 devres、timer、NAPI 和 delayed work 的最后引用。
