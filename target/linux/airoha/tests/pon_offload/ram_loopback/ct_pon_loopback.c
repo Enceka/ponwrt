@@ -21,6 +21,7 @@
 #define PROBE_BYTES 128
 #define PROBE_MARKER_BYTES 20
 #define PROBE_MAX_BYTES 130
+#define PROBE_CURRENT_SERVICE (~0U)
 #undef airoha_fe_rr
 #undef airoha_fe_wr
 #define airoha_fe_rr(eth, reg) readl((eth)->fe_regs + (reg))
@@ -32,6 +33,8 @@ static struct net_device *probe_netdev;
 static struct airoha_gdm_dev *probe_dev;
 static bool retained, controller, opened, handler;
 static bool registers_saved;
+static bool configured, sent_current;
+static u32 mapped_service;
 static u32 saved_ifc_desired, saved_vip;
 static u32 saved_registers[10];
 static u32 sequence;
@@ -249,7 +252,43 @@ static int mapping(unsigned int service, bool enable)
 	err = airoha_eth_pon_configure(probe_netdev, 0, service, enable);
 	if (err)
 		return err;
-	return airoha_eth_pon_update_end(probe_netdev);
+	err = airoha_eth_pon_update_end(probe_netdev);
+	if (!err) {
+		configured = enable;
+		mapped_service = service;
+	}
+	return err;
+}
+
+static int map_service(unsigned int service)
+{
+	if (!retained || !opened || service > U16_MAX)
+		return -EINVAL;
+	if (READ_ONCE(probe_dev->eth->ppe->ct_npu_owner))
+		return -EBUSY;
+	return mapping(service, true);
+}
+
+static bool mapping_current(void)
+{
+	const struct airoha_pon_flow_table *table;
+	bool matches;
+	u32 tag;
+
+	if (!configured || smp_load_acquire(&probe_dev->pon_update_blocked) ||
+	    READ_ONCE(probe_dev->pon_qdma_tag) ||
+	    !netif_running(probe_netdev) || !netif_carrier_ok(probe_netdev))
+		return false;
+	tag = AIROHA_PON_QDMA_VALID |
+		FIELD_PREP(AIROHA_PON_QDMA_GEM_MASK, mapped_service) |
+		FIELD_PREP(AIROHA_PON_QDMA_PBIT_MASK, 0xff);
+	rcu_read_lock();
+	table = rcu_dereference(probe_dev->pon_flow_table);
+	matches = table && table->count == 1 &&
+		table->entries[0].vlan_id == AIROHA_PON_VID_ANY &&
+		table->entries[0].pbit_mask == 0xff && table->entries[0].tag == tag;
+	rcu_read_unlock();
+	return matches;
 }
 
 static int restore(void)
@@ -259,6 +298,8 @@ static int restore(void)
 	u32 value;
 	int err;
 
+	if (READ_ONCE(eth->ppe->ct_npu_owner))
+		return -EBUSY;
 	if (!retained)
 		return 0;
 	if (READ_ONCE(eth->ct_ifc_pon_ready) || eth->ppe->ct_pon_ifc.saved_valid)
@@ -334,7 +375,8 @@ static int prepare(void)
 	err = eligible();
 	if (err)
 		return err;
-	if (retained || netif_running(probe_netdev) || probe_dev->pon_link_ops ||
+	if (retained || READ_ONCE(eth->ppe->ct_npu_owner) ||
+	    netif_running(probe_netdev) || probe_dev->pon_link_ops ||
 	    eth->ppe->ct_pon_ifc.saved_valid || eth->pon_update_owner ||
 	    rcu_access_pointer(probe_dev->pon_flow_table) || probe_dev->pon_qdma_tag ||
 	    atomic_read(&probe_dev->pon_tx_pending) ||
@@ -410,12 +452,15 @@ static int transmit(unsigned int service, unsigned int kind, unsigned int varian
 	__be16 protocol = htons(ETH_P_IP);
 	int pending, err;
 
-	if (!retained || !opened || service > U16_MAX || kind >= PROBE_KIND_COUNT ||
+	if (!retained || !opened ||
+	    (service > U16_MAX && service != PROBE_CURRENT_SERVICE) || kind >= PROBE_KIND_COUNT ||
 	    variant > 4 || (variant && kind != PROBE_IPV4 && kind != PROBE_IPV6))
 		return -EINVAL;
-	err = mapping(service, true);
-	if (err)
-		return err;
+	if (service != PROBE_CURRENT_SERVICE) {
+		err = mapping(service, true);
+		if (err)
+			return err;
+	}
 	length = kind == PROBE_SHORT ? ETH_HLEN + 56 :
 		 kind == PROBE_FRAGMENT ? PROBE_MAX_BYTES : PROBE_BYTES;
 	skb = netdev_alloc_skb(probe_netdev, length + NET_IP_ALIGN);
@@ -518,8 +563,32 @@ marker:
 	}
 	err = read_poll_timeout(atomic_read, pending, !pending, 1000, 100000,
 				false, &probe_dev->pon_tx_pending);
-	msleep(20);
+	if (service != PROBE_CURRENT_SERVICE)
+		msleep(20);
+	if (err || service != PROBE_CURRENT_SERVICE)
+		smp_store_release(&awaiting, false);
+	return err;
+}
+
+static int transmit_current(unsigned int kind)
+{
+	bool waiting;
+	int err;
+
+	if (!retained || !opened || (kind != PROBE_IPV4 && kind != PROBE_IPV6))
+		return -EINVAL;
+	if (!mapping_current())
+		return -ESTALE;
+	sent_current = true;
+	err = transmit(PROBE_CURRENT_SERVICE, kind, 0);
+	if (!err)
+		err = read_poll_timeout(smp_load_acquire, waiting, !waiting,
+					1000, 100000, false, &awaiting);
 	smp_store_release(&awaiting, false);
+	if (!err && READ_ONCE(received_sequence) != sequence)
+		err = -EPROTO;
+	if (err)
+		synchronize_net();
 	return err;
 }
 
@@ -539,6 +608,9 @@ static int status_show(struct seq_file *file, void *unused)
 		kind_names[READ_ONCE(sent_kind)], READ_ONCE(sent_length),
 		kind_names[READ_ONCE(received_kind)], READ_ONCE(received_length));
 	seq_printf(file, "tx_variant=%u\n", READ_ONCE(sent_variant));
+	seq_printf(file, "configured=%u mapped_service=%u tx_current=%u npu_owner=%u\n",
+		configured, mapped_service, sent_current,
+		!!READ_ONCE(eth->ppe->ct_npu_owner));
 	seq_printf(file, "submitted=%llu completed=%llu dropped=%llu no_mapping=%llu rx_data=%llu rx_delivered=%llu last_tx=%08x/%08x last_rx=%08x/%08x\n",
 		stats.tx_packets_submitted, stats.tx_packets_completed, stats.tx_packets_hw_dropped,
 		stats.tx_no_mapping, stats.rx_data_packets, stats.rx_packets_delivered,
@@ -560,7 +632,7 @@ DEFINE_SHOW_ATTRIBUTE(status);
 static ssize_t command_write(struct file *file, const char __user *buffer,
 			      size_t length, loff_t *offset)
 {
-	char command[64], kind_name[16] = "ipv4", variant_word[16], trailing;
+	char command[64], operation[16] = {}, kind_name[16] = "ipv4", variant_word[16], trailing;
 	unsigned int service, kind, variant = 0;
 	int err, fields;
 
@@ -572,14 +644,32 @@ static ssize_t command_write(struct file *file, const char __user *buffer,
 		err = prepare();
 	else if (sysfs_streq(command, "restore"))
 		err = restore();
-	else {
+	else if (sscanf(command, "%15s", operation) == 1 && !strcmp(operation, "map")) {
+		err = -EINVAL;
+		if (sscanf(command, "%*s %15s %c", variant_word, &trailing) == 1 &&
+		    !kstrtouint(variant_word, 0, &service))
+			err = map_service(service);
+	} else if (!strcmp(operation, "send-current")) {
+		err = -EINVAL;
+		if (sscanf(command, "%*s %15s %c", kind_name, &trailing) == 1) {
+			if (!strcmp(kind_name, "ipv4"))
+				err = transmit_current(PROBE_IPV4);
+			else if (!strcmp(kind_name, "ipv6"))
+				err = transmit_current(PROBE_IPV6);
+		}
+	} else {
 		err = -EINVAL;
 		fields = sscanf(command, "send %u %15s %15s %c", &service, kind_name, variant_word, &trailing);
-		if (fields >= 1 && fields <= 3 &&
+		if (fields >= 1 && fields <= 3 && service <= U16_MAX &&
 		    (fields < 3 || !kstrtouint(variant_word, 10, &variant))) {
 			for (kind = 0; kind < PROBE_KIND_COUNT; kind++) {
 				if (!strcmp(kind_name, kind_names[kind])) {
-					err = transmit(service, kind, variant);
+					if (READ_ONCE(probe_dev->eth->ppe->ct_npu_owner))
+						err = -EBUSY;
+					else {
+						sent_current = false;
+						err = transmit(service, kind, variant);
+					}
 					break;
 				}
 			}
