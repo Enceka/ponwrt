@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+import re
+import shlex
+import struct
+import subprocess
+import time
+import uuid
+
+from prepare_npu_ram import require, sha256
+
+
+DIAG = '/sys/kernel/debug/ppe/pon_npu_diag'
+PROBE = '/sys/kernel/debug/ct_pon_loopback/'
+CLASSIFIER = '/sys/bus/platform/devices/1fb50000.ethernet/ct_pon_cpu_probe'
+POLICY = '/sys/bus/platform/devices/1fb50000.ethernet/ct_native_pair_policy'
+
+
+def fields(text):
+    return dict(re.findall(r'\b([a-z][a-z0-9_]*)=([^\s]+)', text))
+
+
+def check_packet(diag, probe, service, count, kind, previous):
+    state, packet = fields(diag), fields(probe)
+    for name, expected in dict(owner=1, diagnostic=1, qualified=0, policy=0, fallback=0,
+                                error=0, invalidated=0, ring=1, auth_count=0, auth_enabled=1,
+                                auth_inflight=0, gate_mask=4, gate_closed=0, gate_fault=0,
+                                gate_error=0, auth_error=0, er_error=0, er_fault=0,
+                                packets=count, consumed=count, dropped=0, fault=0).items():
+        require(int(state[name]) == expected, 'diagnostic state: ' + name)
+    require(int(state['flow'], 16) == 0 and int(state['scope'], 16) == 0x01000004,
+            'bank1 learning or ingress scope changed')
+    require(all(state[family + '_' + name] == state[name]
+                for family in ('gate', 'auth') for name in ('epoch', 'generation')),
+            'GATE/AUTH transaction identity mismatch')
+    require(int(packet['sequence']) == previous + 1 and
+            packet['sequence'] == packet['rx_sequence'] and packet['error'] == '0' and
+            packet['tx_kind'] == packet['rx_kind'] == kind and packet['pending'] == '0',
+            'numbered RX did not match TX')
+    descriptor = [int(word, 16) for word in state['er_desc'].split('/')]
+    require(len(descriptor) == 16 and descriptor[0] == 0x80000080 and
+            descriptor[1] == int(state['epoch']) and descriptor[2] == count and
+            descriptor[3] == 2 and descriptor[4] == int(state['generation']) and
+            descriptor[5] == 0x80000000 | service and not descriptor[7], 'ER identity mismatch')
+    require(descriptor[8] & 0xffff == 128 and descriptor[10] == 7 and
+            descriptor[13] >> 28 == 6 and descriptor[14] & 31 == 2 and
+            descriptor[12] >> 14 & 0xffff == service, 'FE prefix mismatch')
+    frame = bytes.fromhex(state['er_frame'])
+    offset = 14 + (40 if kind == 'ipv6' else 20) + 8
+    require(len(frame) == 128 and int(state['frame_bytes']) == 128, 'ER frame length')
+    magic, sequence, cookie, packet_kind, length = struct.unpack_from('>5I', frame, offset)
+    require(magic == 0x4354504e and sequence == previous + 1 and
+            packet_kind == (1 if kind == 'ipv6' else 0) and length == 128, 'ER packet marker')
+    require(int(state['observed_produced']) == count and int(state['observed_consumed']) == count,
+            'ER producer/consumer evidence mismatch')
+    return dict(service=service, kind=kind, sequence=sequence, cookie=cookie,
+                er_sequence=count, epoch=descriptor[1], generation=descriptor[4], descriptor=descriptor)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Run bounded PON NPU ER diagnostics in a pinned RAM boot')
+    parser.add_argument('--pin', type=Path, required=True)
+    parser.add_argument('--boot', required=True)
+    parser.add_argument('--identity', type=Path)
+    parser.add_argument('--module', type=Path, required=True)
+    parser.add_argument('--sha256', required=True)
+    parser.add_argument('--firmware-sha256', required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--run', action='store_true')
+    args = parser.parse_args()
+    uuid.UUID(args.boot)
+    blob = args.module.read_bytes()
+    require(sha256(blob) == args.sha256, 'module hash mismatch')
+    require(re.fullmatch('[0-9a-f]{64}', args.firmware_sha256), 'invalid firmware hash')
+    args.output.mkdir(parents=True, exist_ok=False)
+    ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=yes',
+           '-o', 'UserKnownHostsFile=' + str(args.pin.resolve()),
+           '-o', 'ProxyCommand=/usr/bin/nc -4 -b en6 -G 4 %h %p']
+    if args.identity:
+        ssh += ['-i', str(args.identity.resolve())]
+    ssh += ['root@192.168.1.1']
+    guard = ('set -eu; test "$(cat /proc/sys/kernel/random/boot_id)" = ' + shlex.quote(args.boot) +
+             '; test "$(wc -l </proc/mtd)" = 1; ')
+
+    def remote(label, command, data=None):
+        result = subprocess.run(ssh + [guard + command], input=data, capture_output=True, timeout=30)
+        (args.output / (label + '.stdout')).write_bytes(result.stdout)
+        (args.output / (label + '.stderr')).write_bytes(result.stderr)
+        (args.output / (label + '.json')).write_text(json.dumps(dict(returncode=result.returncode)) + '\n')
+        result.check_returncode()
+        return result.stdout.decode()
+
+    def write(label, path, command):
+        return remote(label, 'echo ' + shlex.quote(command) + ' > ' + path)
+
+    before = remote('before', 'cat ' + DIAG + '; cat ' + CLASSIFIER + '; cat ' + POLICY +
+                    '; cat /sys/kernel/debug/gpio; ip -d link show pon0; ' +
+                    'sha256sum /lib/firmware/airoha/hg5585f-ct/npu_rebuilt_rv32.bin')
+    initial = fields(before)
+    for name, expected in dict(owner=0, qualified=0, policy=0, fallback=0, route_owner=0, fe_owner=0,
+                                gate_error=0, auth_error=0, er_error=0, gate_caps=15,
+                                auth_caps=7, er_caps=15).items():
+        require(int(initial[name]) == expected, 'preflight: ' + name)
+    require(re.search(r'ram-pon-tx-disable[^\n]*out hi', before) and 'state DOWN' in before,
+            'optical guard or interface state')
+    require('tuple=0 pool=00000000 pool_pending=0 leases=0' in before and
+            'saved=0 dirty=00 active=00 pending=0 scope=01000000 ready=0' in before and
+            re.search(r'^generation=\d+ allowed=0 failed=0$', before, re.M), 'classifier or native policy busy')
+    require(args.firmware_sha256 in before, 'board firmware mismatch')
+    if not args.run:
+        print(json.dumps(dict(preflight=True, output=str(args.output))))
+        return
+    report = dict(boot=args.boot, module_sha256=args.sha256, firmware_sha256=args.firmware_sha256,
+                  pon_ppe_qualified=False, observations=[], cpu_observations=[],
+                  matrix_passed=False, passed=False, restored=False)
+    loaded = False
+    baseline = ''
+    failure = None
+    ipv6 = remote('ipv6-before', 'cat /proc/sys/net/ipv6/conf/pon0/disable_ipv6').strip()
+    require(ipv6 in ('0', '1'), 'invalid IPv6 state')
+    try:
+        write('ipv6-disable', '/proc/sys/net/ipv6/conf/pon0/disable_ipv6', '1')
+        remote('upload', 'test ! -d /sys/module/ct_pon_loopback; cat > /tmp/ct_pon_loopback.ko', blob)
+        remote('load', 'test "$(sha256sum /tmp/ct_pon_loopback.ko | cut -d " " -f1)" = ' +
+               shlex.quote(args.sha256) + '; insmod /tmp/ct_pon_loopback.ko special_tag=1')
+        loaded = True
+        baseline = remote('baseline', 'cat ' + PROBE + 'status')
+        write('prepare', PROBE + 'command', 'prepare')
+        cookie = None
+        for service in (0, 0x8000):
+            prefix = 'service-' + str(service)
+            write(prefix + '-map', PROBE + 'command', 'map ' + str(service))
+            write(prefix + '-start', DIAG, 'start')
+            remote(prefix + '-started', 'cat ' + DIAG)
+            for index in range(18):
+                label = prefix + '-packet-' + str(index + 1)
+                kind = 'ipv4' if index % 2 == 0 else 'ipv6'
+                previous = int(fields(remote(label + '-before', 'cat ' + PROBE + 'status'))['sequence'])
+                write(label + '-send', PROBE + 'command', 'send-current ' + kind)
+                for attempt in range(10):
+                    observed = remote(label + '-observation-' + str(attempt), 'cat ' + DIAG)
+                    if int(fields(observed)['consumed']) == index + 1:
+                        break
+                    time.sleep(0.01)
+                received = remote(label + '-received', 'cat ' + PROBE + 'status')
+                observation = check_packet(observed, received, service, index + 1, kind, previous)
+                if cookie is not None:
+                    require(cookie == observation['cookie'], 'probe cookie changed')
+                cookie = observation['cookie']
+                report['observations'].append(observation)
+            write(prefix + '-close', DIAG, 'close')
+            closed = fields(remote(prefix + '-closed', 'cat ' + DIAG))
+            require(closed['ring'] == '0' and closed['gate_mask'] == '0' and closed['auth_enabled'] == '0'
+                    and closed['qualified'] == '0' and closed['ingress'] == '0', 'close incomplete')
+            for kind in ('ipv4', 'ipv6'):
+                previous = fields(remote(prefix + '-cpu-' + kind + '-before', 'cat ' + PROBE + 'status'))
+                write(prefix + '-cpu-' + kind, PROBE + 'command', 'send-current ' + kind)
+                received = fields(remote(prefix + '-cpu-' + kind + '-after', 'cat ' + PROBE + 'status'))
+                require(int(received['rx_sequence']) == int(previous['sequence']) + 1 and
+                        int(received['received']) == int(previous['received']) + 1 and
+                        received['tx_kind'] == received['rx_kind'] == kind and
+                        received['error'] == '0' and received['pending'] == '0', 'CPU return after close missing')
+                quiet = fields(remote(prefix + '-cpu-' + kind + '-quiet', 'cat ' + DIAG))
+                require(quiet['ring'] == '0' and quiet['gate_mask'] == '0' and quiet['auth_enabled'] == '0'
+                        and quiet['qualified'] == '0' and quiet['ingress'] == '0'
+                        and quiet['consumed'] == closed['consumed'], 'closed path resumed')
+                report['cpu_observations'].append(dict(service=service, kind=kind,
+                    sequence=int(received['rx_sequence']), rx_msg0=received['rx_msg0'],
+                    rx_msg1=received['rx_msg1'], er_consumed=int(quiet['consumed'])))
+            write(prefix + '-release', DIAG, 'release')
+            released = fields(remote(prefix + '-released', 'cat ' + DIAG))
+            require(released['owner'] == released['route_owner'] == released['fe_owner'] == '0', 'owner release incomplete')
+            require(released['flow'] == initial['flow'] and released['tb'] == initial['tb'], 'bank1 restore mismatch')
+        report['matrix_passed'] = True
+    except Exception as error:
+        failure = error
+        report['error'] = repr(error)
+    finally:
+        try:
+            if loaded:
+                try:
+                    remote('cleanup-observation', 'cat ' + DIAG + '; cat ' + PROBE + 'status; dmesg | tail -60')
+                except Exception as error:
+                    report['snapshot_error'] = repr(error)
+                write('cleanup-release', DIAG, 'release')
+                released = fields(remote('cleanup-released', 'cat ' + DIAG))
+                require(released['owner'] == released['route_owner'] == released['fe_owner'] == '0', 'cleanup owner retained')
+                require(released['flow'] == initial['flow'] and released['tb'] == initial['tb'], 'cleanup bank1 mismatch')
+                write('restore', PROBE + 'command', 'restore')
+                restored = remote('restored', 'cat ' + PROBE + 'status')
+                require(restored.startswith('retained=0 controller=0 opened=0 saved=0 error=0 pending=0 '),
+                        'module cleanup incomplete')
+                original = re.findall(r'^([0-9a-f]{4})=([0-9a-f]{8}) ', baseline, re.M)
+                actual = re.findall(r'^([0-9a-f]{4})=([0-9a-f]{8}) ', restored, re.M)
+                require(len(original) == 10 and original == actual, 'loopback register restore mismatch')
+                remote('unload', 'rmmod ct_pon_loopback')
+            write('ipv6-restore', '/proc/sys/net/ipv6/conf/pon0/disable_ipv6', ipv6)
+            remote('after', 'cat ' + DIAG + '; cat ' + CLASSIFIER + '; cat ' + POLICY + '; dmesg | tail -60')
+            report['restored'] = True
+        except Exception as error:
+            report['cleanup_error'] = repr(error)
+            failure = failure or error
+        report['passed'] = report['matrix_passed'] and report['restored'] and failure is None
+        (args.output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
+    if failure:
+        raise failure
+    print(json.dumps(dict(passed=report['passed'], packets=len(report['observations']), restored=report['restored'])))
+
+
+if __name__ == '__main__':
+    main()

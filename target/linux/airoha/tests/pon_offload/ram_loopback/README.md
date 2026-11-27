@@ -126,6 +126,38 @@ python3 -B -m unittest discover -s target/linux/airoha/tests/pon_offload \
 
 ### Build the loopback module
 
+The opt-in `999-zk` diagnostic uses an additional RAM DT marker,
+`airoha,connac2-pon-er-diagnostic`, on the Ethernet node. Its
+`/sys/kernel/debug/ppe/pon_npu_diag` file accepts `start`, `close` and
+`release`, and reports AUTH/GATE/ER capabilities, ownership, bank1 registers,
+and the most recent accepted ER descriptor and frame. The session uses an
+empty AUTH table and keeps PON qualification closed and bank1 FLOW zero.
+Its identity includes the lower interface and its current controller.
+
+Prepare the module, then issue `map 0` before starting the diagnostic.
+`send-current ipv4` and `send-current ipv6` transmit numbered packets using
+that existing mapping. Mapping changes and ordinary `send` commands require
+the NPU owner to be released. `restore` also requires owner release.
+`close` drains and unbinds ER; `release` restores the saved bank1 registers
+and relinquishes FE/route ownership. Errors retain the session for recovery.
+
+`../pack_npu_ram.py` packs the resulting ARM64 Image into a SHA-pinned
+baseline RAM FIT, verifies the embedded prepared archive and loader digests,
+adds only the diagnostic DT marker, and checks final resident configuration
+and RAM ranges. Supply `--kernel-sha256` from the build environment before
+copying the Image; the full-file check catches truncated exports even when
+the embedded initramfs remains complete. Its `--image-helper` argument points to the project's FIT
+parser (`fctory-op/5585f/tools/image.py`); the report records that helper's hash.
+
+`../run_npu_loopback.py` pins the SSH host key, RAM boot UUID, module and
+firmware hashes. Preflight requires optical TX disabled, empty MTD, idle
+native policy/classifiers and GATE/AUTH/ER capabilities 15/7/15. With `--run`,
+it sends 18 alternating IPv4/IPv6 packets for each of service0 and 0x8000,
+checking full GEM, SPORT2, transaction identity and numbered ER payloads.
+Each session also checks two CPU returns after close. Cleanup checks all
+ten loopback registers, bank1 registers and released ownership before
+unloading the module. Run with `--help` for the required artifact arguments.
+
 Build against the exact source/configuration of the running RAM kernel; the
 test uses private driver structures. The test directory must have its own
 copy of the two module source files when using an external build directory.
