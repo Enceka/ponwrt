@@ -40,8 +40,9 @@ def main():
         parser.error('--sif-sweep requires --cover-slot 1 without --withdraw-cycle')
     if args.packet_matrix and (args.cover_slot != 1 or args.withdraw_cycle or args.sif_sweep):
         parser.error('--packet-matrix requires --cover-slot 1 without other experiments')
-    if args.tuple_variants and (args.cover_slot != 1 or args.withdraw_cycle or args.sif_sweep or args.packet_matrix):
-        parser.error('--tuple-variants requires --cover-slot 1 without other experiments')
+    if args.tuple_variants and (args.cover_slot != 1 or args.sif_sweep or args.packet_matrix or
+                                (args.withdraw_cycle and not args.exact_tuple)):
+        parser.error('--tuple-variants requires --cover-slot 1; withdrawal requires --exact-tuple')
     if args.exact_tuple and (not args.tuple_variants or args.cover_slot != 1):
         parser.error('--exact-tuple requires --tuple-variants and --cover-slot 1')
     uuid.UUID(args.boot)
@@ -72,6 +73,15 @@ def main():
     def write(label, path, command):
         return remote(label, 'echo ' + shlex.quote(command) + ' > ' + path)
 
+    def check_tuple_pool(state, owned):
+        pool = re.search(r'\btuple=(\d+) pool=([0-9a-f]{8}) pool_pending=(\d+) leases=(\d+)\b', state)
+        assert pool, 'tuple pool status missing'
+        mask = int(pool[2], 16)
+        assert (int(pool[1]), int(pool[3]), int(pool[4]), bin(mask).count('1')) == (
+            (1, 0, 2, 14) if owned else (0, 0, 0, 0)), 'tuple pool ownership mismatch'
+        assert re.search(r'\bppe=0\b', state), 'PON PPE qualification must stay closed'
+        return mask
+
     before, _ = remote('before', 'cat /sys/kernel/debug/gpio; cat ' + classifier +
                        '; cat /sys/kernel/debug/ppe/config; ip -d link show pon0; cat ' +
                        '/sys/bus/platform/devices/1fb50000.ethernet/ct_native_pair_policy')
@@ -86,6 +96,7 @@ def main():
     assert re.search(policy_pattern, before, re.M)
     report = {'boot': args.boot, 'module_sha256': args.sha256, 'special_tag': args.special_tag,
               'cover_slot': args.cover_slot, 'sif_sweep': args.sif_sweep,
+              'withdraw_cycle': args.withdraw_cycle,
               'tuple_variants': args.tuple_variants, 'exact_tuple': args.exact_tuple,
               'require_native': args.require_native,
               'observations': []}
@@ -115,34 +126,56 @@ def main():
             write('route', classifier, 'route')
         classified, _ = remote('classified', 'cat ' + classifier + '; cat /sys/kernel/debug/ppe/config')
         if args.exact_tuple:
-            pool = re.search(r' tuple=1 pool=([0-9a-f]{8}) pool_pending=0 leases=2\b', classified)
-            assert pool and bin(int(pool[1], 16)).count('1') == 14, 'tuple pool ownership mismatch'
-            assert 'active=0f' in classified and 'ppe=0 ' in classified
-        cases = [(service, (), True) for service in (0x2134, 0xa134, 0x2134)]
+            tuple_owned = True
+            tuple_mask = check_tuple_pool(classified, tuple_owned)
+            assert 'active=0f' in classified
+        cover_ring = 2 + 2 * (args.cover_slot or 0)
+        cases = [(service, (), True, 2 if service == 0x2134 else cover_ring)
+                 for service in (0x2134, 0xa134, 0x2134)]
         if args.sif_sweep:
-            cases = [(0x2134, (args.sif_mode + ' ' + str(source), 'route'), True) for source in range(32)]
-        if args.withdraw_cycle:
+            cases = [(0x2134, (args.sif_mode + ' ' + str(source), 'route'), True, None)
+                     for source in range(32)]
+        if args.withdraw_cycle and not args.exact_tuple:
             cases += [
-                (0x2134, ('clear ' + str(args.cover_slot ^ 1), 'route'), True),
-                (0xa134, (), True),
-                (0x2134, ('set ' + str(args.cover_slot ^ 1) + ' 0x2134', 'route'), True),
-                (0xa134, ('clear ' + str(args.cover_slot),), False),
-                (0x2134, ('clear ' + str(args.cover_slot ^ 1),), False),
+                (0x2134, ('clear ' + str(args.cover_slot ^ 1), 'route'), True, cover_ring),
+                (0xa134, (), True, cover_ring),
+                (0x2134, ('set ' + str(args.cover_slot ^ 1) + ' 0x2134', 'route'), True, 2),
+                (0xa134, ('clear ' + str(args.cover_slot),), False, 0),
+                (0x2134, ('clear ' + str(args.cover_slot ^ 1),), False, 0),
             ]
-        cases = [(*case, 'ipv4') for case in cases]
+        cases = [(service, commands, routed, 'ipv4', 0, expected_ring)
+                 for service, commands, routed, expected_ring in cases]
         if args.packet_matrix:
-            cases = [(service, (), True, kind)
+            cases = [(service, (), True, kind, 0,
+                      2 if kind in ('ipv4', 'ipv6', 'fragment') and service == 0x2134 else 4)
                      for kind in ('ipv4', 'ipv6', 'arp', 'vlan', 'pppoe', 'fragment', 'short')
                      for service in (0x2134, 0xa134)]
-        cases = [(*case, 0) for case in cases]
         if args.tuple_variants:
-            cases = [(service, (), True, kind, variant)
+            cases = [(service, (), True, kind, variant,
+                      2 if service == 0x2134 and (not args.exact_tuple or variant == 0) else 4)
                      for kind in ('ipv4', 'ipv6') for variant in range(5)
                      for service in (0x2134, 0xa134)]
-        for index, (service, commands, routed, kind, variant) in enumerate(cases):
+        if args.exact_tuple and args.withdraw_cycle:
+            cases += [
+                (0x2134, ('clear 0', 'route'), True, 'ipv4', 0, 4),
+                (0x2134, ('tuple 0 0x2134', 'route'), True, 'ipv4', 0, 2),
+                (0x2134, ('clear 1',), False, 'ipv4', 0, 0),
+                (0x2134, ('clear 0',), False, 'ipv4', 0, 0),
+            ]
+        for index, (service, commands, routed, kind, variant, expected_ring) in enumerate(cases):
             label = 'send-' + str(index)
             for step, command in enumerate(commands):
-                write(label + '-transition-' + str(step), classifier, command)
+                transition = label + '-transition-' + str(step)
+                write(transition, classifier, command)
+                if args.exact_tuple:
+                    if command == 'clear 0':
+                        tuple_owned, tuple_mask = False, 0
+                    elif command.startswith('tuple '):
+                        tuple_owned, tuple_mask = True, None
+                    state, _ = remote(transition + '-state', 'cat ' + classifier + '; cat /sys/kernel/debug/ppe/config')
+                    actual_mask = check_tuple_pool(state, tuple_owned)
+                    assert tuple_mask is None or actual_mask == tuple_mask, 'tuple pool mask changed'
+                    tuple_mask = actual_mask
             previous, _ = remote(label + '-before', 'cat ' + probe + 'status')
             command = 'send ' + str(service)
             if args.packet_matrix or args.tuple_variants:
@@ -166,6 +199,8 @@ def main():
                                           'returned_service': returned_service, 'returned_source': returned_source,
                                           'numbered_return': numbered_return, 'changed_rings': changed_rings,
                                           'transitions': commands, 'state': observed})
+            if args.cover_slot is not None:
+                report['observations'][-1]['expected_ring'] = expected_ring
             if status:
                 raise RuntimeError(label + ' failed; see recorded status')
             assert 'ct_cpu_fallback: 0 ' in observed
@@ -173,26 +208,19 @@ def main():
             if args.cover_slot is not None:
                 assert numbered_return and 'routed=' + str(int(routed)) in observed
                 assert len(changed_rings) == 1, 'expected a covered WAN CPU receive ring'
-                if args.tuple_variants:
-                    expected_ring = 2 if service == 0x2134 and (not args.exact_tuple or variant == 0) else 4
-                    report['observations'][-1]['expected_ring'] = expected_ring
+                if expected_ring is not None:
                     assert changed_rings == [expected_ring], (kind + ' variant ' + str(variant) +
                                                               ' service ' + hex(service) +
                                                               ' expected RX' + str(expected_ring))
+                else:
+                    assert changed_rings[0] in (2, 4)
+                if args.exact_tuple:
+                    assert check_tuple_pool(observed, tuple_owned) == tuple_mask, 'tuple pool mask changed'
+                if args.tuple_variants:
                     assert 'tx_variant=' + str(variant) in observed
                     assert 'tx_kind=' + kind in observed and 'rx_kind=' + kind in observed
                 elif args.packet_matrix:
-                    expected_ring = 2 if kind in ('ipv4', 'ipv6', 'fragment') and service == 0x2134 else 4
-                    assert changed_rings == [expected_ring], 'packet missed its exclusive optical CPU rule'
                     assert 'tx_kind=' + kind in observed and 'rx_kind=' + kind in observed
-                elif args.sif_sweep:
-                    assert changed_rings[0] in (2, 4)
-                elif not routed:
-                    assert changed_rings == [0], 'withdrawal did not return to default WAN CPU'
-                elif service == 0xa134 or index in (3, 4):
-                    assert changed_rings == [2 + 2 * args.cover_slot], 'unknown service missed CPU cover'
-                else:
-                    assert changed_rings == [2], 'expected lower-index matching CPU rule'
         report['commands_completed'] = True
         report['numbered_packets_returned'] = all(item['numbered_return'] for item in report['observations'])
         report['service_preserved'] = all(item['returned_service'] == item['service'] and

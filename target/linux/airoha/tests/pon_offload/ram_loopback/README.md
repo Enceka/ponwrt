@@ -190,7 +190,28 @@ address/port and every service 0xa134 packet. The runner records
 PON PPE qualification stays closed. Exact mode uses the existing `off`,
 `restore`, ten-register verification and module-unload sequence, including
 after a packet mismatch or classifier-command failure. It cannot combine
-with `--withdraw-cycle`, `--packet-matrix` or `--sif-sweep`.
+with `--packet-matrix` or `--sif-sweep`.
+
+Add `--withdraw-cycle` to exact mode for a 24-packet withdrawal/reinstall
+matrix. The original 20 packets still require two RX2 and 18 RX4 returns.
+Four IPv4 baseline packets follow, all using service 0x2134 and variant 0:
+
+| Transition before send | Expected ring | Tuple pool after transition |
+| --- | --- | --- |
+| `clear 0`, `route` | RX4 | `tuple=0 pool=00000000 pool_pending=0 leases=0` |
+| `tuple 0 0x2134`, `route` | RX2 | 14 occupied slots, two leases, no pending command |
+| `clear 1` | RX0 | Same pool mask and two leases retained |
+| `clear 0` | RX0 | Entire tuple pool released |
+
+The runner reads back pool ownership after every transition, before the
+next command or packet, and checks it again on every packet observation.
+Reinstallation may allocate a different mask; that mask must remain
+unchanged through cover withdrawal until the final `clear 0`. Transition
+readbacks are saved as `send-N-transition-M-state.stdout`; `report.json`
+records `withdraw_cycle`, commands and explicit per-case `expected_ring`.
+The existing eight-packet wide-service withdrawal run remains available
+without `--tuple-variants`; wide-service tuple variants plus withdrawal
+are rejected.
 
 ```sh
 python3 target/linux/airoha/tests/pon_offload/run_loopback_probe.py \
@@ -198,7 +219,11 @@ python3 target/linux/airoha/tests/pon_offload/run_loopback_probe.py \
   --module /absolute/path/to/matching-kernel987/ct_pon_loopback.ko \
   --sha256 MODULE_SHA256 --output /absolute/path/to/new-evidence-directory \
   --run --special-tag --cover-slot 1 --tuple-variants --exact-tuple --require-native
+```
 
+Add `--withdraw-cycle` to the invocation above for the 24-packet matrix.
+
+```sh
 python3 -B -m unittest discover -s target/linux/airoha/tests/pon_offload \
   -p test_run_loopback_probe.py -v
 ```
@@ -206,7 +231,10 @@ python3 -B -m unittest discover -s target/linux/airoha/tests/pon_offload \
 The host self-check simulates SSH responses without contacting a board.
 It covers exact and wide ring expectations, rejected option combinations,
 preflight-only operation, per-field misses, incorrect baseline/service
-routing, and withdrawal/restoration after command or observation failures.
+routing, the 24-packet exact and eight-packet wide-service withdrawal
+matrices, pool release/reacquisition/retention, and cleanup after transition
+or observation failures. Failed withdrawal/restoration retains the module
+and the per-command evidence for recovery.
 Build the external module against the running kernel987 source/configuration
 before the board run.
 

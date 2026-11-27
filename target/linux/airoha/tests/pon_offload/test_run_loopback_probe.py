@@ -26,14 +26,17 @@ IPV6 = '/proc/sys/net/ipv6/conf/pon0/disable_ipv6'
 BOOT = '986bed54-e67d-4baa-ac06-0627f74789a2'
 CLEAN = 'saved=0 dirty=00 active=00 pending=0 scope=01000000 ready=0\n'
 HEALTH = 'ct_cpu_fallback: 0 healthy\ngeneration=49 allowed=1 failed=0\n'
+EXACT_OPTIONS = ['--run', '--special-tag', '--cover-slot', '1',
+                 '--tuple-variants', '--exact-tuple', '--require-native']
 
 
 class BoardFixture:
-    def __init__(self, exact=True, ring_overrides=None, corrupt=None, fail_command=None):
+    def __init__(self, exact=True, ring_overrides=None, corrupt=None, fail_command=None, fail_occurrence=1):
         self.exact = exact
         self.ring_overrides = ring_overrides or {}
         self.corrupt = corrupt
         self.fail_command = fail_command
+        self.fail_occurrence = fail_occurrence
         self.commands = []
         self.sent = []
         self.heads = {0: 7, 2: 11, 4: 19}
@@ -41,16 +44,22 @@ class BoardFixture:
         self.prepared = False
         self.routed = False
         self.cover = False
+        self.cover_slot = 1
         self.classified = False
+        self.tuple_active = False
         self.ipv6 = '0'
         self.pool_clean = 'tuple=0 pool=00000000 pool_pending=0 leases=0'
 
     def classifier_status(self):
         if not self.cover and not self.classified:
             return CLEAN + 'service0=0 service1=0 ppe=0 errors=0 cover=00 routed=0\n' + self.pool_clean + '\n'
-        return ('saved=1 dirty=0f active=0f pending=0 scope=01000004 ready=1\n'
-                'service0=8500 service1=0 ppe=0 errors=0 cover=02 routed=' +
-                str(int(self.routed)) + '\n tuple=1 pool=00003fff pool_pending=0 leases=2\n')
+        active = (3 << (2 * self.cover_slot) if self.cover else 0)
+        active |= (3 << (2 * (self.cover_slot ^ 1)) if self.classified else 0)
+        cover = 1 << self.cover_slot if self.cover else 0
+        pool = 'tuple=1 pool=00003fff pool_pending=0 leases=2' if self.tuple_active else self.pool_clean
+        return (f'saved=1 dirty=0f active={active:02x} pending=0 scope=01000004 ready=1\n'
+                f'service0=8500 service1=0 ppe=0 errors=0 cover={cover:02x} routed=' +
+                str(int(self.routed)) + '\n ' + pool + '\n')
 
     def status(self):
         sequence = len(self.sent)
@@ -76,7 +85,7 @@ class BoardFixture:
             raise AssertionError('missing boot/MTD guard')
         command = command_line[-1][len(guard):]
         self.commands.append(command)
-        if command == self.fail_command:
+        if command == self.fail_command and self.commands.count(command) == self.fail_occurrence:
             return subprocess.CompletedProcess(command_line, 1, b'', b'injected command failure\n')
         result = ''
         if command.startswith('cat /sys/kernel/debug/gpio; '):
@@ -89,7 +98,7 @@ class BoardFixture:
         elif command.startswith('test "$(sha256sum /tmp/ct_pon_loopback.ko '):
             self.loaded = True
         elif command == 'rmmod ct_pon_loopback':
-            if self.prepared or self.routed or self.cover or self.classified:
+            if self.prepared or self.routed or self.cover or self.classified or self.tuple_active:
                 raise AssertionError('module unloaded before withdrawal/restoration')
             self.loaded = False
         elif command.startswith('echo '):
@@ -100,18 +109,29 @@ class BoardFixture:
             if destination == IPV6:
                 self.ipv6 = value
             elif destination == CLASSIFIER:
-                if value == 'cover 1':
+                if value in ('cover 0', 'cover 1'):
                     self.cover = True
-                elif value in ('tuple 0 0x2134', 'set 0 0x2134'):
+                    self.cover_slot = int(value.split()[1])
+                elif value in ('tuple 0 0x2134', 'set 0 0x2134', 'set 1 0x2134'):
                     if not self.cover:
                         raise AssertionError('consumer installed before cover')
+                    if value.startswith('tuple ') and self.tuple_active:
+                        raise AssertionError('tuple reinstalled before release')
                     self.classified = True
+                    self.tuple_active = value.startswith('tuple ')
+                    self.routed = False
                 elif value == 'route':
-                    if not self.cover or not self.classified:
-                        raise AssertionError('route enabled before both consumers')
+                    if not self.cover:
+                        raise AssertionError('route enabled without cover')
                     self.routed = True
+                elif value in ('clear 0', 'clear 1'):
+                    if int(value.split()[1]) == self.cover_slot:
+                        self.cover = False
+                    else:
+                        self.classified = self.tuple_active = False
+                    self.routed = False
                 elif value == 'off':
-                    self.routed = self.cover = self.classified = False
+                    self.routed = self.cover = self.classified = self.tuple_active = False
                 else:
                     raise AssertionError('unexpected classifier command: ' + value)
             elif destination == PROBE + 'command':
@@ -122,14 +142,19 @@ class BoardFixture:
                         raise AssertionError('restored before classifier withdrawal')
                     self.prepared = False
                 elif value.startswith('send '):
-                    if not self.loaded or not self.prepared or not self.routed:
-                        raise AssertionError('send before route preparation')
-                    _, service, kind, variant = value.split()
-                    packet = (int(service), kind, int(variant))
-                    if self.exact:
-                        ring = 2 if packet in ((0x2134, 'ipv4', 0), (0x2134, 'ipv6', 0)) else 4
+                    if not self.loaded or not self.prepared:
+                        raise AssertionError('send before module preparation')
+                    fields = value.split()
+                    packet = (int(fields[1]), fields[2] if len(fields) > 2 else 'ipv4',
+                              int(fields[3]) if len(fields) > 3 else 0)
+                    if not self.routed:
+                        ring = 0
+                    elif self.cover_slot == 0:
+                        ring = 2
+                    elif self.classified and packet[0] == 0x2134 and (not self.exact or packet[2] == 0):
+                        ring = 2
                     else:
-                        ring = 2 if packet[0] == 0x2134 else 4
+                        ring = 4
                     ring = self.ring_overrides.get(len(self.sent), ring)
                     self.sent.append(packet)
                     self.heads[ring] += 1
@@ -171,8 +196,7 @@ class LoopbackRunnerTests(unittest.TestCase):
                 '--module', str(self.module), '--sha256', self.sha256,
                 '--output', str(self.output)]
         if options is None:
-            options = ['--run', '--special-tag', '--cover-slot', '1',
-                       '--tuple-variants', '--exact-tuple', '--require-native']
+            options = EXACT_OPTIONS
         with mock.patch.object(sys, 'argv', [str(RUNNER_PATH)] + args + options), \
                 mock.patch.object(RUNNER.subprocess, 'run', side_effect=board.run), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -185,6 +209,7 @@ class LoopbackRunnerTests(unittest.TestCase):
         self.assertFalse(board.routed)
         self.assertFalse(board.cover)
         self.assertFalse(board.classified)
+        self.assertFalse(board.tuple_active)
         self.assertEqual(board.ipv6, '0')
         withdrawal = board.commands.index('echo off > ' + CLASSIFIER)
         restoration = board.commands.index('echo restore > ' + PROBE + 'command')
@@ -225,6 +250,110 @@ class LoopbackRunnerTests(unittest.TestCase):
         self.assertIn("echo 'set 0 0x2134' > " + CLASSIFIER, board.commands)
         self.assertNotIn("echo 'tuple 0 0x2134' > " + CLASSIFIER, board.commands)
         self.assert_restored(board)
+
+    def test_exact_tuple_withdrawal_reinstall_matrix(self):
+        board = BoardFixture()
+        report = self.invoke(board, EXACT_OPTIONS + ['--withdraw-cycle'])
+        self.assertTrue(report['withdraw_cycle'])
+        self.assertTrue(report['commands_completed'])
+        self.assertTrue(report['numbered_packets_returned'])
+        self.assertTrue(report['service_preserved'])
+        expected_rings = [2] + [4] * 9 + [2] + [4] * 9 + [4, 2, 0, 0]
+        self.assertEqual(len(board.sent), 24)
+        self.assertEqual(board.sent[20:], [(0x2134, 'ipv4', 0)] * 4)
+        self.assertEqual([item['expected_ring'] for item in report['observations']], expected_rings)
+        self.assertEqual([item['changed_rings'] for item in report['observations']],
+                         [[ring] for ring in expected_rings])
+        self.assertEqual([item['transitions'] for item in report['observations'][20:]],
+                         [['clear 0', 'route'], ['tuple 0 0x2134', 'route'], ['clear 1'], ['clear 0']])
+        for packet_index, pool in ((20, board.pool_clean),
+                                   (21, 'tuple=1 pool=00003fff pool_pending=0 leases=2'),
+                                   (22, 'tuple=1 pool=00003fff pool_pending=0 leases=2'),
+                                   (23, board.pool_clean)):
+            state = (self.output / f'send-{packet_index}-transition-0-state.stdout').read_text()
+            self.assertIn(pool, state)
+            self.assertIn(pool, report['observations'][packet_index]['state'])
+        self.assert_restored(board)
+
+    def test_wide_service_eight_packet_withdrawal(self):
+        for cover_slot, expected_rings in ((0, [2, 2, 2, 2, 2, 2, 0, 0]),
+                                           (1, [2, 4, 2, 4, 4, 2, 0, 0])):
+            with self.subTest(cover_slot=cover_slot):
+                board = BoardFixture(exact=False)
+                report = self.invoke(board, ['--run', '--special-tag', '--cover-slot', str(cover_slot),
+                                             '--withdraw-cycle', '--require-native'])
+                self.assertEqual(len(board.sent), 8)
+                self.assertEqual([item['expected_ring'] for item in report['observations']], expected_rings)
+                self.assertEqual([item['changed_rings'] for item in report['observations']],
+                                 [[ring] for ring in expected_rings])
+                self.assert_restored(board)
+
+    def test_each_wrong_withdrawal_destination_fails_and_restores(self):
+        for packet_index, wrong_ring in ((20, 2), (21, 4), (22, 2), (23, 4)):
+            with self.subTest(packet=packet_index):
+                board = BoardFixture(ring_overrides={packet_index: wrong_ring})
+                with self.assertRaisesRegex(AssertionError, 'expected RX'):
+                    self.invoke(board, EXACT_OPTIONS + ['--withdraw-cycle'])
+                self.assertEqual(len(board.sent), packet_index + 1)
+                self.assert_restored(board)
+
+    def test_withdrawal_pool_failures_stop_before_next_step(self):
+        mutations = [
+            ('clear 0', 1, 'tuple=0', 'tuple=1', 20),
+            ('clear 0', 1, 'pool=00000000', 'pool=00000001', 20),
+            ('clear 0', 1, 'pool_pending=0', 'pool_pending=1', 20),
+            ('clear 0', 1, 'leases=0', 'leases=1', 20),
+            ('tuple 0 0x2134', 2, 'pool=00003fff', 'pool=00001fff', 21),
+            ('tuple 0 0x2134', 2, 'leases=2', 'leases=1', 21),
+            ('tuple 0 0x2134', 2, 'pool_pending=0', 'pool_pending=1', 21),
+            ('clear 1', 1, 'pool=00003fff', 'pool=00000000', 22),
+            ('clear 1', 1, 'pool=00003fff', 'pool=00007ffe', 22),
+            ('clear 1', 1, 'leases=2', 'leases=0', 22),
+            ('clear 0', 2, 'pool=00000000', 'pool=00000001', 23),
+        ]
+        for command, occurrence, original, replacement, packet_count in mutations:
+            with self.subTest(command=command, occurrence=occurrence, field=original):
+                board = BoardFixture()
+                original_status = board.classifier_status
+                target = 'echo ' + shlex.quote(command) + ' > ' + CLASSIFIER
+
+                def corrupt_transition():
+                    state = original_status()
+                    if board.commands.count(target) == occurrence and board.commands[-2] == target:
+                        return state.replace(original, replacement)
+                    return state
+
+                board.classifier_status = corrupt_transition
+                with self.assertRaisesRegex(AssertionError, 'tuple pool'):
+                    self.invoke(board, EXACT_OPTIONS + ['--withdraw-cycle'])
+                self.assertEqual(len(board.sent), packet_count)
+                command_index = len(board.commands) - 1 - board.commands[::-1].index(target)
+                self.assertEqual(board.commands[command_index + 2], 'echo off > ' + CLASSIFIER)
+                self.assert_restored(board)
+
+    def test_withdrawal_transition_command_failures_restore(self):
+        failures = [('clear 0', 1, 20), ('route', 2, 20), ('tuple 0 0x2134', 2, 21),
+                    ('route', 3, 21), ('clear 1', 1, 22), ('clear 0', 2, 23)]
+        for command, occurrence, packet_count in failures:
+            with self.subTest(command=command, occurrence=occurrence):
+                board = BoardFixture(fail_command='echo ' + shlex.quote(command) + ' > ' + CLASSIFIER,
+                                     fail_occurrence=occurrence)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.invoke(board, EXACT_OPTIONS + ['--withdraw-cycle'])
+                self.assertEqual(len(board.sent), packet_count)
+                self.assert_restored(board)
+
+    def test_failed_matrix_restoration_retains_module(self):
+        for command in ('echo off > ' + CLASSIFIER, 'echo restore > ' + PROBE + 'command'):
+            with self.subTest(command=command):
+                board = BoardFixture(fail_command=command)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.invoke(board, EXACT_OPTIONS + ['--withdraw-cycle'])
+                self.assertEqual(len(board.sent), 24)
+                self.assertTrue(board.loaded)
+                self.assertTrue(board.prepared)
+                self.assertNotIn('rmmod ct_pon_loopback', board.commands)
+                self.assertFalse((self.output / 'report.json').exists())
 
     def test_each_wrong_tuple_destination_fails_and_restores(self):
         for packet_index in range(20):
@@ -303,9 +432,10 @@ class LoopbackRunnerTests(unittest.TestCase):
             ['--exact-tuple', '--tuple-variants', '--special-tag'],
             ['--exact-tuple', '--tuple-variants', '--special-tag', '--cover-slot', '0'],
             ['--exact-tuple', '--tuple-variants', '--cover-slot', '1'],
+            ['--tuple-variants', '--special-tag', '--cover-slot', '1', '--withdraw-cycle'],
         ]
         options += [['--exact-tuple', '--tuple-variants', '--special-tag', '--cover-slot', '1', experiment]
-                    for experiment in ('--withdraw-cycle', '--packet-matrix', '--sif-sweep')]
+                    for experiment in ('--packet-matrix', '--sif-sweep')]
         for combination in options:
             with self.subTest(options=combination):
                 board = BoardFixture()
