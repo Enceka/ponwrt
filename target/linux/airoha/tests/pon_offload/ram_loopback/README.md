@@ -188,6 +188,29 @@ Cleanup sends classifier `off`, restores the module's mapping and ten
 registers, verifies idle classifier/pool state, unloads the module, and
 restores IPv6 configuration. Failed withdrawal or restoration retains
 the loaded module and per-command stdout/stderr/status evidence for recovery.
+
+## 2026-11-27 service0 board acceptance
+
+The kernel through `999-zi` booted the rebuilt NPU once after provider binding
+and registered its packet pool. RAM FIT SHA-256:
+`56c023b9cbb2b637302f901f910b48bb3d806dc428a1d4f85d4a6a89884f5e26`.
+The matching external module SHA-256 is
+`204bf87c4b97db4f0df7f756089fc95cf473a9858cdcb115b7aed33110dcd1a6`;
+its Ethernet/PPE structure layouts matched the kernel's DWARF records.
+
+On boot `ceb1871b-e673-43f5-9cb8-f452aa091ed2`, the service0 dual-stack
+withdrawal matrix passed all 18 packets and the exact-tuple withdrawal matrix
+passed all 28 packets. Each numbered packet preserved service and SPORT2,
+and selected the expected RX2, RX4 or default RX0 ring. Both runs released
+tuple leases, restored all ten registers and unloaded the test module.
+PON PPE qualification stayed closed and CPU fallback stayed clear.
+
+Native policy remained disabled because the expected wireless station had
+joined another network; native coexistence is a separate pending board run.
+Evidence is under `/Volumes/Workspace/5585f/build/pon-bound-start-board/`:
+`service0-withdraw/report.json`, `service0-exact-withdraw/report.json`,
+`sealed.json` and `acceptance.json`. The firmware payload and 1101 initramfs
+entries match the previously accepted RAM image. No flash write was performed.
 Default runs without `--service-zero` keep A=0x2134, B=0xa134 and their
 existing packet sequences and commands.
 

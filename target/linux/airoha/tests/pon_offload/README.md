@@ -234,8 +234,11 @@ CPU fallback 的路由及 IFC 写入失败在 owner 关闭后继续重试，状�
 祖先，Ethernet 消费者也须完成绑定；详情见 `../npu_start/README.md`。
 最终 `.config` 和 DTB 的常驻关系检查见 `../npu_resident_config/`。
 无光纤 service0 回环 runner 已加入双栈 A/B/A、撤销重装和精确 tuple 矩阵，
-下一步执行板上验收，再构建完整镜像。当前 GPON GEM 准备路径已接通；
+2026-11-27 新 RAM 镜像的 service0 双栈撤销 18 包及精确 tuple 撤销 28 包
+均通过，寄存器恢复、lease 释放及模块卸载完成，详情见 `ram_loopback/README.md`。
+接下来核验常驻 supplier 运行期关系并验证 PON NPU 入口，再构建完整镜像。
+当前 GPON GEM 准备路径已接通；
 EPON 还需配对 wire LLID、channel、IFC service 和 FE service。
 硬件强制退役需补齐全部 hart 停止、GDMA 完成和 DRAM 总线排空条件；
 正常退役继续使用 QUIESCE→STOP→消费完成→UNBIND。
-PON 硬件准入仍关闭，设备沿用此前通过验收的 RAM 镜像。
+PON 硬件准入仍关闭，设备运行包含 `999-zi` 的新版 RAM 镜像。
