@@ -19,6 +19,7 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 #define BIT(index) (UINT32_C(1) << (index))
+#define U32_MAX UINT32_MAX
 #define GENMASK(high, low) ((UINT32_MAX >> (31 - (high))) & (UINT32_MAX << (low)))
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
 #define READ_ONCE(value) (value)
@@ -133,7 +134,7 @@ struct airoha_ppe {
 	struct airoha_eth *eth;
 	struct airoha_ct_pon_ifc_owner ct_pon_ifc;
 	struct { bool cfg_owned; struct { u32 lut_index; bool lut_dirty; } rule[2]; } ct_ifc;
-	struct { bool health_stopping; struct work health_work; } ct_fe;
+	struct { bool health_stopping, active; struct work health_work; } ct_fe;
 	struct work ct_pon_ifc_work;
 	u16 ct_pon_ifc_services[2];
 	u8 ct_pon_ifc_cover;
@@ -141,6 +142,7 @@ struct airoha_ppe {
 	u32 ct_pon_ifc_errors;
 	bool ct_host_ppe, ct_stopping, ct_pon_qualified, ct_native_pairs;
 	bool ct_pon_ifc_registered, ct_pon_ifc_work_stopping;
+	bool ct_pair_policy_allowed;
 };
 enum fault { NONE, BEFORE, AFTER, DEFERRED, READBACK };
 struct simulation {
@@ -153,7 +155,7 @@ struct simulation {
 	u16 audited[4];
 	enum fault route_fault;
 	bool route_read_error, cpu_route_stuck, enforce_cpu_before_table, cpu_acknowledged;
-	bool audit_route_open, enforce_cpu_before_gate;
+	bool audit_route_open, enforce_cpu_before_gate, source_publish;
 	enum fault fault;
 	bool busy, release, late, gate_stuck, route_drop, require_gate_closed;
 };
@@ -171,6 +173,7 @@ static unsigned int sport_cases, sport_close_cases;
 static unsigned int store_dispatch_cases, store_stop_cases, store_pending_cases;
 static unsigned int cover_cases, cover_tamper_cases, cover_route_faults, cover_io_faults;
 static unsigned int cover_publish_faults;
+static unsigned int source_cases, source_faults;
 
 static unsigned int page_words(unsigned int bank, unsigned int page)
 {
@@ -241,6 +244,8 @@ static void airoha_fe_wr(struct airoha_eth *eth, unsigned int address, u32 value
 		mock.data_writes++;
 	} else if (address == CT_IFC_CONTROL) {
 		assert(ppe_lock.held && !mock.busy);
+		if (mock.source_publish && mock.commands >= 78)
+			assert(eth->ppe->ct_pon_ifc_cover == BIT(1));
 		if ((value & BIT(1)) && mock.require_gate_closed)
 			assert(!(mock.registers[REG_FE_CSR_IFC_CFG / 4] & FE_IFC_EN_MASK));
 		if ((value & BIT(1)) && mock.enforce_cpu_before_table) {
@@ -1492,6 +1497,167 @@ static void cover_publication_failures(void)
 	}
 }
 
+static void source_sweep(unsigned int mode)
+{
+	struct fixture fixture;
+	const char *verb = mode == 0 ? "source" : mode == 1 ? "absent" : "only";
+	char guarded_command[32];
+	const char *invalid[] = { "", " -1", " 32", " 4294967295",
+		" 4294967296", " nope", " 0 extra", " 0 1 2", " 0x20", " 1x" };
+
+	snprintf(guarded_command, sizeof(guarded_command), "%s 24", verb);
+
+	for (unsigned int source = 0; source < 32; source++) {
+		char command[32];
+		u32 peer[2][2][9][3];
+
+		open_cover(&fixture, 1);
+		for (unsigned int row = 0; row < 2; row++)
+			for (unsigned int bank = 0; bank < 2; bank++)
+				memcpy(peer[row][bank], mock.table[bank * 2][58 + row], sizeof(peer[row][bank]));
+		mock.source_publish = true;
+		snprintf(command, sizeof(command), "%s %u", verb, source);
+		assert(store(&fixture, command) == (ssize_t)strlen(command));
+		assert(mock.commands == 130 && mock.cpu_acknowledgements);
+		assert(!fixture.ppe.ct_pon_ifc_route_owned && fixture.ppe.ct_pon_ifc_cover == 2);
+		assert(fixture.ppe.ct_pon_ifc.active == 15 && fixture.ppe.ct_pon_ifc.dirty == 15);
+		assert(!fixture.ppe.ct_pon_ifc_services[0] && !fixture.ppe.ct_pon_ifc_services[1]);
+		for (unsigned int row = 0; row < 2; row++) {
+			for (unsigned int page = 0; page < 9; page++) {
+				assert(mock.table[0][56 + row][page][0] ==
+				       (page == 0 ? (mode == 1 ? 0 : BIT(source)) : page == 8 ? row << 6 : 0));
+				assert(mock.table[0][56 + row][page][1] ==
+				       (page == 0 ? (mode == 2 ? UINT32_MAX : BIT(source)) : page == 8 ? 0xc0 : 0));
+			}
+			for (unsigned int page = 0; page < 3; page++)
+				for (unsigned int word = 0; word < page_words(2, page); word++)
+					assert(mock.table[2][56 + row][page][word] ==
+					       (page == 1 && word == 2 ? 2U << 10 : page == 2 ? 0xd0000000 : 0));
+			for (unsigned int bank = 0; bank < 2; bank++)
+				assert(!memcmp(peer[row][bank], mock.table[bank * 2][58 + row], sizeof(peer[row][bank])));
+		}
+		check_shadow(&fixture);
+		mock.source_publish = false;
+		reset_counts();
+		assert(store(&fixture, "route") == 5);
+		assert(mock.commands == 24 && mock.audited[0] == 0 && mock.audited[1] == 0);
+		assert(store(&fixture, "off") == 3);
+		check_restored(&fixture);
+		source_cases++;
+		cases++;
+	}
+	for (unsigned int input = 0; input < ARRAY_SIZE(invalid); input++) {
+		struct airoha_ct_pon_ifc_owner saved;
+		char command[40];
+
+		prepare_cover(&fixture, 1);
+		saved = fixture.ppe.ct_pon_ifc;
+		snprintf(command, sizeof(command), "%s%s", verb, invalid[input]);
+		assert(store(&fixture, command) == -EINVAL);
+		assert(!mock.commands && !mock.route_writes && !mock.port_writes);
+		assert(!memcmp(&saved, &fixture.ppe.ct_pon_ifc, sizeof(saved)));
+		source_cases++;
+		cases++;
+	}
+	for (unsigned int state = 0; state < 8; state++) {
+		struct airoha_ct_pon_ifc_owner saved;
+
+		if (state == 1)
+			continue;
+		open_cover(&fixture, 1);
+		saved = fixture.ppe.ct_pon_ifc;
+		fixture.ppe.ct_pon_ifc_cover = state & 1 ? 2 : 0;
+		fixture.ppe.ct_fe.active = !!(state & 2);
+		fixture.ppe.ct_pair_policy_allowed = !!(state & 4);
+		assert(store(&fixture, guarded_command) == -EBUSY);
+		assert(!mock.commands && !mock.route_writes && !mock.port_writes && !mock.gate_clears);
+		assert(!memcmp(&saved, &fixture.ppe.ct_pon_ifc, sizeof(saved)));
+		assert(fixture.ppe.ct_pon_ifc_route_owned);
+		source_cases++;
+		cases++;
+	}
+	for (unsigned int state = 0; state < 8; state++) {
+		if (state == 1)
+			continue;
+		prepare_cover(&fixture, 1);
+		fixture.ppe.ct_pon_ifc_registered = !!(state & 1);
+		fixture.ppe.ct_pon_ifc_work_stopping = !!(state & 2);
+		fixture.ppe.ct_stopping = !!(state & 4);
+		assert(store(&fixture, guarded_command) == -ESHUTDOWN);
+		assert(!mock.commands && !mock.route_writes && !mock.port_writes);
+		source_cases++;
+		cases++;
+	}
+}
+
+static void source_invalid_api(void)
+{
+	struct fixture fixture;
+	const unsigned int sources[] = { 0, 31, 32, UINT_MAX };
+	const unsigned int modes[] = { 0, 1, 2, 3, 4, UINT_MAX };
+
+	for (unsigned int source = 0; source < ARRAY_SIZE(sources); source++)
+		for (unsigned int mode = 0; mode < ARRAY_SIZE(modes); mode++) {
+			struct airoha_ct_pon_ifc_owner saved;
+
+			if (sources[source] <= 31 && modes[mode] <= 2)
+				continue;
+			open_cover(&fixture, 1);
+			saved = fixture.ppe.ct_pon_ifc;
+			assert(airoha_ct_pon_ifc_source_set(&fixture.ppe, sources[source], modes[mode]) == -EINVAL);
+			assert(!mock.commands && !mock.route_writes && !mock.port_writes && !mock.gate_clears);
+			assert(!memcmp(&saved, &fixture.ppe.ct_pon_ifc, sizeof(saved)));
+			assert(fixture.ppe.ct_pon_ifc_route_owned && fixture.ppe.ct_pon_ifc_cover == 2);
+			source_cases++;
+			cases++;
+		}
+}
+
+static void source_publish_failures(unsigned int encoding)
+{
+	struct fixture fixture;
+	const char *verb = encoding == 0 ? "source" : encoding == 1 ? "absent" : "only";
+
+	for (unsigned int source = 0; source <= 31; source += 31)
+		for (unsigned int mode = BEFORE; mode <= DEFERRED; mode++)
+			for (unsigned int failure = 1; failure <= 130; failure++) {
+				char command[32];
+				u32 peer[2][2][9][3];
+				unsigned int data, control;
+
+				open_cover(&fixture, 1);
+				for (unsigned int row = 0; row < 2; row++)
+					for (unsigned int bank = 0; bank < 2; bank++)
+						memcpy(peer[row][bank], mock.table[bank * 2][58 + row], sizeof(peer[row][bank]));
+				mock.source_publish = true;
+				mock.fail_at = failure;
+				mock.fault = mode;
+				snprintf(command, sizeof(command), "%s %u", verb, source);
+				assert(store(&fixture, command) == -ETIMEDOUT);
+				assert(mock.commands == failure && fixture.ppe.ct_pon_ifc.pending);
+				assert(fixture.ppe.ct_pon_ifc.saved_valid && fixture.ppe.ct_pon_ifc.dirty);
+				assert(fixture.ppe.ct_pon_ifc_cover == 2 && !fixture.ppe.ct_pon_ifc_route_owned);
+				assert((fixture.ppe.ct_pon_ifc.active & 12) == 12);
+				assert(fixture.ppe.ct_pon_ifc_services[0] == (failure <= 78 ? 0x2134 : 0));
+				for (unsigned int row = 0; row < 2; row++)
+					for (unsigned int bank = 0; bank < 2; bank++)
+						assert(!memcmp(peer[row][bank], mock.table[bank * 2][58 + row], sizeof(peer[row][bank])));
+				check_shadow(&fixture);
+				data = mock.data_writes;
+				control = mock.control_writes;
+				assert(store(&fixture, command) == -ESHUTDOWN);
+				assert(store(&fixture, "off") == -ETIMEDOUT);
+				assert(mock.data_writes == data && mock.control_writes == control);
+				mock.source_publish = false;
+				mock.release = true;
+				mock.fail_at = 0;
+				assert(store(&fixture, "off") == 3);
+				check_restored(&fixture);
+				source_faults++;
+				cases++;
+			}
+}
+
 int main(int argc, char **argv)
 {
 	if (argc == 2) {
@@ -1520,16 +1686,22 @@ int main(int argc, char **argv)
 	cover_route_failures();
 	cover_shutdown_order();
 	cover_publication_failures();
+	source_invalid_api();
+	for (unsigned int mode = 0; mode < 3; mode++) {
+		source_sweep(mode);
+		source_publish_failures(mode);
+	}
 	printf("{\"passed\":true,\"cases\":%u,\"transport_faults\":%u,\"blocked_retries\":%u,"
 	       "\"dependency_faults\":%u,\"readback_faults\":%u,\"scope_cases\":%u,"
 	       "\"fallback_stop_cases\":%u,\"rejected_set_retries\":%u,"
 	       "\"sport_cases\":%u,\"sport_close_cases\":%u,\"store_dispatch_cases\":%u,"
 	       "\"store_stop_cases\":%u,\"store_pending_cases\":%u,"
 	       "\"cover_cases\":%u,\"cover_tamper_cases\":%u,\"cover_route_faults\":%u,\"cover_io_faults\":%u,"
-	       "\"cover_publish_faults\":%u}\n",
+	       "\"cover_publish_faults\":%u,\"source_cases\":%u,\"source_faults\":%u}\n",
 	       cases, transport_faults, blocked_retries, dependency_faults, readback_faults,
 	       scope_cases, fallback_stop_cases, rejected_set_retries, sport_cases, sport_close_cases,
 	       store_dispatch_cases, store_stop_cases, store_pending_cases,
-	       cover_cases, cover_tamper_cases, cover_route_faults, cover_io_faults, cover_publish_faults);
+	       cover_cases, cover_tamper_cases, cover_route_faults, cover_io_faults, cover_publish_faults,
+	       source_cases, source_faults);
 	return 0;
 }

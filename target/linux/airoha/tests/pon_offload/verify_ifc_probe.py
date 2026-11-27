@@ -48,6 +48,7 @@ def main():
             'airoha_ct_pon_ifc_route_open', 'airoha_ct_pon_ifc_cpu_stop',
             'airoha_ct_pon_ifc_cpu_publish',
             'airoha_ct_pon_ifc_cpu_set', 'airoha_ct_pon_ifc_cpu_clear',
+            'airoha_ct_pon_ifc_source_set',
             'ct_pon_cpu_probe_store'],
     }
     complete = ['airoha_ct_pon_ifc_words.h', 'airoha_ct_pon_ifc_owner.h',
@@ -110,11 +111,34 @@ def main():
         assert result['cover_cases'] == 71 and result['cover_tamper_cases'] == 70
         assert result['cover_route_faults'] == 12 and result['cover_io_faults'] == 144
         assert result['cover_publish_faults'] == 2630
+        assert result['source_cases'] == 186 and result['source_faults'] == 2340
         results.append(dict(mode=mode, **result))
     assert {key: value for key, value in results[0].items() if key != 'mode'} == {
         key: value for key, value in results[1].items() if key != 'mode'}
 
     mutations = [
+        ('source_missing_cover_guard', 'airoha_ct_pon_ifc_source_set',
+         '!(ppe->ct_pon_ifc_cover & BIT(1))', 'false'),
+        ('source_ignores_native_active', 'airoha_ct_pon_ifc_source_set',
+         'ppe->ct_fe.active', 'false'),
+        ('source_ignores_policy', 'airoha_ct_pon_ifc_source_set',
+         'ppe->ct_pair_policy_allowed', 'false'),
+        ('source_wrong_bit', 'airoha_ct_pon_ifc_source_set',
+         'BIT(source)', 'BIT(2)'),
+        ('source_wrong_mask', 'airoha_ct_pon_ifc_source_set',
+         'rows[type].tcam[0][1] = mode == 2 ? U32_MAX : BIT(source);',
+         'rows[type].tcam[0][1] = BIT(2);'),
+        ('source_invalid_mode', 'airoha_ct_pon_ifc_source_set',
+         'mode > 2', 'false'),
+        ('source_absent_polarity', 'airoha_ct_pon_ifc_source_set',
+         'mode == 1 ? 0 : BIT(source)', 'BIT(source)'),
+        ('source_only_missing_full_mask', 'airoha_ct_pon_ifc_source_set',
+         'mode == 2 ? U32_MAX : BIT(source)', 'BIT(source)'),
+        ('source_declared_cover0', 'airoha_ct_pon_ifc_source_set',
+         'ppe->ct_pon_ifc_cover &= ~BIT(0);', 'ppe->ct_pon_ifc_cover |= BIT(0);'),
+        ('source_overwrites_cover1', 'airoha_ct_pon_ifc_source_set',
+         'airoha_ct_pon_ifc_publish(&ppe->ct_pon_ifc, &io, 0, rows)',
+         'airoha_ct_pon_ifc_publish(&ppe->ct_pon_ifc, &io, 1, rows)'),
         ('cover_wildcard_type', 'header:airoha_ct_pon_ifc_words.h',
          '[8] = { type << 6, 0xc0 }', '[8] = { type << 6, 0 }'),
         ('cover_both_type0', 'airoha_ct_pon_ifc_cpu_publish',
