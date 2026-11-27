@@ -229,8 +229,12 @@ CPU fallback 的路由及 IFC 写入失败在 owner 关闭后继续重试，状�
 都停止复用该 buffer。整机重启恢复。收到完整的普通负响应仍可重试，
 触发前的 regmap 错误也保留重试能力，测试见 `../npu_mailbox/README.md`。
 
-接下来处理 provider 成功绑定后的启动及固定 ETH/NPU/SCU 生命周期准入，
-随后进行无光纤回环验收和完整镜像构建。当前 GPON GEM 准备路径已接通；
+`999-zi` 将 rebuilt NPU 启动移到 provider 完成绑定之后，首次启动失败
+保留错误和资源，后续获取不再触发启动。运行时核验固定配置、设备节点及
+祖先，Ethernet 消费者也须完成绑定；详情见 `../npu_start/README.md`。
+最终 `.config` 和 DTB 的常驻关系检查见 `../npu_resident_config/`。
+无光纤 service0 回环 runner 已加入双栈 A/B/A、撤销重装和精确 tuple 矩阵，
+下一步执行板上验收，再构建完整镜像。当前 GPON GEM 准备路径已接通；
 EPON 还需配对 wire LLID、channel、IFC service 和 FE service。
 硬件强制退役需补齐全部 hart 停止、GDMA 完成和 DRAM 总线排空条件；
 正常退役继续使用 QUIESCE→STOP→消费完成→UNBIND。

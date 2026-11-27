@@ -77,9 +77,8 @@ The ER ledger stays owned by ZG. ZH does not clear or retire its records.
 
 The quarantine is scoped to the existing provider lifetime. It has no software
 reset/unquarantine API. This change implements the shared transport quarantine
-alongside ZG's exposure ledger. Production qualification still requires the
-fixed-DT/built-in admission checks, constraints on supplier/parent detach and
-provider reprobe, and moving master startup after successful provider binding.
-These lifecycle requirements remain pending. In particular, provider reprobe
-must be prevented from allocating a fresh wrapper while old hardware accesses
-remain possible.
+alongside ZG's exposure ledger. Patch `999-zi` adds fixed-DT/built-in startup
+admission and moves rebuilt master startup after successful provider binding;
+see `../npu_start/README.md`. The supported resident profile excludes
+supplier/parent detach and provider reprobe. Whole-system reset is required
+before allocating a fresh wrapper following ambiguous hardware access.

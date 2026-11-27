@@ -24,9 +24,11 @@ submission it prevents further buffer reuse, including STOP/UNBIND retries.
 An ordinary completed negative response can still be retried.
 
 The supported product uses fixed DT nodes and resident built-in ETH/NPU/SCU
-providers, with OF_DYNAMIC, OF_OVERLAY and kexec disabled. Remaining lifetime
-work covers activation after successful provider binding and all supplier
-teardown paths before enabling PON qualification. Hardware reset retirement
+providers, with OF_DYNAMIC, OF_OVERLAY and kexec disabled. Patch `999-zi`
+enforces startup admission and activates the rebuilt NPU only after successful
+provider binding; see `../npu_start/README.md`. Final configuration and DTB
+checks live in `../npu_resident_config/`. Supplier teardown remains excluded
+from this resident profile. Hardware reset retirement
 still needs the hart, GDMA and DRAM bridge completion protocol described in
 `../reset_provider/README.md`.
 
