@@ -1,0 +1,132 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: quarantine ambiguous shared mailbox completion
+
+Keep the core0 coherent buffer untouched after an ambiguous trigger or
+completion error. Latch quarantine under the transport lock and withdraw
+the WLAN guard without retiring any ER exposure. All shared senders stay
+blocked until a fresh boot, including after a late completion.
+
+Check each regmap result, retain retryability before the sequence trigger,
+and read back the existing zero-DONE request status before triggering.
+Order a completed coherent response with dma_rmb() before copying it.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -20,6 +20,7 @@
+ #include "airoha_eth.h"
+ #include "airoha_ct_npu_guard.h"
+ #include "airoha_npu_transaction.h"
++#include "airoha_npu_er_provider.h"
+ 
+ #define NPU_EN7581_FIRMWARE_DATA		"airoha/en7581_npu_data.bin"
+ #define NPU_EN7581_FIRMWARE_RV32		"airoha/en7581_npu_rv32.bin"
+@@ -177,6 +178,8 @@
+ 				 const void *data, int len, void *reply,
+ 				 u16 reply_len)
+ {
++	struct airoha_npu_instance *instance =
++		container_of(npu, struct airoha_npu_instance, npu);
+ 	struct airoha_npu_core *core = &npu->cores[0]; /* FIXME: core */
+ 	u32 val, offset = 0;
+ 	int ret;
+@@ -196,28 +199,61 @@
+ 	 * foe_commit under atomic context).
+ 	 */
+ 	spin_lock_bh(&core->lock);
++	if (READ_ONCE(instance->transport_quarantined)) {
++		ret = -ESHUTDOWN;
++		goto unlock;
++	}
+ 
+ 	memcpy(core->buf, data, len);
+ 
+ 	dma_wmb();
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, core->addr);
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, len);
++	ret = regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, core->addr);
++	if (ret)
++		goto unlock;
++	ret = regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, len);
++	if (ret)
++		goto unlock;
+ 	val = FIELD_PREP(MBOX_MSG_FUNC_ID, func_id) | MBOX_MSG_WAIT_RSP;
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, val);
+-	regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, &val);
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, val + 1);
++	ret = regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, val);
++	if (ret)
++		goto unlock;
++	ret = regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, &val);
++	if (ret)
++		goto unlock;
++	if (val & MBOX_MSG_DONE) {
++		ret = -EIO;
++		goto unlock;
++	}
++	ret = regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, &val);
++	if (ret)
++		goto unlock;
++	ret = regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, val + 1);
++	if (ret)
++		goto quarantine;
+ 
+ 	ret = regmap_read_poll_timeout_atomic(npu->regmap,
+ 					      REG_CR_MBQ0_CTRL(3) + offset,
+ 					      val, (val & MBOX_MSG_DONE),
+ 					      100, AIROHA_NPU_MBOX_TIMEOUT_US);
+-	if (!ret && FIELD_GET(MBOX_MSG_STATUS, val) != NPU_MBOX_SUCCESS)
++	if (ret)
++		goto quarantine;
++	if (FIELD_GET(MBOX_MSG_STATUS, val) != NPU_MBOX_SUCCESS) {
+ 		ret = -EINVAL;
++		goto unlock;
++	}
+ 
+ 	/* Copy the trailing reply_len bytes of the response. */
+-	if (!ret && reply)
++	if (reply) {
++		dma_rmb();
+ 		memcpy(reply, core->buf + len - reply_len, reply_len);
+-
++	}
++	goto unlock;
++
++quarantine:
++	WRITE_ONCE(instance->transport_quarantined, true);
++	WRITE_ONCE(npu->wlan_short_guard_verified, false);
++	WRITE_ONCE(npu->wlan_short_guard_started, false);
++unlock:
+ 	spin_unlock_bh(&core->lock);
+ 
+ 	if (ret == -ETIMEDOUT)
+@@ -380,7 +416,11 @@
+ /* No capability is exposed until verified code, data and boot are complete. */
+ static bool airoha_npu_wlan_short_guard_ready(struct airoha_npu *npu)
+ {
+-	return smp_load_acquire(&npu->wlan_short_guard_started) &&
++	struct airoha_npu_instance *instance =
++		container_of(npu, struct airoha_npu_instance, npu);
++
++	return !READ_ONCE(instance->transport_quarantined) &&
++	       smp_load_acquire(&npu->wlan_short_guard_started) &&
+ 	       READ_ONCE(npu->wlan_short_guard_verified);
+ }
+ 
+--- a/drivers/net/ethernet/airoha/airoha_npu_transaction.inc
++++ b/drivers/net/ethernet/airoha/airoha_npu_transaction.inc
+@@ -1,5 +1,4 @@
+ #include "npu_eth_return_abi.h"
+-#include "airoha_npu_er_provider.h"
+ 
+ int airoha_npu_auth_command(struct airoha_npu *npu,
+ 			    struct npu_auth_message *msg)
+--- a/drivers/net/ethernet/airoha/airoha_npu_er_provider.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_er_provider.h
+@@ -16,6 +16,7 @@
+ struct airoha_npu_instance {
+ 	struct airoha_npu npu;
+ 	struct airoha_npu_er_provider er;
++	bool transport_quarantined;
+ };
+ 
+ static struct airoha_npu_er_exposure *

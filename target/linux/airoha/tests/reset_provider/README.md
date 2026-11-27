@@ -92,3 +92,22 @@ health work。普通可重试的 close 错误仍需 NAPI 消费完成，不能�
 - `drivers/net/ethernet/airoha/airoha_npu_owner.h`：owner 退役。
 - Linux v6.18 `drivers/base/dd.c`：`__device_release_driver()`、
   `device_unbind_cleanup()` 与 `devres_release_all()`。
+
+## 2026-11-27 provider 进展与下一步
+
+`999-zg` 已实现 BIND 前完整配置登记、两来源串行化、低30位 DMA 窗口
+重叠检查和精确 STOP/UNBIND 退役。`999-zh` 在触发后出现不确定错误时
+冻结整个共享 mailbox，保留 buffer 和 ER 登记，避免迟到响应混入新请求。
+对应主机测试位于 `../npu_er_provider` 和 `../npu_mailbox`。
+
+进一步核查固定 SDK 的 `ecnt_rbus.c` 与 `private/tcci/cpu_bus_arm_test.c`
+发现 `0x1fa00130 WB_ValidBits`、`0x1fa00110–12c WtBuff` 及
+`0x1fa00134–14c DMA_Port`。原厂测试覆盖 host CPU 写缓冲与 DMA 读的
+地址冲突控制；NPU→DRAM 写事务的覆盖范围和隔离 ACK 继续核实。
+现阶段这些寄存器只作为诊断线索，生产代码沿用正常协议退役。
+
+固定产品的最终配置要求 ETH/NPU/SCU built-in，OF_DYNAMIC、OF_OVERLAY
+和 kexec 关闭，provider、supplier 及其父设备常驻。动态释放入口的检查
+需在进入 driver core 之前完成。另一个待处理点是启动时序：provider probe
+应先完成资源准备，在成功绑定后的显式 start 阶段启动 master；启动后的
+故障保留常驻资源。该时序与最终配置准入完成后再推进 PON 资格开放。
