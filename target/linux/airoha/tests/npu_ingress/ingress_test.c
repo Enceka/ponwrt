@@ -19,6 +19,7 @@ typedef uint32_t u32;
 #include "airoha_npu_ingress.h"
 
 static unsigned int checks, scenarios, injected_faults;
+static unsigned int ignored_key_bits, rejected_key_bits, rejected_mask_bits, rejected_action_bits;
 #define CHECK(condition) do { \
 	++checks; \
 	if (!(condition)) { \
@@ -36,6 +37,8 @@ struct host {
 	u16 dependencies[2];
 	u8 closed, target;
 	bool restoring, busy, delayed, finish_on_failed_drain;
+	bool normalize_tcam;
+	u32 unused_key_pattern;
 	enum fault_mode fault;
 	u32 *late_page, late_words[3];
 	unsigned int late_count;
@@ -113,7 +116,12 @@ static int transfer(struct host *host, unsigned int bank, unsigned int row,
 static int read_words(void *context, unsigned int bank, unsigned int row,
 		      unsigned int page, u32 *words, unsigned int count)
 {
-	return transfer(context, bank, row, page, words, count, false);
+	struct host *host = context;
+	int error = transfer(host, bank, row, page, words, count, false);
+
+	if (!error && !bank && host->normalize_tcam)
+		words[0] = (words[0] & words[1]) | (host->unused_key_pattern & ~words[1]);
+	return error;
 }
 
 static int put_words(void *context, unsigned int bank, unsigned int row,
@@ -260,9 +268,17 @@ static void audit_words(void)
 					for (unsigned int bit = 0; bit < 32; ++bit) {
 						u32 *location = bank ? &host.hardware[row].action[page][word] :
 								       &host.hardware[row].tcam[page][word];
+						bool significant = bank || word ||
+							(host.hardware[row].tcam[page][1] & BIT(bit));
 
 						*location ^= BIT(bit);
-						CHECK(airoha_npu_ingress_check(&host.owner, &host.io, short_lut) == -EUCLEAN);
+						CHECK(airoha_npu_ingress_check(&host.owner, &host.io, short_lut) ==
+						      (significant ? -EUCLEAN : 0));
+						CHECK(host.owner.active == 3 && host.owner.dirty == 3 && !host.owner.pending);
+						if (bank) ++rejected_action_bits;
+						else if (word) ++rejected_mask_bits;
+						else if (significant) ++rejected_key_bits;
+						else ++ignored_key_bits;
 						*location ^= BIT(bit);
 						++scenarios;
 					}
@@ -334,12 +350,42 @@ static void audit_restore(void)
 					location = bank ? &host.hardware[row].action[page][word] :
 							  &host.hardware[row].tcam[page][word];
 					*location ^= BIT(31);
-					CHECK(airoha_npu_ingress_check(&host.owner, &host.io, short_lut) == -EUCLEAN);
+					CHECK(airoha_npu_ingress_check(&host.owner, &host.io, short_lut) ==
+					      (bank || word || (host.hardware[row].tcam[page][1] & BIT(31)) ? -EUCLEAN : 0));
 					CHECK(host.owner.active == 3 && host.owner.dirty == 3 && !host.owner.pending);
 					unchanged_peer(&host);
 					restore_ok(&host);
 					++scenarios;
 				}
+}
+
+static void normalized_readback(void)
+{
+	const u32 patterns[] = { U32_MAX, 0, 0xa5a5a5a5 };
+
+	for (unsigned int pattern = 0; pattern < 3; ++pattern) {
+		struct host host;
+		u32 actual[2];
+
+		initialize(&host);
+		host.normalize_tcam = true;
+		host.unused_key_pattern = patterns[pattern];
+		for (unsigned int row = 0; row < 4; ++row)
+			for (unsigned int page = 0; page < 9; ++page) {
+				u32 *words = host.hardware[row].tcam[page];
+
+				words[0] = (words[0] & words[1]) | (patterns[pattern] & ~words[1]);
+			}
+		memcpy(host.original, host.hardware, sizeof(host.original));
+		prepare_ok(&host, true);
+		CHECK(!host.hardware[0].tcam[1][0] && !host.hardware[0].tcam[1][1]);
+		CHECK(!read_words(&host, 0, 56, 1, actual, 2));
+		CHECK(actual[0] == patterns[pattern] && !actual[1]);
+		CHECK(!airoha_npu_ingress_check(&host.owner, &host.io, short_lut));
+		prepare_ok(&host, false);
+		restore_ok(&host);
+		++scenarios;
+	}
 }
 
 static void emit_words(void)
@@ -365,10 +411,14 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	invalid_inputs();
+	normalized_readback();
 	audit_words();
 	audit_restore();
 	fault_sweep();
-	printf("{\"passed\":true,\"scenarios\":%u,\"checks\":%u,\"transport_faults\":%u}\n",
-	       scenarios, checks, injected_faults);
+	printf("{\"passed\":true,\"scenarios\":%u,\"checks\":%u,\"transport_faults\":%u,"
+	       "\"ignored_key_bits\":%u,\"rejected_key_bits\":%u,\"rejected_mask_bits\":%u,"
+	       "\"rejected_action_bits\":%u,\"normalization_patterns\":3}\n",
+	       scenarios, checks, injected_faults, ignored_key_bits, rejected_key_bits,
+	       rejected_mask_bits, rejected_action_bits);
 	return 0;
 }

@@ -1,0 +1,34 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: honor PON TCAM masks during readback
+
+The AN7581 returns ones in unused TCAM data bits, including pages whose
+mask is zero. Compare the complete mask and only selected data bits in
+PON NPU write verification and ongoing row checks. Keep action words
+fully checked. This lets the owned ingress transaction reach route open
+while still detecting changed masks and matching keys.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu_ingress.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_ingress.h
+@@ -64,7 +64,8 @@
+ 			                 page, actual, 2);
+ 			if (error)
+ 				goto pending;
+-			if (memcmp(actual, expected[index].tcam[page], 2 * sizeof(u32)))
++			if (actual[1] != expected[index].tcam[page][1] ||
++			    ((actual[0] ^ expected[index].tcam[page][0]) & actual[1]))
+ 				return -EUCLEAN;
+ 		}
+ 		for (page = 0; page < 3; ++page) {
+--- a/drivers/net/ethernet/airoha/airoha_npu_ingress_owner.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_ingress_owner.h
+@@ -28,7 +28,9 @@
+ 	error = airoha_ct_fe_table(owner->ppe, bank, row, page, true, copy, count);
+ 	if (!error)
+ 		error = airoha_npu_owner_ingress_read(ctx, bank, row, page, actual, count);
+-	if (!error && memcmp(actual, words, count * sizeof(*words))) {
++	if (!error && (bank == CT_IFC_TCAM_BANK ?
++	    count != 2 || actual[1] != words[1] || ((actual[0] ^ words[0]) & words[1]) :
++	    memcmp(actual, words, count * sizeof(*words)))) {
+ 		if (owner->diag_lower)
+ 			dev_err(owner->ppe->eth->dev, "PON diagnostic IFC mismatch: bank=%u row=%u page=%u count=%u expected=%08x/%08x/%08x actual=%08x/%08x/%08x\n",
+ 				bank, row, page, count, copy[0], copy[1], copy[2],

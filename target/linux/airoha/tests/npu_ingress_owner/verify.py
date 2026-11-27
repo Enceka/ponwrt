@@ -9,6 +9,10 @@ from pathlib import Path
 import re
 import resource
 import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'npu_ingress'))
+from source_binding import SourceBinding
 
 
 DRIVER = Path('drivers/net/ethernet/airoha')
@@ -26,6 +30,7 @@ def main():
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--cc', default=os.environ.get('CC', 'clang'))
+    parser.add_argument('--through-patch', help='last production patch in the generated tree')
     args = parser.parse_args()
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     output = args.output.resolve()
@@ -33,21 +38,16 @@ def main():
     source = args.source.resolve() / DRIVER
     patch = tests.parents[1] / 'patches-6.18' / PATCH
     patch_data = patch.read_bytes()
-    pattern = r'^--- /dev/null\n\+\+\+ b/' + str(DRIVER / HEADER) + r'\n@@ [^\n]+\n(.*?)(?=^--- |\Z)'
-    section = re.search(pattern, patch_data.decode(), re.M | re.S)
-    if not section:
-        raise ValueError('missing added owner header')
-    header = ''.join(line[1:] for line in section[1].splitlines(True) if line.startswith('+'))
-    if header.encode() != (source / HEADER).read_bytes():
-        raise ValueError('owner header differs from production patch')
+    binding = SourceBinding(patch.parent, output, args.through_patch)
+    originals = binding.bind(source, (HEADER, 'airoha_npu_ingress.h', 'airoha_ct_pon_ifc_owner.h',
+                                     'airoha_ct_pon_ifc_words.h', 'airoha_ct_pon_ifc_cpu.h',
+                                     'airoha_ct_ifc.h'))
+    header = originals[HEADER].decode()
     spec = importlib.util.spec_from_file_location('routes', tests.parent / 'bank1_routes/verify.py')
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
-    originals = {}
-    for name in (HEADER, 'airoha_npu_ingress.h', 'airoha_ct_pon_ifc_owner.h',
-                 'airoha_ct_pon_ifc_words.h', 'airoha_ct_pon_ifc_cpu.h', 'airoha_ct_ifc.h'):
-        originals[name] = (source / name).read_bytes()
-        (output / name).write_bytes(originals[name])
+    for name, data in originals.items():
+        (output / name).write_bytes(data)
     guard = originals['airoha_ct_ifc.h'].decode()
     constants = '\n'.join(line for line in guard.splitlines() if line.startswith('#define CT_IFC_'))
     constants += '\n' + re.search(r'^static const u8 ct_ifc_action_words.*?;', guard, re.M)[0]
@@ -75,7 +75,14 @@ def main():
     run(build, 'build')
     result = json.loads(run([str(output / 'owner_io_test')], 'test'))
     mutants = {
-        'ignore_write_readback': ('!error && memcmp(actual, words, count * sizeof(*words))', 'false'),
+        'ignore_write_readback': ('if (!error && (bank == CT_IFC_TCAM_BANK ?',
+                                  'if (false && (bank == CT_IFC_TCAM_BANK ?'),
+        'strict_tcam_memcmp': ('count != 2 || actual[1] != words[1] || ((actual[0] ^ words[0]) & words[1])',
+                               'memcmp(actual, words, count * sizeof(*words))'),
+        'ignore_tcam_count': ('count != 2 ||', 'false ||'),
+        'ignore_tcam_mask': ('actual[1] != words[1] ||', 'false ||'),
+        'ignore_tcam_key': ('((actual[0] ^ words[0]) & words[1])', '0'),
+        'ignore_action_bits': ('memcmp(actual, words, count * sizeof(*words))', '0'),
         'lose_pending_owner': ('owner->ingress.pending = true;', 'owner->ppe->ct_pon_ifc.pending = true;'),
         'skip_guard_dependencies': ('return airoha_ct_pon_ifc_dependencies_io(ppe, io);',
                                     '(void)airoha_ct_pon_ifc_dependencies_io; return 0;'),
@@ -102,15 +109,18 @@ def main():
         finally:
             (output / HEADER).write_text(header)
     run(build, 'build-final')
+    binding.verify_unchanged()
     if patch.read_bytes() != patch_data:
         raise RuntimeError('production patch changed during run')
     for name, data in originals.items():
         if (source / name).read_bytes() != data:
             raise RuntimeError('source changed during run: ' + name)
     result.update(source=str(args.source.resolve()), patch_sha256=digest(patch_data),
+                  production_binding=binding.report(),
                   source_sha256={name: digest(data) for name, data in originals.items()},
                   test_sha256={name: digest((tests / name).read_bytes())
-                               for name in ('verify.py', 'owner_io_test.c')},
+                               for name in ('verify.py', 'owner_io_test.c', 'README.md')},
+                  binding_helper_sha256=digest((tests.parent / 'npu_ingress/source_binding.py').read_bytes()),
                   sanitizers=['address', 'undefined'], mutations=caught)
     (output / 'report.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2))

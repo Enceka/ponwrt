@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 
+from source_binding import SourceBinding
+
 
 DRIVER = Path('drivers/net/ethernet/airoha')
 HEADER = 'airoha_npu_ingress.h'
@@ -85,6 +87,7 @@ def main():
     parser.add_argument('--stock-dir', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--cc', default=os.environ.get('CC', 'clang'))
+    parser.add_argument('--through-patch', help='last production patch in the generated tree')
     args = parser.parse_args()
     if not __debug__:
         parser.error('omit Python -O')
@@ -100,16 +103,12 @@ def main():
     tree = output / 'kernel'
     driver = tree / DRIVER
     driver.mkdir(parents=True)
-    original = {}
-    for name in DEPENDENCIES:
-        original[name] = (args.source.resolve() / DRIVER / name).read_bytes()
-        (driver / name).write_bytes(original[name])
+    binding = SourceBinding(patch.parent, output, args.through_patch)
+    original = binding.bind(args.source.resolve() / DRIVER, (HEADER, *DEPENDENCIES))
+    for name, data in original.items():
+        (driver / name).write_bytes(data)
     environment = dict(os.environ, ASAN_OPTIONS='halt_on_error=1:abort_on_error=1',
                        UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
-    applied = execute(['patch', '--batch', '--forward', '--fuzz=0', '-p1', '-i', str(patch)],
-                      tree, 'apply', environment)
-    if re.search(r'fuzz|offset|FAILED|reversed', applied, re.I):
-        raise ValueError('patch must apply exactly')
     production = (driver / HEADER).read_text()
     compiler = shutil.which(args.cc)
     if not compiler:
@@ -129,7 +128,13 @@ def main():
         'wrong_channel': ('7 << 10', '6 << 10'),
         'skip_short_guard': ('[4] = { 0, BIT(short_lut) }', '[4] = { 0, 0 }'),
         'overlap_lut_leases': ('short_lut[0] == short_lut[1]', 'false'),
-        'skip_tcam_audit': ('memcmp(actual, expected[index].tcam[page], 2 * sizeof(u32))', '0'),
+        'skip_tcam_audit': ('actual[1] != expected[index].tcam[page][1] ||\n'
+                            '\t\t\t    ((actual[0] ^ expected[index].tcam[page][0]) & actual[1])', 'false'),
+        'strict_tcam_memcmp': ('actual[1] != expected[index].tcam[page][1] ||\n'
+                               '\t\t\t    ((actual[0] ^ expected[index].tcam[page][0]) & actual[1])',
+                               'memcmp(actual, expected[index].tcam[page], 2 * sizeof(u32))'),
+        'ignore_tcam_mask': ('actual[1] != expected[index].tcam[page][1] ||', 'false ||'),
+        'ignore_tcam_key': ('((actual[0] ^ expected[index].tcam[page][0]) & actual[1])', '0'),
         'skip_action_audit': ('memcmp(actual, expected[index].action[page], count * sizeof(u32))', '0'),
         'skip_second_row_audit': ('index < 2', 'index < 1'),
         'lose_audit_pending': ('owner->pending = true;', 'owner->pending = false;'),
@@ -161,6 +166,7 @@ def main():
         finally:
             (driver / HEADER).write_text(production)
     execute(build, output, 'build-final', environment)
+    binding.verify_unchanged()
     if patch.read_bytes() != patch_data:
         raise RuntimeError('patch changed during verification')
     for name, data in original.items():
@@ -169,9 +175,11 @@ def main():
     report = dict(result, compiler=version, sanitizers=['address', 'undefined'],
                   stock=stock, mutations=caught, source=str(args.source.resolve()),
                   patch_sha256=digest(patch_data), header_sha256=digest(production.encode()),
+                  production_binding=binding.report(),
                   dependency_sha256={name: digest(data) for name, data in original.items()},
                   test_sha256={name: digest((tests / name).read_bytes())
-                               for name in ('verify.py', 'ingress_test.c', 'kernel_test.c', 'Makefile')})
+                               for name in ('verify.py', 'ingress_test.c', 'kernel_test.c', 'Makefile',
+                                            'source_binding.py', 'source_binding_test.py', 'README.md')})
     (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
 

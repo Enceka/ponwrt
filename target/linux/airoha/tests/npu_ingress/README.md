@@ -7,8 +7,8 @@ default must stay on its CPU receiver: a direct PPE2 default can match an
 existing bound tuple before firmware sees the packet.
 
 This component implements row encoding, publication, readback audit and
-restoration. The Linux owner still needs to connect it to source-scope
-closure/opening and AUTH/GATE/ER readiness. PON qualification remains off.
+restoration. `999-ze` connects the Linux owner, `999-zk` adds diagnostic
+logging, and `999-zl` permits normalization of unused TCAM data bits.
 
 ## Caller contract
 
@@ -33,7 +33,7 @@ closure/opening and AUTH/GATE/ER readiness. PON qualification remains off.
 | --- | --- |
 | `airoha_npu_ingress_encode()` | Creates a plain IPv4 or IPv6 row; invalid inputs leave output unchanged. |
 | `airoha_npu_ingress_prepare()` | Validates both LUT indexes, snapshots once, publishes rows56/57, then audits both complete rows. Replacement retains the original snapshot. |
-| `airoha_npu_ingress_check()` | Requires the exact owned pair and compares all 48 hardware words, including unused TCAM fields and action flags. Transport failure retains pending I/O; mismatched words return `-EUCLEAN`. |
+| `airoha_npu_ingress_check()` | Requires the exact owned pair, exact TCAM masks and matching selected key bits; every action bit remains significant. Transport failure retains pending I/O; significant mismatches return `-EUCLEAN`. |
 | `airoha_npu_ingress_restore()` | Restores changed rows with original actions last, drains pending commands and releases the snapshot only after success. Repeated completed restoration is harmless. |
 
 Source selection is `{BIT(2), U32_MAX}` using the verified SPORT-indexed SIF
@@ -49,15 +49,21 @@ From the enclosing workspace:
 
 ```sh
 /usr/bin/python3 -B build/ponwrt/target/linux/airoha/tests/npu_ingress/verify.py \
-  --source build/pon-er-consumer-20261127/owner-source-bank1-retire \
+  --source build/pon-npu-diag-20261127/kernel \
+  --through-patch 999-zl-net-airoha-mask-unused-pon-tcam-readback.patch \
   --stock-dir build/stage2/zip/root/lib/modules \
-  --output build/pon-er-consumer-20261127/npu-ingress-validation
+  --output build/ponwrt/target/linux/airoha/tests/npu_ingress/.results/through-zl-v1
 ```
 
 The output directory must be new. Dependencies are Python3, Unicorn,
-pyelftools, patch and Clang with ASan/UBSan. The runner applies the production
-patch exactly in its output tree and compiles the unchanged header with the
-existing production row owner. It does not access devices.
+pyelftools, patch and Clang with ASan/UBSan. Supply a complete generated
+source tree. The runner reconstructs all three tested production headers
+from their creation patches and subsequent overlays, then compares every
+byte with that tree. Patch application rejects offsets, fuzz and failed
+hunks. `--through-patch NAME` optionally selects the last patch for a
+historical generated tree; the default includes all available patches.
+Tests compile the original verified headers. Source and applicable patch
+chains are checked again after testing and their hashes enter the report.
 
 The stock oracle executes the SHA-pinned original `ifc.ko` named field
 setters and `ifc_set_action_forcePort`; only architecture and interface
@@ -71,17 +77,25 @@ injects failures before effects, after effects and with delayed completion
 at every initial prepare, replacement, audit and restore command. Recovery
 includes two failed drains, a late write completed during a failed drain,
 then either republish or direct restore. Every bit of each audited hardware
-word is independently corrupted. Four encoding mutations must differ from
-the executed stock output; eight control-flow mutations must compile and
-fail a runtime assertion.
+word is independently flipped: unused TCAM key bits must succeed, while
+changed masks, selected key bits and every action bit must return
+`-EUCLEAN`. Both IPv4/IPv6 rows and all TCAM/action pages are exercised.
 
-The completed run passed 2,773 scenarios, 1,188 transport faults,
-1,260,874 C checks and 285,056 predicate checks; all 12 negative controls
-were caught. It includes direct restoration after each of the 48 audited
-words is corrupted, leaving the corrupted value present until restore.
-Evidence is in `build/pon-er-consumer-20261127/npu-ingress-final` relative
-to the enclosing workspace. The runner records patch, production header,
-dependency and test hashes in `report.json`.
+The read callback also normalizes unused bits to ones, zeroes or an
+alternating pattern without changing the stored hardware image. It
+reproduces row56/page1 `{0, 0}` reading as `{0xffffffff, 0}`, then checks
+prepare, audit, replacement, original snapshot retention and restoration.
+The bit matrix records accepted unused bits and rejected significant key,
+mask and action bits separately. Four encoding controls and eleven runtime
+controls include restoring the old whole-word `memcmp` and independently
+removing mask or selected-key validation.
+
+`source_binding_test.py --output NEW_DIRECTORY` checks a valid stacked
+creation/logging/fix chain and rejects seven independent provenance faults:
+wrong source bytes, a missing overlay, shifted hunk, reordered patch, changed
+patch, newly inserted overlay and source change during a run. The harness
+never edits the supplied production tree. All temporary outputs in these
+examples stay inside the ignored `.results/` directory.
 
 `kernel_test.c` also compiles the actual prepare/restore paths through the
 Linux 6.18.60 AArch64 build with GCC 14.4.0. Copy this fixture and its
@@ -89,5 +103,5 @@ Makefile to a VM output directory, apply 999-zd to the kernel tree, and run
 the normal kernel make command with `M=OUTPUT_DIRECTORY kernel_test.o`.
 The 2026-11-27 build completed without warnings; its log is
 `build/pon-er-consumer-20261127/npu-ingress-kernel-build.log`. This is an
-object compilation check; the component has not been connected to live
-owner routes or included in a newly flashed image.
+object compilation check. The masked-readback host suite leaves current
+kernel compilation and device integration to the main task.
