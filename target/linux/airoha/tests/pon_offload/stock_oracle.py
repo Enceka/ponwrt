@@ -14,6 +14,7 @@ from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM, UC_HOOK_CODE
 from unicorn import arm64_const as R
 
 HASHES = {
+    'ifc.ko': 'd10c1b67b2368a0f2a9255feb851621f8bd73ab16eb6d6a47c9992e4617e3bf7',
     'fe_core.ko': '368cd6f4fa5519454b735ceba7d9f4c36316ddf390595ef549cd86912e1c5dc9',
     'xpon_10g.ko': 'aab0b4191f4db514a04035f0e43fbae073eea44ad834345cbcb899136976e860',
     'hw_nat.ko': 'f8ab9e61d80ce1ace05fc367742be9640c692aa65d8ce20210a9e886769d0d24',

@@ -65,6 +65,12 @@ python3 verify_ewan_ingress.py --stock-dir /path/to/stock/lib/modules \
 
 `971` 在主机 QDMA 收到 PPE 学习请求时，将完整 GEM 与已发布的单播映射比对，EPON 则只比对当前注册的 channel。映射更新中、描述符标错、控制包和跨描述符的光侧帧跳过学习，软件收发路径保留。RCU 读段覆盖映射查询和学习调用，沿用现有撤流事务的 `synchronize_net()`。运行 `python3 verify_rx_learn.py --source /path/to/linux-after-971` 可核对所有 65,536 个 GEM 值、32×32 对 EPON channel 及异常条件。这项检查用于 CPU 学习入口；已绑定硬件流的逐包业务隔离仍由 FE 分类器负责。
 
+`verify_ifc_service.py --stock-dir /path/to/stock/lib/modules` 执行原厂 `ifc.ko`：在同一 type-0 行组合 GDM2、16 位业务号、EtherType 和无 VLAN/PPPoE 条件，再用第二行隔离仅最高位不同的业务。IPv4/IPv6 各测一轮；按字段正序、逆序写入后核对全部九页，比较 263,168 组输入，并在另一行业务保留时停用、改号、重开第一行。TCAM page 0 的键/掩码是 `4/4`；page 5 是 EtherType/`0xffff`；page 7 是 `service << 16`/`0xffff0430`；page 8 是 `0/0xc0`。匹配检查使用原厂写入模拟 MMIO 的最终表项。
+
+板测分两步。先保持 GDM2 的硬件流关闭，用 `forcePort(CDM2=5)` 将仅业务号不同的 A、B 编号包分别送到两个可观测的 WAN CPU 环，核对同五元组、无效映射和撤销后的默认去向。原厂动作页 1 `DATA2[14:10]` 选队列。测试中的行号 54/55 是模拟值，实板上这两行由 LAN1 使用；须在现有 IFC 所有权下选择空闲行。LAN1 板测曾发现直接覆盖 GDM 默认 CPU 路由会绕过 IFC（见 `hg5585f-ct/NATIVE_PAIRS.md`）。若在 GDM2 上也出现绕过，应先解决 IFC 与默认 CPU 路由的次序，保留 WAN CPU 回退。
+
+仅在实板确认分类生效、未匹配流量保持 WAN CPU 后，再让一个已配置的非零业务 A 进入独占 PPE 表，检查只有 A 推动绑定行计数并抵达目标。这个方案在 IFC 查表处使用业务号，无需 FE32 向 NPU 透传该字段。原厂字段名为 `GEM_LLID`，EPON 线侧输入值与其 CPU channel 的关系须单独测量。
+
 `verify_path_order.py` 从真实 netfilter 路径生成、tuple 反转、action 生成和 Airoha action 解析一路执行到 PON GEM 选择。96 个场景覆盖两个方向、IPv4/IPv6、单/双 VLAN、PPPoE+单 VLAN，以及 PPPoE+双 VLAN 的现有两层容量拒绝。IPv6 测试执行驱动的出口准入判断，并检查物理端口、桥接、输入封装键、VLAN 剥离、优先级、保留 VID 和 PPPoE 会话号。
 
 `965` 把入方向 PPPoE 会话号、EtherType 和 PPP 协议加入 flowtable 交给驱动的精确匹配键。184 次入向检查涵盖 IPv4/IPv6、TCP/UDP、相同五元组下仅 SID 高位不同、裸 PPPoE 和外层 802.1Q、硬件处理外层 VLAN，以及保留 SID、倒置和超限封装。Airoha 的 IPv4/IPv6 FOE 当前无法匹配入方向 SID，驱动在发布前拒绝该类规则，保留原有普通 IP 路径和出方向 PPPoE 动作。测试在 CT 和普通 PPE 模式下均检查物理有线出口，另有四个运行期负控制。
