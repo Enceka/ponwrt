@@ -99,7 +99,7 @@ python3 target/linux/airoha/tests/pon_offload/run_loopback_probe.py \
 
 Omit `--run` for preflight only. Omit `--special-tag` for the control run.
 PON PPE qualification stays closed throughout. The final module exposes
-only `prepare`, `send <decimal-service> [kind]` and `restore`.
+only `prepare`, `send <decimal-service> [kind [variant]]` and `restore`.
 
 ## Packet kinds
 
@@ -158,6 +158,46 @@ below TX length; stripped VLAN removes another 4. The existing `sequence`
 and `rx_sequence` distinguish a new TX from the last successful marked RX.
 All lengths and kinds are diagnostic observations, independent of the
 runner's per-packet service/ring/native-health checks.
+
+## Tuple packet variants
+
+For `ipv4` and `ipv6`, an optional decimal variant selects one changed
+tuple field. Variant 0 is the baseline; 1 increments the source address,
+2 increments the destination address, 3 increments the UDP source port,
+and 4 increments the UDP destination port. Address changes affect the low
+word only. The remaining tuple fields and frame lengths stay identical.
+IPv4 header and IPv6 UDP checksums include the changed fields.
+
+For example, `send 8500 ipv6 3` uses source port 49153. Other packet kinds
+accept only variant 0. Invalid variant text, values above 4 and extra
+arguments fail with `-EINVAL`. Status reports `tx_variant` for each send.
+
+Use `--tuple-variants --cover-slot 1 --special-tag --require-native` to
+exercise both families, all five variants and both service IDs: 20 packets
+in total. This validates packet generation and the current service classifier;
+every variant of service 0x2134 selects RX2, while service 0xa134 selects RX4.
+Exact tuple classifier integration will add per-field miss expectations.
+The runner checks returned kind, marker, service, source, receive ring and
+native policy, then withdraws the classifier and restores the module.
+
+On 2026-11-27, all 20 tuple-variant packets passed on RAM kernel984, boot
+`986bed54-e67d-4baa-ac06-0627f74789a2`. Every returned sequence, cookie,
+kind, full service and SPORT2 matched; A selected RX2 and B selected RX4.
+The ten saved registers were restored, the classifier was cleared and the
+module unloaded. Native policy remained `generation=49 allowed=1 failed=0`,
+with `ct_cpu_fallback=0`. The final Wi-Fi HTTPS check returned 200.
+PON PPE qualification remained closed throughout this CPU-classifier test.
+
+The candidate module SHA256 was
+`30ad89ef0a3c07587203404451dce3d5d7c17a2d3248332065190ae4a73a3dd7`,
+built against `/workdir/pon-sif-984` in `/workdir/pon-tuple-module.mN4wKd`.
+Its updated receive functions also passed 575 ASan/UBSan cases: the existing
+545 parser cases plus 30 matching/mismatched-port cases over both families
+and all variants. Build, parser, 20-packet and final Wi-Fi evidence is under
+`/Volumes/Workspace/5585f/build/pon-tuple-variants-985-board`.
+
+The runner rejects Python `-O` before accessing the device, so preflight,
+packet and restoration assertions remain enabled.
 
 The packet-kind candidate is built separately in
 `/workdir/pon-cover-module-types` against `/workdir/pon-cover-982`, using

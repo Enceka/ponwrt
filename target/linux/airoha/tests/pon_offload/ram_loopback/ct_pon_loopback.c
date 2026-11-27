@@ -45,6 +45,7 @@ static const char * const kind_names[] = {
 	"ipv4", "ipv6", "arp", "vlan", "pppoe", "fragment", "short",
 };
 static u32 probe_cookie, sent_kind, sent_length, received_kind, received_length;
+static u32 sent_variant;
 static bool awaiting;
 static int last_error;
 static bool special_tag;
@@ -154,7 +155,8 @@ static int marker_offset(struct sk_buff *skb, u32 kind)
 	}
 	if (transport_length < sizeof(udp) + PROBE_MARKER_BYTES ||
 	    skb_copy_bits(skb, offset, &udp, sizeof(udp)) ||
-	    udp.source != htons(49152) || udp.dest != htons(49153) ||
+	    udp.source != (READ_ONCE(sent_variant) == 3 ? htons(49153) : htons(49152)) ||
+	    udp.dest != (READ_ONCE(sent_variant) == 4 ? htons(49154) : htons(49153)) ||
 	    ntohs(udp.len) != transport_length + (kind == PROBE_FRAGMENT ? 8 : 0))
 		return -EINVAL;
 	return offset + sizeof(udp);
@@ -396,7 +398,7 @@ static int prepare(void)
 	return err;
 }
 
-static int transmit(unsigned int service, unsigned int kind)
+static int transmit(unsigned int service, unsigned int kind, unsigned int variant)
 {
 	struct sk_buff *skb;
 	struct ethhdr *ethernet;
@@ -408,7 +410,8 @@ static int transmit(unsigned int service, unsigned int kind)
 	__be16 protocol = htons(ETH_P_IP);
 	int pending, err;
 
-	if (!retained || !opened || !service || service > U16_MAX || kind >= PROBE_KIND_COUNT)
+	if (!retained || !opened || !service || service > U16_MAX || kind >= PROBE_KIND_COUNT ||
+	    variant > 4 || (variant && kind != PROBE_IPV4 && kind != PROBE_IPV6))
 		return -EINVAL;
 	err = mapping(service);
 	if (err)
@@ -466,9 +469,9 @@ static int transmit(unsigned int service, unsigned int kind)
 		ipv6->nexthdr = IPPROTO_UDP;
 		ipv6->hop_limit = 32;
 		ipv6->saddr.s6_addr32[0] = htonl(0x20010db8);
-		ipv6->saddr.s6_addr32[3] = htonl(1);
+		ipv6->saddr.s6_addr32[3] = htonl(1 + (variant == 1));
 		ipv6->daddr.s6_addr32[0] = htonl(0x20010db8);
-		ipv6->daddr.s6_addr32[3] = htonl(2);
+		ipv6->daddr.s6_addr32[3] = htonl(2 + (variant == 2));
 	} else {
 		ipv4 = ip_hdr(skb);
 		ipv4->version = 4;
@@ -478,13 +481,13 @@ static int transmit(unsigned int service, unsigned int kind)
 		ipv4->frag_off = htons(kind == PROBE_FRAGMENT ? IP_MF : 0);
 		ipv4->ttl = 32;
 		ipv4->protocol = IPPROTO_UDP;
-		ipv4->saddr = htonl(0xc0000201);
-		ipv4->daddr = htonl(0xc0000202);
+		ipv4->saddr = htonl(0xc0000201 + (variant == 1));
+		ipv4->daddr = htonl(0xc0000202 + (variant == 2));
 		ip_send_check(ipv4);
 	}
 	udp = udp_hdr(skb);
-	udp->source = htons(49152);
-	udp->dest = htons(49153);
+	udp->source = variant == 3 ? htons(49153) : htons(49152);
+	udp->dest = variant == 4 ? htons(49154) : htons(49153);
 	udp->len = htons(udp_length + (kind == PROBE_FRAGMENT ? 8 : 0));
 	payload = (u8 *)(udp + 1);
 marker:
@@ -502,6 +505,7 @@ marker:
 			udp->check = CSUM_MANGLED_0;
 	}
 	WRITE_ONCE(sent_kind, kind);
+	WRITE_ONCE(sent_variant, variant);
 	WRITE_ONCE(sent_length, length);
 	smp_store_release(&awaiting, true);
 	skb->protocol = protocol;
@@ -534,6 +538,7 @@ static int status_show(struct seq_file *file, void *unused)
 	seq_printf(file, "tx_kind=%s tx_length=%u rx_kind=%s rx_length=%u\n",
 		kind_names[READ_ONCE(sent_kind)], READ_ONCE(sent_length),
 		kind_names[READ_ONCE(received_kind)], READ_ONCE(received_length));
+	seq_printf(file, "tx_variant=%u\n", READ_ONCE(sent_variant));
 	seq_printf(file, "submitted=%llu completed=%llu dropped=%llu no_mapping=%llu rx_data=%llu rx_delivered=%llu last_tx=%08x/%08x last_rx=%08x/%08x\n",
 		stats.tx_packets_submitted, stats.tx_packets_completed, stats.tx_packets_hw_dropped,
 		stats.tx_no_mapping, stats.rx_data_packets, stats.rx_packets_delivered,
@@ -555,8 +560,8 @@ DEFINE_SHOW_ATTRIBUTE(status);
 static ssize_t command_write(struct file *file, const char __user *buffer,
 			      size_t length, loff_t *offset)
 {
-	char command[64], kind_name[16] = "ipv4", trailing;
-	unsigned int service, kind;
+	char command[64], kind_name[16] = "ipv4", variant_word[16], trailing;
+	unsigned int service, kind, variant = 0;
 	int err, fields;
 
 	if (!length || length >= sizeof(command) || copy_from_user(command, buffer, length))
@@ -569,11 +574,12 @@ static ssize_t command_write(struct file *file, const char __user *buffer,
 		err = restore();
 	else {
 		err = -EINVAL;
-		fields = sscanf(command, "send %u %15s %c", &service, kind_name, &trailing);
-		if (fields == 1 || fields == 2) {
+		fields = sscanf(command, "send %u %15s %15s %c", &service, kind_name, variant_word, &trailing);
+		if (fields >= 1 && fields <= 3 &&
+		    (fields < 3 || !kstrtouint(variant_word, 10, &variant))) {
 			for (kind = 0; kind < PROBE_KIND_COUNT; kind++) {
 				if (!strcmp(kind_name, kind_names[kind])) {
-					err = transmit(service, kind);
+					err = transmit(service, kind, variant);
 					break;
 				}
 			}

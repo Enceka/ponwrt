@@ -12,6 +12,8 @@ import uuid
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    if not __debug__:
+        parser.error('Run without -O; hardware validation requires assertions.')
     parser.add_argument('--pin', type=Path, required=True)
     parser.add_argument('--boot', required=True)
     parser.add_argument('--identity', type=Path)
@@ -26,6 +28,7 @@ def main():
     parser.add_argument('--sif-mode', choices=('source', 'absent', 'only'), default='source')
     parser.add_argument('--packet-matrix', action='store_true')
     parser.add_argument('--require-native', action='store_true')
+    parser.add_argument('--tuple-variants', action='store_true')
     args = parser.parse_args()
     if args.cover_slot is not None and not args.special_tag:
         parser.error('--cover-slot requires --special-tag')
@@ -35,6 +38,8 @@ def main():
         parser.error('--sif-sweep requires --cover-slot 1 without --withdraw-cycle')
     if args.packet_matrix and (args.cover_slot != 1 or args.withdraw_cycle or args.sif_sweep):
         parser.error('--packet-matrix requires --cover-slot 1 without other experiments')
+    if args.tuple_variants and (args.cover_slot != 1 or args.withdraw_cycle or args.sif_sweep or args.packet_matrix):
+        parser.error('--tuple-variants requires --cover-slot 1 without other experiments')
     uuid.UUID(args.boot)
     blob = args.module.read_bytes()
     assert hashlib.sha256(blob).hexdigest() == args.sha256
@@ -73,7 +78,9 @@ def main():
     policy_pattern = r'^generation=\d+ allowed=' + ('1' if args.require_native else r'\d+') + r' failed=0$'
     assert re.search(policy_pattern, before, re.M)
     report = {'boot': args.boot, 'module_sha256': args.sha256, 'special_tag': args.special_tag,
-              'cover_slot': args.cover_slot, 'sif_sweep': args.sif_sweep, 'observations': []}
+              'cover_slot': args.cover_slot, 'sif_sweep': args.sif_sweep,
+              'tuple_variants': args.tuple_variants, 'require_native': args.require_native,
+              'observations': []}
     if not args.run:
         print(json.dumps({'preflight': True, 'output': str(output)}))
         return
@@ -114,12 +121,21 @@ def main():
             cases = [(service, (), True, kind)
                      for kind in ('ipv4', 'ipv6', 'arp', 'vlan', 'pppoe', 'fragment', 'short')
                      for service in (0x2134, 0xa134)]
-        for index, (service, commands, routed, kind) in enumerate(cases):
+        cases = [(*case, 0) for case in cases]
+        if args.tuple_variants:
+            cases = [(service, (), True, kind, variant)
+                     for kind in ('ipv4', 'ipv6') for variant in range(5)
+                     for service in (0x2134, 0xa134)]
+        for index, (service, commands, routed, kind, variant) in enumerate(cases):
             label = 'send-' + str(index)
             for step, command in enumerate(commands):
                 write(label + '-transition-' + str(step), classifier, command)
             previous, _ = remote(label + '-before', 'cat ' + probe + 'status')
-            command = 'send ' + str(service) + (' ' + kind if args.packet_matrix else '')
+            command = 'send ' + str(service)
+            if args.packet_matrix or args.tuple_variants:
+                command += ' ' + kind
+            if args.tuple_variants:
+                command += ' ' + str(variant)
             sent, status = remote(label, 'echo ' + shlex.quote(command) +
                                   ' > ' + probe + 'command', check=False)
             observed, _ = remote(label + '-observed', 'cat ' + probe + 'status; cat ' + classifier +
@@ -133,7 +149,7 @@ def main():
             after_heads = dict(re.findall(r'^rx(\d+) head=(\d+)', observed, re.M))
             changed_rings = [int(ring) for ring in before_heads if before_heads[ring] != after_heads[ring]]
             report['observations'].append({'service': service, 'command_status': status,
-                                          'kind': kind,
+                                          'kind': kind, 'variant': variant,
                                           'returned_service': returned_service, 'returned_source': returned_source,
                                           'numbered_return': numbered_return, 'changed_rings': changed_rings,
                                           'transitions': commands, 'state': observed})
@@ -144,7 +160,11 @@ def main():
             if args.cover_slot is not None:
                 assert numbered_return and 'routed=' + str(int(routed)) in observed
                 assert len(changed_rings) == 1, 'expected a covered WAN CPU receive ring'
-                if args.packet_matrix:
+                if args.tuple_variants:
+                    assert changed_rings == ([2] if service == 0x2134 else [4])
+                    assert 'tx_variant=' + str(variant) in observed
+                    assert 'tx_kind=' + kind in observed and 'rx_kind=' + kind in observed
+                elif args.packet_matrix:
                     expected_ring = 2 if kind in ('ipv4', 'ipv6', 'fragment') and service == 0x2134 else 4
                     assert changed_rings == [expected_ring], 'packet missed its exclusive optical CPU rule'
                     assert 'tx_kind=' + kind in observed and 'rx_kind=' + kind in observed
