@@ -38,6 +38,7 @@ def main():
             'airoha_ct_ifc_cpu_route_close_locked', 'airoha_ct_ifc_cpu_port_change',
             'airoha_ct_ppe_selectors', 'airoha_ct_cpu_selectors', 'airoha_ct_gdm_cpu_locked',
             'airoha_ct_gdm_route_locked', 'airoha_gdm_fwd_cfg_update', 'airoha_ct_cpu_fallback'],
+        'airoha_eth.c': ['airoha_ifc_scope_update', 'airoha_ifc_lan_ports_ready'],
         'airoha_ct_pon_ifc_cpu.h': [
             'airoha_ct_pon_ifc_read', 'airoha_ct_pon_ifc_put', 'airoha_ct_pon_ifc_drain',
             'airoha_ct_pon_ifc_io', 'airoha_ct_pon_ifc_route_ready',
@@ -89,6 +90,8 @@ def main():
         result = json.loads(tested.stdout)
         assert result['passed'] and result['transport_faults'] == 1080
         assert result['blocked_retries'] == 2160 and result['readback_faults'] == 156
+        assert result['scope_cases'] == 28 and result['fallback_stop_cases'] == 3
+        assert result['rejected_set_retries'] == 1276
         results.append(dict(mode=mode, **result))
     assert {key: value for key, value in results[0].items() if key != 'mode'} == {
         key: value for key, value in results[1].items() if key != 'mode'}
@@ -120,6 +123,19 @@ def main():
         ('skip_shared_pending', None, 'if (eth->ct_ifc_command_pending)', 'if (false)'),
         ('missing_command_lock', None, 'lockdep_assert_held(&ppe_lock);',
          'spin_unlock_bh(&ppe_lock);'),
+        ('scope_ignores_expected', 'airoha_ifc_scope_update',
+         'eth->ct_ifc_port_mask != expected', 'false'),
+        ('scope_leaves_optical_port_closed', 'airoha_ifc_scope_update',
+         'ports = eth->ifc_port_desired & scope;', 'ports = eth->ifc_port_desired & expected;'),
+        ('scope_ignores_authorization', 'airoha_ifc_scope_update',
+         '(scope & BIT(AIROHA_GDM2_IDX)) && !eth->ct_ifc_pon_ready', 'false'),
+        ('scope_skips_failed_rollback_fallback', 'airoha_ifc_scope_update',
+         'recover = true;', 'recover = false;'),
+        ('lan_accepts_fallback', 'airoha_ifc_lan_ports_ready',
+         '!eth->ct_cpu_fallback &&', 'true &&'),
+        ('scope_replaces_desired', 'airoha_ifc_scope_update',
+         'eth->ct_ifc_port_mask = scope;',
+         'eth->ifc_port_desired = scope;\n\t\teth->ct_ifc_port_mask = scope;'),
     ]
 
     def negative(specification):
@@ -149,7 +165,7 @@ def main():
                   extracted_sha256=hashlib.sha256(extracted.encode()).hexdigest(),
                   test_sha256=hashlib.sha256(test.read_bytes()).hexdigest(),
                   stubs=['MMIO and command completion', 'lock and RCU assertions',
-                         'scope update and LAN readiness', 'work scheduling and netdev state'],
+                         'work scheduling and netdev state'],
                   sanitizers=['address', 'undefined'])
     (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(dict(passed=True, modes=results, runtime_mutations=len(rejected),

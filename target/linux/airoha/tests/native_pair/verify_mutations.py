@@ -35,7 +35,7 @@ mutations = {
     'omit_cpu_cutover': (cpu_build, 'cpu_fallback_extracted.inc', extracted, extracted.replace('route_err = airoha_ct_cpu_fallback(eth);', 'route_err = 0;')),
     'allow_ifc_reenable': (cpu_build, 'cpu_fallback_extracted.inc', extracted, extracted.replace('reg == REG_FE_CSR_IFC_CFG && (value & mask & FE_IFC_EN_MASK) &&', 'reg == REG_FE_CSR_IFC_CFG && false &&')),
     'omit_late_route_retry': (cpu_build, 'airoha_ct_cpu_fallback.h', cpu, cpu.replace('schedule_delayed_work(&eth->ppe->ct_fe.health_work,\n\t\t\t\t\t      msecs_to_jiffies(100));', '(void)eth;')),
-    'clear_sticky_latch_on_update': (cpu_build, 'airoha_ct_cpu_fallback.h', cpu, cpu.replace('\terr = airoha_ct_gdm_route_locked(eth, id, cfg);\n\tspin_unlock_bh', '\terr = airoha_ct_gdm_route_locked(eth, id, cfg);\n\teth->ct_cpu_fallback = false;\n\tspin_unlock_bh')),
+    'clear_sticky_latch_on_update': (cpu_build, 'airoha_ct_cpu_fallback.h', cpu, cpu.replace('\terr = airoha_ct_gdm_route_locked(eth, id, cfg);\nunlock:\n\tspin_unlock_bh', '\terr = airoha_ct_gdm_route_locked(eth, id, cfg);\n\teth->ct_cpu_fallback = false;\nunlock:\n\tspin_unlock_bh')),
     'omit_global_ifc_gate': (cpu_build, 'airoha_ct_cpu_fallback.h', cpu, cpu.replace('airoha_fe_clear(eth, REG_FE_CSR_IFC_CFG, FE_IFC_EN_MASK);', '(void)eth;')),
     'discard_fault_ifc_shadow': (cpu_build, 'cpu_fallback_extracted.inc', extracted, extracted.replace('\t\tppe->ct_fe.active = false;\n\t} else {', '\t\tppe->ct_fe.active = false;\n\t\tppe->ct_fe.touched = false;\n\t} else {')),
     'guess_qdma_cpu_port': (cpu_build, 'airoha_ct_cpu_fallback.h', cpu, cpu.replace('next = FE_PSE_PORT_CDM2;', 'next = FE_PSE_PORT_CDM1;')),

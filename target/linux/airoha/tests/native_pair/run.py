@@ -50,14 +50,17 @@ paths += ['drivers/net/ethernet/airoha/airoha_eth.h', 'drivers/net/ethernet/airo
           'net/bridge/netfilter/nf_conntrack_bridge.c']
 pair_report = json.loads((output / 'build/source3-verification.json').read_text())
 cpu_report = json.loads((output / 'build/cpu-fallback-verification.json').read_text())
+lifecycle_report = json.loads((output / 'build/lifecycle-verification.json').read_text())
+shutdown_report = json.loads((output / 'build/shutdown-verification.json').read_text())
+teardown_report = json.loads((output / 'build/teardown-verification.json').read_text())
 mutation_report = json.loads((output / 'build/mutation-verification.json').read_text())
 report = {
     'passed': True,
     'cases': 0,
     'runtime_caught_mutations': len(mutation_report['mutations']),
     'selector_combinations': cpu_report['selector_combinations'],
-    'groups': {'pair': pair_report['cases'], 'cpu_fallback': cpu_report['cases'], 'policy_core': 11, 'bank_lifecycle': 224,
-               'mailbox_wrapper': 72, 'bpf': 16, 'shutdown': 7, 'teardown': 10, 'station_fallback': 40,
+    'groups': {'pair': pair_report['cases'], 'cpu_fallback': cpu_report['cases'], 'policy_core': 11, 'bank_lifecycle': lifecycle_report['cases'],
+               'mailbox_wrapper': 72, 'bpf': 16, 'shutdown': shutdown_report['cases'], 'teardown': teardown_report['cases'], 'station_fallback': 40,
                'fdb_roam': 6, 'bridge_ct_hooks': 298, 'nft_audit': 20, 'wired_mtu': 130, 'wired_notifier': 8, 'radio_owner': 4},
     'sanitizers': ['address', 'undefined'],
     'kernel_tree': str(source),
@@ -65,7 +68,7 @@ report = {
                       for name in paths},
 }
 report['cases'] = sum(report['groups'].values())
-assert pair_report['cases'] == 199 and cpu_report['cases'] == 20
+assert pair_report['cases'] == 199 and cpu_report['cases'] == 25 and lifecycle_report['cases'] == 232 and shutdown_report['cases'] == 13 and teardown_report['cases'] == 90
 assert report['runtime_caught_mutations'] == 19
 for name in ('airoha_eth.h', 'airoha_ppe.c', 'airoha_ppe_debugfs.c'):
     text = (source / 'drivers/net/ethernet/airoha' / name).read_text()
