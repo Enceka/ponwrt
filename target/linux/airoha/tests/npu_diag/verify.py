@@ -15,9 +15,15 @@ from source_binding import SourceBinding
 
 FUNCTIONS = {
     'airoha_npu_owner.h': {'active': 'airoha_ppe_npu_diag_active',
+                           'bank0_owned': 'airoha_ppe_npu_bank0_owned',
                            'diag_flow': 'airoha_ppe_npu_diag_flow',
+                           'bank0_drain': 'airoha_npu_diag_bank0_drain',
+                           'bank1_drain': 'airoha_npu_owner_bank1_drain',
                            'retire': 'airoha_npu_owner_retire_locked'},
     'airoha_npu_diag.h': {'platform': 'airoha_npu_diag_platform',
+                         'install': 'airoha_npu_diag_install',
+                         'bind': 'airoha_npu_diag_bind',
+                         'bind_command': 'airoha_npu_diag_bind_command',
                          'snapshot': 'airoha_npu_diag_snapshot',
                          'diag_authorize': 'airoha_npu_diag_authorize',
                          'start_mode': 'airoha_npu_diag_start_mode',
@@ -29,6 +35,9 @@ FUNCTIONS = {
     'airoha_bank1_routes.h': {'routes': 'airoha_bank1_routes_open'},
     'airoha_eth_return.c': {'er_stats': 'airoha_er_get_stats', 'er_observe': 'airoha_er_observe',
                            'er_enable': 'airoha_er_enable_observation'},
+    'airoha_npu_bank1.h': {'bank0_hash': 'airoha_ppe_bank0_hash'},
+    'airoha_ppe.c': {'sram_ack': 'airoha_ppe_ct_sram_ack',
+                    'ipv4_tuple': 'airoha_ppe_foe_entry_set_ipv4_tuple'},
 }
 HEADERS = ['airoha_npu_transaction_core.h', 'airoha_npu_auth_publish.h',
            'npu_auth_mailbox_abi.h', 'npu_bank1_gate_abi.h', 'npu_eth_return_abi.h']
@@ -74,18 +83,60 @@ def main():
     extracted = output / 'source'
     extracted.mkdir()
     driver = source / 'drivers/net/ethernet/airoha'
-    inputs = {name: (driver / name).read_bytes() for name in [*FUNCTIONS, *HEADERS]}
+    inputs = {name: (driver / name).read_bytes()
+              for name in [*FUNCTIONS, *HEADERS, 'airoha_eth.h', 'airoha_regs.h']}
+    test_inputs = {name: (tests / name).read_bytes() for name in ('verify.py', 'diag_test.c')}
     binding = SourceBinding(repo / 'target/linux/airoha/patches-6.18', output,
-                            '999-zr-net-airoha-add-pon-ppe-learning-diagnostic.patch')
-    binding.bind(driver, ('airoha_npu_owner.h', 'airoha_npu_diag.h',
-                         'airoha_npu_reopen.h', 'airoha_bank1_routes.h'))
+                            '999-zu-net-airoha-retain-pon-bank0-ownership.patch')
+    binding_error = None
+    try:
+        binding.bind(driver, ('airoha_npu_owner.h', 'airoha_npu_diag.h',
+                             'airoha_npu_reopen.h', 'airoha_bank1_routes.h', 'airoha_npu_bank1.h'))
+    except ValueError as error:
+        binding_error = str(error)
+        print('Source binding failed: ' + binding_error, file=sys.stderr)
     binding_module = tests.parent / 'npu_ingress/source_binding.py'
     binding_bytes = binding_module.read_bytes()
+    host_guards = {
+        'airoha_ppe_foe_commit_entry': '''
+            if (ppe->ct_npu_owner &&
+                ((hash >= PPE_SRAM_NUM_ENTRIES && hash < 2 * PPE_SRAM_NUM_ENTRIES) ||
+                 (hash < PPE_SRAM_NUM_ENTRIES && airoha_ppe_npu_bank0_owned(ppe))) &&
+                FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, e->ib1) == AIROHA_FOE_STATE_BIND)
+                return -EBUSY;
+        ''',
+        'airoha_ppe_foe_insert_entry': '''
+            if (ppe->ct_host_ppe &&
+                (hash >= airoha_ppe_get_total_sram_num_entries(ppe) ||
+                 (ppe->ct_npu_owner &&
+                  (hash >= PPE_SRAM_NUM_ENTRIES || airoha_ppe_npu_bank0_owned(ppe)))))
+                goto unlock;
+        ''',
+    }
+    for symbol, guard in host_guards.items():
+        body = function(inputs['airoha_ppe.c'].decode(), symbol)
+        assert re.sub(r'\s+', '', guard) in re.sub(r'\s+', '', body), symbol + ': ownership guard differs'
+        assert body.count('airoha_ppe_npu_bank0_owned(ppe)') == 1, symbol
     for name, functions in FUNCTIONS.items():
         for target, symbol in functions.items():
             (extracted / (target + '.inc')).write_text(function(inputs[name].decode(), symbol))
     for name in HEADERS:
         (extracted / name).write_bytes(inputs[name])
+    eth_header = inputs['airoha_eth.h'].decode()
+    entry_start = eth_header.index('enum {\n\tAIROHA_FOE_STATE_INVALID,')
+    entry_end = eth_header.index('struct airoha_foe_stats {', entry_start)
+    data_start = eth_header.index('struct airoha_flow_data {')
+    data_end = eth_header.index('enum airoha_flow_entry_type {', data_start)
+    entry_size = re.search(r'^#define PPE_ENTRY_SIZE\s+\d+$', eth_header, re.M)
+    assert entry_size
+    (extracted / 'foe_types.inc').write_text(entry_size[0] + '\n' +
+        eth_header[entry_start:entry_end] + eth_header[data_start:data_end])
+    register_header = inputs['airoha_regs.h'].decode()
+    sram_masks = ['PPE_SRAM_CTRL_ACK_MASK', 'PPE_SRAM_CTRL_ENTRY_MASK',
+                  'PPE_SRAM_CTRL_WR_MASK', 'PPE_SRAM_CTRL_REQ_MASK']
+    (extracted / 'sram_masks.inc').write_text(''.join(
+        re.search(r'^#define ' + name + r'\s+[^\n]+$', register_header, re.M)[0] + '\n'
+        for name in sram_masks))
     build = ['clang', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
              '-Wno-unused-function', '-Wno-unused-parameter', '-fsanitize=address,undefined',
              '-fno-sanitize-recover=all', '-I', str(extracted), str(tests / 'diag_test.c')]
@@ -112,7 +163,7 @@ def main():
         'ignore_release_ack': ('close.inc', '!owner->closed_ack ||', 'false ||'),
         'leak_lower_ref': ('retire.inc', 'dev_put(owner->diag_lower);', '(void)owner->diag_lower;'),
         'ignore_restore_flow': ('restore.inc', 'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) ||', 'false ||'),
-        'ignore_route_flow': ('routes.inc', 'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) != diagnostic_flow ||', 'false ||'),
+        'ignore_route_flow': ('routes.inc', 'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) ||', 'false ||'),
         'ignore_route_busy': ('routes.inc', '(airoha_fe_rr(eth, REG_PPE_GLO_CFG(1)) & PPE_GLO_CFG_BUSY_MASK)', 'false'),
         'allow_two_diagnostic_rules': ('active.inc', '(owner->diag_auth ? 1 : 0)', '(owner->diag_auth ? 2 : 0)'),
         'ignore_explicit_auth_mode': ('diag_authorize.inc', '!owner->diag_auth ||', 'false ||'),
@@ -141,32 +192,80 @@ def main():
         'flow_ignore_learn': ('diag_flow.inc', '&& owner->diag_learn', '&& true'),
         'flow_enable_extra_protocol': ('diag_flow.inc', 'PPE_FLOW_CFG_IP4_NAPT_MASK : 0', '(PPE_FLOW_CFG_IP4_NAPT_MASK | BIT(14)) : 0'),
         'ignore_restore_cursor': ('restore.inc', 'owner->bank1_next_row != PPE_SRAM_NUM_ENTRIES ||', 'false ||'),
-        'ignore_restore_miss': ('restore.inc', 'FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, table) != 2', 'false'),
-        'ignore_restore_busy': ('restore.inc', '(status & PPE_GLO_CFG_BUSY_MASK) ||', 'false ||'),
-        'ignore_restore_enabled': ('restore.inc', '!(status & PPE_GLO_CFG_EN_MASK) ||', 'false ||'),
+        'ignore_restore_miss': ('restore.inc', 'FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, table) != 2', 'false', 0),
+        'ignore_restore_busy': ('restore.inc', '(status & PPE_GLO_CFG_BUSY_MASK) ||', 'false ||', 0),
+        'ignore_restore_enabled': ('restore.inc', '!(status & PPE_GLO_CFG_EN_MASK) ||', 'false ||', 0),
         'skip_learning_writes': ('restore.inc', 'if (!flow)', 'if (true)'),
-        'retain_stale_retirement_cursor': ('restore.inc', '\t\towner->bank1_next_row = 0;', '\t\towner->bank1_next_row = PPE_SRAM_NUM_ENTRIES;'),
+        'retain_stale_retirement_cursor': ('restore.inc', '\t\towner->bank0_next_row = 0;', '\t\towner->bank0_next_row = PPE_SRAM_NUM_ENTRIES;'),
         'wrong_learning_miss': ('restore.inc', 'FIELD_PREP(PPE_TB_CFG_SEARCH_MISS_MASK, 3)', 'FIELD_PREP(PPE_TB_CFG_SEARCH_MISS_MASK, 2)'),
         'clobber_other_table_fields': ('restore.inc', '(table & ~PPE_TB_CFG_SEARCH_MISS_MASK) |', '0 |'),
-        'skip_table_readback': ('restore.inc', 'error = airoha_fe_rr(eth, REG_PPE_TB_CFG(1)) == table ? 0 : -EIO;', 'error = 0;'),
+        'skip_table_readback': ('restore.inc', 'error = airoha_fe_rr(eth, REG_PPE_TB_CFG(0)) == table ? 0 : -EIO;', 'error = 0;'),
         'write_flow_after_table_failure': ('restore.inc', 'if (!error) {', 'if (true) {'),
-        'skip_flow_readback': ('restore.inc', 'error = airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) == flow ? 0 : -EIO;', 'error = 0;'),
+        'skip_flow_readback': ('restore.inc', 'error = airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) == flow ? 0 : -EIO;', 'error = 0;'),
         'skip_learning_postcheck': ('restore.inc',
             '\t\treturn error ?: airoha_npu_owner_open_check(owner, id, NPU_TXN_PPE_RESTORE);', '\t\treturn error;'),
         'allow_extra_route_flows': ('routes.inc',
-            'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) != diagnostic_flow ||',
-            '(airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) & diagnostic_flow) != diagnostic_flow ||'),
+            'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) != diagnostic_flow ||',
+            '(airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) & diagnostic_flow) != diagnostic_flow ||'),
         'ignore_route_miss': ('routes.inc',
-            'FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, airoha_fe_rr(eth, REG_PPE_TB_CFG(1))) != (diagnostic_flow ? 3 : 2) ||', 'false ||'),
-        'route_learning_accepts_miss_two': ('routes.inc', '(diagnostic_flow ? 3 : 2)', '2'),
+            'FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, airoha_fe_rr(eth, REG_PPE_TB_CFG(1))) != 2 ||', 'false ||'),
+        'route_learning_accepts_miss_two': ('routes.inc', 'REG_PPE_TB_CFG(0))) != 3', 'REG_PPE_TB_CFG(0))) != 2'),
+        'ignore_bank0_route_flow': ('routes.inc', 'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) != diagnostic_flow ||', 'false ||'),
+        'ignore_bank0_route_busy': ('routes.inc', '(airoha_fe_rr(eth, REG_PPE_GLO_CFG(0)) & PPE_GLO_CFG_BUSY_MASK) ||', 'false ||'),
+        'ignore_bank0_route_enabled': ('routes.inc', '!(airoha_fe_rr(eth, REG_PPE_GLO_CFG(0)) & PPE_GLO_CFG_EN_MASK) ||', 'false ||'),
+        'ignore_bank0_restore_saved': ('restore.inc', '!owner->bank0_saved ||', 'false ||'),
+        'ignore_bank0_restore_cursor': ('restore.inc', 'owner->bank0_next_row != PPE_SRAM_NUM_ENTRIES ||', 'false ||'),
+        'ignore_bank0_restore_flow': ('restore.inc', 'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) ||', 'false ||'),
+        'ignore_bank0_restore_miss': ('restore.inc', 'FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, table) != 2', 'false', 1),
+        'ignore_bank0_restore_busy': ('restore.inc', '(status & PPE_GLO_CFG_BUSY_MASK) ||', 'false ||', 1),
+        'ignore_bank0_restore_enabled': ('restore.inc', '!(status & PPE_GLO_CFG_EN_MASK) ||', 'false ||', 1),
+        'learn_on_bank1': ('restore.inc', 'airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(0), flow);', 'airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(1), flow);'),
+        'skip_start_bank0_drain': ('start_mode.inc', 'error = airoha_npu_diag_bank0_drain(owner);', 'error = 0;'),
+        'skip_close_bank0_drain': ('bank1_drain.inc', 'error = airoha_npu_diag_bank0_drain(owner);', 'error = 0;'),
+        'skip_bank0_clear': ('bank0_drain.inc', 'error = airoha_ppe_bank0_clear_rows(owner->ppe, &owner->bank0_next_row);', 'error = 0;'),
+        'overwrite_bank0_snapshot': ('bank0_drain.inc', 'if (!owner->bank0_saved)', 'if (true)'),
+        'ignore_bank0_drain_flow': ('bank0_drain.inc', 'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) ||', 'false ||'),
+        'ignore_bank0_drain_miss': ('bank0_drain.inc', '(airoha_fe_rr(eth, REG_PPE_TB_CFG(0)) & PPE_TB_CFG_SEARCH_MISS_MASK) != no_foe', 'false'),
+        'ignore_bank0_drain_busy': ('bank0_drain.inc', '!(status & PPE_GLO_CFG_BUSY_MASK)', 'true'),
+        'ignore_bank0_drain_enabled': ('bank0_drain.inc', '!(status & PPE_GLO_CFG_EN_MASK)', 'false'),
+        'ignore_bank0_release_cursor': ('close.inc', '(owner->bank0_saved && owner->bank0_next_row != PPE_SRAM_NUM_ENTRIES) ||', 'false ||'),
+        'ignore_bank0_retire_cursor': ('retire.inc', '(owner->bank0_saved && owner->bank0_next_row != PPE_SRAM_NUM_ENTRIES) ||', 'false ||'),
+        'skip_bank0_release': ('close.inc', 'if (!error && owner->bank0_saved)', 'if (false)'),
+        'skip_bank0_table_readback': ('close.inc', 'airoha_fe_rr(eth, REG_PPE_TB_CFG(0)) != owner->bank0_tb', 'false'),
+        'skip_bank0_flow_readback': ('close.inc', 'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) == owner->bank0_flow ? 0 : -EIO', '0'),
+        'leak_egress_ref': ('retire.inc', 'dev_put(owner->diag_egress);', '(void)owner->diag_egress;'),
+        'ignore_install_saved': ('install.inc', '!owner->bank0_saved ||', 'false ||'),
+        'ignore_install_hash': ('install.inc', '!airoha_ppe_bank0_hash(owner->diag_hash) ||', 'false ||'),
+        'ignore_install_cursor': ('install.inc', 'owner->bank0_next_row != PPE_SRAM_NUM_ENTRIES ||', 'false ||'),
+        'ignore_install_invalidated': ('install.inc', 'if (owner->invalidated)', 'if (false)'),
+        'skip_install': ('restore.inc', 'error = airoha_npu_diag_install(owner);', 'error = 0;'),
+        'ignore_install_empty': ('install.inc', 'memcmp(entry, &invalid, sizeof(invalid))', '((void)invalid, 0)'),
+        'ignore_install_readback': ('install.inc', 'memcmp(entry, &owner->diag_entry, sizeof(*entry))', '0'),
+        'ignore_install_read_ack': ('install.inc', '!airoha_ppe_ct_sram_ack(ppe->eth, owner->diag_hash, false)', 'false', 0),
+        'ignore_install_write_ack': ('install.inc', '!airoha_ppe_ct_sram_ack(ppe->eth, owner->diag_hash, true)', 'false'),
+        'ignore_install_verify_ack': ('install.inc', '!airoha_ppe_ct_sram_ack(ppe->eth, owner->diag_hash, false)', 'false', 1),
+        'ignore_bind_tuple': ('bind.inc', 'memcmp(&learned->ipv4.orig_tuple, &bound.ipv4.orig_tuple,\n\t\t\tsizeof(bound.ipv4.orig_tuple))', 'false'),
+        'ignore_bind_ack': ('bind.inc', '!airoha_ppe_ct_sram_ack(eth, hash, false)', 'false'),
+        'ignore_bind_hash': ('bind.inc', '!airoha_ppe_bank0_hash(hash) ||', 'false ||'),
+        'lose_bind_service': ('bind.inc', 'owner->diag_service);', 'owner->diag_service ^ 1u);'),
+        'ownership_requires_active': ('bank0_owned.inc', 'return owner &&', 'return airoha_ppe_npu_diag_active(ppe, owner) &&'),
+        'ownership_requires_flow': ('bank0_owned.inc', 'return owner &&', 'return airoha_ppe_npu_diag_flow(ppe, owner) &&'),
+        'ownership_ignores_saved': ('bank0_owned.inc', 'owner->bank0_saved ||', 'false ||'),
+        'ownership_ignores_learning': ('bank0_owned.inc', '|| owner->diag_learn', '|| false'),
+        'ownership_requires_both': ('bank0_owned.inc', 'owner->bank0_saved || owner->diag_learn', 'owner->bank0_saved && owner->diag_learn'),
+        'ownership_after_release': ('bank0_owned.inc', 'return owner &&', 'return !owner ||'),
     }
     caught = {}
-    for name, (filename, before, after) in mutations.items():
+    for name, mutation in mutations.items():
+        filename, before, after, *occurrence = mutation
         path = extracted / filename
         original = path.read_text()
-        assert original.count(before) == 1, name
+        assert original.count(before) == (2 if occurrence else 1), name
+        position = original.index(before)
+        if occurrence and occurrence[0]:
+            position = original.index(before, position + len(before))
         try:
-            path.write_text(original.replace(before, after))
+            path.write_text(original[:position] + after + original[position + len(before):])
             target = output / name
             run(build + ['-o', str(target)], output, name + '-build')
             outcome = subprocess.run([str(target)], text=True, capture_output=True, timeout=30)
@@ -175,15 +274,22 @@ def main():
             caught[name] = outcome.returncode
         finally:
             path.write_text(original)
-    binding.verify_unchanged()
+    if binding_error is None:
+        binding.verify_unchanged()
+    else:
+        assert binding.read_patches() == binding.snapshot, 'patches changed during tests; rerun'
     assert binding_module.read_bytes() == binding_bytes, 'source-binding helper changed during tests; rerun'
     assert all((driver / name).read_bytes() == data for name, data in inputs.items()), 'source changed during tests; rerun'
-    passed = review['accepted_invalid_hogs'] == 0
+    assert all((tests / name).read_bytes() == data for name, data in test_inputs.items()), 'tests changed during run; rerun'
+    passed = binding_error is None and review['accepted_invalid_hogs'] == 0
     report = {'passed': passed, 'regression_passed': True, 'result': result, 'review': review,
-              'caught_mutations': caught, 'source_binding': binding.report(),
+              'caught_mutations': caught,
+              'host_ownership_guards': list(host_guards),
+              'sanitizers': ['address', 'undefined'],
+              'source_binding': binding.report() if binding_error is None else {'error': binding_error},
               'source_binding_helper_sha256': digest(binding_bytes),
               'source_sha256': {name: digest(data) for name, data in inputs.items()},
-              'tests_sha256': {path.name: digest(path.read_bytes()) for path in tests.iterdir() if path.is_file()}}
+              'tests_sha256': {name: digest(data) for name, data in test_inputs.items()}}
     (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
     return 0 if passed else 1
