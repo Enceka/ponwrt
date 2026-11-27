@@ -1,0 +1,323 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: preserve NPU lifecycle transaction identities
+
+Build CLOSE, AUTH QUERY/DISARM, QUIET and OPEN messages at acknowledged
+transaction boundaries. Retain the exact operation identity on timeout,
+cache the old authorization for DISARM, and close an interrupted reopen
+before advancing its epoch. Keep both return consumers running during
+QUIET and leave register ownership to the driver's lifecycle callbacks.
+
+The core does not enable PON qualification or install authorization rules.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -22,4 +22,5 @@
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
++#include "airoha_npu_transaction_core.h"
+ 
+ /* Serialize airoha_gdm_dev flags, QDMA pointer and PPE CPU port
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_transaction_core.h
+@@ -0,0 +1,301 @@
++#ifndef AIROHA_NPU_TRANSACTION_CORE_H
++#define AIROHA_NPU_TRANSACTION_CORE_H
++
++#ifdef __KERNEL__
++#include <linux/errno.h>
++#else
++#include <errno.h>
++#include <stdbool.h>
++#endif
++#include "npu_auth_mailbox_abi.h"
++#include "npu_bank1_gate_abi.h"
++
++enum airoha_npu_txn_phase {
++	NPU_TXN_IDLE, NPU_TXN_ROUTES_CLOSE, NPU_TXN_GATE_CLOSE,
++	NPU_TXN_EPOCH_ADVANCE, NPU_TXN_AUTH_QUERY, NPU_TXN_AUTH_DISARM,
++	NPU_TXN_FE_QUIESCE, NPU_TXN_GATE_QUIET, NPU_TXN_PPE_DRAIN,
++	NPU_TXN_CLOSED, NPU_TXN_READY, NPU_TXN_PPE_RESTORE,
++	NPU_TXN_FE_ARM, NPU_TXN_GATE_OPEN, NPU_TXN_ROUTES_OPEN, NPU_TXN_OPEN,
++};
++
++struct airoha_npu_txn_identity {
++	gate_u32 epoch, generation, open_mask;
++};
++
++struct airoha_npu_txn {
++	struct airoha_npu_txn_identity id;
++	enum airoha_npu_txn_phase phase;
++	gate_u32 auth_epoch, auth_generation;
++	int last_error;
++	bool renew_epoch;
++};
++
++struct airoha_npu_txn_ops {
++	int (*gate)(void *ctx, struct npu_gate_message *message);
++	int (*auth)(void *ctx, struct npu_auth_message *message);
++	int (*routes_close)(void *ctx, const struct airoha_npu_txn_identity *id);
++	int (*fe_quiesce)(void *ctx, const struct airoha_npu_txn_identity *id);
++	int (*ppe_drain)(void *ctx, const struct airoha_npu_txn_identity *id);
++	int (*ready)(void *ctx, const struct airoha_npu_txn_identity *id);
++	int (*ppe_restore)(void *ctx, const struct airoha_npu_txn_identity *id);
++	int (*fe_arm)(void *ctx, const struct airoha_npu_txn_identity *id);
++	int (*routes_open)(void *ctx, const struct airoha_npu_txn_identity *id);
++};
++
++static inline bool
++airoha_npu_txn_identity_valid(const struct airoha_npu_txn_identity *id)
++{
++	return id->epoch && id->generation && id->open_mask &&
++	       !(id->open_mask & ~(GATE_FE24 | GATE_PON2));
++}
++
++static inline bool
++airoha_npu_txn_ops_valid(const struct airoha_npu_txn_ops *ops)
++{
++	return ops && ops->gate && ops->auth && ops->routes_close &&
++	       ops->fe_quiesce && ops->ppe_drain && ops->ready &&
++	       ops->ppe_restore && ops->fe_arm && ops->routes_open;
++}
++
++static inline int
++airoha_npu_txn_begin(struct airoha_npu_txn *txn, gate_u32 epoch,
++		    gate_u32 generation, gate_u32 open_mask)
++{
++	struct airoha_npu_txn_identity id = { epoch, generation, open_mask };
++
++	if (!txn || !airoha_npu_txn_identity_valid(&id) ||
++	    txn->phase < NPU_TXN_IDLE || txn->phase > NPU_TXN_OPEN)
++		return -EINVAL;
++	if (txn->phase != NPU_TXN_IDLE && epoch == txn->id.epoch &&
++	    generation == txn->id.generation && open_mask == txn->id.open_mask)
++		return 0;
++	if (txn->phase != NPU_TXN_IDLE && txn->phase != NPU_TXN_OPEN &&
++	    txn->phase != NPU_TXN_CLOSED)
++		return -ESTALE;
++	if (epoch <= txn->id.epoch)
++		return -ESTALE;
++	txn->id = id;
++	txn->phase = NPU_TXN_ROUTES_CLOSE;
++	txn->auth_epoch = 0;
++	txn->auth_generation = 0;
++	txn->renew_epoch = false;
++	txn->last_error = 0;
++	return 0;
++}
++
++static inline int
++airoha_npu_txn_gate(struct airoha_npu_txn *txn,
++		   const struct airoha_npu_txn_ops *ops, void *ctx, gate_u32 op)
++{
++	struct npu_gate_message message = {
++		.w = {
++			[GM_MAGIC] = GATE_MAGIC,
++			[GM_ABI_OP] = GATE_ABI | op << 16,
++			[GM_BYTES] = GATE_BYTES,
++			[GM_EPOCH] = txn->id.epoch,
++			[GM_GENERATION] = txn->id.generation,
++			[GM_OPEN_MASK] = op == GATE_OPEN ? txn->id.open_mask : 0,
++			[GM_STATUS] = (gate_u32)-115,
++		},
++	};
++	struct npu_gate_message request = message;
++	gate_u32 index;
++	int error;
++
++	error = ops->gate(ctx, &message);
++	if (error)
++		return error;
++	for (index = 0; index < GM_STATUS; ++index)
++		if (message.w[index] != request.w[index])
++			return -EPROTO;
++	if (message.w[GM_STATUS] || message.w[GM_RESERVED2] ||
++	    (message.w[GM_CAPS] != GATE_CAPS &&
++	     message.w[GM_CAPS] != (GATE_CAPS | GATE_CAP_PON2)) ||
++	    message.w[GM_STATE_EPOCH] != txn->id.epoch ||
++	    message.w[GM_STATE_GENERATION] != txn->id.generation)
++		return -EPROTO;
++	if (op != GATE_OPEN &&
++	    (message.w[GM_CLOSED] != 1 || message.w[GM_MASK]))
++		return -EPROTO;
++	if (op == GATE_QUIET &&
++	    (message.w[GM_QUIET_ACK] != 1 || message.w[GM_FAULT] ||
++	     message.w[GM_TDMA0] || message.w[GM_TDMA1] ||
++	     message.w[GM_COMPLETION] || message.w[GM_DONE] ||
++	     message.w[GM_FE_ENABLED] || message.w[GM_FE_QUIESCED] != 1 ||
++	     message.w[GM_FE_INFLIGHT] || message.w[GM_ER_STATE] ||
++	     message.w[GM_ER_QUEUED] || message.w[GM_DMA_IDLE] != 1 ||
++	     message.w[GM_AUTH_INFLIGHT] || message.w[GM_AUTH_ENABLED]))
++		return -EPROTO;
++	if (op == GATE_OPEN &&
++	    (message.w[GM_CLOSED] || message.w[GM_MASK] != txn->id.open_mask ||
++	     (!(message.w[GM_CAPS] & GATE_CAP_PON2) &&
++	      (txn->id.open_mask & GATE_PON2)) ||
++	     message.w[GM_QUIET_ACK] || message.w[GM_FAULT] ||
++	     message.w[GM_FE_ENABLED] != 1 || message.w[GM_FE_QUIESCED] ||
++	     message.w[GM_ER_FLAGS] > (GATE_ER_BOUND | GATE_ER_ACTIVE) ||
++	     !(message.w[GM_ER_FLAGS] & GATE_ER_BOUND) ||
++	     ((message.w[GM_CAPS] == GATE_CAPS ||
++	       txn->id.open_mask == (GATE_FE24 | GATE_PON2)) &&
++	      !(message.w[GM_ER_FLAGS] & GATE_ER_ACTIVE)) ||
++	     message.w[GM_AUTH_ENABLED] != 1 ||
++	     message.w[GM_AUTH_EPOCH] != txn->id.epoch ||
++	     message.w[GM_AUTH_GENERATION] != txn->id.generation))
++		return -EPROTO;
++	return 0;
++}
++
++static inline int
++airoha_npu_txn_auth(struct airoha_npu_txn *txn,
++		   const struct airoha_npu_txn_ops *ops, void *ctx, gate_u32 op)
++{
++	struct npu_auth_message message = {
++		.w = {
++			[AM_MAGIC] = AUTH_MBOX_MAGIC,
++			[AM_ABI_OP] = AUTH_MBOX_ABI | op << 16,
++			[AM_BYTES] = AUTH_MBOX_BYTES,
++			[AM_EPOCH] = op == AUTH_MBOX_QUERY ? 0 : txn->auth_epoch,
++			[AM_GENERATION] = op == AUTH_MBOX_QUERY ? 0 : txn->auth_generation,
++			[AM_STATUS] = (auth_u32)-115,
++		},
++	};
++	struct npu_auth_message request = message;
++	auth_u32 epoch, generation, index;
++	int error;
++
++	error = ops->auth(ctx, &message);
++	if (error)
++		return error;
++	for (index = 0; index < AM_STATUS; ++index)
++		if (message.w[index] != request.w[index])
++			return -EPROTO;
++	epoch = message.w[AM_STATE_EPOCH];
++	generation = message.w[AM_STATE_GENERATION];
++	if (message.w[AM_STATUS] || message.w[AM_CAPS] != AUTH_MBOX_CAPS ||
++	    message.w[AM_RESERVED2] || message.w[AM_COUNT] > 32 ||
++	    message.w[AM_INFLIGHT] > 64 || message.w[AM_ENABLED] > 1 ||
++	    (!epoch != !generation) ||
++	    (!epoch && (message.w[AM_COUNT] || message.w[AM_INFLIGHT] ||
++			message.w[AM_ENABLED])))
++		return -EPROTO;
++	if (op == AUTH_MBOX_DISARM &&
++	    (epoch != txn->auth_epoch || generation != txn->auth_generation ||
++	     message.w[AM_ENABLED]))
++		return -EPROTO;
++	if (op == AUTH_MBOX_QUERY) {
++		txn->auth_epoch = epoch;
++		txn->auth_generation = generation;
++	}
++	return 0;
++}
++
++static inline int
++airoha_npu_txn_close(struct airoha_npu_txn *txn,
++		    const struct airoha_npu_txn_ops *ops, void *ctx)
++{
++	int error = 0;
++
++	if (!txn || !airoha_npu_txn_ops_valid(ops) ||
++	    !airoha_npu_txn_identity_valid(&txn->id) ||
++	    txn->phase <= NPU_TXN_IDLE || txn->phase > NPU_TXN_OPEN)
++		return -EINVAL;
++	if (txn->phase > NPU_TXN_CLOSED) {
++		txn->renew_epoch = true;
++		txn->phase = NPU_TXN_ROUTES_CLOSE;
++	}
++	while (txn->phase < NPU_TXN_CLOSED) {
++		switch (txn->phase) {
++		case NPU_TXN_ROUTES_CLOSE:
++			error = ops->routes_close(ctx, &txn->id);
++			break;
++		case NPU_TXN_GATE_CLOSE:
++			error = airoha_npu_txn_gate(txn, ops, ctx, GATE_CLOSE);
++			if (!error) {
++				txn->phase = txn->renew_epoch ?
++					NPU_TXN_EPOCH_ADVANCE : NPU_TXN_AUTH_QUERY;
++				continue;
++			}
++			break;
++		case NPU_TXN_EPOCH_ADVANCE:
++			if (txn->id.epoch == (gate_u32)-1) {
++				error = -EOVERFLOW;
++				break;
++			}
++			++txn->id.epoch;
++			txn->renew_epoch = false;
++			txn->phase = NPU_TXN_GATE_CLOSE;
++			continue;
++		case NPU_TXN_AUTH_QUERY:
++			error = airoha_npu_txn_auth(txn, ops, ctx, AUTH_MBOX_QUERY);
++			if (!error && !txn->auth_epoch) {
++				txn->phase = NPU_TXN_FE_QUIESCE;
++				continue;
++			}
++			break;
++		case NPU_TXN_AUTH_DISARM:
++			error = airoha_npu_txn_auth(txn, ops, ctx, AUTH_MBOX_DISARM);
++			break;
++		case NPU_TXN_FE_QUIESCE:
++			error = ops->fe_quiesce(ctx, &txn->id);
++			break;
++		case NPU_TXN_GATE_QUIET:
++			error = airoha_npu_txn_gate(txn, ops, ctx, GATE_QUIET);
++			break;
++		case NPU_TXN_PPE_DRAIN:
++			error = ops->ppe_drain(ctx, &txn->id);
++			break;
++		default:
++			error = -EINVAL;
++			break;
++		}
++		if (error)
++			break;
++		++txn->phase;
++	}
++	txn->last_error = error > 0 ? -EPROTO : error;
++	return txn->last_error;
++}
++
++static inline int
++airoha_npu_txn_open(struct airoha_npu_txn *txn,
++		   const struct airoha_npu_txn_ops *ops, void *ctx)
++{
++	int error = 0;
++
++	if (!txn || !airoha_npu_txn_ops_valid(ops) ||
++	    !airoha_npu_txn_identity_valid(&txn->id) ||
++	    txn->phase < NPU_TXN_IDLE || txn->phase > NPU_TXN_OPEN)
++		return -EINVAL;
++	if (txn->phase < NPU_TXN_CLOSED)
++		return -EBUSY;
++	if (txn->phase == NPU_TXN_CLOSED)
++		txn->phase = NPU_TXN_READY;
++	while (txn->phase < NPU_TXN_OPEN) {
++		switch (txn->phase) {
++		case NPU_TXN_READY:
++			error = ops->ready(ctx, &txn->id);
++			break;
++		case NPU_TXN_PPE_RESTORE:
++			error = ops->ppe_restore(ctx, &txn->id);
++			break;
++		case NPU_TXN_FE_ARM:
++			error = ops->fe_arm(ctx, &txn->id);
++			break;
++		case NPU_TXN_GATE_OPEN:
++			error = airoha_npu_txn_gate(txn, ops, ctx, GATE_OPEN);
++			break;
++		case NPU_TXN_ROUTES_OPEN:
++			error = ops->routes_open(ctx, &txn->id);
++			break;
++		default:
++			error = -EINVAL;
++			break;
++		}
++		if (error)
++			break;
++		++txn->phase;
++	}
++	txn->last_error = error > 0 ? -EPROTO : error;
++	return txn->last_error;
++}
++
++#endif

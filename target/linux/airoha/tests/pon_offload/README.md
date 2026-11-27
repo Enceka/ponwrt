@@ -138,6 +138,16 @@ vmlinux 链接。模块检查使用独立内核树，将基线中同一驱动的
 
 NPU 固件对应的双来源实现已经进入 `an7581-npu-firmware` 主仓库，两个队列
 共享 FE/channel7 停止与故障边界，各自维护 epoch、consumer 和 producer。
+
+`990` 实现关闭/重开事务核：先关闭入口与 gate，再用查询得到的旧身份撤销
+授权，随后 FE QUIESCE、全局 QUIET 和 PPE drain。每阶段收到有效回执才推进；
+失败保留阶段、epoch/generation 及旧授权身份。放弃重开时先 CLOSE 原身份，
+再推进 epoch 并重新关闭。CLOSED 阶段的 AUTH_BEGIN/ADD 超时由 owner 显式
+分配新 epoch，重新关闭后重建授权。`tests/npu_transaction_core/` 的 366 项
+ASan/UBSan 用例已通过，涵盖阶段失败、丢 ACK、身份溢出及两队列排空。
+此事务核已随 AArch64 vmlinux 编译；实际入口、寄存器和设备引用由后续 owner
+接入，重开期间仍需在各回调检查实时 generation、撤销状态与 ER binding。
+
 下一步接入内核关闭/重开事务、native FE 共享所有权和 PON 映射更新，完成
 同 tuple 跨 LAN/PON 的硬件查表隔离后再开放 PON PPE 准入并做实板验收。
 当前设备沿用之前通过验收的 RAM 镜像。
