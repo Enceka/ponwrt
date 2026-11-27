@@ -2,18 +2,25 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/ip.h>
+#include <linux/if_arp.h>
+#include <linux/if_vlan.h>
+#include <linux/ipv6.h>
 #include <linux/of.h>
+#include <linux/random.h>
 #include <linux/rtnetlink.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/udp.h>
 #include <linux/unaligned.h>
 #include <net/ip.h>
+#include <net/ip6_checksum.h>
 #include "airoha_eth.h"
 #include "airoha_regs.h"
 
 #define PROBE_MAGIC 0x4354504e
 #define PROBE_BYTES 128
+#define PROBE_MARKER_BYTES 20
+#define PROBE_MAX_BYTES 130
 #undef airoha_fe_rr
 #undef airoha_fe_wr
 #define airoha_fe_rr(eth, reg) readl((eth)->fe_regs + (reg))
@@ -30,6 +37,15 @@ static u32 saved_registers[10];
 static u32 sequence;
 static atomic_t received = ATOMIC_INIT(0);
 static u32 received_sequence, received_msg0, received_msg1;
+enum probe_kind {
+	PROBE_IPV4, PROBE_IPV6, PROBE_ARP, PROBE_VLAN, PROBE_PPPOE,
+	PROBE_FRAGMENT, PROBE_SHORT, PROBE_KIND_COUNT,
+};
+static const char * const kind_names[] = {
+	"ipv4", "ipv6", "arp", "vlan", "pppoe", "fragment", "short",
+};
+static u32 probe_cookie, sent_kind, sent_length, received_kind, received_length;
+static bool awaiting;
 static int last_error;
 static bool special_tag;
 module_param(special_tag, bool, 0400);
@@ -65,20 +81,112 @@ static const struct airoha_pon_link_ops controller_ops = {
 	.stop = controller_stop,
 };
 
+static int marker_offset(struct sk_buff *skb, u32 kind)
+{
+	struct iphdr ipv4;
+	struct ipv6hdr ipv6;
+	struct udphdr udp;
+	u8 header[28];
+	unsigned int offset = 0, end = skb->len, transport_length;
+	__be16 protocol = skb->protocol;
+	bool tagged = skb_vlan_tag_present(skb), session = false;
+	u16 fragment;
+
+	if (protocol == htons(ETH_P_8021Q)) {
+		if (skb_copy_bits(skb, 0, header, VLAN_HLEN) ||
+		    get_unaligned_be16(header) != 37)
+			return -EINVAL;
+		protocol = htons(get_unaligned_be16(header + 2));
+		offset = VLAN_HLEN;
+		tagged = true;
+	}
+	if (tagged && kind != PROBE_VLAN)
+		return -EINVAL;
+	if (protocol == htons(ETH_P_PPP_SES)) {
+		if (kind != PROBE_PPPOE ||
+		    skb_copy_bits(skb, offset, header, 8) ||
+		    header[0] != 0x11 || header[1] ||
+		    get_unaligned_be16(header + 2) != 1 ||
+		    get_unaligned_be16(header + 6) != 0x21 ||
+		    get_unaligned_be16(header + 4) < 2 ||
+		    get_unaligned_be16(header + 4) > end - offset - 6)
+			return -EINVAL;
+		end = offset + 6 + get_unaligned_be16(header + 4);
+		offset += 8;
+		protocol = htons(ETH_P_IP);
+		session = true;
+	}
+	if (kind == PROBE_PPPOE && !session)
+		return -EINVAL;
+	if (protocol == htons(ETH_P_ARP)) {
+		if (kind != PROBE_ARP || skb_copy_bits(skb, offset, header, sizeof(header)) ||
+		    get_unaligned_be16(header) != ARPHRD_ETHER ||
+		    get_unaligned_be16(header + 2) != ETH_P_IP ||
+		    header[4] != ETH_ALEN || header[5] != 4 ||
+		    get_unaligned_be16(header + 6) != ARPOP_REQUEST)
+			return -EINVAL;
+		return offset + sizeof(header);
+	}
+	if (protocol == htons(ETH_P_IPV6)) {
+		if (kind != PROBE_IPV6 || end - offset < sizeof(ipv6) ||
+		    skb_copy_bits(skb, offset, &ipv6, sizeof(ipv6)) ||
+		    ipv6.version != 6 || ipv6.nexthdr != IPPROTO_UDP ||
+		    ntohs(ipv6.payload_len) > end - offset - sizeof(ipv6))
+			return -EINVAL;
+		offset += sizeof(ipv6);
+		transport_length = ntohs(ipv6.payload_len);
+	} else if (protocol == htons(ETH_P_IP)) {
+		if (kind == PROBE_IPV6 || kind == PROBE_ARP ||
+		    end - offset < sizeof(ipv4) ||
+		    skb_copy_bits(skb, offset, &ipv4, sizeof(ipv4)) ||
+		    ipv4.version != 4 || ipv4.ihl != 5 || ipv4.protocol != IPPROTO_UDP ||
+		    ntohs(ipv4.tot_len) < sizeof(ipv4) + sizeof(udp) + PROBE_MARKER_BYTES ||
+		    ntohs(ipv4.tot_len) > end - offset)
+			return -EINVAL;
+		fragment = ntohs(ipv4.frag_off);
+		if (fragment != (kind == PROBE_FRAGMENT ? IP_MF : 0) ||
+		    (kind == PROBE_SHORT && ntohs(ipv4.tot_len) != 56))
+			return -EINVAL;
+		offset += sizeof(ipv4);
+		transport_length = ntohs(ipv4.tot_len) - sizeof(ipv4);
+	} else {
+		return -EINVAL;
+	}
+	if (transport_length < sizeof(udp) + PROBE_MARKER_BYTES ||
+	    skb_copy_bits(skb, offset, &udp, sizeof(udp)) ||
+	    udp.source != htons(49152) || udp.dest != htons(49153) ||
+	    ntohs(udp.len) != transport_length + (kind == PROBE_FRAGMENT ? 8 : 0))
+		return -EINVAL;
+	return offset + sizeof(udp);
+}
+
 static rx_handler_result_t receive(struct sk_buff **packet)
 {
 	struct sk_buff *skb = *packet;
-	u8 payload[8];
+	u8 payload[PROBE_MARKER_BYTES];
+	u32 kind;
+	int offset;
 
-	if (skb->protocol != htons(ETH_P_IP) ||
-	    skb_copy_bits(skb, sizeof(struct iphdr) + sizeof(struct udphdr),
-			  payload, sizeof(payload)) ||
-	    get_unaligned_be32(payload) != PROBE_MAGIC)
+	if (!smp_load_acquire(&awaiting) || skb->len > PROBE_MAX_BYTES)
 		return RX_HANDLER_PASS;
+	kind = READ_ONCE(sent_kind);
+	if (kind >= PROBE_KIND_COUNT)
+		return RX_HANDLER_PASS;
+	offset = marker_offset(skb, kind);
+	if (offset < 0 || skb_copy_bits(skb, offset, payload, sizeof(payload)) ||
+	    get_unaligned_be32(payload) != PROBE_MAGIC ||
+	    get_unaligned_be32(payload + 4) != READ_ONCE(sequence) ||
+	    get_unaligned_be32(payload + 8) != probe_cookie ||
+	    get_unaligned_be32(payload + 12) != kind ||
+	    get_unaligned_be32(payload + 16) != READ_ONCE(sent_length))
+		return RX_HANDLER_PASS;
+	WRITE_ONCE(received_kind, kind);
+	WRITE_ONCE(received_length, skb->len);
 	WRITE_ONCE(received_sequence, get_unaligned_be32(payload + 4));
 	WRITE_ONCE(received_msg0, READ_ONCE(probe_dev->pon_stats.last_rx_msg0));
 	WRITE_ONCE(received_msg1, READ_ONCE(probe_dev->pon_stats.last_rx_msg1));
 	atomic_inc(&received);
+	smp_store_release(&awaiting, false);
 	dev_kfree_skb_any(skb);
 	return RX_HANDLER_CONSUMED;
 }
@@ -288,56 +396,126 @@ static int prepare(void)
 	return err;
 }
 
-static int transmit(unsigned int service)
+static int transmit(unsigned int service, unsigned int kind)
 {
 	struct sk_buff *skb;
 	struct ethhdr *ethernet;
 	struct iphdr *ipv4;
+	struct ipv6hdr *ipv6;
 	struct udphdr *udp;
-	u8 *payload;
+	u8 *payload, *frame;
+	unsigned int length, network = ETH_HLEN, transport, udp_length;
+	__be16 protocol = htons(ETH_P_IP);
 	int pending, err;
 
-	if (!retained || !opened || !service || service > U16_MAX)
+	if (!retained || !opened || !service || service > U16_MAX || kind >= PROBE_KIND_COUNT)
 		return -EINVAL;
 	err = mapping(service);
 	if (err)
 		return err;
-	skb = netdev_alloc_skb(probe_netdev, PROBE_BYTES + NET_IP_ALIGN);
+	length = kind == PROBE_SHORT ? ETH_HLEN + 56 :
+		 kind == PROBE_FRAGMENT ? PROBE_MAX_BYTES : PROBE_BYTES;
+	skb = netdev_alloc_skb(probe_netdev, length + NET_IP_ALIGN);
 	if (!skb)
 		return -ENOMEM;
 	skb_reserve(skb, NET_IP_ALIGN);
-	ethernet = skb_put_zero(skb, PROBE_BYTES);
+	frame = skb_put_zero(skb, length);
+	ethernet = (struct ethhdr *)frame;
 	ether_addr_copy(ethernet->h_dest, probe_netdev->dev_addr);
 	eth_random_addr(ethernet->h_source);
-	ethernet->h_proto = htons(ETH_P_IP);
+	if (kind == PROBE_VLAN) {
+		protocol = htons(ETH_P_8021Q);
+		put_unaligned_be16(37, frame + network);
+		put_unaligned_be16(ETH_P_IP, frame + network + 2);
+		network += VLAN_HLEN;
+	} else if (kind == PROBE_PPPOE) {
+		protocol = htons(ETH_P_PPP_SES);
+		frame[network] = 0x11;
+		put_unaligned_be16(1, frame + network + 2);
+		put_unaligned_be16(length - network - 6, frame + network + 4);
+		put_unaligned_be16(0x21, frame + network + 6);
+		network += 8;
+	} else if (kind == PROBE_IPV6) {
+		protocol = htons(ETH_P_IPV6);
+	} else if (kind == PROBE_ARP) {
+		protocol = htons(ETH_P_ARP);
+	}
+	ethernet->h_proto = protocol;
 	skb_reset_mac_header(skb);
-	skb_set_network_header(skb, ETH_HLEN);
-	skb_set_transport_header(skb, ETH_HLEN + sizeof(*ipv4));
-	ipv4 = ip_hdr(skb);
-	ipv4->version = 4;
-	ipv4->ihl = 5;
-	ipv4->tot_len = htons(PROBE_BYTES - ETH_HLEN);
-	ipv4->ttl = 32;
-	ipv4->protocol = IPPROTO_UDP;
-	ipv4->saddr = htonl(0xc0000201);
-	ipv4->daddr = htonl(0xc0000202);
-	ip_send_check(ipv4);
+	skb_set_network_header(skb, network);
+	if (kind == PROBE_ARP) {
+		payload = frame + network;
+		put_unaligned_be16(ARPHRD_ETHER, payload);
+		put_unaligned_be16(ETH_P_IP, payload + 2);
+		payload[4] = ETH_ALEN;
+		payload[5] = 4;
+		put_unaligned_be16(ARPOP_REQUEST, payload + 6);
+		ether_addr_copy(payload + 8, ethernet->h_source);
+		put_unaligned_be32(0xc0000201, payload + 14);
+		put_unaligned_be32(0xc0000202, payload + 24);
+		payload += 28;
+		goto marker;
+	}
+	transport = network + (kind == PROBE_IPV6 ? sizeof(*ipv6) : sizeof(*ipv4));
+	skb_set_transport_header(skb, transport);
+	udp_length = length - transport;
+	if (kind == PROBE_IPV6) {
+		ipv6 = ipv6_hdr(skb);
+		ipv6->version = 6;
+		ipv6->payload_len = htons(udp_length);
+		ipv6->nexthdr = IPPROTO_UDP;
+		ipv6->hop_limit = 32;
+		ipv6->saddr.s6_addr32[0] = htonl(0x20010db8);
+		ipv6->saddr.s6_addr32[3] = htonl(1);
+		ipv6->daddr.s6_addr32[0] = htonl(0x20010db8);
+		ipv6->daddr.s6_addr32[3] = htonl(2);
+	} else {
+		ipv4 = ip_hdr(skb);
+		ipv4->version = 4;
+		ipv4->ihl = 5;
+		ipv4->tot_len = htons(length - network);
+		ipv4->id = htons(sequence + 1);
+		ipv4->frag_off = htons(kind == PROBE_FRAGMENT ? IP_MF : 0);
+		ipv4->ttl = 32;
+		ipv4->protocol = IPPROTO_UDP;
+		ipv4->saddr = htonl(0xc0000201);
+		ipv4->daddr = htonl(0xc0000202);
+		ip_send_check(ipv4);
+	}
 	udp = udp_hdr(skb);
 	udp->source = htons(49152);
 	udp->dest = htons(49153);
-	udp->len = htons(PROBE_BYTES - ETH_HLEN - sizeof(*ipv4));
+	udp->len = htons(udp_length + (kind == PROBE_FRAGMENT ? 8 : 0));
 	payload = (u8 *)(udp + 1);
+marker:
 	put_unaligned_be32(PROBE_MAGIC, payload);
 	put_unaligned_be32(++sequence, payload + 4);
-	skb->protocol = htons(ETH_P_IP);
+	put_unaligned_be32(probe_cookie, payload + 8);
+	put_unaligned_be32(kind, payload + 12);
+	put_unaligned_be32(length, payload + 16);
+	if (kind == PROBE_IPV6) {
+		ipv6 = ipv6_hdr(skb);
+		udp = udp_hdr(skb);
+		udp->check = csum_ipv6_magic(&ipv6->saddr, &ipv6->daddr, udp_length,
+					   IPPROTO_UDP, csum_partial(udp, udp_length, 0));
+		if (!udp->check)
+			udp->check = CSUM_MANGLED_0;
+	}
+	WRITE_ONCE(sent_kind, kind);
+	WRITE_ONCE(sent_length, length);
+	smp_store_release(&awaiting, true);
+	skb->protocol = protocol;
 	skb->ip_summed = CHECKSUM_NONE;
 	skb->dev = probe_netdev;
 	err = dev_queue_xmit(skb);
-	if (err)
+	if (err) {
+		smp_store_release(&awaiting, false);
 		return net_xmit_errno(err);
+	}
 	err = read_poll_timeout(atomic_read, pending, !pending, 1000, 100000,
 				false, &probe_dev->pon_tx_pending);
 	msleep(20);
+	smp_store_release(&awaiting, false);
 	return err;
 }
 
@@ -353,6 +531,9 @@ static int status_show(struct seq_file *file, void *unused)
 		retained, controller, opened, registers_saved, last_error,
 		atomic_read(&probe_dev->pon_tx_pending), sequence, atomic_read(&received),
 		received_sequence, received_msg0, received_msg1);
+	seq_printf(file, "tx_kind=%s tx_length=%u rx_kind=%s rx_length=%u\n",
+		kind_names[READ_ONCE(sent_kind)], READ_ONCE(sent_length),
+		kind_names[READ_ONCE(received_kind)], READ_ONCE(received_length));
 	seq_printf(file, "submitted=%llu completed=%llu dropped=%llu no_mapping=%llu rx_data=%llu rx_delivered=%llu last_tx=%08x/%08x last_rx=%08x/%08x\n",
 		stats.tx_packets_submitted, stats.tx_packets_completed, stats.tx_packets_hw_dropped,
 		stats.tx_no_mapping, stats.rx_data_packets, stats.rx_packets_delivered,
@@ -374,9 +555,9 @@ DEFINE_SHOW_ATTRIBUTE(status);
 static ssize_t command_write(struct file *file, const char __user *buffer,
 			      size_t length, loff_t *offset)
 {
-	char command[40], trailing;
-	unsigned int service;
-	int err;
+	char command[64], kind_name[16] = "ipv4", trailing;
+	unsigned int service, kind;
+	int err, fields;
 
 	if (!length || length >= sizeof(command) || copy_from_user(command, buffer, length))
 		return -EINVAL;
@@ -386,10 +567,18 @@ static ssize_t command_write(struct file *file, const char __user *buffer,
 		err = prepare();
 	else if (sysfs_streq(command, "restore"))
 		err = restore();
-	else if (sscanf(command, "send %u %c", &service, &trailing) == 1)
-		err = transmit(service);
-	else
+	else {
 		err = -EINVAL;
+		fields = sscanf(command, "send %u %15s %c", &service, kind_name, &trailing);
+		if (fields == 1 || fields == 2) {
+			for (kind = 0; kind < PROBE_KIND_COUNT; kind++) {
+				if (!strcmp(kind_name, kind_names[kind])) {
+					err = transmit(service, kind);
+					break;
+				}
+			}
+		}
+	}
 	last_error = err;
 	mutex_unlock(&probe_lock);
 	return err ?: length;
@@ -413,6 +602,7 @@ static int __init probe_init(void)
 		goto release;
 	}
 	probe_dev = netdev_priv(probe_netdev);
+	probe_cookie = get_random_u32();
 	err = eligible();
 	if (err)
 		goto release;

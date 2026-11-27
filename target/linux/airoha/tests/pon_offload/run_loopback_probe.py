@@ -20,7 +20,21 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--special-tag', action='store_true')
+    parser.add_argument('--cover-slot', type=int, choices=(0, 1))
+    parser.add_argument('--withdraw-cycle', action='store_true')
+    parser.add_argument('--sif-sweep', action='store_true')
+    parser.add_argument('--sif-mode', choices=('source', 'absent', 'only'), default='source')
+    parser.add_argument('--packet-matrix', action='store_true')
+    parser.add_argument('--require-native', action='store_true')
     args = parser.parse_args()
+    if args.cover_slot is not None and not args.special_tag:
+        parser.error('--cover-slot requires --special-tag')
+    if args.withdraw_cycle and args.cover_slot is None:
+        parser.error('--withdraw-cycle requires --cover-slot')
+    if args.sif_sweep and (args.cover_slot != 1 or args.withdraw_cycle):
+        parser.error('--sif-sweep requires --cover-slot 1 without --withdraw-cycle')
+    if args.packet_matrix and (args.cover_slot != 1 or args.withdraw_cycle or args.sif_sweep):
+        parser.error('--packet-matrix requires --cover-slot 1 without other experiments')
     uuid.UUID(args.boot)
     blob = args.module.read_bytes()
     assert hashlib.sha256(blob).hexdigest() == args.sha256
@@ -50,13 +64,16 @@ def main():
         return remote(label, 'echo ' + shlex.quote(command) + ' > ' + path)
 
     before, _ = remote('before', 'cat /sys/kernel/debug/gpio; cat ' + classifier +
-                       '; cat /sys/kernel/debug/ppe/config; ip -d link show pon0')
+                       '; cat /sys/kernel/debug/ppe/config; ip -d link show pon0; cat ' +
+                       '/sys/bus/platform/devices/1fb50000.ethernet/ct_native_pair_policy')
     assert re.search(r'ram-pon-tx-disable[^\n]*out hi', before)
     assert 'saved=0 dirty=00 active=00 pending=0 scope=01000000 ready=0' in before
     assert 'ct_cpu_fallback: 0 ' in before
     assert 'state DOWN' in before
+    policy_pattern = r'^generation=\d+ allowed=' + ('1' if args.require_native else r'\d+') + r' failed=0$'
+    assert re.search(policy_pattern, before, re.M)
     report = {'boot': args.boot, 'module_sha256': args.sha256, 'special_tag': args.special_tag,
-              'observations': []}
+              'cover_slot': args.cover_slot, 'sif_sweep': args.sif_sweep, 'observations': []}
     if not args.run:
         print(json.dumps({'preflight': True, 'output': str(output)}))
         return
@@ -73,23 +90,72 @@ def main():
         baseline, _ = remote('baseline', 'cat ' + probe + 'status')
         write('prepare', probe + 'command', 'prepare')
         remote('prepared', 'cat ' + probe + 'status; cat /sys/kernel/debug/ppe/config')
-        write('classify-a', classifier, 'set 0 0x2134')
-        write('classify-b', classifier, 'set 1 0xa134')
+        if args.cover_slot is None:
+            write('classify-a', classifier, 'set 0 0x2134')
+            write('classify-b', classifier, 'set 1 0xa134')
+        else:
+            write('cover', classifier, 'cover ' + str(args.cover_slot))
+            write('classify-a', classifier, 'set ' + str(args.cover_slot ^ 1) + ' 0x2134')
+            write('route', classifier, 'route')
         remote('classified', 'cat ' + classifier + '; cat /sys/kernel/debug/ppe/config')
-        for index, service in enumerate((0x2134, 0xa134, 0x2134)):
+        cases = [(service, (), True) for service in (0x2134, 0xa134, 0x2134)]
+        if args.sif_sweep:
+            cases = [(0x2134, (args.sif_mode + ' ' + str(source), 'route'), True) for source in range(32)]
+        if args.withdraw_cycle:
+            cases += [
+                (0x2134, ('clear ' + str(args.cover_slot ^ 1), 'route'), True),
+                (0xa134, (), True),
+                (0x2134, ('set ' + str(args.cover_slot ^ 1) + ' 0x2134', 'route'), True),
+                (0xa134, ('clear ' + str(args.cover_slot),), False),
+                (0x2134, ('clear ' + str(args.cover_slot ^ 1),), False),
+            ]
+        cases = [(*case, 'ipv4') for case in cases]
+        if args.packet_matrix:
+            cases = [(service, (), True, kind)
+                     for kind in ('ipv4', 'ipv6', 'arp', 'vlan', 'pppoe', 'fragment', 'short')
+                     for service in (0x2134, 0xa134)]
+        for index, (service, commands, routed, kind) in enumerate(cases):
             label = 'send-' + str(index)
-            sent, status = remote(label, 'echo ' + shlex.quote('send ' + str(service)) +
+            for step, command in enumerate(commands):
+                write(label + '-transition-' + str(step), classifier, command)
+            previous, _ = remote(label + '-before', 'cat ' + probe + 'status')
+            command = 'send ' + str(service) + (' ' + kind if args.packet_matrix else '')
+            sent, status = remote(label, 'echo ' + shlex.quote(command) +
                                   ' > ' + probe + 'command', check=False)
-            observed, _ = remote(label + '-observed', 'cat ' + probe + 'status; cat ' + classifier)
+            observed, _ = remote(label + '-observed', 'cat ' + probe + 'status; cat ' + classifier +
+                                 '; cat /sys/kernel/debug/ppe/config; cat ' +
+                                 '/sys/bus/platform/devices/1fb50000.ethernet/ct_native_pair_policy')
             fields = dict(re.findall(r'(\w+)=([0-9a-f]+)', observed.splitlines()[0]))
             returned_service = (int(fields['rx_msg0'], 16) >> 14) & 0xffff
             returned_source = (int(fields['rx_msg1'], 16) >> 21) & 31
             numbered_return = int(fields['received']) == index + 1 and int(fields['rx_sequence']) == index + 1
+            before_heads = dict(re.findall(r'^rx(\d+) head=(\d+)', previous, re.M))
+            after_heads = dict(re.findall(r'^rx(\d+) head=(\d+)', observed, re.M))
+            changed_rings = [int(ring) for ring in before_heads if before_heads[ring] != after_heads[ring]]
             report['observations'].append({'service': service, 'command_status': status,
+                                          'kind': kind,
                                           'returned_service': returned_service, 'returned_source': returned_source,
-                                          'numbered_return': numbered_return, 'state': observed})
+                                          'numbered_return': numbered_return, 'changed_rings': changed_rings,
+                                          'transitions': commands, 'state': observed})
             if status:
                 raise RuntimeError(label + ' failed; see recorded status')
+            assert 'ct_cpu_fallback: 0 ' in observed
+            assert re.search(policy_pattern, observed, re.M)
+            if args.cover_slot is not None:
+                assert numbered_return and 'routed=' + str(int(routed)) in observed
+                assert len(changed_rings) == 1, 'expected a covered WAN CPU receive ring'
+                if args.packet_matrix:
+                    expected_ring = 2 if kind in ('ipv4', 'ipv6', 'fragment') and service == 0x2134 else 4
+                    assert changed_rings == [expected_ring], 'packet missed its exclusive optical CPU rule'
+                    assert 'tx_kind=' + kind in observed and 'rx_kind=' + kind in observed
+                elif args.sif_sweep:
+                    assert changed_rings[0] in (2, 4)
+                elif not routed:
+                    assert changed_rings == [0], 'withdrawal did not return to default WAN CPU'
+                elif service == 0xa134 or index in (3, 4):
+                    assert changed_rings == [2 + 2 * args.cover_slot], 'unknown service missed CPU cover'
+                else:
+                    assert changed_rings == [2], 'expected lower-index matching CPU rule'
         report['commands_completed'] = True
         report['numbered_packets_returned'] = all(item['numbered_return'] for item in report['observations'])
         report['service_preserved'] = all(item['returned_service'] == item['service'] and
@@ -110,7 +176,7 @@ def main():
                           '; cat /sys/bus/platform/devices/1fb50000.ethernet/ct_native_pair_policy; dmesg | tail -45')
         assert 'ct_cpu_fallback: 0 ' in after
         assert 'saved=0 dirty=00 active=00 pending=0 scope=01000000 ready=0' in after
-        assert re.search(r'^generation=\d+ allowed=\d+ failed=0$', after, re.M)
+        assert re.search(policy_pattern, after, re.M)
         (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     assert report['numbered_packets_returned'], 'numbered loopback packets missing'
     if args.special_tag:

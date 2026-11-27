@@ -1,6 +1,19 @@
 # RAM GDM2 service loopback
 
-This optional external test module submits numbered IPv4/UDP packets through
+The current covered-route acceptance is recorded in `../IFC-PROBE.md`.
+With kernel patches through 984, the runner supports `--cover-slot 1`
+plus either `--packet-matrix` or `--withdraw-cycle`. Add `--require-native`
+to require the existing native policy to stay enabled and healthy before,
+during and after every packet. The matrix verifies exact optical rings:
+IPv4/IPv6/fragment service2134 selects RX2; other tested packets select RX4.
+The withdrawal cycle also verifies the return to default WAN CPU RX0.
+
+`--sif-sweep --sif-mode source|absent|only --cover-slot 1` selects the
+32-source diagnostic in patch 983. It requires native policy disabled.
+Each source replacement returns GDM2 to CPU before changing the owned
+rows; the runner then requests the audited classifier route again.
+
+This optional external test module submits bounded numbered packets through
 the existing PON mapping and QDMA transmit interfaces. It owns a temporary
 controller for an otherwise down `pon0`, enables GDM2 internal loopback, and
 captures the returning packets through an RX handler. It is not part of the
@@ -30,9 +43,11 @@ registers a local controller, opens the interface, and configures the mapping
 through `airoha_eth_pon_update_begin/configure/update_end`. The temporary
 controller's start callback restores GDM2 CPU forwarding before returning.
 The same transaction interface changes GEM for each send. The module sends
-one 128-byte frame per `send`, waits up to 100 ms for TX completion, and
-observes RX for 20 ms. The packet carries a magic word and monotonically
-increasing sequence number; the handler consumes only those packets.
+one 70..130-byte frame per `send`, waits up to 100 ms for TX completion, and
+observes RX for another 20 ms. The handler accepts marked packets during
+this send window. Its marker contains magic, sequence, a per-load random
+cookie, kind and transmitted frame length, each a big-endian 32-bit word.
+Only a marker matching the currently submitted packet is consumed.
 
 `restore` first requires optical classifier withdrawal, stops transmission,
 removes mappings through the transaction API, disables loopback, removes
@@ -84,7 +99,80 @@ python3 target/linux/airoha/tests/pon_offload/run_loopback_probe.py \
 
 Omit `--run` for preflight only. Omit `--special-tag` for the control run.
 PON PPE qualification stays closed throughout. The final module exposes
-only `prepare`, `send <decimal-service>` and `restore`.
+only `prepare`, `send <decimal-service> [kind]` and `restore`.
+
+## Packet kinds
+
+Omitting `kind` preserves the existing `send <decimal-service>` command
+and selects `ipv4`. Kind names are case-sensitive; unknown kinds and
+trailing arguments fail with `-EINVAL`. The decimal service remains a
+nonzero 16-bit number. For example, `send 8500 ipv6` selects service 0x2134.
+
+All frames target the local `pon0` MAC and use a locally administered
+random source MAC. IPv4 uses documentation addresses 192.0.2.1/192.0.2.2;
+IPv6 uses 2001:db8::1/::2. UDP ports are 49152/49153. No neighbor lookup,
+external route, socket or external endpoint participates in construction.
+The existing internal-loopback and TX_DISABLE prerequisites remain in
+force. The module does not add a route-to-PPE command.
+
+Lengths below include the Ethernet header and exclude FCS:
+
+| Kind | Frame bytes | Inner format and length | Marker location |
+| --- | ---: | --- | --- |
+| `ipv4` | 128 | IPv4 IHL5, total 114, UDP 94 | UDP payload |
+| `ipv6` | 128 | Basic IPv6, payload 74, UDP 74 | UDP payload |
+| `arp` | 128 | Ethernet/IPv4 ARP request, standard 28-byte ARP body | Private experiment trailer immediately after ARP body |
+| `vlan` | 128 | One 802.1Q tag, VID37, IPv4 total 110, UDP 90 | Inner UDP payload |
+| `pppoe` | 128 | PPPoE session 1, code 0, length 108; PPP protocol 0x0021; IPv4 total 106, UDP 86 | Inner UDP payload |
+| `fragment` | 130 | IPv4 total 116, MF=1/offset=0; 96 bytes of fragment payload, UDP declared 104 | First fragment's UDP payload |
+| `short` | 70 | IPv4 total 56, UDP 36 | UDP payload |
+
+Every IPv4 header has a software checksum. IPv4 UDP uses its permitted
+zero checksum. IPv6 UDP has a mandatory computed pseudo-header checksum,
+with a computed zero encoded as 0xffff. PPPoE session data has no discovery
+exchange: its locally fabricated session header is an encapsulation probe.
+ARP retains a standard request body; the identifying trailer is private
+experiment data, not an additional ARP field.
+
+`fragment` is an intentional first fragment of an incomplete datagram.
+Its 96-byte non-final IP payload is eight-byte aligned; UDP declares eight
+more bytes than this fragment carries. No tail fragment is sent. `short`
+is a complete, well-formed small IPv4/UDP packet: total 56 deliberately
+falls inside the existing 20..57 IPv4 short-LUT interval. The RX handler
+consumes both before host reassembly or ordinary protocol handling.
+
+The RX handler starts from `skb->protocol` and bounded `skb_copy_bits`
+reads. It accepts a single inline VLAN header or a stripped VLAN packet,
+checks PPPoE length/protocol, and validates fixed IPv4/IPv6 and UDP header
+boundaries before locating the marker. IPv4 options, IPv6 extensions,
+non-first fragments, unexpected protocols, truncated headers and mismatched
+markers pass to the normal receive path. A frame over 130 RX skb bytes
+also passes. A VLAN-kind packet with stripped tags is identified by its
+current sequence/cookie/kind marker even if RX presents plain IPv4.
+
+Status retains the original counters and adds `tx_kind`, `tx_length`,
+`rx_kind` and `rx_length`. `tx_length` is the complete submitted Ethernet
+frame. `rx_length` is `skb->len` at the RX handler, after Ethernet removal
+and any VLAN stripping. For an unchanged frame, expect RX length 14 bytes
+below TX length; stripped VLAN removes another 4. The existing `sequence`
+and `rx_sequence` distinguish a new TX from the last successful marked RX.
+All lengths and kinds are diagnostic observations, independent of the
+runner's per-packet service/ring/native-health checks.
+
+The packet-kind candidate is built separately in
+`/workdir/pon-cover-module-types` against `/workdir/pon-cover-982`, using
+the matching OpenWrt toolchain and original module Makefile. Private
+driver structures and controller/mapping lifecycle remain unchanged.
+
+Local validation extracts the actual `marker_offset` and `receive`
+functions into a bounded skb harness. Its 545 ASan/UBSan cases cover all
+seven formats, truncation before the complete marker, each marker byte,
+wrong protocol, oversized input, stripped VLAN, PPPoE length errors,
+IPv4 fragment flags/offsets and an unsupported IPv6 extension header.
+The harness uses independent packet fixtures; transmit construction is
+compiled as part of the real module. Inputs, extracted harness, compiler
+logs and `rx-parser-result.json` are in `/workdir/pon-cover-module-types`.
+No packet-kind board run is included in this validation.
 
 ## Board evidence — 2026-11-27
 
