@@ -1,0 +1,175 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: retain ER exposure identity until exact unbind
+
+Serialize provider ER operations, record ring exposure before BIND, and
+retain it across mailbox errors. Reject stale identities and overlapping
+DMA window aliases; release exposure only after a clean STOP and UNBIND.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -891,6 +891,7 @@
+ static int airoha_npu_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
++	struct airoha_npu_instance *instance;
+ 	struct airoha_npu *npu;
+ 	struct resource res;
+ 	void __iomem *base;
+@@ -901,11 +902,13 @@
+ 	if (IS_ERR(base))
+ 		return PTR_ERR(base);
+ 
+-	npu = devm_kzalloc(dev, sizeof(*npu), GFP_KERNEL);
+-	if (!npu)
++	instance = devm_kzalloc(dev, sizeof(*instance), GFP_KERNEL);
++	if (!instance)
+ 		return -ENOMEM;
+ 
++	npu = &instance->npu;
+ 	npu->dev = dev;
++	mutex_init(&instance->er.lock);
+ 	npu->ops.ppe_init = airoha_npu_ppe_init;
+ 	npu->ops.ppe_deinit = airoha_npu_ppe_deinit;
+ 	npu->ops.ppe_init_stats = airoha_npu_ppe_stats_setup;
+--- a/drivers/net/ethernet/airoha/airoha_npu_transaction.inc
++++ b/drivers/net/ethernet/airoha/airoha_npu_transaction.inc
+@@ -1,4 +1,5 @@
+ #include "npu_eth_return_abi.h"
++#include "airoha_npu_er_provider.h"
+ 
+ int airoha_npu_auth_command(struct airoha_npu *npu,
+ 			    struct npu_auth_message *msg)
+@@ -51,7 +52,7 @@
+ 	return err;
+ }
+ 
+-int airoha_npu_er_command(struct airoha_npu *npu, struct er_message *msg)
++static int airoha_npu_er_exchange(struct airoha_npu *npu, struct er_message *msg)
+ {
+ 	struct {
+ 		__le32 command, function, data[16];
+@@ -86,12 +87,34 @@
+ 	discovery = op == ER_QUERY && !msg->w[2] && !msg->w[3] &&
+ 		    !msg->w[4] && !msg->w[5] && !sport && !msg->w[7];
+ 	if (err > 0 || (!err && (op > ER_UNBIND ||
++	    (op != ER_QUERY && (le32_to_cpu(reply[10]) != ER_IDLE || reply[12])) ||
+ 	    (!discovery && sport != ER_LAN1 &&
+ 	     (sport != ER_PON || !(caps & ER_CAP_SOURCES))))))
+ 		return -EPROTO;
+ 
+ 	for (index = 0; index < 16; index++)
+ 		msg->w[index] = le32_to_cpu(reply[index]);
++	return err;
++}
++
++int airoha_npu_er_command(struct airoha_npu *npu, struct er_message *msg)
++{
++	struct airoha_npu_instance *instance;
++	struct airoha_npu_er_provider *provider;
++	int err;
++
++	if (!npu || !msg)
++		return -EOPNOTSUPP;
++	instance = container_of(npu, struct airoha_npu_instance, npu);
++	provider = &instance->er;
++	mutex_lock(&provider->lock);
++	err = airoha_npu_er_prepare(provider, msg);
++	if (!err) {
++		err = airoha_npu_er_exchange(npu, msg);
++		if (!err)
++			airoha_npu_er_complete(provider, msg);
++	}
++	mutex_unlock(&provider->lock);
+ 	return err;
+ }
+ 
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_er_provider.h
+@@ -0,0 +1,86 @@
++#ifndef AIROHA_NPU_ER_PROVIDER_H
++#define AIROHA_NPU_ER_PROVIDER_H
++
++#include <linux/mutex.h>
++#include "npu_eth_return_abi.h"
++
++struct airoha_npu_er_provider {
++	struct mutex lock;
++	struct airoha_npu_er_exposure {
++		struct er_config config;
++		bool exposed;
++		bool stopped;
++	} sources[2];
++};
++
++struct airoha_npu_instance {
++	struct airoha_npu npu;
++	struct airoha_npu_er_provider er;
++};
++
++static struct airoha_npu_er_exposure *
++airoha_npu_er_source(struct airoha_npu_er_provider *provider, u32 sport)
++{
++	return &provider->sources[sport == ER_PON];
++}
++
++static int airoha_npu_er_prepare(struct airoha_npu_er_provider *provider,
++				const struct er_message *msg)
++{
++	struct airoha_npu_er_exposure *source;
++	struct er_config config;
++	u32 op = msg->w[1] >> 16, index, base;
++
++	lockdep_assert_held(&provider->lock);
++	if (msg->w[0] != ER_MAGIC || (msg->w[1] & 0xffff) != ER_ABI ||
++	    op > ER_UNBIND)
++		return -EINVAL;
++	if (op == ER_QUERY)
++		return 0;
++	memcpy(&config, &msg->w[2], sizeof(config));
++	if (!er_config_valid(&config))
++		return -EINVAL;
++	source = airoha_npu_er_source(provider, config.sport);
++	if (op != ER_BIND) {
++		if (memcmp(&source->config, &config, sizeof(config)))
++			return -ESTALE;
++		if (op == ER_UNBIND && source->exposed && !source->stopped)
++			return -EBUSY;
++		return 0;
++	}
++	if (source->exposed)
++		return -EBUSY;
++	if (config.epoch <= source->config.epoch)
++		return -ESTALE;
++	base = config.dma & (ER_WINDOW - 1);
++	for (index = 0; index < ARRAY_SIZE(provider->sources); index++) {
++		struct airoha_npu_er_exposure *other = &provider->sources[index];
++		u32 other_base = other->config.dma & (ER_WINDOW - 1);
++
++		if (other->exposed && base < other_base + other->config.bytes &&
++		    other_base < base + config.bytes)
++			return -EEXIST;
++	}
++	source->config = config;
++	source->stopped = false;
++	source->exposed = true;
++	return 0;
++}
++
++static void airoha_npu_er_complete(struct airoha_npu_er_provider *provider,
++				  const struct er_message *msg)
++{
++	struct airoha_npu_er_exposure *source;
++	u32 op = msg->w[1] >> 16;
++
++	lockdep_assert_held(&provider->lock);
++	if (op == ER_QUERY || op == ER_BIND)
++		return;
++	source = airoha_npu_er_source(provider, msg->w[6]);
++	if (op == ER_STOP)
++		source->stopped = true;
++	else if (op == ER_UNBIND)
++		source->exposed = false;
++}
++
++#endif
+
