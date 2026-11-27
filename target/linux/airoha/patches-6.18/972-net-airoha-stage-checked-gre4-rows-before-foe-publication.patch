@@ -1,0 +1,151 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: stage plain GRE egress rows before linking the FOE
+
+Prepare a caller-owned FOE only after the entire shared FE row has been
+acknowledged. Stop on the first incomplete bank and let the row owner
+drain the command port before cleanup. Expose the missing underlay and
+ownership requirements when flower asks for tunnel encapsulation.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_gre4_port.h
+@@ -0,0 +1,119 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef AIROHA_CT_GRE4_PORT_H
++#define AIROHA_CT_GRE4_PORT_H
++
++#include "airoha_ct_gre4_lifetime.h"
++#include <linux/iopoll.h>
++
++#define AIROHA_CT_GRE4_CMD 0x207c
++
++/* All transactions on this staging port must have the same owner. wait()
++ * acknowledges the preceding command. The owner drains separately on fault.
++ */
++struct airoha_ct_gre4_port {
++	void (*wr)(void *ctx, u32 reg, u32 val);
++	int (*wait)(void *ctx);
++	void *ctx;
++};
++
++static inline void airoha_ct_gre4_fe_wr(void *ctx, u32 reg, u32 value)
++{
++	struct airoha_eth *eth = ctx;
++
++	airoha_fe_wr(eth, reg, value);
++}
++
++static inline int airoha_ct_gre4_fe_wait(void *ctx)
++{
++	struct airoha_eth *eth = ctx;
++	u32 value;
++
++	return read_poll_timeout(airoha_fe_rr, value, value & BIT(31), 2, 1000,
++				 false, eth, AIROHA_CT_GRE4_CMD);
++}
++
++static inline int airoha_ct_gre4_drain(void *ctx)
++{
++	struct airoha_ct_gre4_port *port = ctx;
++
++	/* The lifetime manager calls this only for our own timed-out command.
++	 * An exclusive owner leaves the staging words alone until it finishes.
++	 */
++	return port->wait(port->ctx);
++}
++
++static inline int airoha_ct_gre4_write(void *arg, u8 slot,
++				       const struct airoha_ct_gre4_row *row)
++{
++	struct airoha_ct_gre4_port *port = arg;
++	static const u8 banks[] = { 4, 0, 1, 2, 3 };
++	unsigned int i, j;
++	int err;
++
++	if (slot < 32 || slot >= 64)
++		return -ERANGE;
++	for (i = 0; i < ARRAY_SIZE(banks); i++) {
++		u32 bank = banks[i];
++
++		for (j = 0; j < 4; j++) {
++			u32 value = 0;
++
++			if (row && bank < 4)
++				value = row->words[1 + bank * 4 + j];
++			else if (row && j == 3)
++				value = row->words[0];
++			port->wr(port->ctx, AIROHA_CT_GRE4_CMD + 16 - 4 * j, value);
++		}
++		port->wr(port->ctx, AIROHA_CT_GRE4_CMD, (bank << 16) | (slot << 8) | 0x11);
++		err = port->wait(port->ctx);
++		if (err)
++			return err;
++	}
++	return 0;
++}
++
++static inline void airoha_ct_gre4_io_init(struct airoha_eth *eth, struct airoha_ct_gre4_port *port,
++					 struct airoha_ct_gre4_io *io)
++{
++	*port = (struct airoha_ct_gre4_port) {
++		.wr = airoha_ct_gre4_fe_wr, .wait = airoha_ct_gre4_fe_wait, .ctx = eth,
++	};
++	*io = (struct airoha_ct_gre4_io) {
++		.write = airoha_ct_gre4_write, .drain = airoha_ct_gre4_drain, .ctx = port,
++	};
++}
++
++/* The slot range and action/type checks in link() are independent. Validate
++ * the latter before issuing the first FE command, then put the allocated
++ * slot into the validated draft. No fallible step follows acquisition.
++ */
++static inline int
++airoha_ct_gre4_prepare(struct airoha_ct_gre4_pool *pool, struct airoha_ct_gre4_ref *ref,
++		       const struct airoha_ct_gre4_io *io, struct airoha_foe_entry *foe,
++		       enum flow_action_id action, const u8 *header, size_t len)
++{
++	struct airoha_ct_gre4_row row;
++	struct airoha_foe_entry draft;
++	int err;
++
++	if (!pool || !pool->owned || !io || !io->write || !io->drain)
++		return -EOPNOTSUPP;
++	if (!ref || !foe)
++		return -EINVAL;
++	err = airoha_ct_gre4_row_encode(&row, action, header, len);
++	if (err)
++		return err;
++	draft = *foe;
++	err = airoha_ct_gre4_link(&draft, action, 32);
++	if (err)
++		return err;
++	err = airoha_ct_gre4_get(pool, ref, &row, io);
++	if (err)
++		return err;
++	draft.ipv4.data &= ~AIROHA_FOE_TUNNEL_ID;
++	draft.ipv4.data |= FIELD_PREP(AIROHA_FOE_TUNNEL_ID, ref->slot);
++	*foe = draft;
++	return 0;
++}
++
++#endif
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -33,6 +33,7 @@
+ #define AIROHA_PON_QDMA_HQOS_EN	BIT(31)
+ 
+ #include "airoha_ct_ifc.h"
++#include "airoha_ct_gre4_port.h"
+ #include "airoha_ct_smac.h"
+ 
+ static const struct rhashtable_params airoha_flow_table_params = {
+@@ -2279,6 +2280,10 @@
+ 		case FLOW_ACTION_REDIRECT:
+ 			odev = act->dev;
+ 			break;
++		case FLOW_ACTION_TUNNEL_ENCAP:
++			NL_SET_ERR_MSG_MOD(f->common.extack,
++				"Tunnel offload requires a resolved egress header and qualified FE row ownership");
++			return -EOPNOTSUPP;
+ 		case FLOW_ACTION_PRIORITY:
+ 			if (bridge && act->priority)
+ 				return -EOPNOTSUPP;

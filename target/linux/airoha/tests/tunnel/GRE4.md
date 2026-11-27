@@ -82,3 +82,31 @@ The FE model delivers a late write during drain. Cases include both ends of the
 dynamic range, sparse ownership, pool exhaustion, a one-word difference at each
 of the 17 positions, a shared row after an earlier hole, a failed FOE retirement,
 and repeated recovery failures during both row creation and final release.
+
+## FE row transaction (patch 972)
+
+With an exclusively owned, clean slot mask, `airoha_ct_gre4_prepare` validates
+the outbound header and FOE type, acquires a shared row through the supplied I/O
+backend and updates a caller-owned, unpublished FOE only on success. The FE
+adapter stages four words at offsets `0x208c` down to `0x2080`, then issues the
+bank command at `0x207c` and waits for bit 31. Bank order is 4, 0, 1, 2, 3.
+A timeout stops staging and quarantines the port. Draining this command port
+and draining FOE packet readers are separate operations.
+
+The driver returns `-EOPNOTSUPP` for flower tunnel encap. The current action
+provides `ip_tunnel_info`; a flow owner still needs a route-qualified, complete
+wire header, exclusive access to the table and acknowledged retirement of the
+FOE consumers. No hardware owner or packet path is registered by this patch.
+
+Run the compiled row transaction with traced register I/O on ARM64 Linux:
+
+```sh
+cp "$TEST_DIR/gre4_port_vectors.c" drivers/net/ethernet/airoha/
+make ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" KCFLAGS=-fno-stack-protector drivers/net/ethernet/airoha/gre4_port_vectors.o
+gcc -shared -o /tmp/gre4_port.so drivers/net/ethernet/airoha/gre4_port_vectors.o
+python3 -c 'import ctypes,itertools; f=ctypes.CDLL("/tmp/gre4_port.so").gre4_port_test; assert all(f(s,n,c)==0 for s,n,c in itertools.product(range(32,64),range(6),range(2)))'
+```
+
+Only the user-mode test wrapper disables the per-task kernel stack canary.
+The 384 cases check each staging word, command, completion boundary and slot;
+failed creation preserves the draft and a shared acquisition emits no writes.
