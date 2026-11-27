@@ -53,10 +53,13 @@ is unchanged. Route opening revalidates the firmware gate before MMIO.
 claim/close, return preparation and authorization. Success retains the
 owner and return consumer. Failure starts the complete close transaction;
 a failed close preserves its phase and DMA resources for another close
-attempt. Normal activation remains gated by `ct_pon_qualified`. Atomic
-admission revocation, periodic owner health checks, cross-domain flow
-isolation and hardware-reset DMA retirement are the next activation
-prerequisites; boot and ordinary PON configuration still use existing paths.
+attempt. Normal activation remains gated by `ct_pon_qualified`. Patch `999-z`
+adds atomic admission revocation and periodic owner health checks; `999-za`
+blocks host learning into the claimed bank and validates native IP learning
+against its physical source bank. Activation still requires retiring old host
+bank1 cookies and rows before reuse, completing ingress-domain classification,
+and hardware-reset DMA retirement. Boot and ordinary PON configuration still
+use existing paths.
 
 Run against a kernel source tree containing patches through `999`:
 
