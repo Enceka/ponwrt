@@ -113,6 +113,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/patches-6.18/999-za-net-airoha-isolate-ct-flow-learning.patch \
   target/linux/airoha/patches-6.18/999-zb-net-airoha-publish-epon-registration-identity.patch \
   target/linux/airoha/patches-6.18/999-zc-net-airoha-retire-host-bank1-before-npu-reuse.patch \
+  target/linux/airoha/patches-6.18/999-zd-net-airoha-prepare-authorized-pon-npu-ingress.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config,NATIVE_PAIRS.md} \
   target/linux/airoha/tests/native_pair/*.{py,c} \
   target/linux/airoha/tests/native_pair/fixtures/*.inc \
@@ -127,6 +128,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/tests/reset_provider/*.{py,c,md} \
   target/linux/airoha/tests/npu_owner/*.{py,c,h,inc,md} \
   target/linux/airoha/tests/npu_bank1/*.{py,c,h,inc,md} \
+  target/linux/airoha/tests/npu_ingress/{*.py,*.c,*.md,Makefile} \
   target/linux/airoha/tests/npu_owner_events/*.{py,c,md} \
   target/linux/airoha/tests/npu_auth_publish/*.{py,c,md} \
   target/linux/airoha/tests/eth_return/*.{py,c,h,md} \
