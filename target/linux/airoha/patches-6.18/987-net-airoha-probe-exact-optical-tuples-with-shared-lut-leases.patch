@@ -1,0 +1,415 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: exercise exact optical tuples with CPU consumers
+
+Add a RAM-only fixed UDP tuple probe backed by transactional shared LUT
+leases. Audit the typed optical cover and short guards before publishing,
+verify predicates and consumers before routing, and retire consumers before
+recovering or releasing predicates. Keep optical PPE qualification disabled.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -19,6 +19,7 @@
+ #include <net/dsa.h>
+ #include "airoha_ct_flow_admission.h"
+ #include "airoha_ct_pon_ifc_owner.h"
++#include "airoha_ct_ifc_tuple_pool.h"
+ 
+ #define AIROHA_MAX_NUM_GDM_PORTS	4
+ #define AIROHA_MAX_NUM_GDM_DEVS		2
+@@ -778,6 +779,9 @@
+ 	 */
+ 	bool ct_pon_qualified;
+ 	struct airoha_ct_pon_ifc_owner ct_pon_ifc;
++	struct airoha_ct_ifc_pool ct_pon_ifc_pool;
++	struct airoha_ct_ifc_pool_lease ct_pon_ifc_lease[2];
++	bool ct_pon_ifc_tuple;
+ 	u16 ct_pon_ifc_services[2];
+ 	u8 ct_pon_ifc_cover;
+ 	bool ct_pon_ifc_route_owned;
+--- a/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_cpu.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_cpu.h
+@@ -46,6 +46,208 @@
+ 		.put = airoha_ct_pon_ifc_put,
+ 		.drain = airoha_ct_pon_ifc_drain,
+ 	};
++}
++
++static int airoha_ct_pon_ifc_tuple_read(void *ctx, unsigned int slot, u32 words[2])
++{
++	return airoha_ct_fe_table(ctx, CT_IFC_LUT1_BANK, slot, 0, false, words, 2);
++}
++
++static int airoha_ct_pon_ifc_tuple_put(void *ctx, unsigned int slot, const u32 words[2])
++{
++	u32 copy[2] = { words[0], words[1] };
++
++	return airoha_ct_fe_table(ctx, CT_IFC_LUT1_BANK, slot, 0, true, copy, 2);
++}
++
++static struct airoha_ct_ifc_pool_io airoha_ct_pon_ifc_tuple_io(struct airoha_ppe *ppe)
++{
++	return (struct airoha_ct_ifc_pool_io) {
++		.ctx = ppe,
++		.read = airoha_ct_pon_ifc_tuple_read,
++		.put = airoha_ct_pon_ifc_tuple_put,
++		.drain = airoha_ct_pon_ifc_drain,
++	};
++}
++
++static bool airoha_ct_pon_ifc_tuple_busy(struct airoha_ppe *ppe)
++{
++	struct airoha_ct_ifc_pool *pool = &ppe->ct_pon_ifc_pool;
++
++	return ppe->ct_pon_ifc_tuple || pool->pending || pool->reserved || pool->dirty ||
++	       pool->leases || pool->releasing || ppe->ct_pon_ifc_lease[0].count ||
++	       ppe->ct_pon_ifc_lease[1].count;
++}
++
++static int airoha_ct_pon_ifc_tuple_words(struct airoha_ct_ifc_tuple_words words[2])
++{
++	const struct airoha_ct_ifc_tuple tuples[2] = {
++		{ .src = { 0xc0000201 }, .dst = { 0xc0000202 },
++		  .sport = 49152, .dport = 49153, .family = 4, .protocol = 17 },
++		{ .src = { 0x20010db8, 0, 0, 1 }, .dst = { 0x20010db8, 0, 0, 2 },
++		  .sport = 49152, .dport = 49153, .family = 6, .protocol = 17 },
++	};
++	unsigned int family;
++	int err;
++
++	for (family = 0; family < 2; family++) {
++		err = airoha_ct_ifc_tuple_encode(&words[family], &tuples[family]);
++		if (err)
++			return err;
++	}
++	return 0;
++}
++
++static int airoha_ct_pon_ifc_tuple_rows(struct airoha_ppe *ppe, unsigned int service,
++				      struct airoha_ct_pon_ifc_words rows[2])
++{
++	u32 short_mask = 0;
++	unsigned int family;
++	int err;
++
++	for (family = 0; family < 2; family++) {
++		if (ppe->ct_ifc.rule[family].lut_index >= CT_IFC_LUT1_COUNT)
++			return -EUCLEAN;
++		short_mask |= BIT(ppe->ct_ifc.rule[family].lut_index);
++	}
++	for (family = 0; family < 2; family++) {
++		u32 mask = ppe->ct_pon_ifc_lease[family].mask;
++		unsigned int short_lut = ppe->ct_ifc.rule[family].lut_index;
++
++		if (!mask || (mask & short_mask))
++			return -EUCLEAN;
++		err = airoha_ct_pon_ifc_cpu_encode(&rows[family], service,
++						  family ? ETH_P_IPV6 : ETH_P_IP, 2, short_lut);
++		if (err)
++			return err;
++		rows[family].tcam[4][0] = mask;
++		rows[family].tcam[4][1] = mask | BIT(short_lut);
++	}
++	return 0;
++}
++
++static int airoha_ct_pon_ifc_rows_check(struct airoha_ppe *ppe, unsigned int slot,
++				      const struct airoha_ct_pon_ifc_words rows[2])
++{
++	unsigned int family, page;
++	u32 actual[3];
++	int err;
++
++	if ((ppe->ct_pon_ifc.active & (3 << (slot * 2))) != (3 << (slot * 2)))
++		return -ESHUTDOWN;
++	for (family = 0; family < 2; family++) {
++		unsigned int row = AIROHA_CT_PON_IFC_ROW_BASE + slot * 2 + family;
++
++		for (page = 0; page < 9; page++) {
++			err = airoha_ct_pon_ifc_read(ppe, 0, row, page, actual, 2);
++			if (err)
++				return err;
++			if (actual[1] != rows[family].tcam[page][1] ||
++			    ((actual[0] ^ rows[family].tcam[page][0]) & actual[1]))
++				return -EUCLEAN;
++		}
++		for (page = 0; page < ARRAY_SIZE(ct_ifc_action_words); page++) {
++			err = airoha_ct_pon_ifc_read(ppe, 2, row, page, actual,
++						    ct_ifc_action_words[page]);
++			if (err)
++				return err;
++			if (memcmp(actual, rows[family].action[page],
++				   ct_ifc_action_words[page] * sizeof(u32)))
++				return -EUCLEAN;
++		}
++	}
++	return 0;
++}
++
++static int airoha_ct_pon_ifc_tuple_check(struct airoha_ppe *ppe)
++{
++	struct airoha_ct_ifc_pool_io io = airoha_ct_pon_ifc_tuple_io(ppe);
++	struct airoha_ct_ifc_pool *pool = &ppe->ct_pon_ifc_pool;
++	struct airoha_ct_ifc_tuple_words words[2];
++	struct airoha_ct_pon_ifc_words rows[2];
++	unsigned int family, index;
++	u32 actual[2];
++	int err;
++
++	if (!ppe->ct_pon_ifc_tuple || !ppe->ct_pon_ifc_services[0] ||
++	    pool->pending || pool->releasing || airoha_ct_ifc_pool_orphans(pool))
++		return -ESHUTDOWN;
++	err = airoha_ct_pon_ifc_tuple_words(words);
++	if (err)
++		return err;
++	for (family = 0; family < 2; family++) {
++		struct airoha_ct_ifc_pool_lease *lease = &ppe->ct_pon_ifc_lease[family];
++		u32 mask = 0;
++
++		if (!airoha_ct_ifc_pool_has(pool, lease) || lease->count != words[family].count)
++			return -EUCLEAN;
++		for (index = 0; index < lease->count; index++) {
++			unsigned int slot = lease->slot[index];
++
++			if (slot >= CT_IFC_LUT1_COUNT || !pool->refs[slot] ||
++			    !(pool->reserved & BIT(slot)) ||
++			    memcmp(pool->words[slot], words[family].lut[index], sizeof(actual)))
++				return -EUCLEAN;
++			err = airoha_ct_ifc_pool_read(pool, &io, slot, actual);
++			if (err)
++				return err;
++			if (memcmp(actual, words[family].lut[index], sizeof(actual)))
++				return -EUCLEAN;
++			mask |= BIT(slot);
++		}
++		if (mask != lease->mask)
++			return -EUCLEAN;
++	}
++	err = airoha_ct_pon_ifc_tuple_rows(ppe, ppe->ct_pon_ifc_services[0], rows);
++	return err ?: airoha_ct_pon_ifc_rows_check(ppe, 0, rows);
++}
++
++static int airoha_ct_pon_ifc_tuple_release(struct airoha_ppe *ppe)
++{
++	struct airoha_ct_ifc_pool_io io = airoha_ct_pon_ifc_tuple_io(ppe);
++	struct airoha_ct_ifc_pool *pool = &ppe->ct_pon_ifc_pool;
++	unsigned int family;
++	int err;
++
++	err = airoha_ct_ifc_pool_recover(pool, &io);
++	if (err)
++		return err;
++	for (family = 0; family < 2; family++) {
++		if (!airoha_ct_ifc_pool_has(pool, &ppe->ct_pon_ifc_lease[family]))
++			continue;
++		err = airoha_ct_ifc_pool_release(pool, &io, &ppe->ct_pon_ifc_lease[family], true);
++		if (err)
++			return err;
++	}
++	ppe->ct_pon_ifc_tuple = false;
++	return 0;
++}
++
++static int airoha_ct_pon_ifc_tuple_space(struct airoha_ppe *ppe,
++				       const struct airoha_ct_ifc_tuple_words words[2])
++{
++	struct airoha_ct_ifc_pool_io io = airoha_ct_pon_ifc_tuple_io(ppe);
++	u32 unique[AIROHA_CT_IFC_TUPLE_MAX * 2][2], actual[2];
++	unsigned int family, index, other, needed = 0, available = 0;
++	int err;
++
++	for (family = 0; family < 2; family++) {
++		for (index = 0; index < words[family].count; index++) {
++			for (other = 0; other < needed; other++)
++				if (!memcmp(unique[other], words[family].lut[index], sizeof(actual)))
++					break;
++			if (other == needed)
++				memcpy(unique[needed++], words[family].lut[index], sizeof(actual));
++		}
++	}
++	for (index = 0; index < CT_IFC_LUT1_COUNT; index++) {
++		err = airoha_ct_ifc_pool_read(&ppe->ct_pon_ifc_pool, &io, index, actual);
++		if (err)
++			return err;
++		if (!(actual[1] & CT_IFC_LUT1_ENABLE))
++			available++;
++	}
++	return available >= needed ? 0 : -ENOSPC;
+ }
+ 
+ static bool airoha_ct_pon_ifc_route_ready(struct airoha_ppe *ppe)
+@@ -200,6 +402,17 @@
+ 	    ppe->ct_pon_qualified || !airoha_ct_pon_ifc_route_ready(ppe))
+ 		return err;
+ 	spin_lock_bh(&ppe_lock);
++	if (airoha_ct_pon_ifc_tuple_busy(ppe)) {
++		if (!(ppe->ct_pon_ifc_cover & BIT(1))) {
++			err = -ESHUTDOWN;
++			goto out;
++		}
++		err = airoha_ct_pon_ifc_dependencies(ppe);
++		if (!err)
++			err = airoha_ct_pon_ifc_tuple_check(ppe);
++		if (err)
++			goto out;
++	}
+ 	for (slot = 0; slot < 2; slot++) {
+ 		if (!(ppe->ct_pon_ifc_cover & BIT(slot)))
+ 			continue;
+@@ -250,7 +463,8 @@
+ 	spin_unlock_bh(&eth->ct_route_lock);
+ out:
+ 	spin_unlock_bh(&ppe_lock);
+-	if (err && (ppe->ct_pon_ifc.pending || ppe->ct_pon_ifc_route_owned))
++	if (err && (ppe->ct_pon_ifc.pending || ppe->ct_pon_ifc_pool.pending ||
++		    ppe->ct_pon_ifc_route_owned))
+ 		airoha_ct_pon_ifc_fault(ppe);
+ 	return err;
+ }
+@@ -269,7 +483,8 @@
+ 		return err;
+ 	}
+ 	if (!ppe->ct_pon_ifc.saved_valid && !ppe->ct_pon_ifc.dirty &&
+-	    !ppe->ct_pon_ifc.pending && !READ_ONCE(eth->ct_ifc_pon_ready))
++	    !ppe->ct_pon_ifc.pending && !READ_ONCE(eth->ct_ifc_pon_ready) &&
++	    !airoha_ct_pon_ifc_tuple_busy(ppe))
+ 		return 0;
+ 	if ((scope & BIT(2)) && (airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK)) {
+ 		if (READ_ONCE(ppe->ct_host_ppe) && !READ_ONCE(ppe->ct_stopping) &&
+@@ -291,6 +506,8 @@
+ 	airoha_ct_pon_ifc_authorize(eth, false);
+ 	spin_lock_bh(&ppe_lock);
+ 	err = airoha_ct_pon_ifc_restore(&ppe->ct_pon_ifc, &io);
++	if (!err && airoha_ct_pon_ifc_tuple_busy(ppe))
++		err = airoha_ct_pon_ifc_tuple_release(ppe);
+ 	spin_unlock_bh(&ppe_lock);
+ 	if (err) {
+ 		airoha_ct_pon_ifc_fault(ppe);
+@@ -315,6 +532,8 @@
+ 	lockdep_assert_held(&flow_offload_mutex);
+ 	if (slot >= 2 || (!cover && !service) || service > U16_MAX)
+ 		return -EINVAL;
++	if (!slot && airoha_ct_pon_ifc_tuple_busy(ppe))
++		return -EBUSY;
+ 	err = airoha_ct_pon_ifc_route_close(ppe);
+ 	if (err) {
+ 		airoha_ct_pon_ifc_fault(ppe);
+@@ -367,6 +586,73 @@
+ 	return airoha_ct_pon_ifc_cpu_publish(ppe, slot, service, false);
+ }
+ 
++static int airoha_ct_pon_ifc_cpu_tuple(struct airoha_ppe *ppe,
++				      unsigned int slot, unsigned int service)
++{
++	struct airoha_ct_pon_ifc_io io = airoha_ct_pon_ifc_io(ppe);
++	struct airoha_ct_ifc_pool_io pool_io = airoha_ct_pon_ifc_tuple_io(ppe);
++	struct airoha_ct_ifc_tuple_words words[2];
++	struct airoha_ct_pon_ifc_words rows[2];
++	struct airoha_eth *eth = ppe->eth;
++	unsigned int family;
++	int err;
++
++	ASSERT_RTNL();
++	lockdep_assert_held(&flow_offload_mutex);
++	if (slot || !service || service > U16_MAX)
++		return -EINVAL;
++	if (airoha_ct_pon_ifc_tuple_busy(ppe) ||
++	    (ppe->ct_pon_ifc.active & 3) || (ppe->ct_pon_ifc.dirty & 3) ||
++	    !(ppe->ct_pon_ifc_cover & BIT(1)))
++		return -EBUSY;
++	err = airoha_ct_pon_ifc_route_close(ppe);
++	if (err)
++		goto fault;
++	if (!READ_ONCE(ppe->ct_pon_ifc_registered) ||
++	    READ_ONCE(ppe->ct_pon_ifc_work_stopping) ||
++	    !READ_ONCE(ppe->ct_host_ppe) || READ_ONCE(ppe->ct_stopping) ||
++	    READ_ONCE(ppe->ct_pon_qualified) || READ_ONCE(eth->ct_cpu_fallback) ||
++	    READ_ONCE(eth->ct_ifc_cpu_port_failed) || !READ_ONCE(eth->ct_ifc_pon_ready) ||
++	    !ppe->ct_pon_ifc.saved_valid || ppe->ct_pon_ifc.pending ||
++	    eth->ct_ifc_command_pending || !airoha_ifc_lan_ports_ready(eth) ||
++	    !airoha_ct_pon_ifc_route_ready(ppe))
++		return -ESHUTDOWN;
++	err = airoha_ct_pon_ifc_tuple_words(words);
++	if (err)
++		return err;
++	for (family = 0; family < 2; family++)
++		airoha_ct_pon_ifc_cover_encode(&rows[family], 4, family);
++	spin_lock_bh(&ppe_lock);
++	err = airoha_ct_pon_ifc_dependencies(ppe);
++	if (!err)
++		err = airoha_ct_pon_ifc_rows_check(ppe, 1, rows);
++	if (!err)
++		err = airoha_ct_pon_ifc_tuple_space(ppe, words);
++	if (!err) {
++		ppe->ct_pon_ifc_tuple = true;
++		for (family = 0; family < 2; family++) {
++			err = airoha_ct_ifc_pool_acquire(&ppe->ct_pon_ifc_pool, &pool_io,
++							&words[family], &ppe->ct_pon_ifc_lease[family]);
++			if (err)
++				break;
++		}
++	}
++	if (!err)
++		err = airoha_ct_pon_ifc_tuple_rows(ppe, service, rows);
++	if (!err)
++		err = airoha_ct_pon_ifc_publish(&ppe->ct_pon_ifc, &io, 0, rows);
++	if (!err) {
++		ppe->ct_pon_ifc_services[0] = service;
++		ppe->ct_pon_ifc_cover &= ~BIT(0);
++	}
++	spin_unlock_bh(&ppe_lock);
++	if (!err || (err == -ENOSPC && !airoha_ct_pon_ifc_tuple_busy(ppe)))
++		return err;
++fault:
++	airoha_ct_pon_ifc_fault(ppe);
++	return err;
++}
++
+ static int airoha_ct_pon_ifc_cpu_clear(struct airoha_ppe *ppe, unsigned int slot)
+ {
+ 	struct airoha_ct_pon_ifc_io io = airoha_ct_pon_ifc_io(ppe);
+@@ -382,6 +668,8 @@
+ 	}
+ 	spin_lock_bh(&ppe_lock);
+ 	err = airoha_ct_pon_ifc_withdraw(&ppe->ct_pon_ifc, &io, slot);
++	if (!err && !slot && airoha_ct_pon_ifc_tuple_busy(ppe))
++		err = airoha_ct_pon_ifc_tuple_release(ppe);
+ 	spin_unlock_bh(&ppe_lock);
+ 	if (err) {
+ 		airoha_ct_pon_ifc_fault(ppe);
+@@ -446,13 +734,16 @@
+ 	ssize_t size;
+ 
+ 	mutex_lock(&flow_offload_mutex);
+-	size = sysfs_emit(buf, "saved=%u dirty=%02x active=%02x pending=%u scope=%08x ready=%u service0=%u service1=%u ppe=%u errors=%u cover=%02x routed=%u\n",
++	size = sysfs_emit(buf, "saved=%u dirty=%02x active=%02x pending=%u scope=%08x ready=%u service0=%u service1=%u ppe=%u errors=%u cover=%02x routed=%u tuple=%u pool=%08x pool_pending=%u leases=%u\n",
+ 			  ppe->ct_pon_ifc.saved_valid, ppe->ct_pon_ifc.dirty,
+ 			  ppe->ct_pon_ifc.active, ppe->ct_pon_ifc.pending,
+ 			  eth->ct_ifc_port_mask, READ_ONCE(eth->ct_ifc_pon_ready),
+ 			  ppe->ct_pon_ifc_services[0], ppe->ct_pon_ifc_services[1],
+ 			  READ_ONCE(ppe->ct_pon_qualified), ppe->ct_pon_ifc_errors,
+-			  ppe->ct_pon_ifc_cover, ppe->ct_pon_ifc_route_owned);
++			  ppe->ct_pon_ifc_cover, ppe->ct_pon_ifc_route_owned,
++			  ppe->ct_pon_ifc_tuple, ppe->ct_pon_ifc_pool.reserved,
++			  ppe->ct_pon_ifc_pool.pending,
++			  !!ppe->ct_pon_ifc_lease[0].count + !!ppe->ct_pon_ifc_lease[1].count);
+ 	mutex_unlock(&flow_offload_mutex);
+ 	return size;
+ }
+@@ -471,7 +762,7 @@
+ 	if (!sysfs_streq(buf, "off") && !sysfs_streq(buf, "route")) {
+ 		if (fields < 2 || kstrtouint(slot_word, 0, &slot))
+ 			return -EINVAL;
+-		if (!strcmp(command, "set")) {
++		if (!strcmp(command, "set") || !strcmp(command, "tuple")) {
+ 			if (fields != 3 || kstrtouint(service_word, 0, &service))
+ 				return -EINVAL;
+ 		} else if ((strcmp(command, "clear") && strcmp(command, "cover") &&
+@@ -500,6 +791,8 @@
+ 		err = airoha_ct_pon_ifc_source_set(ppe, slot, 2);
+ 	else if (!strcmp(command, "set"))
+ 		err = airoha_ct_pon_ifc_cpu_set(ppe, slot, service);
++	else if (!strcmp(command, "tuple"))
++		err = airoha_ct_pon_ifc_cpu_tuple(ppe, slot, service);
+ 	else
+ 		err = airoha_ct_pon_ifc_cpu_clear(ppe, slot);
+ 	mutex_unlock(&flow_offload_mutex);

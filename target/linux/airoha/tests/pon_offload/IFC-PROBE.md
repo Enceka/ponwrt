@@ -148,6 +148,27 @@ continues to run kernel984.
 
 ### Tuple consumers
 
+Patch987 adds `tuple 0 SERVICE` to the RAM probe. Install `cover 1` first,
+then the tuple consumer, then `route`. Slot0 must be clear before installation
+or replacement. The fixed UDP endpoints are `192.0.2.1:49152` to
+`192.0.2.2:49153` and `[2001:db8::1]:49152` to `[2001:db8::2]:49153`.
+Matching service and tuple select RX2; typed PON cover selects RX4 for misses.
+PON PPE qualification remains zero.
+
+The two fixed-address leases share identical port predicates. Their 14 unique
+LUT rows plus the two dynamic short guards use 16 of the 32 slots. A combined
+capacity check runs before allocation. Publication preserves full SPORT2,
+service, EtherType, type0 and encapsulation masks. Route opening audits both
+leases, every predicate, consumer pages, typed cover and short dependencies.
+
+`clear 0` and `off` restore consumers before recovering or releasing LUT
+ownership. A timeout retains ownership for the repair worker, including when
+consumer restoration has already finished. Legacy slot0 `set`, `cover` and
+source probes return `-EBUSY` while tuple ownership remains. Status appends
+`tuple`, `pool`, `pool_pending` and `leases`; all return to zero after cleanup.
+The board runner's `--exact-tuple --tuple-variants --cover-slot 1 --special-tag`
+matrix requires two packets on RX2 and eighteen on RX4.
+
 The stock investigation identified GDM2 loopback and special-tag configuration
 as the next no-fiber ingress experiment. Relevant stock FE symbols are
 `fe_api_set_loopback_enable` at `0x7df8`, `fe_api_set_loopback_mode` at `0x7e68`,
