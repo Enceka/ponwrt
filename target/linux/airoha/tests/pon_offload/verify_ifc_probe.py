@@ -44,7 +44,9 @@ def main():
             'airoha_ct_pon_ifc_read', 'airoha_ct_pon_ifc_put', 'airoha_ct_pon_ifc_drain',
             'airoha_ct_pon_ifc_io', 'airoha_ct_pon_ifc_route_ready',
             'airoha_ct_pon_ifc_dependencies', 'airoha_ct_pon_ifc_authorize',
-            'airoha_ct_pon_ifc_fault', 'airoha_ct_pon_ifc_cpu_stop',
+            'airoha_ct_pon_ifc_fault', 'airoha_ct_pon_ifc_route_close',
+            'airoha_ct_pon_ifc_route_open', 'airoha_ct_pon_ifc_cpu_stop',
+            'airoha_ct_pon_ifc_cpu_publish',
             'airoha_ct_pon_ifc_cpu_set', 'airoha_ct_pon_ifc_cpu_clear',
             'ct_pon_cpu_probe_store'],
     }
@@ -61,16 +63,19 @@ def main():
                            sources['airoha_eth.h'], re.S)
     assert sport_enum
     constants += sport_enum.group() + '\n'
+    pse_enum = re.search(r'enum\s*\{\s*FE_PSE_PORT_CDM1.*?\n\};', sources['airoha_eth.h'], re.S)
+    assert pse_enum
+    constants += pse_enum.group() + '\n'
     extracted = '#include "airoha_ct_ifc_command.h"\n' + ''.join(
         function(sources[name], selected) for name, names in selections.items() for selected in names)
     test = output / 'verify_ifc_probe.c'
     shutil.copyfile(Path(__file__).with_suffix('.c'), test)
 
-    def run(name, code, sanitized, command_header=None):
+    def run(name, code, sanitized, overrides=None, arguments=()):
         directory = output / name
         directory.mkdir(parents=True)
         for header in complete:
-            contents = command_header if header == 'airoha_ct_ifc_command.h' and command_header else sources[header]
+            contents = (overrides or {}).get(header, sources[header])
             (directory / header).write_text(contents)
         (directory / 'probe_constants.inc').write_text(constants)
         (directory / 'probe_production.inc').write_text(code)
@@ -84,7 +89,7 @@ def main():
         compiled = subprocess.run(command, capture_output=True, text=True)
         (directory / 'compile.log').write_text(compiled.stdout + compiled.stderr)
         compiled.check_returncode()
-        tested = subprocess.run([str(directory / 'test')], capture_output=True, text=True)
+        tested = subprocess.run([str(directory / 'test'), *arguments], capture_output=True, text=True)
         (directory / 'stdout.txt').write_text(tested.stdout)
         (directory / 'stderr.txt').write_text(tested.stderr)
         (directory / 'exit-status.json').write_text(json.dumps({'returncode': tested.returncode}) + '\n')
@@ -102,11 +107,48 @@ def main():
         assert result['sport_cases'] == 72 and result['sport_close_cases'] == 2
         assert result['store_dispatch_cases'] == 32 and result['store_stop_cases'] == 6
         assert result['store_pending_cases'] == 6
+        assert result['cover_cases'] == 71 and result['cover_tamper_cases'] == 70
+        assert result['cover_route_faults'] == 12 and result['cover_io_faults'] == 144
+        assert result['cover_publish_faults'] == 2630
         results.append(dict(mode=mode, **result))
     assert {key: value for key, value in results[0].items() if key != 'mode'} == {
         key: value for key, value in results[1].items() if key != 'mode'}
 
     mutations = [
+        ('cover_wildcard_type', 'header:airoha_ct_pon_ifc_words.h',
+         '[8] = { type << 6, 0xc0 }', '[8] = { type << 6, 0 }'),
+        ('cover_both_type0', 'airoha_ct_pon_ifc_cpu_publish',
+         'slot ? 4 : 2, family)', 'slot ? 4 : 2, 0)'),
+        ('route_skips_mask_audit', 'airoha_ct_pon_ifc_route_open',
+         'actual[1] != expected.tcam[page][1]', 'false'),
+        ('route_skips_key_audit', 'airoha_ct_pon_ifc_route_open',
+         '((actual[0] ^ expected.tcam[page][0]) & actual[1])', 'false'),
+        ('route_skips_action_audit', 'airoha_ct_pon_ifc_route_open',
+         'if (memcmp(actual, expected.action[page],', 'if (false && memcmp(actual, expected.action[page],'),
+        ('route_partial_cover_returns_success', 'airoha_ct_pon_ifc_route_open',
+         'err = -ESHUTDOWN;\n\t\t\tgoto out;', 'err = 0;\n\t\t\tgoto out;'),
+        ('route_skips_cfg_owned', 'airoha_ct_pon_ifc_route_open',
+         '!ppe->ct_ifc.cfg_owned ||', 'false ||'),
+        ('route_skips_exact_scope', 'airoha_ct_pon_ifc_route_open',
+         'eth->ct_ifc_port_mask != (XSI_ETH_VIP_PORT_MASK | BIT(2))', 'false'),
+        ('route_skips_atomic_fallback', 'airoha_ct_pon_ifc_route_open',
+         'eth->ct_cpu_fallback ||', 'false ||'),
+        ('route_ownership_after_write', 'airoha_ct_pon_ifc_route_open',
+         'ppe->ct_pon_ifc_route_owned = true;\n\tairoha_fe_wr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX), value);',
+         'airoha_fe_wr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX), value);\n\tppe->ct_pon_ifc_route_owned = true;'),
+        ('route_close_ignores_readback', 'airoha_ct_pon_ifc_route_close',
+         'if (airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)) != value)',
+         'if (false && airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)) != value)'),
+        ('stop_skips_route_close', 'airoha_ct_pon_ifc_cpu_stop',
+         'err = airoha_ct_pon_ifc_route_close(ppe);', 'err = 0;'),
+        ('publish_skips_route_close', 'airoha_ct_pon_ifc_cpu_publish',
+         'err = airoha_ct_pon_ifc_route_close(ppe);', 'err = 0;'),
+        ('clear_skips_route_close', 'airoha_ct_pon_ifc_cpu_clear',
+         'err = airoha_ct_pon_ifc_route_close(ppe);', 'err = 0;'),
+        ('gate_close_skips_cpu_return', 'airoha_ct_ifc_cpu_route_close_locked',
+         'if (eth->ppe->ct_pon_ifc_route_owned)', 'if (false)'),
+        ('gdm_setter_resends_native', 'airoha_gdm_fwd_cfg_update',
+         'if (eth->ppe->ct_pon_ifc_route_owned)', 'if (false)'),
         ('store_blocks_stopping_off', 'ct_pon_cpu_probe_store',
          'READ_ONCE(ppe->ct_pon_ifc_work_stopping))',
          'READ_ONCE(ppe->ct_pon_ifc_work_stopping) || READ_ONCE(ppe->ct_stopping))'),
@@ -128,22 +170,24 @@ def main():
         ('clear_both_slots', 'airoha_ct_pon_ifc_cpu_clear',
          'airoha_ct_pon_ifc_withdraw(&ppe->ct_pon_ifc, &io, slot)',
          'airoha_ct_pon_ifc_restore(&ppe->ct_pon_ifc, &io)'),
-        ('skip_dependencies', 'airoha_ct_pon_ifc_cpu_set',
+        ('skip_dependencies', 'airoha_ct_pon_ifc_cpu_publish',
          'err = airoha_ct_pon_ifc_dependencies(ppe);', 'err = 0;'),
-        ('missing_optical_scope', 'airoha_ct_pon_ifc_cpu_set',
+        ('missing_optical_scope', 'airoha_ct_pon_ifc_cpu_publish',
          'XSI_ETH_VIP_PORT_MASK | BIT(2)', 'XSI_ETH_VIP_PORT_MASK'),
-        ('skip_route_revalidation', 'airoha_ct_pon_ifc_cpu_set',
+        ('skip_route_revalidation', 'airoha_ct_pon_ifc_cpu_publish',
          'err = airoha_ct_pon_ifc_route_ready(ppe) ?', 'err = true ?'),
-        ('duplicate_service_allowed', 'airoha_ct_pon_ifc_cpu_set',
+        ('duplicate_service_allowed', 'airoha_ct_pon_ifc_cpu_publish',
          'ppe->ct_pon_ifc_services[slot ^ 1] == service', 'false'),
         ('release_service_on_failed_clear', 'airoha_ct_pon_ifc_cpu_clear',
-         'if (err) {', 'if (err) {\n\t\tppe->ct_pon_ifc_services[slot] = 0;'),
+         'err = airoha_ct_pon_ifc_withdraw(&ppe->ct_pon_ifc, &io, slot);',
+         'err = airoha_ct_pon_ifc_withdraw(&ppe->ct_pon_ifc, &io, slot);\n\tif (err) ppe->ct_pon_ifc_services[slot] = 0;'),
         ('skip_stop_gate', 'airoha_ct_pon_ifc_cpu_stop',
          'if ((scope & BIT(2))', 'if (false && (scope & BIT(2))'),
         ('ignore_stop_gate_error', 'airoha_ct_pon_ifc_cpu_stop',
          'return gate_err;', 'gate_err = 0;'),
         ('release_shadow_on_failed_stop', 'airoha_ct_pon_ifc_cpu_stop',
-         'if (err) {', 'if (err) {\n\t\tppe->ct_pon_ifc.saved_valid = false;'),
+         'err = airoha_ct_pon_ifc_restore(&ppe->ct_pon_ifc, &io);',
+         'err = airoha_ct_pon_ifc_restore(&ppe->ct_pon_ifc, &io);\n\tif (err) ppe->ct_pon_ifc.saved_valid = false;'),
         ('skip_optical_port_close', 'airoha_ct_ifc_cpu_port_change',
          'sport == 2 &&', 'false &&'),
         ('skip_gdm_route_close', 'airoha_gdm_fwd_cfg_update',
@@ -168,16 +212,21 @@ def main():
 
     def negative(specification):
         name, selected, old, new = specification
-        command_header = sources['airoha_ct_ifc_command.h']
+        overrides = {}
         code = extracted
-        if selected:
+        if selected and selected.startswith('header:'):
+            header = selected.split(':', 1)[1]
+            assert old in sources[header], name
+            overrides[header] = sources[header].replace(old, new, 1)
+        elif selected:
             original = function(code, selected)
             assert old in original, name
             code = code.replace(original, original.replace(old, new, 1), 1)
         else:
+            command_header = sources['airoha_ct_ifc_command.h']
             assert old in command_header, name
-            command_header = command_header.replace(old, new, 1)
-        tested = run('mutations/' + name, code, True, command_header)
+            overrides['airoha_ct_ifc_command.h'] = command_header.replace(old, new, 1)
+        tested = run('mutations/' + name, code, True, overrides)
         assert tested.returncode == -signal.SIGABRT, (name, tested.returncode, tested.stderr)
         assert 'assert' in tested.stderr.lower() and 'failed' in tested.stderr.lower(), (name, tested.stderr)
         assert not any(marker in tested.stderr for marker in
@@ -187,7 +236,13 @@ def main():
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         rejected = list(executor.map(negative, mutations))
-    report = dict(passed=True, modes=results, runtime_mutations=rejected,
+    stuck = []
+    for mode in ('plain', 'sanitized'):
+        tested = run('stuck-route-' + mode, extracted, mode == 'sanitized', arguments=('stuck-route',))
+        stuck.append(dict(mode=mode, passed=tested.returncode == 0,
+                          returncode=tested.returncode, stdout=tested.stdout, stderr=tested.stderr))
+    passed = all(result['passed'] for result in stuck)
+    report = dict(passed=passed, modes=results, stuck_route=stuck, runtime_mutations=rejected,
                   extracted_functions=selections, source=str(args.source.resolve()),
                   source_sha256={name: hashlib.sha256(text.encode()).hexdigest() for name, text in sources.items()},
                   extracted_sha256=hashlib.sha256(extracted.encode()).hexdigest(),
@@ -196,8 +251,9 @@ def main():
                          'work scheduling and netdev state'],
                   sanitizers=['address', 'undefined'])
     (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
-    print(json.dumps(dict(passed=True, modes=results, runtime_mutations=len(rejected),
+    print(json.dumps(dict(passed=passed, modes=results, stuck_route=stuck, runtime_mutations=len(rejected),
                           report=str(output / 'report.json')), indent=2))
+    assert passed, 'owned CPU route must be acknowledged before disabling IFC; see stuck-route logs'
 
 
 if __name__ == '__main__':

@@ -1,0 +1,351 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: own covered optical CPU route probes
+
+Add RAM-only source coverage and explicit optical classifier routing.
+Read back the complete CPU coverage before changing GDM2 forwarding.
+Return the optical route to CPU before any classifier withdrawal or
+rewrite, retaining ownership when route restoration fails.
+
+--- a/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_words.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_words.h
+@@ -31,4 +31,23 @@
+ 	return 0;
+ }
+ 
++static inline int
++airoha_ct_pon_ifc_cover_encode(struct airoha_ct_pon_ifc_words *row,
++			      unsigned int ring, unsigned int type)
++{
++	if (!row || (ring != 2 && ring != 4) || type > 1)
++		return -EINVAL;
++	*row = (struct airoha_ct_pon_ifc_words) {
++		.tcam = {
++			[0] = { BIT(2), BIT(2) },
++			[8] = { type << 6, 0xc0 },
++		},
++		.action = {
++			[1] = { 0, 0, ring << 10 },
++			[2] = { BIT(31) | BIT(30) | BIT(28), 0, 0 },
++		},
++	};
++	return 0;
++}
++
+ #endif
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -779,6 +779,8 @@
+ 	bool ct_pon_qualified;
+ 	struct airoha_ct_pon_ifc_owner ct_pon_ifc;
+ 	u16 ct_pon_ifc_services[2];
++	u8 ct_pon_ifc_cover;
++	bool ct_pon_ifc_route_owned;
+ 	u32 ct_pon_ifc_errors;
+ 	bool ct_pon_ifc_registered, ct_pon_ifc_work_stopping;
+ 	struct delayed_work ct_pon_ifc_work;
+--- a/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
+@@ -11,6 +11,14 @@
+ 
+ 	lockdep_assert_held(&eth->ct_route_lock);
+ 	if (eth->ppe && READ_ONCE(eth->ppe->ct_ifc.cfg_owned)) {
++		if (eth->ppe->ct_pon_ifc_route_owned) {
++			u32 value = (airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)) &
++				     ~GENMASK(15, 0)) | FE_PSE_PORT_CDM2 * 0x1111;
++
++			airoha_fe_wr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX), value);
++			if (airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)) != value)
++				return -EIO;
++		}
+ 		WRITE_ONCE(eth->ct_ifc_cpu_port_failed, true);
+ 		airoha_fe_clear(eth, REG_FE_CSR_IFC_CFG, FE_IFC_EN_MASK);
+ 		if (airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK)
+@@ -149,6 +157,9 @@
+ 		err = airoha_ct_ifc_cpu_route_close_locked(eth);
+ 		if (err)
+ 			goto unlock;
++		if (eth->ppe->ct_pon_ifc_route_owned)
++			cfg = airoha_ct_cpu_selectors(cfg, airoha_ct_ppe_selectors(cfg),
++						     FE_PSE_PORT_CDM2);
+ 	}
+ 	if (eth->ct_cpu_fallback) {
+ 		eth->ct_cpu_route_mask[id - 1] &= ~mask;
+@@ -167,6 +178,7 @@
+ {
+ 	unsigned int id;
+ 	int err = 0, ret;
++	bool optical_pending = false;
+ 
+ 	spin_lock_bh(&eth->ct_route_lock);
+ 	WRITE_ONCE(eth->ct_cpu_fallback, true);
+@@ -175,10 +187,14 @@
+ 
+ 		eth->ct_cpu_route_mask[id - 1] |= airoha_ct_ppe_selectors(cfg);
+ 		ret = airoha_ct_gdm_route_locked(eth, id, cfg);
++		if (id == AIROHA_GDM2_IDX && eth->ppe->ct_pon_ifc_route_owned && ret)
++			optical_pending = true;
+ 		if (ret && !err)
+ 			err = ret;
+ 	}
+ 	WRITE_ONCE(eth->ct_cpu_routes_ready, !err);
++	if (optical_pending)
++		goto unlock;
+ 	if (READ_ONCE(eth->ppe->ct_ifc.cfg_owned))
+ 		airoha_fe_clear(eth, REG_FE_CSR_IFC_CFG, FE_IFC_EN_MASK);
+ 	if (airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK) {
+@@ -187,6 +203,7 @@
+ 	} else {
+ 		WRITE_ONCE(eth->ct_cpu_ifc_disabled, true);
+ 	}
++unlock:
+ 	spin_unlock_bh(&eth->ct_route_lock);
+ 	if (err)
+ 		dev_err_ratelimited(eth->dev, "CT CPU fallback incomplete: %d\n", err);
+--- a/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_cpu.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_cpu.h
+@@ -166,6 +166,98 @@
+ 		schedule_delayed_work(&ppe->ct_pon_ifc_work, msecs_to_jiffies(100));
+ }
+ 
++static int airoha_ct_pon_ifc_route_close(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	u32 value;
++	int err = 0;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	spin_lock_bh(&eth->ct_route_lock);
++	if (ppe->ct_pon_ifc_route_owned) {
++		value = (airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)) &
++			 ~GENMASK(15, 0)) | FE_PSE_PORT_CDM2 * 0x1111;
++		airoha_fe_wr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX), value);
++		if (airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)) != value)
++			err = -EIO;
++		else
++			ppe->ct_pon_ifc_route_owned = false;
++	}
++	spin_unlock_bh(&eth->ct_route_lock);
++	return err;
++}
++
++static int airoha_ct_pon_ifc_route_open(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	struct airoha_ct_pon_ifc_words expected;
++	unsigned int slot, row, page;
++	u32 actual[3], value;
++	int err = -ESHUTDOWN;
++
++	ASSERT_RTNL();
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!ppe->ct_pon_ifc_cover || !ppe->ct_pon_ifc.saved_valid ||
++	    ppe->ct_pon_ifc.pending || eth->ct_ifc_command_pending ||
++	    ppe->ct_pon_ifc_route_owned || !ppe->ct_host_ppe || ppe->ct_stopping ||
++	    ppe->ct_pon_qualified || !airoha_ct_pon_ifc_route_ready(ppe))
++		return err;
++	spin_lock_bh(&ppe_lock);
++	for (slot = 0; slot < 2; slot++) {
++		if (!(ppe->ct_pon_ifc_cover & BIT(slot)))
++			continue;
++		if ((ppe->ct_pon_ifc.active & (3 << (slot * 2))) != (3 << (slot * 2))) {
++			err = -ESHUTDOWN;
++			goto out;
++		}
++		for (row = 56 + slot * 2; row < 58 + slot * 2; row++) {
++			airoha_ct_pon_ifc_cover_encode(&expected, slot ? 4 : 2, row % 2);
++			for (page = 0; page < 9; page++) {
++				err = airoha_ct_pon_ifc_read(ppe, 0, row, page, actual, 2);
++				if (err)
++					goto out;
++				if (actual[1] != expected.tcam[page][1] ||
++				    ((actual[0] ^ expected.tcam[page][0]) & actual[1])) {
++					err = -EUCLEAN;
++					goto out;
++				}
++			}
++			for (page = 0; page < 3; page++) {
++				err = airoha_ct_pon_ifc_read(ppe, 2, row, page, actual,
++							    ct_ifc_action_words[page]);
++				if (err)
++					goto out;
++				if (memcmp(actual, expected.action[page],
++					   ct_ifc_action_words[page] * sizeof(u32))) {
++					err = -EUCLEAN;
++					goto out;
++				}
++			}
++		}
++	}
++	spin_lock_bh(&eth->ct_route_lock);
++	err = -ESHUTDOWN;
++	if (eth->ct_cpu_fallback || eth->ct_ifc_cpu_port_failed ||
++	    !ppe->ct_ifc.cfg_owned || !eth->ct_ifc_pon_ready ||
++	    eth->ct_ifc_port_mask != (XSI_ETH_VIP_PORT_MASK | BIT(2)) ||
++	    !(airoha_fe_rr(eth, REG_FE_IFC_PORT_EN) & BIT(2)) ||
++	    !(airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK) ||
++	    !airoha_ct_pon_ifc_route_ready(ppe))
++		goto unlock;
++	value = (airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)) &
++		 ~GENMASK(15, 0)) | FE_PSE_PORT_PPE2 * 0x1111;
++	ppe->ct_pon_ifc_route_owned = true;
++	airoha_fe_wr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX), value);
++	err = airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)) == value ? 0 : -EIO;
++unlock:
++	spin_unlock_bh(&eth->ct_route_lock);
++out:
++	spin_unlock_bh(&ppe_lock);
++	if (err && (ppe->ct_pon_ifc.pending || ppe->ct_pon_ifc_route_owned))
++		airoha_ct_pon_ifc_fault(ppe);
++	return err;
++}
++
+ static int airoha_ct_pon_ifc_cpu_stop(struct airoha_ppe *ppe)
+ {
+ 	struct airoha_ct_pon_ifc_io io = airoha_ct_pon_ifc_io(ppe);
+@@ -174,11 +266,17 @@
+ 	int gate_err = 0, err;
+ 
+ 	lockdep_assert_held(&flow_offload_mutex);
++	err = airoha_ct_pon_ifc_route_close(ppe);
++	if (err) {
++		airoha_ct_pon_ifc_fault(ppe);
++		return err;
++	}
+ 	if (!ppe->ct_pon_ifc.saved_valid && !ppe->ct_pon_ifc.dirty &&
+ 	    !ppe->ct_pon_ifc.pending && !READ_ONCE(eth->ct_ifc_pon_ready))
+ 		return 0;
+ 	if ((scope & BIT(2)) && (airoha_fe_rr(eth, REG_FE_CSR_IFC_CFG) & FE_IFC_EN_MASK)) {
+-		if (READ_ONCE(ppe->ct_host_ppe) && !READ_ONCE(ppe->ct_stopping))
++		if (READ_ONCE(ppe->ct_host_ppe) && !READ_ONCE(ppe->ct_stopping) &&
++		    !READ_ONCE(eth->ct_cpu_fallback) && !READ_ONCE(eth->ct_ifc_cpu_port_failed))
+ 			gate_err = airoha_ifc_scope_update(eth, scope, XSI_ETH_VIP_PORT_MASK);
+ 		else {
+ 			spin_lock_bh(&eth->ct_route_lock);
+@@ -202,11 +300,12 @@
+ 		return err;
+ 	}
+ 	memset(ppe->ct_pon_ifc_services, 0, sizeof(ppe->ct_pon_ifc_services));
++	ppe->ct_pon_ifc_cover = 0;
+ 	return gate_err;
+ }
+ 
+-static int airoha_ct_pon_ifc_cpu_set(struct airoha_ppe *ppe,
+-				    unsigned int slot, unsigned int service)
++static int airoha_ct_pon_ifc_cpu_publish(struct airoha_ppe *ppe,
++					unsigned int slot, unsigned int service, bool cover)
+ {
+ 	struct airoha_ct_pon_ifc_io io = airoha_ct_pon_ifc_io(ppe);
+ 	struct airoha_ct_pon_ifc_words rows[2];
+@@ -217,17 +316,23 @@
+ 
+ 	ASSERT_RTNL();
+ 	lockdep_assert_held(&flow_offload_mutex);
+-	if (slot >= 2 || !service || service > U16_MAX)
++	if (slot >= 2 || (!cover && !service) || service > U16_MAX)
+ 		return -EINVAL;
++	err = airoha_ct_pon_ifc_route_close(ppe);
++	if (err) {
++		airoha_ct_pon_ifc_fault(ppe);
++		return err;
++	}
+ 	if (!READ_ONCE(ppe->ct_host_ppe) || READ_ONCE(ppe->ct_stopping) ||
+ 	    READ_ONCE(ppe->ct_pon_qualified) || !airoha_ifc_lan_ports_ready(eth) ||
+ 	    !airoha_ct_pon_ifc_route_ready(ppe))
+ 		return -ESHUTDOWN;
+-	if ((ppe->ct_pon_ifc.active & (3 << ((slot ^ 1) * 2))) &&
++	if (!cover && (ppe->ct_pon_ifc.active & (3 << ((slot ^ 1) * 2))) &&
+ 	    ppe->ct_pon_ifc_services[slot ^ 1] == service)
+ 		return -EEXIST;
+ 	for (family = 0; family < 2; family++) {
+-		err = airoha_ct_pon_ifc_cpu_encode(&rows[family], service,
++		err = cover ? airoha_ct_pon_ifc_cover_encode(&rows[family], slot ? 4 : 2, family) :
++			airoha_ct_pon_ifc_cpu_encode(&rows[family], service,
+ 						  family ? ETH_P_IPV6 : ETH_P_IP,
+ 						  slot ? 4 : 2, ppe->ct_ifc.rule[family].lut_index);
+ 		if (err)
+@@ -247,6 +352,9 @@
+ 		return err;
+ 	}
+ 	ppe->ct_pon_ifc_services[slot] = service;
++	ppe->ct_pon_ifc_cover &= ~BIT(slot);
++	if (cover)
++		ppe->ct_pon_ifc_cover |= BIT(slot);
+ 	airoha_ct_pon_ifc_authorize(eth, true);
+ 	scope = eth->ct_ifc_port_mask;
+ 	err = airoha_ct_pon_ifc_route_ready(ppe) ?
+@@ -256,6 +364,12 @@
+ 	return err;
+ }
+ 
++static int airoha_ct_pon_ifc_cpu_set(struct airoha_ppe *ppe,
++				    unsigned int slot, unsigned int service)
++{
++	return airoha_ct_pon_ifc_cpu_publish(ppe, slot, service, false);
++}
++
+ static int airoha_ct_pon_ifc_cpu_clear(struct airoha_ppe *ppe, unsigned int slot)
+ {
+ 	struct airoha_ct_pon_ifc_io io = airoha_ct_pon_ifc_io(ppe);
+@@ -264,6 +378,11 @@
+ 	lockdep_assert_held(&flow_offload_mutex);
+ 	if (slot >= 2 || !ppe->ct_pon_ifc.saved_valid)
+ 		return -EINVAL;
++	err = airoha_ct_pon_ifc_route_close(ppe);
++	if (err) {
++		airoha_ct_pon_ifc_fault(ppe);
++		return err;
++	}
+ 	spin_lock_bh(&ppe_lock);
+ 	err = airoha_ct_pon_ifc_withdraw(&ppe->ct_pon_ifc, &io, slot);
+ 	spin_unlock_bh(&ppe_lock);
+@@ -272,6 +391,7 @@
+ 		return err;
+ 	}
+ 	ppe->ct_pon_ifc_services[slot] = 0;
++	ppe->ct_pon_ifc_cover &= ~BIT(slot);
+ 	return ppe->ct_pon_ifc.active ? 0 : airoha_ct_pon_ifc_cpu_stop(ppe);
+ }
+ 
+@@ -297,12 +417,13 @@
+ 	ssize_t size;
+ 
+ 	mutex_lock(&flow_offload_mutex);
+-	size = sysfs_emit(buf, "saved=%u dirty=%02x active=%02x pending=%u scope=%08x ready=%u service0=%u service1=%u ppe=%u errors=%u\n",
++	size = sysfs_emit(buf, "saved=%u dirty=%02x active=%02x pending=%u scope=%08x ready=%u service0=%u service1=%u ppe=%u errors=%u cover=%02x routed=%u\n",
+ 			  ppe->ct_pon_ifc.saved_valid, ppe->ct_pon_ifc.dirty,
+ 			  ppe->ct_pon_ifc.active, ppe->ct_pon_ifc.pending,
+ 			  eth->ct_ifc_port_mask, READ_ONCE(eth->ct_ifc_pon_ready),
+ 			  ppe->ct_pon_ifc_services[0], ppe->ct_pon_ifc_services[1],
+-			  READ_ONCE(ppe->ct_pon_qualified), ppe->ct_pon_ifc_errors);
++			  READ_ONCE(ppe->ct_pon_qualified), ppe->ct_pon_ifc_errors,
++			  ppe->ct_pon_ifc_cover, ppe->ct_pon_ifc_route_owned);
+ 	mutex_unlock(&flow_offload_mutex);
+ 	return size;
+ }
+@@ -318,13 +439,13 @@
+ 	int fields, err;
+ 
+ 	fields = sscanf(buf, "%7s %23s %23s %c", command, slot_word, service_word, &extra);
+-	if (!sysfs_streq(buf, "off")) {
++	if (!sysfs_streq(buf, "off") && !sysfs_streq(buf, "route")) {
+ 		if (fields < 2 || kstrtouint(slot_word, 0, &slot))
+ 			return -EINVAL;
+ 		if (!strcmp(command, "set")) {
+ 			if (fields != 3 || kstrtouint(service_word, 0, &service))
+ 				return -EINVAL;
+-		} else if (strcmp(command, "clear") || fields != 2)
++		} else if ((strcmp(command, "clear") && strcmp(command, "cover")) || fields != 2)
+ 			return -EINVAL;
+ 	}
+ 	rtnl_lock();
+@@ -336,6 +457,10 @@
+ 		err = airoha_ct_pon_ifc_cpu_stop(ppe);
+ 	else if (READ_ONCE(ppe->ct_stopping))
+ 		err = -ESHUTDOWN;
++	else if (sysfs_streq(buf, "route"))
++		err = airoha_ct_pon_ifc_route_open(ppe);
++	else if (!strcmp(command, "cover"))
++		err = airoha_ct_pon_ifc_cpu_publish(ppe, slot, 0, true);
+ 	else if (!strcmp(command, "set"))
+ 		err = airoha_ct_pon_ifc_cpu_set(ppe, slot, service);
+ 	else

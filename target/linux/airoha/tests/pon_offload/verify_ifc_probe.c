@@ -31,11 +31,6 @@ typedef uint32_t u32;
 #define AIROHA_GDM3_IDX 3
 #define AIROHA_GDM4_IDX 4
 #define AIROHA_DEV_F_PON 0
-#define FE_PSE_PORT_CDM1 1
-#define FE_PSE_PORT_CDM2 2
-#define FE_PSE_PORT_PPE1 4
-#define FE_PSE_PORT_PPE2 5
-#define FE_PSE_PORT_DROP 15
 #define REG_SP_DFT_CPORT(index) (0x800 + (index) * 4)
 #define SP_CPORT_MASK(sport) (0xfU << ((sport) * 4))
 #define REG_GDM_FWD_CFG(index) (0x840 + (index) * 4)
@@ -141,6 +136,8 @@ struct airoha_ppe {
 	struct { bool health_stopping; struct work health_work; } ct_fe;
 	struct work ct_pon_ifc_work;
 	u16 ct_pon_ifc_services[2];
+	u8 ct_pon_ifc_cover;
+	bool ct_pon_ifc_route_owned;
 	u32 ct_pon_ifc_errors;
 	bool ct_host_ppe, ct_stopping, ct_pon_qualified, ct_native_pairs;
 	bool ct_pon_ifc_registered, ct_pon_ifc_work_stopping;
@@ -152,6 +149,11 @@ struct simulation {
 	unsigned int commands, data_writes, control_writes, fail_at, port_writes, table_writes;
 	unsigned int port_fail_first, port_fail_last, gate_clears;
 	unsigned int route_reads;
+	unsigned int route_writes, route_fail_at, cpu_acknowledgements, audit_race_at;
+	u16 audited[4];
+	enum fault route_fault;
+	bool route_read_error, cpu_route_stuck, enforce_cpu_before_table, cpu_acknowledged;
+	bool audit_route_open, enforce_cpu_before_gate;
 	enum fault fault;
 	bool busy, release, late, gate_stuck, route_drop, require_gate_closed;
 };
@@ -167,6 +169,8 @@ static unsigned int cases, transport_faults, blocked_retries, dependency_faults,
 static unsigned int scope_cases, fallback_stop_cases, rejected_set_retries;
 static unsigned int sport_cases, sport_close_cases;
 static unsigned int store_dispatch_cases, store_stop_cases, store_pending_cases;
+static unsigned int cover_cases, cover_tamper_cases, cover_route_faults, cover_io_faults;
+static unsigned int cover_publish_faults;
 
 static unsigned int page_words(unsigned int bank, unsigned int page)
 {
@@ -189,6 +193,8 @@ static void complete_command(void)
 	}
 	if (mock.command & BIT(1))
 		mock.table_writes++;
+	else if ((bank == 0 || bank == 2) && row >= 56 && row < 60)
+		mock.audited[row - 56] |= BIT(bank == 0 ? page : 9 + page);
 	mock.late = false;
 }
 
@@ -198,12 +204,25 @@ static u32 airoha_fe_rr(struct airoha_eth *eth, unsigned int address)
 	assert(address / 4 < ARRAY_SIZE(mock.registers));
 	if (address == REG_SP_DFT_CPORT(0) && ++mock.route_reads == 2 && mock.route_drop)
 		return 0;
+	if (address == REG_GDM_FWD_CFG(2)) {
+		if (mock.route_read_error) {
+			mock.route_read_error = false;
+			return mock.registers[address / 4] ^ 1;
+		}
+		if (mock.route_writes && (mock.registers[address / 4] & 0xffff) ==
+		    FE_PSE_PORT_CDM2 * 0x1111U) {
+			mock.cpu_acknowledged = true;
+			mock.cpu_acknowledgements++;
+		}
+	}
 	if (address == CT_IFC_CONTROL) {
 		if (mock.busy && mock.release) {
 			if (mock.late)
 				complete_command();
 			mock.busy = false;
 		}
+		if (mock.audit_race_at && mock.commands == mock.audit_race_at)
+			eth->ct_cpu_fallback = true;
 		return mock.busy ? 0 : CT_IFC_DONE;
 	}
 	return mock.registers[address / 4];
@@ -224,6 +243,11 @@ static void airoha_fe_wr(struct airoha_eth *eth, unsigned int address, u32 value
 		assert(ppe_lock.held && !mock.busy);
 		if ((value & BIT(1)) && mock.require_gate_closed)
 			assert(!(mock.registers[REG_FE_CSR_IFC_CFG / 4] & FE_IFC_EN_MASK));
+		if ((value & BIT(1)) && mock.enforce_cpu_before_table) {
+			assert(mock.cpu_acknowledged);
+			assert((mock.registers[REG_GDM_FWD_CFG(2) / 4] & 0xffff) ==
+			       FE_PSE_PORT_CDM2 * 0x1111U);
+		}
 		mock.commands++;
 		mock.control_writes++;
 		mock.command = value;
@@ -242,9 +266,31 @@ static void airoha_fe_wr(struct airoha_eth *eth, unsigned int address, u32 value
 			complete_command();
 		}
 		return;
-	} else if (address == REG_GDM_FWD_CFG(2) && eth->ct_ifc_pon_ready &&
-		   ((value ^ mock.registers[address / 4]) & 0xffff)) {
-		assert(!(mock.registers[REG_FE_CSR_IFC_CFG / 4] & FE_IFC_EN_MASK));
+	} else if (address == REG_GDM_FWD_CFG(2)) {
+		assert(eth->ct_route_lock.held);
+		mock.route_writes++;
+		mock.cpu_acknowledged = false;
+		if (mock.audit_route_open && (value & 0xffff) == FE_PSE_PORT_PPE2 * 0x1111U) {
+			assert(ppe_lock.held && eth->ppe->ct_pon_ifc_route_owned);
+			assert(eth->ppe->ct_pon_ifc_cover && eth->ct_ifc_pon_ready);
+			assert(!eth->ct_ifc_command_pending && !eth->ppe->ct_pon_ifc.pending);
+			for (unsigned int slot = 0; slot < 2; slot++)
+				if (eth->ppe->ct_pon_ifc_cover & BIT(slot)) {
+					assert(mock.audited[slot * 2] == 0xfff);
+					assert(mock.audited[slot * 2 + 1] == 0xfff);
+				}
+		} else if (eth->ct_ifc_pon_ready && !eth->ppe->ct_pon_ifc_route_owned &&
+			   ((value ^ mock.registers[address / 4]) & 0xffff)) {
+			assert(!(mock.registers[REG_FE_CSR_IFC_CFG / 4] & FE_IFC_EN_MASK));
+		}
+		if (mock.cpu_route_stuck && (value & 0xffff) == FE_PSE_PORT_CDM2 * 0x1111U)
+			return;
+		if (mock.route_writes == mock.route_fail_at) {
+			if (mock.route_fault == BEFORE)
+				return;
+			assert(mock.route_fault == AFTER);
+			mock.route_read_error = true;
+		}
 	}
 	mock.registers[address / 4] = value;
 }
@@ -252,8 +298,14 @@ static void airoha_fe_wr(struct airoha_eth *eth, unsigned int address, u32 value
 static void airoha_fe_clear(struct airoha_eth *eth, unsigned int address, u32 mask)
 {
 	assert(eth->ct_route_lock.held);
-	if (address == REG_FE_CSR_IFC_CFG)
+	if (address == REG_FE_CSR_IFC_CFG) {
+		if (mock.enforce_cpu_before_gate && eth->ppe->ct_pon_ifc_route_owned) {
+			assert(mock.cpu_acknowledged);
+			assert((mock.registers[REG_GDM_FWD_CFG(2) / 4] & 0xffff) ==
+			       FE_PSE_PORT_CDM2 * 0x1111U);
+		}
 		mock.gate_clears++;
+	}
 	if (address != REG_FE_CSR_IFC_CFG || !mock.gate_stuck)
 		mock.registers[address / 4] &= ~mask;
 }
@@ -326,6 +378,10 @@ static void reset_counts(void)
 	mock.port_writes = mock.fail_at = mock.route_reads = mock.gate_clears = 0;
 	mock.fault = NONE;
 	mock.release = false;
+	mock.route_writes = mock.route_fail_at = mock.cpu_acknowledgements = mock.audit_race_at = 0;
+	mock.route_fault = NONE;
+	mock.route_read_error = mock.cpu_acknowledged = false;
+	memset(mock.audited, 0, sizeof(mock.audited));
 }
 
 static void check_shadow(const struct fixture *fixture)
@@ -348,6 +404,7 @@ static void check_restored(const struct fixture *fixture)
 	       !fixture->ppe.ct_pon_ifc.active && !fixture->ppe.ct_pon_ifc.pending);
 	assert(!fixture->eth.ct_ifc_pon_ready && !fixture->ppe.ct_pon_ifc_services[0] &&
 	       !fixture->ppe.ct_pon_ifc_services[1]);
+	assert(!fixture->ppe.ct_pon_ifc_cover && !fixture->ppe.ct_pon_ifc_route_owned);
 	for (unsigned int row = 0; row < 4; row++) {
 		assert(!memcmp(mock.table[0][56 + row], mock.original[row][0], sizeof(mock.original[row][0])));
 		assert(!memcmp(mock.table[2][56 + row], mock.original[row][1], sizeof(mock.original[row][1])));
@@ -641,7 +698,7 @@ static void scope_and_route_failures(void)
 		       fixture.ppe.ct_pon_ifc_services[1]);
 		mock.gate_stuck = false;
 		mock.port_fail_first = mock.port_fail_last = 0;
-		assert(airoha_ct_pon_ifc_cpu_stop(&fixture.ppe) == (stopping ? 0 : -ESHUTDOWN));
+		assert(!airoha_ct_pon_ifc_cpu_stop(&fixture.ppe));
 		check_restored(&fixture);
 		cases++;
 	}
@@ -659,15 +716,16 @@ static void scope_and_route_failures(void)
 		assert(!!(mock.registers[REG_FE_CSR_IFC_CFG / 4] & FE_IFC_EN_MASK) == !!failed);
 		check_shadow(&fixture);
 		mock.gate_stuck = false;
-		assert(airoha_ct_pon_ifc_cpu_stop(&fixture.ppe) == (failed ? -ESHUTDOWN : 0));
+		assert(!airoha_ct_pon_ifc_cpu_stop(&fixture.ppe));
 		check_restored(&fixture);
 		prepare(&fixture);
 		mock.gate_stuck = failed;
 		assert(airoha_gdm_fwd_cfg_update(&fixture.eth, 2, 0xffff, 0x1111) == (failed ? -EIO : 0));
-		assert(mock.registers[REG_GDM_FWD_CFG(2) / 4] == (failed ? 0x2222U : 0x1111U));
+		assert(mock.registers[REG_GDM_FWD_CFG(2) / 4] ==
+		       (failed ? FE_PSE_PORT_CDM2 * 0x1111U : 0x1111U));
 		assert(fixture.eth.ct_ifc_cpu_port_failed);
 		mock.gate_stuck = false;
-		assert(airoha_ct_pon_ifc_cpu_stop(&fixture.ppe) == (failed ? -ESHUTDOWN : 0));
+		assert(!airoha_ct_pon_ifc_cpu_stop(&fixture.ppe));
 		check_restored(&fixture);
 		cases += 2;
 	}
@@ -822,7 +880,8 @@ static void fallback_stop(void)
 			mock.fail_at = 1;
 			mock.fault = DEFERRED;
 		}
-		assert(airoha_ct_pon_ifc_cpu_stop(&fixture.ppe) == (failure == 2 ? -ETIMEDOUT : -ESHUTDOWN));
+		assert(airoha_ct_pon_ifc_cpu_stop(&fixture.ppe) ==
+		       (failure == 2 ? -ETIMEDOUT : failure == 1 ? -EIO : 0));
 		assert(mock.gate_clears && !mock.port_writes);
 		assert(fixture.eth.ct_ifc_port_mask == (XSI_ETH_VIP_PORT_MASK | BIT(2)));
 		assert(fixture.eth.ifc_port_desired == (XSI_ETH_VIP_PORT_MASK | BIT(2)));
@@ -831,7 +890,7 @@ static void fallback_stop(void)
 			assert(!memcmp(services, fixture.ppe.ct_pon_ifc_services, sizeof(services)));
 			assert(fixture.eth.ct_ifc_pon_ready && (mock.registers[REG_FE_CSR_IFC_CFG / 4] & FE_IFC_EN_MASK));
 			mock.gate_stuck = false;
-			assert(airoha_ct_pon_ifc_cpu_stop(&fixture.ppe) == -ESHUTDOWN);
+			assert(!airoha_ct_pon_ifc_cpu_stop(&fixture.ppe));
 		} else if (failure == 2) {
 			assert(mock.commands == 1 && fixture.ppe.ct_pon_ifc.saved_valid &&
 			       fixture.ppe.ct_pon_ifc.dirty == 15 && fixture.ppe.ct_pon_ifc.pending);
@@ -889,7 +948,7 @@ static void source_port_mapping(void)
 		assert(fixture.dev[0].qdma == &fixture.eth.qdma[1]);
 		check_shadow(&fixture);
 		mock.gate_stuck = false;
-		assert(airoha_ct_pon_ifc_cpu_stop(&fixture.ppe) == (failed ? -ESHUTDOWN : 0));
+		assert(!airoha_ct_pon_ifc_cpu_stop(&fixture.ppe));
 		check_restored(&fixture);
 		sport_close_cases++;
 		cases++;
@@ -1039,8 +1098,409 @@ static void store_stopping_off(void)
 		}
 }
 
-int main(void)
+static void prepare_cover(struct fixture *fixture, unsigned int slot)
 {
+	char command[32];
+
+	initialize(fixture);
+	mock.registers[REG_GDM_FWD_CFG(2) / 4] |= 0xa5b60000;
+	snprintf(command, sizeof(command), "cover %u", slot);
+	assert(store(fixture, command) == (ssize_t)strlen(command));
+	snprintf(command, sizeof(command), "set %u 0x2134", slot ^ 1);
+	assert(store(fixture, command) == (ssize_t)strlen(command));
+	assert(fixture->ppe.ct_pon_ifc_cover == BIT(slot));
+	assert(fixture->ppe.ct_pon_ifc.active == 15);
+	assert(fixture->ppe.ct_pon_ifc_services[slot] == 0);
+	assert(fixture->ppe.ct_pon_ifc_services[slot ^ 1] == 0x2134);
+	for (unsigned int family = 0; family < 2; family++) {
+		unsigned int row = 56 + slot * 2 + family;
+
+		for (unsigned int page = 0; page < 9; page++) {
+			assert(mock.table[0][row][page][0] ==
+			       (page == 0 ? BIT(2) : page == 8 ? family << 6 : 0));
+			assert(mock.table[0][row][page][1] ==
+			       (page == 0 ? BIT(2) : page == 8 ? 0xc0 : 0));
+		}
+		for (unsigned int page = 0; page < 3; page++)
+			for (unsigned int word = 0; word < page_words(2, page); word++)
+				assert(mock.table[2][row][page][word] ==
+				       (page == 1 && word == 2 ? (slot ? 4U : 2U) << 10 :
+					page == 2 ? 0xd0000000 : 0));
+		for (unsigned int type = 0; type < 4; type++)
+			assert(!(((type << 6) ^ mock.table[0][row][8][0]) &
+				 mock.table[0][row][8][1]) == (type == family));
+	}
+	check_shadow(fixture);
+	reset_counts();
+	mock.audit_route_open = true;
+	mock.enforce_cpu_before_gate = true;
+}
+
+static void open_cover(struct fixture *fixture, unsigned int slot)
+{
+	prepare_cover(fixture, slot);
+	assert(store(fixture, "route") == 5);
+	assert(mock.commands == 24 && !mock.table_writes);
+	assert(mock.route_writes == 1 && fixture->ppe.ct_pon_ifc_route_owned);
+	assert(mock.registers[REG_GDM_FWD_CFG(2) / 4] == 0xa5b68888);
+	reset_counts();
+	mock.enforce_cpu_before_table = true;
+}
+
+static void cover_lifecycle(void)
+{
+	struct fixture fixture;
+	const char *operations[] = { "off", "clear %u", "set %u 0xa134", "cover %u" };
+	struct airoha_ct_pon_ifc_words encoded;
+
+	assert(airoha_ct_pon_ifc_cover_encode(NULL, 2, 0) == -EINVAL);
+	assert(airoha_ct_pon_ifc_cover_encode(&encoded, 3, 0) == -EINVAL);
+	assert(airoha_ct_pon_ifc_cover_encode(&encoded, 2, 2) == -EINVAL);
+	for (unsigned int slot = 0; slot < 2; slot++)
+		for (unsigned int operation = 0; operation < ARRAY_SIZE(operations); operation++) {
+			char command[32];
+			u32 peer[2][2][9][3];
+
+			open_cover(&fixture, slot);
+			for (unsigned int row = 0; row < 2; row++)
+				for (unsigned int bank = 0; bank < 2; bank++)
+					memcpy(peer[row][bank], mock.table[bank * 2][56 + (slot ^ 1) * 2 + row],
+					       sizeof(peer[row][bank]));
+			snprintf(command, sizeof(command), operations[operation], slot);
+			assert(store(&fixture, command) == (ssize_t)strlen(command));
+			assert(!fixture.ppe.ct_pon_ifc_route_owned && mock.cpu_acknowledgements);
+			assert(mock.registers[REG_GDM_FWD_CFG(2) / 4] == 0xa5b65555);
+			if (operation) {
+				assert(fixture.ppe.ct_pon_ifc_services[slot ^ 1] == 0x2134);
+				assert(fixture.ppe.ct_pon_ifc_cover == (operation == 3 ? BIT(slot) : 0));
+				for (unsigned int row = 0; row < 2; row++)
+					for (unsigned int bank = 0; bank < 2; bank++)
+						assert(!memcmp(peer[row][bank], mock.table[bank * 2][56 + (slot ^ 1) * 2 + row],
+							       sizeof(peer[row][bank])));
+				assert(store(&fixture, "off") == 3);
+			}
+			check_restored(&fixture);
+			assert(store(&fixture, "off") == 3);
+			cover_cases++;
+			cases++;
+		}
+	for (unsigned int slot = 0; slot < 2; slot++) {
+		char command[32];
+
+		prepare_cover(&fixture, slot);
+		snprintf(command, sizeof(command), "cover %u", slot ^ 1);
+		assert(store(&fixture, command) == (ssize_t)strlen(command));
+		reset_counts();
+		assert(store(&fixture, "route") == 5);
+		assert(mock.commands == 48 && fixture.ppe.ct_pon_ifc_cover == 3);
+		assert(store(&fixture, "off") == 3);
+		check_restored(&fixture);
+		cover_cases++;
+		cases++;
+	}
+}
+
+static void cover_tampering(void)
+{
+	struct fixture fixture;
+
+	for (unsigned int slot = 0; slot < 2; slot++)
+		for (unsigned int family = 0; family < 2; family++)
+			for (unsigned int field = 0; field < 17; field++) {
+				unsigned int row = 56 + slot * 2 + family;
+				struct airoha_ct_pon_ifc_owner saved;
+
+				prepare_cover(&fixture, slot);
+				saved = fixture.ppe.ct_pon_ifc;
+				if (field < 9)
+					mock.table[0][row][field][1] ^= field == 8 ? 0xc0 : 1;
+				else if (field < 11)
+					mock.table[0][row][field == 9 ? 0 : 8][0] ^= field == 9 ? BIT(2) : BIT(6);
+				else if (field < 13)
+					mock.table[2][row][0][field - 11] ^= 1;
+				else if (field < 16)
+					mock.table[2][row][1][field - 13] ^= 1;
+				else
+					mock.table[2][row][2][0] ^= BIT(31);
+				assert(store(&fixture, "route") == -EUCLEAN);
+				assert(!mock.route_writes && !mock.table_writes && !mock.gate_clears);
+				assert(!memcmp(&saved, &fixture.ppe.ct_pon_ifc, sizeof(saved)));
+				assert(store(&fixture, "off") == 3);
+				check_restored(&fixture);
+				cover_tamper_cases++;
+				cases++;
+			}
+	for (unsigned int slot = 0; slot < 2; slot++) {
+		prepare_cover(&fixture, slot);
+		for (unsigned int row = 56 + slot * 2; row < 58 + slot * 2; row++)
+			for (unsigned int page = 0; page < 9; page++)
+				mock.table[0][row][page][0] ^= ~mock.table[0][row][page][1];
+		assert(store(&fixture, "route") == 5);
+		assert(store(&fixture, "off") == 3);
+		check_restored(&fixture);
+		cover_tamper_cases++;
+		cases++;
+	}
+}
+
+static void cover_route_guards(void)
+{
+	struct fixture fixture;
+
+	for (unsigned int slot = 0; slot < 2; slot++)
+		for (unsigned int guard = 0; guard < 18; guard++) {
+			prepare_cover(&fixture, slot);
+			switch (guard) {
+			case 0: fixture.ppe.ct_pon_ifc_cover = 0; break;
+			case 1: fixture.ppe.ct_pon_ifc.saved_valid = false; break;
+			case 2: fixture.ppe.ct_pon_ifc.pending = true; break;
+			case 3: fixture.eth.ct_ifc_command_pending = true; break;
+			case 4: fixture.ppe.ct_host_ppe = false; break;
+			case 5: fixture.ppe.ct_stopping = true; break;
+			case 6: fixture.ppe.ct_pon_qualified = true; break;
+			case 7: fixture.ppe.ct_pon_ifc.active &= ~BIT(slot * 2); break;
+			case 8: fixture.ppe.ct_ifc.cfg_owned = false; break;
+			case 9: fixture.eth.ct_ifc_port_mask &= ~BIT(2); break;
+			case 10: fixture.eth.ct_ifc_port_mask |= BIT(3); break;
+			case 11: mock.registers[REG_FE_IFC_PORT_EN / 4] &= ~BIT(2); break;
+			case 12: mock.registers[REG_FE_CSR_IFC_CFG / 4] = 0; break;
+			case 13: fixture.eth.ct_ifc_cpu_port_failed = true; break;
+			case 14: fixture.eth.ct_ifc_pon_ready = false; break;
+			case 15: mock.audit_race_at = 24; break;
+			case 16: mock.route_drop = true; break;
+			case 17:
+				fixture.ppe.ct_pon_ifc_cover = 3;
+				fixture.ppe.ct_pon_ifc.active &= ~BIT((slot ^ 1) * 2);
+				if (slot == 1)
+					fixture.ppe.ct_pon_ifc.active &= ~BIT(slot * 2);
+				break;
+			}
+			assert(store(&fixture, "route") == -ESHUTDOWN);
+			assert(!mock.route_writes && !mock.table_writes && !mock.gate_clears);
+			assert(!fixture.ppe.ct_pon_ifc_route_owned);
+			cover_cases++;
+			cases++;
+		}
+	for (unsigned int state = 0; state < 8; state++)
+		for (unsigned int command = 0; command < 2; command++) {
+			const char *text = command ? "route" : "cover 0";
+			bool rejected = !(state & 1) || (state & 6);
+
+			prepare_cover(&fixture, 1);
+			fixture.ppe.ct_pon_ifc_registered = !!(state & 1);
+			fixture.ppe.ct_pon_ifc_work_stopping = !!(state & 2);
+			fixture.ppe.ct_stopping = !!(state & 4);
+			assert(store(&fixture, text) == (rejected ? -ESHUTDOWN : (ssize_t)strlen(text)));
+			if (rejected)
+				assert(!mock.commands && !mock.route_writes && !mock.port_writes);
+			cover_cases++;
+			cases++;
+		}
+}
+
+static void cover_audit_failures(void)
+{
+	struct fixture fixture;
+
+	for (unsigned int slot = 0; slot < 2; slot++)
+		for (unsigned int mode = BEFORE; mode <= DEFERRED; mode++)
+			for (unsigned int failure = 1; failure <= 24; failure++) {
+				unsigned int data, control;
+
+				prepare_cover(&fixture, slot);
+				mock.fault = mode;
+				mock.fail_at = failure;
+				assert(store(&fixture, "route") == -ETIMEDOUT);
+				assert(fixture.ppe.ct_pon_ifc.saved_valid && fixture.ppe.ct_pon_ifc.active == 15);
+				assert(fixture.ppe.ct_pon_ifc_cover == BIT(slot));
+				assert(fixture.eth.ct_ifc_command_pending && fixture.ppe.ct_pon_ifc.pending);
+				assert(!fixture.ppe.ct_pon_ifc_route_owned && !mock.table_writes);
+				data = mock.data_writes;
+				control = mock.control_writes;
+				assert(store(&fixture, "route") == -ESHUTDOWN);
+				assert(store(&fixture, "off") == -ETIMEDOUT);
+				assert(mock.data_writes == data && mock.control_writes == control);
+				check_shadow(&fixture);
+				mock.release = true;
+				mock.fail_at = 0;
+				assert(store(&fixture, "off") == 3);
+				check_restored(&fixture);
+				cover_io_faults++;
+				cases++;
+			}
+}
+
+static void cover_route_failures(void)
+{
+	struct fixture fixture;
+	const char *operations[] = { "off", "clear 0", "set 0 0xa134", "cover 0" };
+
+	for (unsigned int slot = 0; slot < 2; slot++)
+		for (unsigned int mode = BEFORE; mode <= AFTER; mode++) {
+			prepare_cover(&fixture, slot);
+			mock.route_fail_at = 1;
+			mock.route_fault = mode;
+			assert(store(&fixture, "route") == -EIO);
+			assert(fixture.ppe.ct_pon_ifc_route_owned && fixture.ppe.ct_pon_ifc.active == 15);
+			assert(fixture.ppe.ct_pon_ifc_cover == BIT(slot) && !mock.table_writes);
+			assert(fixture.eth.ct_cpu_fallback);
+			check_shadow(&fixture);
+			assert(store(&fixture, "off") == 3);
+			check_restored(&fixture);
+			cover_route_faults++;
+			cases++;
+		}
+	for (unsigned int operation = 0; operation < ARRAY_SIZE(operations); operation++)
+		for (unsigned int mode = BEFORE; mode <= AFTER; mode++) {
+			struct airoha_ct_pon_ifc_owner saved;
+
+			open_cover(&fixture, 0);
+			saved = fixture.ppe.ct_pon_ifc;
+			mock.route_fail_at = 1;
+			mock.route_fault = mode;
+			assert(store(&fixture, operations[operation]) == -EIO);
+			assert(!mock.commands && !memcmp(&saved, &fixture.ppe.ct_pon_ifc, sizeof(saved)));
+			assert(fixture.ppe.ct_pon_ifc_route_owned && fixture.ppe.ct_pon_ifc_cover == 1);
+			assert(fixture.ppe.ct_pon_ifc_services[1] == 0x2134);
+			assert(store(&fixture, "off") == 3);
+			check_restored(&fixture);
+			cover_route_faults++;
+			cases++;
+		}
+}
+
+static void cover_shutdown_order(void)
+{
+	struct fixture fixture;
+
+	for (unsigned int path = 0; path < 3; path++)
+		for (unsigned int mode = NONE; mode <= AFTER; mode++) {
+			struct airoha_ct_pon_ifc_owner saved;
+			int result;
+
+			open_cover(&fixture, path & 1);
+			saved = fixture.ppe.ct_pon_ifc;
+			mock.route_fail_at = mode ? 1 : 0;
+			mock.route_fault = mode;
+			result = path < 2 ? airoha_ct_ifc_cpu_port_change(&fixture.eth, path ? 24 : 2) :
+				airoha_gdm_fwd_cfg_update(&fixture.eth, 2, 0xffff,
+					(FE_PSE_PORT_PPE1 << 12) | (FE_PSE_PORT_PPE2 << 8) | 0x55);
+			assert(result == (mode ? -EIO : 0));
+			assert(!mock.commands && !memcmp(&saved, &fixture.ppe.ct_pon_ifc, sizeof(saved)));
+			assert(fixture.ppe.ct_pon_ifc_route_owned);
+			if (mode) {
+				assert(!mock.gate_clears && !fixture.eth.ct_ifc_cpu_port_failed);
+				assert(mock.registers[REG_FE_CSR_IFC_CFG / 4] & FE_IFC_EN_MASK);
+				mock.route_fail_at = 0;
+				assert(!airoha_ct_ifc_cpu_port_change(&fixture.eth, 2));
+			}
+			assert(mock.gate_clears == 1 && mock.cpu_acknowledgements);
+			assert(mock.registers[REG_GDM_FWD_CFG(2) / 4] == 0xa5b65555);
+			assert(!(mock.registers[REG_FE_CSR_IFC_CFG / 4] & FE_IFC_EN_MASK));
+			assert(store(&fixture, "off") == 3);
+			check_restored(&fixture);
+			cover_cases++;
+			cases++;
+		}
+}
+
+static void cover_stuck_shutdown(void)
+{
+	struct fixture fixture;
+	struct airoha_ct_pon_ifc_owner saved;
+
+	open_cover(&fixture, 0);
+	saved = fixture.ppe.ct_pon_ifc;
+	mock.cpu_route_stuck = true;
+	assert(store(&fixture, "off") == -EIO);
+	assert(!mock.gate_clears && !mock.commands);
+	assert(!memcmp(&saved, &fixture.ppe.ct_pon_ifc, sizeof(saved)));
+	assert(fixture.ppe.ct_pon_ifc_route_owned && fixture.ppe.ct_pon_ifc_cover == 1);
+	mock.cpu_route_stuck = false;
+	assert(store(&fixture, "off") == 3);
+	check_restored(&fixture);
+	cover_route_faults++;
+	cases++;
+}
+
+static void cover_publication_failures(void)
+{
+	struct fixture fixture;
+	const unsigned int counts[] = { 126, 78, 78, 52, 104 };
+
+	for (unsigned int operation = 0; operation < ARRAY_SIZE(counts); operation++)
+		for (unsigned int slot = 0; slot < 2; slot++)
+			for (unsigned int mode = BEFORE; mode <= DEFERRED; mode++)
+				for (unsigned int failure = 1; failure <= counts[operation]; failure++) {
+					char command[32];
+					u16 services[2];
+					unsigned int cover, data, control;
+
+					if (!operation)
+						initialize(&fixture);
+					else if (operation == 1)
+						prepare(&fixture);
+					else
+						open_cover(&fixture, slot);
+					memcpy(services, fixture.ppe.ct_pon_ifc_services, sizeof(services));
+					cover = fixture.ppe.ct_pon_ifc_cover;
+					snprintf(command, sizeof(command), operation < 2 ? "cover %u" :
+						 operation == 2 ? "set %u 0xa134" : operation == 3 ? "clear %u" : "off", slot);
+					mock.fault = mode;
+					mock.fail_at = failure;
+					assert(store(&fixture, command) == -ETIMEDOUT);
+					assert(mock.commands == failure && fixture.ppe.ct_pon_ifc.pending);
+					assert(!fixture.ppe.ct_pon_ifc_route_owned);
+					assert(fixture.ppe.ct_pon_ifc_cover == cover);
+					assert(!memcmp(services, fixture.ppe.ct_pon_ifc_services, sizeof(services)));
+					check_shadow(&fixture);
+					data = mock.data_writes;
+					control = mock.control_writes;
+					assert(store(&fixture, "route") == -ESHUTDOWN);
+					assert(store(&fixture, "off") == -ETIMEDOUT);
+					assert(mock.data_writes == data && mock.control_writes == control);
+					assert(fixture.ppe.ct_pon_ifc_cover == cover);
+					mock.release = true;
+					mock.fail_at = 0;
+					assert(store(&fixture, "off") == 3);
+					if (fixture.eth.ct_ifc_command_pending) {
+						u32 words[2];
+
+						assert(!operation && failure <= 74);
+						assert(!ct_ifc_access(&fixture.eth, 0, 56, 0, false, words, 2));
+					}
+					assert(!fixture.eth.ct_ifc_command_pending && !mock.busy);
+					check_restored(&fixture);
+					cover_publish_faults++;
+					cases++;
+				}
+	for (unsigned int slot = 0; slot < 2; slot++) {
+		char command[32];
+
+		initialize(&fixture);
+		mock.port_fail_first = mock.port_fail_last = 1;
+		snprintf(command, sizeof(command), "cover %u", slot);
+		assert(store(&fixture, command) == -EIO);
+		assert(fixture.ppe.ct_pon_ifc_cover == BIT(slot));
+		assert(fixture.ppe.ct_pon_ifc.active == (3 << (slot * 2)));
+		assert(fixture.ppe.ct_pon_ifc.saved_valid && fixture.eth.ct_cpu_fallback);
+		assert(store(&fixture, "route") == -ESHUTDOWN);
+		assert(store(&fixture, "off") == 3);
+		check_restored(&fixture);
+		cover_publish_faults++;
+		cases++;
+	}
+}
+
+int main(int argc, char **argv)
+{
+	if (argc == 2) {
+		assert(!strcmp(argv[1], "stuck-route"));
+		cover_stuck_shutdown();
+		puts("{\"passed\":true,\"stuck_route_cases\":1}");
+		return 0;
+	}
+	assert(argc == 1);
 	source_port_mapping();
 	lifecycle();
 	route_and_inputs();
@@ -1053,13 +1513,23 @@ int main(void)
 	fallback_stop();
 	store_dispatch();
 	store_stopping_off();
+	cover_lifecycle();
+	cover_tampering();
+	cover_route_guards();
+	cover_audit_failures();
+	cover_route_failures();
+	cover_shutdown_order();
+	cover_publication_failures();
 	printf("{\"passed\":true,\"cases\":%u,\"transport_faults\":%u,\"blocked_retries\":%u,"
 	       "\"dependency_faults\":%u,\"readback_faults\":%u,\"scope_cases\":%u,"
 	       "\"fallback_stop_cases\":%u,\"rejected_set_retries\":%u,"
 	       "\"sport_cases\":%u,\"sport_close_cases\":%u,\"store_dispatch_cases\":%u,"
-	       "\"store_stop_cases\":%u,\"store_pending_cases\":%u}\n",
+	       "\"store_stop_cases\":%u,\"store_pending_cases\":%u,"
+	       "\"cover_cases\":%u,\"cover_tamper_cases\":%u,\"cover_route_faults\":%u,\"cover_io_faults\":%u,"
+	       "\"cover_publish_faults\":%u}\n",
 	       cases, transport_faults, blocked_retries, dependency_faults, readback_faults,
 	       scope_cases, fallback_stop_cases, rejected_set_retries, sport_cases, sport_close_cases,
-	       store_dispatch_cases, store_stop_cases, store_pending_cases);
+	       store_dispatch_cases, store_stop_cases, store_pending_cases,
+	       cover_cases, cover_tamper_cases, cover_route_faults, cover_io_faults, cover_publish_faults);
 	return 0;
 }
