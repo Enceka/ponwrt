@@ -65,12 +65,51 @@ class Classifier(Module):
         for i in range(9):
             assert self.rows[0,row,i] == expected.get(i, (0,0)), (row,i,self.rows[0,row,i])
 
+    def force_cpu(self, row, enabled, ring):
+        self.cpu.mem_write(self.DATA, bytes(64))
+        self.put(self.DATA + 18, '<B', 1)
+        self.put(self.DATA + 20, '<7I', row, enabled, 1, 0, 0, 0, ring)
+        self.call('ifc_set_action_forceCPU', self.DATA)
+        assert self.rows[2,row,0] == (0, 0)
+        assert self.rows[2,row,1] == (0, 0, ring << 10)
+        assert self.rows[2,row,2] == ((enabled << 31) | (1 << 30) | (1 << 28),)
+
     def matches(self, row, gem, etype, source=2, encap=0):
         if not self.rows[2,row,2][0] & (1 << 31):
             return False
         packet = {0: 1 << source, 5: etype, 7: gem << 16 | encap}
         return all(not ((packet.get(i, 0) ^ key) & mask)
                    for i in range(9) for key, mask in [self.rows[0,row,i]])
+
+
+def check_cpu_rings(path):
+    checked = 0
+    for etype in (0x0800, 0x86dd):
+        cpu = Classifier(path)
+        first, second = 54, 55
+        cpu.configure(first, 0x2134, etype, False)
+        cpu.configure(second, 0xa134, etype, True)
+        cpu.force_cpu(first, 1, 2)
+        cpu.force_cpu(second, 1, 4)
+        saved = {key: value for key, value in cpu.rows.items() if key[1] == second}
+
+        def destinations(gem, source=2):
+            return [cpu.rows[2,row,1][2] >> 10 & 31 for row in (first, second)
+                    if cpu.matches(row, gem, etype, source)]
+
+        for gem in range(65536):
+            expected = {0x2134: [2], 0xa134: [4]}.get(gem, [])
+            assert destinations(gem) == expected
+            checked += 1
+        assert destinations(0x2134, 24) == destinations(0xa134, 24) == []
+        cpu.force_cpu(first, 0, 2)
+        assert destinations(0x2134) == [] and destinations(0xa134) == [4]
+        cpu.field(first, 'GEM_LLID', 0x2135, 65535)
+        cpu.force_cpu(first, 1, 2)
+        assert destinations(0x2134) == [] and destinations(0x2135) == [2]
+        assert destinations(0xa134) == [4]
+        assert saved == {key: value for key, value in cpu.rows.items() if key[1] == second}
+    return checked
 
 
 def main():
@@ -85,7 +124,6 @@ def main():
         m.steer(b, 8, 0)
         m.configure(a, 0x2134, etype, False)
         m.configure(b, 0xa134, etype, True)
-        # First stage on a board: same CDM2 output, independently observable rings.
         m.steer(a, 5, 1, 2)
         m.steer(b, 5, 1, 4)
         assert m.rows[2,a,1][2] == 2 << 10 and m.rows[2,b,1][2] == 4 << 10
@@ -109,6 +147,7 @@ def main():
         assert m.matches(a, 0x2135, etype) and not m.matches(a, 0x2134, etype)
         assert m.matches(b, 0xa134, etype)
     print(json.dumps(dict(module=m.sha256, ternary_checks=checked, families=2,
+                          cpu_ring_service_checks=check_cpu_rings(args.stock_dir / 'ifc.ko'),
                           row_replace=True, mmio='emulated')))
 
 

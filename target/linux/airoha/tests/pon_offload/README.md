@@ -67,7 +67,9 @@ python3 verify_ewan_ingress.py --stock-dir /path/to/stock/lib/modules \
 
 `verify_ifc_service.py --stock-dir /path/to/stock/lib/modules` 执行原厂 `ifc.ko`：在同一 type-0 行组合 GDM2、16 位业务号、EtherType 和无 VLAN/PPPoE 条件，再用第二行隔离仅最高位不同的业务。IPv4/IPv6 各测一轮；按字段正序、逆序写入后核对全部九页，比较 263,168 组输入，并在另一行业务保留时停用、改号、重开第一行。TCAM page 0 的键/掩码是 `4/4`；page 5 是 EtherType/`0xffff`；page 7 是 `service << 16`/`0xffff0430`；page 8 是 `0/0xc0`。匹配检查使用原厂写入模拟 MMIO 的最终表项。
 
-板测分两步。先保持 GDM2 的硬件流关闭，用 `forcePort(CDM2=5)` 将仅业务号不同的 A、B 编号包分别送到两个可观测的 WAN CPU 环，核对同五元组、无效映射和撤销后的默认去向。原厂动作页 1 `DATA2[14:10]` 选队列。测试中的行号 54/55 是模拟值，实板上这两行由 LAN1 使用；须在现有 IFC 所有权下选择空闲行。LAN1 板测曾发现直接覆盖 GDM 默认 CPU 路由会绕过 IFC（见 `hg5585f-ct/NATIVE_PAIRS.md`）。若在 GDM2 上也出现绕过，应先解决 IFC 与默认 CPU 路由的次序，保留 WAN CPU 回退。
+板测分两步。先保持 GDM2 的硬件流关闭，用 `forceCPU` 将仅业务号不同的 A、B 编号包分别送到 WAN CPU 接收环 2、4。它通过动作页 2 `DATA0[28]` 强制送 CPU，页 1 `DATA2[14:10]` 选环；接收端口来自源端口映射。`forcePort(CDM2=5, nbq=2/4)` 是另一种动作，其端口覆盖位在页 1 `DATA1[28]`。脚本分别执行这两个原厂 setter，并对 `forceCPU` 行做 131,072 次 IPv4/IPv6 业务号检查，另测撤销及改号时另一行保持原样。
+
+同一次板上启动须先读回 `REG_SP_DFT_CPORT(0)`（`0x1fb520e0`）的 sport2 字段 `[11:8]` 为 `5`，并确认 QDMA1 接收环 2、4 已分配、索引有效。PPE 默认 CPU 端口和 GDM 默认路由是不同寄存器。实包以相同五元组的独立包号核对来源、收包环和交付；无效业务、撤销后和未匹配包另测。测试中的行号 54/55 是模拟值，实板上这两行由 LAN1 使用；须在现有 IFC 所有权下选择空闲行。LAN1 板测曾发现直接覆盖 GDM 默认 CPU 路由会绕过 IFC（见 `hg5585f-ct/NATIVE_PAIRS.md`）。若在 GDM2 上也出现绕过，应先解决 IFC 与默认 CPU 路由的次序，保留 WAN CPU 回退。
 
 仅在实板确认分类生效、未匹配流量保持 WAN CPU 后，再让一个已配置的非零业务 A 进入独占 PPE 表，检查只有 A 推动绑定行计数并抵达目标。这个方案在 IFC 查表处使用业务号，无需 FE32 向 NPU 透传该字段。原厂字段名为 `GEM_LLID`，EPON 线侧输入值与其 CPU channel 的关系须单独测量。
 
