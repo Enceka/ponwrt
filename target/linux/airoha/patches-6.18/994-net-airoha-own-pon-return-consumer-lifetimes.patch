@@ -1,0 +1,297 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: own PON return consumers through teardown
+
+Bind PON return DMA only while the shared lifecycle is closed. Pin the lower
+and immutable service mapping, validate complete GEM identities at delivery,
+and retire STOP/UNBIND before hardware restoration or provider release.
+Keep ambiguous binds and failed teardown owned, and advance the gate epoch
+before another admission attempt. Fault cutover retries preserve CPU routing.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -999,6 +999,8 @@
+ int airoha_ct_cpu_fallback(struct airoha_eth *eth);
+ int airoha_ppe_npu_owner_claim_locked(struct airoha_eth *eth, u64 generation);
+ int airoha_ppe_npu_owner_close_locked(struct airoha_eth *eth);
++int airoha_ppe_npu_return_prepare_locked(struct airoha_eth *eth,
++					struct airoha_gdm_dev *dev, u32 count);
+ int airoha_ppe_ct_shutdown(struct airoha_eth *eth);
+ int airoha_ppe_ct_prepare(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+--- a/drivers/net/ethernet/airoha/airoha_npu_owner.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_owner.h
+@@ -8,6 +8,8 @@
+ 	struct airoha_npu_txn txn;
+ 	u32 bank1_flow, bank1_tb;
+ 	bool bank1_saved, native_stopped, stop_completed;
++	struct airoha_npu_return *return_path;
++	bool epoch_dirty;
+ };
+ 
+ static struct airoha_npu *airoha_npu_owner_provider(struct airoha_npu_owner *owner)
+@@ -101,9 +103,12 @@
+ 	.routes_open = airoha_npu_owner_open_unsupported,
+ };
+ 
++#include "airoha_npu_return.h"
++
+ int airoha_ppe_npu_owner_close_locked(struct airoha_eth *eth)
+ {
+ 	struct airoha_npu_owner *owner;
++	int error;
+ 
+ 	if (!eth || !eth->ppe)
+ 		return -EINVAL;
+@@ -111,7 +116,19 @@
+ 	owner = eth->ppe->ct_npu_owner;
+ 	if (!owner)
+ 		return 0;
++	if (owner->epoch_dirty && owner->txn.phase == NPU_TXN_CLOSED) {
++		if (owner->txn.id.epoch == U32_MAX)
++			return -EOVERFLOW;
++		error = airoha_npu_txn_begin(&owner->txn, owner->txn.id.epoch + 1,
++					     owner->txn.id.generation, owner->txn.id.open_mask);
++		if (error)
++			return error;
++	}
++	error = airoha_npu_txn_close(&owner->txn, &airoha_npu_owner_ops, owner);
++	if (error)
++		return error;
++	owner->epoch_dirty = false;
++	return airoha_npu_return_destroy(owner);
+-	return airoha_npu_txn_close(&owner->txn, &airoha_npu_owner_ops, owner);
+ }
+ 
+ int airoha_ppe_npu_owner_claim_locked(struct airoha_eth *eth, u64 generation)
+@@ -196,7 +213,8 @@
+ 	lockdep_assert_held(&flow_offload_mutex);
+ 	if (!owner)
+ 		return 0;
++	if (owner->txn.phase != NPU_TXN_CLOSED || !owner->bank1_saved ||
++	    owner->return_path || owner->epoch_dirty)
+-	if (owner->txn.phase != NPU_TXN_CLOSED || !owner->bank1_saved)
+ 		return -EBUSY;
+ 	if (ppe->eth->ct_bank1_routes.owner) {
+ 		error = airoha_bank1_routes_release(ppe->eth, owner);
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_return.h
+@@ -0,0 +1,219 @@
++#ifndef AIROHA_NPU_RETURN_H
++#define AIROHA_NPU_RETURN_H
++
++#include "airoha_eth_return.h"
++
++struct airoha_npu_return {
++	struct airoha_npu_owner *owner;
++	struct airoha_er *ring;
++	struct er_config config;
++	struct airoha_gdm_dev *dev;
++	const struct airoha_pon_flow_table *table;
++	struct delayed_work fault_work;
++	u32 epoch, generation, count, fault;
++	int route_error;
++	bool bound, stopping;
++};
++
++static int airoha_npu_return_command(void *ctx, struct er_message *message)
++{
++	struct airoha_npu_return *path = ctx;
++	struct airoha_npu *npu = airoha_npu_owner_provider(path->owner);
++
++	if (message->w[1] >> 16 == ER_BIND)
++		path->config = (struct er_config) { message->w[2], message->w[3],
++			message->w[4], message->w[5], message->w[6], message->w[7] };
++	return npu ? airoha_npu_er_command(npu, message) : -ENODEV;
++}
++
++static int airoha_npu_return_quiesce(void *ctx)
++{
++	struct airoha_npu_return *path = ctx;
++	struct airoha_npu_owner *owner = path->owner;
++
++	return airoha_npu_txn_close(&owner->txn, &airoha_npu_owner_ops, owner);
++}
++
++static bool airoha_npu_return_mapping(struct airoha_npu_return *path,
++				      struct net_device *lower)
++{
++	struct airoha_gdm_dev *dev = path->dev;
++	struct airoha_eth *eth = path->owner->ppe->eth;
++
++	return lower == netdev_from_priv(dev) &&
++	       test_bit(AIROHA_DEV_F_PON, &dev->flags) &&
++	       !smp_load_acquire(&dev->pon_update_blocked) &&
++	       netif_running(lower) && netif_carrier_ok(lower) &&
++	       rcu_dereference(dev->qdma) == &eth->qdma[1] &&
++	       rcu_dereference(dev->pon_flow_table) == path->table &&
++	       !READ_ONCE(dev->pon_qdma_tag) &&
++	       br_flow_offload_generation() == path->generation;
++}
++
++static bool airoha_npu_return_binding(void *ctx, struct net_device *lower,
++				     const struct er_config *config, u32 service)
++{
++	struct airoha_npu_return *path = ctx;
++	const struct airoha_pon_flow_table *table;
++	unsigned int index;
++
++	if (!smp_load_acquire(&path->bound) || READ_ONCE(path->fault) ||
++	    READ_ONCE(path->owner->ppe->eth->ct_cpu_fallback) ||
++	    memcmp(config, &path->config, sizeof(*config)) ||
++	    (service & ~0xffffU) != ER_SERVICE_VALID ||
++	    !airoha_npu_return_mapping(path, lower))
++		return false;
++	table = rcu_dereference(path->dev->pon_flow_table);
++	for (index = 0; table && index < table->count; ++index) {
++		u32 tag = table->entries[index].tag;
++
++		if ((tag & (AIROHA_PON_QDMA_VALID | AIROHA_PON_QDMA_EPON)) ==
++		    AIROHA_PON_QDMA_VALID &&
++		    FIELD_GET(AIROHA_PON_QDMA_GEM_MASK, tag) == (service & 0xffff))
++			return true;
++	}
++	return false;
++}
++
++static void airoha_npu_return_fault_work(struct work_struct *work)
++{
++	struct airoha_npu_return *path =
++		container_of(to_delayed_work(work), struct airoha_npu_return, fault_work);
++	int error;
++
++	if (READ_ONCE(path->stopping))
++		return;
++	error = airoha_ct_cpu_fallback(path->owner->ppe->eth);
++	WRITE_ONCE(path->route_error, error);
++	if (error && !READ_ONCE(path->stopping))
++		schedule_delayed_work(&path->fault_work, msecs_to_jiffies(100));
++}
++
++static void airoha_npu_return_fault(void *ctx,
++				    const struct er_config *config, u32 reason)
++{
++	struct airoha_npu_return *path = ctx;
++
++	WRITE_ONCE(path->fault, reason ?: 1);
++	airoha_npu_return_fault_work(&path->fault_work.work);
++}
++
++static const struct airoha_er_ops airoha_npu_return_ops = {
++	.command = airoha_npu_return_command,
++	.quiesce = airoha_npu_return_quiesce,
++	.binding_matches = airoha_npu_return_binding,
++	.fault = airoha_npu_return_fault,
++};
++
++static int airoha_npu_return_destroy(struct airoha_npu_owner *owner)
++{
++	struct airoha_npu_return *path = owner->return_path;
++	int error;
++
++	if (!path)
++		return 0;
++	smp_store_release(&path->bound, false);
++	error = airoha_er_destroy(&path->ring);
++	if (error)
++		return error;
++	WRITE_ONCE(path->stopping, true);
++	cancel_delayed_work_sync(&path->fault_work);
++	owner->return_path = NULL;
++	kfree(path);
++	return 0;
++}
++
++int airoha_ppe_npu_return_prepare_locked(struct airoha_eth *eth,
++					struct airoha_gdm_dev *dev, u32 count)
++{
++	struct er_message discovery = {
++		.w = { ER_MAGIC, ER_ABI | ER_QUERY << 16, 0, 0, 0, 0, 0, 0,
++		       (u32)-EINPROGRESS },
++	};
++	const struct airoha_pon_flow_table *table;
++	struct airoha_npu_owner *owner;
++	struct airoha_npu_return *path;
++	unsigned int index;
++	int error;
++
++	if (!eth || !eth->ppe || !dev || count < ER_MIN_COUNT ||
++	    count > ER_MAX_COUNT || (count & (count - 1)))
++		return -EINVAL;
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!airoha_is_valid_gdm_dev(eth, dev) ||
++	    !test_bit(AIROHA_DEV_F_PON, &dev->flags) ||
++	    dev->port->id != AIROHA_GDM2_IDX ||
++	    eth->soc->ops.get_sport(dev->port, dev->nbq) != ER_PON)
++		return -EOPNOTSUPP;
++	owner = eth->ppe->ct_npu_owner;
++	if (!owner || owner->txn.phase != NPU_TXN_CLOSED ||
++	    owner->txn.id.open_mask != GATE_PON2 || owner->stop_completed ||
++	    owner->native_stopped || !eth->ppe->ct_host_ppe)
++		return -EBUSY;
++	if (READ_ONCE(eth->ct_cpu_fallback))
++		return -EIO;
++	table = rcu_dereference_protected(dev->pon_flow_table,
++					  lockdep_is_held(&flow_offload_mutex));
++	if (!table || !table->count || table->count > 32 ||
++	    READ_ONCE(dev->pon_qdma_tag))
++		return -EOPNOTSUPP;
++	for (index = 0; index < table->count; ++index)
++		if ((table->entries[index].tag &
++		     (AIROHA_PON_QDMA_VALID | AIROHA_PON_QDMA_EPON)) != AIROHA_PON_QDMA_VALID)
++			return -EINVAL;
++	path = owner->return_path;
++	if (path) {
++		if (path->dev != dev || path->count != count)
++			return -ESTALE;
++		rcu_read_lock();
++		error = path->bound && !READ_ONCE(path->fault) &&
++			airoha_npu_return_mapping(path, netdev_from_priv(dev)) ? 0 : -EBUSY;
++		rcu_read_unlock();
++		return error;
++	}
++	if (owner->epoch_dirty)
++		return -EBUSY;
++	if (owner->txn.id.epoch == U32_MAX)
++		return -EOVERFLOW;
++	path = kzalloc(sizeof(*path), GFP_KERNEL);
++	if (!path)
++		return -ENOMEM;
++	path->owner = owner;
++	path->dev = dev;
++	path->table = table;
++	path->epoch = owner->txn.id.epoch;
++	path->generation = owner->txn.id.generation;
++	path->count = count;
++	INIT_DELAYED_WORK(&path->fault_work, airoha_npu_return_fault_work);
++	rcu_read_lock();
++	error = airoha_npu_return_mapping(path, netdev_from_priv(dev)) ? 0 : -ESTALE;
++	rcu_read_unlock();
++	if (error)
++		goto free_path;
++	error = airoha_npu_return_command(path, &discovery);
++	if (error)
++		goto free_path;
++	if (discovery.w[9] != (ER_CAPS | ER_CAP_SOURCES)) {
++		error = -EOPNOTSUPP;
++		goto free_path;
++	}
++	if (discovery.w[10] != ER_IDLE || discovery.w[12]) {
++		error = -EBUSY;
++		goto free_path;
++	}
++	owner->return_path = path;
++	owner->epoch_dirty = true;
++	error = airoha_er_create(&path->ring, eth->dev, netdev_from_priv(dev),
++				 ER_PON, path->generation, path->epoch, count,
++				 true, &airoha_npu_return_ops, path);
++	if (!error)
++		smp_store_release(&path->bound, true);
++	if (path->ring)
++		return error;
++	owner->return_path = NULL;
++free_path:
++	kfree(path);
++	return error;
++}
++
++#endif

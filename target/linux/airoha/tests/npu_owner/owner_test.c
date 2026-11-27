@@ -9,6 +9,8 @@
 typedef uint32_t u32;
 typedef uint64_t u64;
 
+#include "return_types.h"
+
 static unsigned int checks;
 #define CHECK(condition) do { checks++; if (!(condition)) { \
     fprintf(stderr, "CHECK failed: %s at %d\n", #condition, __LINE__); exit(1); } } while (0)
@@ -26,8 +28,8 @@ static unsigned int checks;
 #define AIROHA_FOE_IB1_BIND_TIMESTAMP 0xf0u
 #define AIROHA_FOE_STATE_BIND 2u
 #define PPE_SRAM_NUM_ENTRIES 8192u
-#define rcu_read_lock() CHECK(ppe_lock)
-#define rcu_read_unlock() CHECK(ppe_lock)
+#define rcu_read_lock() CHECK(ppe_lock || flow_offload_mutex)
+#define rcu_read_unlock() CHECK(ppe_lock || flow_offload_mutex)
 #define rcu_dereference(pointer) (pointer)
 #define wmb() CHECK(ppe_lock)
 #define WRITE_ONCE(target, value) ((target) = (value))
@@ -64,7 +66,10 @@ struct airoha_ppe {
     struct { const void *owner; u32 epoch; u64 generation;
              bool pending, armed, touched, arm_pending; } ct_fe;
 };
-struct airoha_soc { int num_ppe; };
+struct airoha_soc {
+    int num_ppe;
+    struct { int (*get_sport)(struct airoha_gdm_port *, int); } ops;
+};
 struct airoha_eth {
     struct airoha_ppe *ppe;
     struct airoha_npu *npu;
@@ -72,6 +77,10 @@ struct airoha_eth {
     int ct_route_lock;
     struct { const void *owner; } ct_bank1_routes;
     u32 regs[6];
+    void *dev;
+    struct airoha_qdma qdma[2];
+    struct airoha_gdm_dev *pon;
+    bool ct_cpu_fallback;
 };
 
 static int flow_offload_mutex = 1, ppe_lock;
@@ -191,6 +200,7 @@ static int airoha_ct_fe_owner_release(struct airoha_ppe *ppe, const void *owner)
     return 0;
 }
 
+#include "return_stubs.inc"
 #include "airoha_npu_owner.h"
 
 static const u32 ct_bank0_regs[] = { 0, 1 };
@@ -321,6 +331,8 @@ static void check_closed(struct airoha_eth *eth)
     CHECK(!eth->regs[3] && eth->regs[4] == 0x1236 && eth->regs[5] == 1);
     CHECK(eth->ct_bank1_routes.owner == owner && eth->ppe->ct_fe.owner == owner);
 }
+
+#include "return_test.inc"
 
 static void check_binding(struct airoha_eth *eth)
 {
@@ -498,6 +510,7 @@ int main(void)
         flow_offload_mutex = 1;
     }
     CHECK(allocated == freed);
+    check_returns();
     printf("npu owner: %u checks passed\n", checks);
     return 0;
 }
