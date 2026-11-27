@@ -148,6 +148,24 @@ ASan/UBSan 用例已通过，涵盖阶段失败、丢 ACK、身份溢出及两�
 此事务核已随 AArch64 vmlinux 编译；实际入口、寄存器和设备引用由后续 owner
 接入，重开期间仍需在各回调检查实时 generation、撤销状态与 ER binding。
 
-下一步接入内核关闭/重开事务、native FE 共享所有权和 PON 映射更新，完成
-同 tuple 跨 LAN/PON 的硬件查表隔离后再开放 PON PPE 准入并做实板验收。
-当前设备沿用之前通过验收的 RAM 镜像。
+`991` 为 bank1 默认路由增加独占所有权。四个 GDM 分别保存请求的 selector，
+持有期间把 PPE2 入口导向实际 QDMA CPU 接收者；QDMA 迁移、native 重开、
+部分字段更新和 sticky fallback 都继续使用该请求值。旧 PON probe 在任何 IFC
+命令前拒绝冲突。恢复失败保留快照并重新关闭入口。74 个 ASan/UBSan 场景及
+524,288 个 selector 向量通过，覆盖逐笔 MMIO 故障和恢复。
+
+`992` 增加 native FE 共享所有权，串行化精确 QUIESCE 身份、policy、health、
+学习和有线端口事件。`993` 将关闭事务接到 PON 映射更新与驱动退出：使用
+flow_offload_mutex 保护 provider 引用，先关闭入口、gate 与旧授权，再排空 FE
+和 bank1。首次认领排除旧路由占用，新 epoch 覆盖 gate、FE、wired 和 AUTH；
+部分退出失败保留已完成阶段，重试继续释放。持有期间禁止新的 bank1 BIND，
+bank0 和 INVALID 撤流继续可用。内部 claim 需显式调用，普通启动不会自动认领。
+
+992 的 96 个生产 C 回归场景、993 的 3,589 项检查及六项运行期负控制均通过
+ASan/UBSan。PON 更新事务通过 74 个场景，含 27 个 MMIO 故障位置与六项负控制；
+旧版无 owner 路径保留独立回归。991–993 联合通过 Linux 6.18.60 AArch64
+vmlinux 编译、modpost 和链接，无警告。验收报告位于上述 build 目录。
+
+下一步完成来源/业务授权、ER 队列生命周期与重开回调，接着隔离同 tuple 的
+LAN/PON 软件候选与硬件表项，开放 PON PPE 准入后做实板验收。当前设备沿用
+之前通过验收的 RAM 镜像。
