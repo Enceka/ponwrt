@@ -25,14 +25,16 @@ typedef uint8_t u8;
 #define LPBK_EN_MASK 1u
 #define PPE_GLO_CFG_EN_MASK 1u
 #define PPE_GLO_CFG_BUSY_MASK 2u
-#define PPE_TB_CFG_SEARCH_MISS_MASK 3u
+#define PPE_TB_CFG_SEARCH_MISS_MASK 0x30u
+#define PPE_FLOW_CFG_IP4_NAPT_MASK BIT(13)
 #define PPE_SRAM_NUM_ENTRIES 8192u
 #define FE_PSE_PORT_CDM2 5
 #define REG_PPE_PPE_FLOW_CFG(bank) ((bank) * 3)
 #define REG_PPE_TB_CFG(bank) ((bank) * 3 + 1)
 #define REG_PPE_GLO_CFG(bank) ((bank) * 3 + 2)
 #define REG_GDM_LPBK_CFG(port) (6 + (port))
-#define FIELD_GET(mask, value) ((value) & (mask))
+#define FIELD_GET(mask, value) (((value) & (mask)) >> __builtin_ctz(mask))
+#define FIELD_PREP(mask, value) (((value) << __builtin_ctz(mask)) & (mask))
 #define read_poll_timeout_atomic(operation, value, condition, delay, timeout, sleep, ...) \
 	((value) = operation(__VA_ARGS__), (condition) ? 0 : -ETIMEDOUT)
 
@@ -93,7 +95,7 @@ struct airoha_npu_owner {
 	const struct airoha_pon_link_ops *diag_controller;
 	void *diag_priv;
 	bool retiring, bank1_saved, bank1_host_retired, closed_ack;
-	bool auth_attempted, epoch_dirty, diag_auth;
+	bool auth_attempted, epoch_dirty, diag_auth, diag_learn;
 	u32 auth_count, bank1_next_row, bank1_flow, bank1_tb;
 	struct { bool saved_valid, dirty, active, pending; } ingress;
 	struct airoha_npu_return *return_path;
@@ -143,6 +145,18 @@ static u32 binding_service;
 static unsigned int binding_calls, ready_calls;
 static int bad_auth_op, fail_auth_status_op;
 static bool fail_ready_after_auth;
+static bool open_runs_bank1, trace_mmio, readback_corrupted, fail_state_after_write;
+static int fail_readback, last_write_reg;
+static u32 readback_mask;
+struct mmio_event {
+	bool write;
+	unsigned int reg;
+	u32 value, next_row;
+	int locked;
+};
+static struct mmio_event mmio_events[64];
+static unsigned int mmio_count, scope_calls;
+static u32 close_entry_row;
 enum { TRACE_BINDING = 5, TRACE_READY, TRACE_OPEN };
 static u32 trace[128], trace_count;
 static struct npu_auth_message auth_requests[5];
@@ -262,14 +276,35 @@ static bool airoha_ct_pon_ifc_busy(struct airoha_ppe *actual) { CHECK(actual == 
 static u64 br_flow_offload_generation(void) { return 19; }
 static u32 airoha_fe_rr(struct airoha_eth *actual, unsigned int reg)
 {
+	u32 value;
+
 	CHECK(actual == &eth && reg < ARRAY_SIZE(registers));
-	return registers[reg];
+	value = registers[reg];
+	if (writes && (int)reg == last_write_reg && (int)reg == fail_readback &&
+	    !readback_corrupted) {
+		value ^= readback_mask;
+		readback_corrupted = true;
+	}
+	if (trace_mmio) {
+		CHECK(mmio_count < ARRAY_SIZE(mmio_events));
+		mmio_events[mmio_count++] = (struct mmio_event) {
+			false, reg, value, session.bank1_next_row, ppe_lock,
+		};
+	}
+	return value;
 }
 static void airoha_fe_wr(struct airoha_eth *actual, unsigned int reg, u32 value)
 {
 	CHECK(actual == &eth && reg < ARRAY_SIZE(registers));
 	CHECK(ppe_lock);
 	writes++;
+	last_write_reg = reg;
+	if (trace_mmio) {
+		CHECK(mmio_count < ARRAY_SIZE(mmio_events));
+		mmio_events[mmio_count++] = (struct mmio_event) {
+			true, reg, value, session.bank1_next_row, ppe_lock,
+		};
+	}
 	if ((int)reg != fail_write)
 		registers[reg] = value;
 }
@@ -279,6 +314,8 @@ static int airoha_npu_owner_return_state(struct airoha_npu_owner *owner,
 {
 	CHECK(owner == &session && id == &owner->txn.id);
 	CHECK(phase >= NPU_TXN_CLOSED);
+	if (fail_state_after_write && writes)
+		return -ESTALE;
 	return state_error;
 }
 static int airoha_npu_owner_return_ready(struct airoha_npu_owner *owner,
@@ -353,8 +390,13 @@ static int airoha_ppe_npu_return_prepare_locked(struct airoha_eth *actual,
 		gdm.pon_link_ops = &other_controller;
 	return 0;
 }
+static int airoha_npu_owner_bank1_restore(void *ctx,
+					 const struct airoha_npu_txn_identity *id);
+int airoha_bank1_routes_open(struct airoha_eth *actual, const void *owner);
 static int airoha_ppe_npu_owner_open_locked(struct airoha_eth *actual)
 {
+	int error;
+
 	CHECK(actual == &eth && auth_enabled);
 	CHECK(session.auth_count == (session.diag_auth ? 1u : 0u));
 	CHECK(auth_calls[AUTH_MBOX_ADD] == (session.diag_auth ? 1u : 0u));
@@ -362,12 +404,19 @@ static int airoha_ppe_npu_owner_open_locked(struct airoha_eth *actual)
 	CHECK(!registers[REG_PPE_PPE_FLOW_CFG(1)]);
 	record_event(TRACE_OPEN);
 	open_calls++;
+	if (!open_error && open_runs_bank1) {
+		error = airoha_npu_owner_bank1_restore(&session, &session.txn.id);
+		if (error)
+			return error;
+		return airoha_bank1_routes_open(actual, &session);
+	}
 	return open_error;
 }
 static int airoha_ppe_npu_owner_close_locked(struct airoha_eth *actual)
 {
 	CHECK(actual == &eth);
 	close_calls++;
+	close_entry_row = session.bank1_next_row;
 	if (close_error)
 		return close_error;
 	if (closed_postconditions) {
@@ -409,6 +458,7 @@ static int airoha_bank1_routes_write_all(struct airoha_eth *actual, bool guarded
 static int airoha_bank1_scope_locked(struct airoha_eth *actual, bool enable)
 {
 	CHECK(actual == &eth && enable && eth.ct_route_lock);
+	scope_calls++;
 	return scope_error;
 }
 static int airoha_bank1_routes_revoke_locked(struct airoha_eth *actual)
@@ -419,6 +469,7 @@ static int airoha_bank1_routes_revoke_locked(struct airoha_eth *actual)
 }
 
 #include "active.inc"
+#include "diag_flow.inc"
 #include "platform.inc"
 #include "er_stats.inc"
 #include "er_observe.inc"
@@ -452,6 +503,12 @@ static void fixture(void)
 	memset(auth_requests, 0, sizeof(auth_requests));
 	memset(trace, 0, sizeof(trace));
 	trace_count = binding_calls = ready_calls = 0;
+	memset(mmio_events, 0, sizeof(mmio_events));
+	mmio_count = scope_calls = 0;
+	close_entry_row = UINT32_MAX;
+	open_runs_bank1 = trace_mmio = readback_corrupted = fail_state_after_write = false;
+	fail_readback = last_write_reg = -1;
+	readback_mask = BIT(31);
 	binding_service = 0x1001u;
 	fail_ready_after_auth = false;
 	bad_auth_op = fail_auth_status_op = -1;
@@ -489,7 +546,7 @@ static void fixture(void)
 	session.bank1_tb = 0x456701;
 	path.dev = &gdm;
 	registers[REG_PPE_GLO_CFG(1)] = PPE_GLO_CFG_EN_MASK;
-	registers[REG_PPE_TB_CFG(1)] = 2;
+	registers[REG_PPE_TB_CFG(1)] = FIELD_PREP(PPE_TB_CFG_SEARCH_MISS_MASK, 2);
 	registers[REG_GDM_LPBK_CFG(2)] = LPBK_EN_MASK;
 	registers[0] = 0xabc001;
 	registers[1] = 0xabc002;
@@ -748,13 +805,14 @@ static void test_auth_isolation(void)
 
 static void test_auth_mode_active(void)
 {
-	for (unsigned int mode = 0; mode < 2; ++mode) {
+	for (unsigned int mode = 0; mode < 3; ++mode) {
 		for (u32 count = 0; count <= 3; ++count) {
 			fixture();
 			attach();
-			session.diag_auth = mode;
+			session.diag_auth = mode != 0;
+			session.diag_learn = mode == 2;
 			session.auth_count = count;
-			CHECK(airoha_ppe_npu_diag_active(&ppe, &session) == (count <= mode));
+			CHECK(airoha_ppe_npu_diag_active(&ppe, &session) == (count <= (mode != 0)));
 			balanced();
 		}
 	}
@@ -770,7 +828,7 @@ static void auth_retained(int expected, bool attempted)
 	CHECK(!registers[REG_PPE_PPE_FLOW_CFG(1)] && !ppe.ct_pon_qualified);
 }
 
-static void test_auth_start(void)
+static void test_auth_start(unsigned int mode)
 {
 	static const u32 services[] = { 0, 1, 0x8000, 0xffff };
 	static const u32 expected_trace[] = {
@@ -789,7 +847,8 @@ static void test_auth_start(void)
 		fixture();
 		binding_service = services[index];
 		lower.dev_addr[5] += index;
-		CHECK(!airoha_npu_diag_start_mode(&ppe, true, services[index]));
+		CHECK(!airoha_npu_diag_start_mode(&ppe, mode, services[index]));
+		CHECK(session.diag_learn == (mode == 2));
 		CHECK(session.diag_auth && session.auth_count == 1 && auth_count == 1 && auth_enabled == 1);
 		CHECK(auth_calls[AUTH_MBOX_BEGIN] == 1 && auth_calls[AUTH_MBOX_ADD] == 1 &&
 		      auth_calls[AUTH_MBOX_ARM] == 1 && open_calls == 1 && binding_calls == 1);
@@ -813,7 +872,7 @@ static void test_auth_admission(void)
 	static const u32 invalid_services[] = { 0x10000, 0x80000000, UINT32_MAX };
 	static const u32 services[] = { 0, 1, 0x8000, 0xffff };
 
-	for (unsigned int mode = 0; mode < 2; ++mode) {
+	for (unsigned int mode = 0; mode < 3; ++mode) {
 		for (unsigned int index = 0; index < ARRAY_SIZE(invalid_services); ++index) {
 			fixture();
 			CHECK(airoha_npu_diag_start_mode(&ppe, mode, invalid_services[index]) == -EINVAL);
@@ -822,14 +881,17 @@ static void test_auth_admission(void)
 			balanced();
 		}
 	}
-	for (unsigned int index = 0; index < ARRAY_SIZE(services); ++index) {
-		for (unsigned int high = 0; high < 2; ++high) {
-			fixture();
-			binding_service = services[index] ^ (high ? 0x8000u : 1u);
-			CHECK(airoha_npu_diag_start_mode(&ppe, true, services[index]) == -ESTALE);
-			auth_retained(-ESTALE, false);
-			CHECK(binding_calls == 1 && !auth_calls[AUTH_MBOX_BEGIN] && !auth_calls[AUTH_MBOX_ADD]);
-			balanced();
+	for (unsigned int mode = 1; mode < 3; ++mode) {
+		for (unsigned int index = 0; index < ARRAY_SIZE(services); ++index) {
+			for (unsigned int high = 0; high < 2; ++high) {
+				fixture();
+				binding_service = services[index] ^ (high ? 0x8000u : 1u);
+				CHECK(airoha_npu_diag_start_mode(&ppe, mode, services[index]) == -ESTALE);
+				auth_retained(-ESTALE, false);
+				CHECK(session.diag_learn == (mode == 2));
+				CHECK(binding_calls == 1 && !auth_calls[AUTH_MBOX_BEGIN] && !auth_calls[AUTH_MBOX_ADD]);
+				balanced();
+			}
 		}
 	}
 	for (unsigned int scenario = 0; scenario < 9; ++scenario) {
@@ -855,12 +917,13 @@ static void test_auth_admission(void)
 		CHECK(ppe.ct_npu_owner == &session && !freed && !netdev_puts);
 		balanced();
 	}
-	for (unsigned int mode = 0; mode < 2; ++mode) {
+	for (unsigned int mode = 0; mode < 3; ++mode) {
 		struct airoha_npu_auth_rule rule = valid_rule();
 
 		fixture();
 		attach();
-		session.diag_auth = mode;
+		session.diag_auth = mode != 0;
+		session.diag_learn = mode == 2;
 		session.return_path = &path;
 		CHECK(airoha_ppe_npu_owner_authorize_locked(&eth, &rule, 1) == -EOPNOTSUPP);
 		CHECK(!binding_calls && !auth_calls[AUTH_MBOX_BEGIN] && !session.auth_attempted);
@@ -868,7 +931,7 @@ static void test_auth_admission(void)
 	}
 }
 
-static void test_auth_failures(void)
+static void test_auth_failures(unsigned int mode)
 {
 	static const int fields[] = {
 		AM_MAGIC, AM_ABI_OP, AM_BYTES, AM_EPOCH, AM_GENERATION, AM_RULE_COUNT,
@@ -879,8 +942,9 @@ static void test_auth_failures(void)
 	for (int operation = AUTH_MBOX_BEGIN; operation <= AUTH_MBOX_ARM; ++operation) {
 		fixture();
 		fail_auth_op = operation;
-		CHECK(airoha_npu_diag_start_mode(&ppe, true, binding_service) == -ETIMEDOUT);
+		CHECK(airoha_npu_diag_start_mode(&ppe, mode, binding_service) == -ETIMEDOUT);
 		auth_retained(-ETIMEDOUT, true);
+		CHECK(session.diag_learn == (mode == 2));
 		CHECK(auth_calls[operation] == 1);
 		if (operation < AUTH_MBOX_ARM)
 			CHECK(!auth_calls[operation + 1]);
@@ -889,8 +953,9 @@ static void test_auth_failures(void)
 			fixture();
 			bad_auth_op = operation;
 			bad_auth_word = fields[index];
-			CHECK(airoha_npu_diag_start_mode(&ppe, true, binding_service) == -EPROTO);
+			CHECK(airoha_npu_diag_start_mode(&ppe, mode, binding_service) == -EPROTO);
 			auth_retained(-EPROTO, true);
+			CHECK(session.diag_learn == (mode == 2));
 			CHECK(auth_calls[operation] == 1);
 			if (operation < AUTH_MBOX_ARM)
 				CHECK(!auth_calls[operation + 1]);
@@ -899,13 +964,13 @@ static void test_auth_failures(void)
 	}
 	fixture();
 	fail_auth_status_op = AUTH_MBOX_ADD;
-	CHECK(airoha_npu_diag_start_mode(&ppe, true, binding_service) == -EPROTO);
+	CHECK(airoha_npu_diag_start_mode(&ppe, mode, binding_service) == -EPROTO);
 	auth_retained(-EPROTO, true);
 	CHECK(auth_calls[AUTH_MBOX_ADD] == 1 && !auth_calls[AUTH_MBOX_ARM]);
 	balanced();
 	fixture();
 	fail_ready_after_auth = true;
-	CHECK(airoha_npu_diag_start_mode(&ppe, true, binding_service) == -ESTALE);
+	CHECK(airoha_npu_diag_start_mode(&ppe, mode, binding_service) == -ESTALE);
 	auth_retained(-ESTALE, true);
 	CHECK(ready_calls == 2 && auth_calls[AUTH_MBOX_ARM] == 1);
 	balanced();
@@ -1060,6 +1125,237 @@ static void test_bank1(void)
 	CHECK(writes == 2 && registers[3] == session.bank1_flow && registers[4] == session.bank1_tb);
 	balanced();
 }
+static void test_learning_flow(void)
+{
+	for (unsigned int flags = 0; flags < 4; ++flags) {
+		fixture();
+		attach();
+		session.diag_auth = flags & 1;
+		session.diag_learn = flags & 2;
+		CHECK(airoha_ppe_npu_diag_flow(&ppe, &session) == (flags == 3 ? BIT(13) : 0));
+		CHECK(!writes);
+		balanced();
+	}
+	for (unsigned int scenario = 0; scenario < 8; ++scenario) {
+		const void *token = &session;
+
+		fixture();
+		attach();
+		session.diag_auth = session.diag_learn = true;
+		switch (scenario) {
+		case 0: ppe.ct_npu_owner = NULL; lower.references = 0; break;
+		case 1: token = &path; break;
+		case 2: token = NULL; break;
+		case 3: session.auth_count = 2; break;
+		case 4: session.retiring = true; break;
+		case 5: ppe.ct_pon_qualified = true; break;
+		case 6: gdm.pon_link_ops = &other_controller; break;
+		default: nodes[ETH_NODE].diagnostic = false; break;
+		}
+		CHECK(!airoha_ppe_npu_diag_flow(&ppe, token));
+		CHECK(!writes);
+		balanced();
+	}
+}
+
+static void test_invalid_modes(void)
+{
+	static const unsigned int modes[] = { 3, 256, 0x10000, UINT32_MAX };
+	static const u32 services[] = { 0, 1, 0x8000, 0xffff };
+
+	for (unsigned int mode = 0; mode < ARRAY_SIZE(modes); ++mode) {
+		for (unsigned int service = 0; service < ARRAY_SIZE(services); ++service) {
+			fixture();
+			CHECK(airoha_npu_diag_start_mode(&ppe, modes[mode], services[service]) == -EINVAL);
+			CHECK(!claim_calls && !binding_calls && !auth_calls[AUTH_MBOX_BEGIN] && !open_calls);
+			CHECK(!ppe.ct_npu_owner && !lower.references && !netdev_puts && !writes);
+			balanced();
+		}
+	}
+}
+
+static void prepare_learning_start(void)
+{
+	fixture();
+	eth.ct_bank1_routes.owner = &session;
+	eth.ct_bank1_routes.ready = eth.ct_bank1_routes.ingress_ready = true;
+	registers[REG_PPE_TB_CFG(1)] = 0xa5a5002bu;
+	open_runs_bank1 = trace_mmio = true;
+}
+
+static void check_learning_writes(unsigned int expected_writes)
+{
+	unsigned int first = 0;
+
+	CHECK(writes == expected_writes);
+	while (first < mmio_count && !mmio_events[first].write)
+		first++;
+	CHECK(first >= 3 && first + expected_writes * 2 <= mmio_count);
+	CHECK(mmio_events[first - 3].reg == REG_PPE_GLO_CFG(1));
+	CHECK(mmio_events[first - 2].reg == REG_PPE_TB_CFG(1));
+	CHECK(mmio_events[first - 1].reg == REG_PPE_PPE_FLOW_CFG(1));
+	for (unsigned int index = first - 3; index < first; ++index) {
+		CHECK(!mmio_events[index].write);
+		CHECK(mmio_events[index].next_row == PPE_SRAM_NUM_ENTRIES);
+	}
+	for (unsigned int index = 0; index < expected_writes; ++index) {
+		struct mmio_event *write = &mmio_events[first + index * 2];
+		struct mmio_event *readback = write + 1;
+		unsigned int reg = index ? REG_PPE_PPE_FLOW_CFG(1) : REG_PPE_TB_CFG(1);
+
+		CHECK(write->write && !readback->write);
+		CHECK(write->reg == reg && readback->reg == reg);
+		CHECK(write->value == (index ? BIT(13) : 0xa5a5003bu));
+		CHECK(write->next_row == 0 && readback->next_row == 0);
+		CHECK(write->locked == 1 && readback->locked == 1);
+		if (index + 1 < expected_writes)
+			CHECK(write->value == readback->value);
+	}
+}
+
+static void test_learning_start(void)
+{
+	static const u32 services[] = { 0, 1, 0x8000, 0xffff };
+
+	for (unsigned int mode = 0; mode < 3; ++mode) {
+		for (unsigned int index = 0; index < ARRAY_SIZE(services); ++index) {
+			prepare_learning_start();
+			binding_service = services[index];
+			CHECK(!airoha_npu_diag_start_mode(&ppe, mode, binding_service));
+			CHECK(session.diag_auth == (mode != 0) && session.diag_learn == (mode == 2));
+			CHECK(session.auth_count == (mode != 0) && auth_enabled == 1);
+			CHECK(binding_calls == (mode != 0) && auth_calls[AUTH_MBOX_ADD] == (mode != 0));
+			CHECK(auth_calls[AUTH_MBOX_BEGIN] == 1 && auth_calls[AUTH_MBOX_ARM] == 1);
+			CHECK(open_calls == 1 && restores == 1 && scope_calls == 1);
+			CHECK(eth.ct_bank1_routes.pon_open && !ppe.ct_pon_qualified);
+			CHECK(registers[REG_PPE_PPE_FLOW_CFG(1)] == (mode == 2 ? BIT(13) : 0));
+			CHECK(registers[REG_PPE_TB_CFG(1)] == (mode == 2 ? 0xa5a5003bu : 0xa5a5002bu));
+			CHECK(session.bank1_next_row == (mode == 2 ? 0 : PPE_SRAM_NUM_ENTRIES));
+			if (mode == 2)
+				check_learning_writes(2);
+			else
+				CHECK(!writes);
+			balanced();
+		}
+	}
+}
+
+static void test_learning_preconditions(void)
+{
+	for (unsigned int scenario = 0; scenario < 7; ++scenario) {
+		u32 initial_row;
+
+		prepare_open();
+		session.diag_auth = session.diag_learn = true;
+		session.auth_count = 1;
+		switch (scenario) {
+		case 0: registers[REG_PPE_PPE_FLOW_CFG(1)] = BIT(14); break;
+		case 1: registers[REG_PPE_TB_CFG(1)] = FIELD_PREP(PPE_TB_CFG_SEARCH_MISS_MASK, 3); break;
+		case 2: registers[REG_PPE_GLO_CFG(1)] = 0; break;
+		case 3: registers[REG_PPE_GLO_CFG(1)] |= PPE_GLO_CFG_BUSY_MASK; break;
+		case 4: session.bank1_next_row = 0; break;
+		case 5: session.bank1_next_row = PPE_SRAM_NUM_ENTRIES - 1; break;
+		default: state_error = -ESTALE; break;
+		}
+		initial_row = session.bank1_next_row;
+		CHECK(airoha_npu_owner_bank1_restore(&session, &session.txn.id) ==
+		      (scenario == 6 ? -ESTALE : -EIO));
+		CHECK(!writes && session.bank1_next_row == initial_row);
+		CHECK(!eth.ct_bank1_routes.pon_open && !scope_calls && !restores);
+		balanced();
+	}
+}
+
+static void test_learning_failures(void)
+{
+	for (unsigned int scenario = 0; scenario < 7; ++scenario) {
+		unsigned int expected_writes = scenario == 0 || scenario == 2 || scenario == 4 ? 1 : 2;
+		int expected_error = scenario == 6 ? -ESTALE : -EIO;
+
+		prepare_learning_start();
+		switch (scenario) {
+		case 0: fail_write = REG_PPE_TB_CFG(1); break;
+		case 1: fail_write = REG_PPE_PPE_FLOW_CFG(1); break;
+		case 2: fail_readback = REG_PPE_TB_CFG(1); break;
+		case 3: fail_readback = REG_PPE_PPE_FLOW_CFG(1); break;
+		case 4: fail_readback = REG_PPE_TB_CFG(1); readback_mask = BIT(4); break;
+		case 5: fail_readback = REG_PPE_PPE_FLOW_CFG(1); readback_mask = BIT(13); break;
+		default: fail_state_after_write = true; break;
+		}
+		CHECK(airoha_npu_diag_start_mode(&ppe, 2, binding_service) == expected_error);
+		CHECK(session.txn.last_error == expected_error);
+		CHECK(session.diag_auth && session.diag_learn && session.auth_count == 1);
+		CHECK(session.auth_attempted && session.epoch_dirty && auth_enabled);
+		CHECK(ppe.ct_npu_owner == &session && session.return_path == &path && path.ring == &ring);
+		CHECK(lower.references == 1 && !freed && !netdev_puts);
+		CHECK(session.bank1_next_row == 0 && !ppe.ct_pon_qualified);
+		CHECK(!eth.ct_bank1_routes.pon_open && !scope_calls && !restores);
+		check_learning_writes(expected_writes);
+		CHECK(readback_corrupted == (scenario >= 2 && scenario <= 5));
+		CHECK(registers[REG_PPE_TB_CFG(1)] == (scenario == 0 ? 0xa5a5002bu : 0xa5a5003bu));
+		CHECK(registers[REG_PPE_PPE_FLOW_CFG(1)] ==
+		      (scenario == 3 || scenario == 5 || scenario == 6 ? BIT(13) : 0));
+		trace_mmio = fail_state_after_write = false;
+		fail_write = fail_readback = -1;
+		CHECK(airoha_npu_diag_close(&ppe, true) == -EBUSY);
+		CHECK(close_entry_row == 0 && session.bank1_next_row == 0);
+		CHECK(writes == expected_writes && !route_releases && !fe_releases);
+		CHECK(ppe.ct_npu_owner == &session && !freed && !netdev_puts);
+		session.bank1_next_row = PPE_SRAM_NUM_ENTRIES;
+		registers[REG_PPE_PPE_FLOW_CFG(1)] = 0;
+		registers[REG_PPE_TB_CFG(1)] = 0xa5a5002bu;
+		CHECK(!airoha_npu_diag_close(&ppe, true));
+		CHECK(close_entry_row == PPE_SRAM_NUM_ENTRIES && !ppe.ct_npu_owner);
+		CHECK(writes == expected_writes + 2 && freed == 1 && netdev_puts == 1);
+		CHECK(registers[REG_PPE_PPE_FLOW_CFG(1)] == session.bank1_flow);
+		CHECK(registers[REG_PPE_TB_CFG(1)] == session.bank1_tb);
+		balanced();
+	}
+}
+
+static void test_learning_routes(void)
+{
+	static const u32 flows[] = { 0, BIT(13), BIT(13) | BIT(14), BIT(14) };
+
+	for (unsigned int mode = 0; mode < 3; ++mode) {
+		for (unsigned int flow = 0; flow < ARRAY_SIZE(flows); ++flow) {
+			for (u32 miss = 0; miss < 4; ++miss) {
+				bool allowed = flows[flow] == (mode == 2 ? BIT(13) : 0) &&
+					miss == (mode == 2 ? 3u : 2u);
+
+				prepare_open();
+				session.diag_auth = mode != 0;
+				session.diag_learn = mode == 2;
+				session.auth_count = mode != 0;
+				registers[REG_PPE_PPE_FLOW_CFG(1)] = flows[flow];
+				registers[REG_PPE_TB_CFG(1)] = 0xa5a5000bu |
+					FIELD_PREP(PPE_TB_CFG_SEARCH_MISS_MASK, miss);
+				CHECK(airoha_bank1_routes_open(&eth, &session) == (allowed ? 0 : -EIO));
+				CHECK(eth.ct_bank1_routes.pon_open == allowed);
+				CHECK(scope_calls == allowed && restores == allowed && !writes);
+				balanced();
+			}
+		}
+	}
+	for (unsigned int scenario = 0; scenario < 4; ++scenario) {
+		prepare_open();
+		session.diag_auth = session.diag_learn = true;
+		session.auth_count = 1;
+		registers[REG_PPE_PPE_FLOW_CFG(1)] = BIT(13);
+		registers[REG_PPE_TB_CFG(1)] = FIELD_PREP(PPE_TB_CFG_SEARCH_MISS_MASK, 3);
+		switch (scenario) {
+		case 0: registers[REG_PPE_GLO_CFG(1)] = 0; break;
+		case 1: registers[REG_PPE_GLO_CFG(1)] |= PPE_GLO_CFG_BUSY_MASK; break;
+		case 2: scope_error = -EIO; break;
+		default: route_write_error = -EIO; break;
+		}
+		CHECK(airoha_bank1_routes_open(&eth, &session) == -EIO);
+		CHECK(!eth.ct_bank1_routes.pon_open && !writes);
+		CHECK(scope_calls == (scenario >= 2) && restores == (scenario == 3));
+		balanced();
+	}
+}
+
 static void review_platform(void)
 {
 	unsigned int scenario, accepted = 0;
@@ -1087,10 +1383,18 @@ int main(int argc, char **argv)
 	test_release();
 	test_bank1();
 	test_auth_mode_active();
-	test_auth_start();
+	test_auth_start(1);
+	test_auth_start(2);
 	test_auth_admission();
-	test_auth_failures();
+	test_auth_failures(1);
+	test_auth_failures(2);
 	test_auth_bank1();
+	test_learning_flow();
+	test_invalid_modes();
+	test_learning_start();
+	test_learning_preconditions();
+	test_learning_failures();
+	test_learning_routes();
 	printf("{\"passed\":true,\"cases\":%u,\"checks\":%u}\n", cases, checks);
 	return 0;
 }

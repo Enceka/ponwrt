@@ -15,6 +15,7 @@ from source_binding import SourceBinding
 
 FUNCTIONS = {
     'airoha_npu_owner.h': {'active': 'airoha_ppe_npu_diag_active',
+                           'diag_flow': 'airoha_ppe_npu_diag_flow',
                            'retire': 'airoha_npu_owner_retire_locked'},
     'airoha_npu_diag.h': {'platform': 'airoha_npu_diag_platform',
                          'snapshot': 'airoha_npu_diag_snapshot',
@@ -75,8 +76,9 @@ def main():
     driver = source / 'drivers/net/ethernet/airoha'
     inputs = {name: (driver / name).read_bytes() for name in [*FUNCTIONS, *HEADERS]}
     binding = SourceBinding(repo / 'target/linux/airoha/patches-6.18', output,
-                            '999-zq-net-airoha-add-nonempty-pon-auth-diagnostic.patch')
-    binding.bind(driver, ('airoha_npu_owner.h', 'airoha_npu_diag.h'))
+                            '999-zr-net-airoha-add-pon-ppe-learning-diagnostic.patch')
+    binding.bind(driver, ('airoha_npu_owner.h', 'airoha_npu_diag.h',
+                         'airoha_npu_reopen.h', 'airoha_bank1_routes.h'))
     binding_module = tests.parent / 'npu_ingress/source_binding.py'
     binding_bytes = binding_module.read_bytes()
     for name, functions in FUNCTIONS.items():
@@ -109,15 +111,15 @@ def main():
         'ignore_restore_error': ('close.inc', 'return error ?: airoha_npu_owner_retire_locked(ppe);', 'return airoha_npu_owner_retire_locked(ppe);'),
         'ignore_release_ack': ('close.inc', '!owner->closed_ack ||', 'false ||'),
         'leak_lower_ref': ('retire.inc', 'dev_put(owner->diag_lower);', '(void)owner->diag_lower;'),
-        'ignore_restore_flow': ('restore.inc', '!airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) &&', 'true &&'),
-        'ignore_route_flow': ('routes.inc', 'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) ||', 'false ||'),
+        'ignore_restore_flow': ('restore.inc', 'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) ||', 'false ||'),
+        'ignore_route_flow': ('routes.inc', 'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) != diagnostic_flow ||', 'false ||'),
         'ignore_route_busy': ('routes.inc', '(airoha_fe_rr(eth, REG_PPE_GLO_CFG(1)) & PPE_GLO_CFG_BUSY_MASK)', 'false'),
         'allow_two_diagnostic_rules': ('active.inc', '(owner->diag_auth ? 1 : 0)', '(owner->diag_auth ? 2 : 0)'),
         'ignore_explicit_auth_mode': ('diag_authorize.inc', '!owner->diag_auth ||', 'false ||'),
         'ignore_closed_phase': ('diag_authorize.inc', 'owner->txn.phase != NPU_TXN_CLOSED', 'false'),
         'allow_repeated_auth': ('diag_authorize.inc', 'owner->auth_attempted ||', 'false ||'),
-        'ignore_start_service_range': ('start_mode.inc', 'if (service > U16_MAX)', 'if (false)'),
-        'lose_auth_mode': ('start_mode.inc', 'owner->diag_auth = authorize;', 'owner->diag_auth = false;'),
+        'ignore_start_service_range': ('start_mode.inc', 'service > U16_MAX ||', 'false ||'),
+        'lose_auth_mode': ('start_mode.inc', 'owner->diag_auth = mode != 0;', 'owner->diag_auth = false;'),
         'truncate_service': ('diag_authorize.inc', '0, 4, 2, service,', '0, 4, 2, service & 0x7fffu,'),
         'omit_service_valid': ('diag_authorize.inc', 'ER_SERVICE_VALID | service', 'service'),
         'ignore_binding_result': ('diag_authorize.inc', '? 0 : -ESTALE', '? 0 : 0'),
@@ -131,6 +133,32 @@ def main():
         'lose_published_rule_count': ('diag_authorize.inc', 'owner->auth_count = 1;', 'owner->auth_count = 0;'),
         'ignore_ack_count': ('airoha_npu_auth_publish.h', 'message.w[AM_COUNT] != count ||', 'false ||'),
         'ignore_ack_rule_echo': ('airoha_npu_auth_publish.h', 'AM_STATUS * sizeof(auth_u32)', 'AM_RULE * sizeof(auth_u32)'),
+        'ignore_start_mode_range': ('start_mode.inc', 'mode > 2', 'false'),
+        'lose_learning_mode': ('start_mode.inc', 'owner->diag_learn = mode == 2;', 'owner->diag_learn = false;'),
+        'learn_in_auth_only_mode': ('start_mode.inc', 'owner->diag_learn = mode == 2;', 'owner->diag_learn = mode != 0;'),
+        'flow_ignore_token': ('diag_flow.inc', 'airoha_ppe_npu_diag_active(ppe, token)', 'airoha_ppe_npu_diag_active(ppe, owner)'),
+        'flow_ignore_auth': ('diag_flow.inc', '&& owner->diag_auth', '&& true'),
+        'flow_ignore_learn': ('diag_flow.inc', '&& owner->diag_learn', '&& true'),
+        'flow_enable_extra_protocol': ('diag_flow.inc', 'PPE_FLOW_CFG_IP4_NAPT_MASK : 0', '(PPE_FLOW_CFG_IP4_NAPT_MASK | BIT(14)) : 0'),
+        'ignore_restore_cursor': ('restore.inc', 'owner->bank1_next_row != PPE_SRAM_NUM_ENTRIES ||', 'false ||'),
+        'ignore_restore_miss': ('restore.inc', 'FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, table) != 2', 'false'),
+        'ignore_restore_busy': ('restore.inc', '(status & PPE_GLO_CFG_BUSY_MASK) ||', 'false ||'),
+        'ignore_restore_enabled': ('restore.inc', '!(status & PPE_GLO_CFG_EN_MASK) ||', 'false ||'),
+        'skip_learning_writes': ('restore.inc', 'if (!flow)', 'if (true)'),
+        'retain_stale_retirement_cursor': ('restore.inc', '\t\towner->bank1_next_row = 0;', '\t\towner->bank1_next_row = PPE_SRAM_NUM_ENTRIES;'),
+        'wrong_learning_miss': ('restore.inc', 'FIELD_PREP(PPE_TB_CFG_SEARCH_MISS_MASK, 3)', 'FIELD_PREP(PPE_TB_CFG_SEARCH_MISS_MASK, 2)'),
+        'clobber_other_table_fields': ('restore.inc', '(table & ~PPE_TB_CFG_SEARCH_MISS_MASK) |', '0 |'),
+        'skip_table_readback': ('restore.inc', 'error = airoha_fe_rr(eth, REG_PPE_TB_CFG(1)) == table ? 0 : -EIO;', 'error = 0;'),
+        'write_flow_after_table_failure': ('restore.inc', 'if (!error) {', 'if (true) {'),
+        'skip_flow_readback': ('restore.inc', 'error = airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) == flow ? 0 : -EIO;', 'error = 0;'),
+        'skip_learning_postcheck': ('restore.inc',
+            '\t\treturn error ?: airoha_npu_owner_open_check(owner, id, NPU_TXN_PPE_RESTORE);', '\t\treturn error;'),
+        'allow_extra_route_flows': ('routes.inc',
+            'airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) != diagnostic_flow ||',
+            '(airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) & diagnostic_flow) != diagnostic_flow ||'),
+        'ignore_route_miss': ('routes.inc',
+            'FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, airoha_fe_rr(eth, REG_PPE_TB_CFG(1))) != (diagnostic_flow ? 3 : 2) ||', 'false ||'),
+        'route_learning_accepts_miss_two': ('routes.inc', '(diagnostic_flow ? 3 : 2)', '2'),
     }
     caught = {}
     for name, (filename, before, after) in mutations.items():
