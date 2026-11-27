@@ -84,6 +84,48 @@ written and does not load stock instructions onto the board.
 
 ## Build and run
 
+### Prepare the PON NPU payload
+
+`../prepare_npu_ram.py` binds a RAM trial to an accepted RV32 ELF. It checks
+the ELF, code and data hashes against `ram-payload.json`, requires ABI3/caps63,
+the PON AUTH/GATE/ER feature set and valid local SRAM bounds, and matches the
+input kernel's RAM loader digests against the baseline initramfs. The input
+acceptance JSON must contain `passed: true` and the matching `elf_sha256`.
+
+```sh
+python3 -B target/linux/airoha/tests/pon_offload/prepare_npu_ram.py \
+  --payload /absolute/path/to/an7581-npu-firmware/build \
+  --acceptance /absolute/path/to/rv32-acceptance.json \
+  --archive /absolute/path/to/verified-base.cpio \
+  --loader /absolute/path/to/kernel/drivers/net/ethernet/airoha/airoha_npu.c \
+  --output /absolute/path/to/new-prepared-directory
+```
+
+The new output directory contains `airoha_npu.c`, `pon-npu.cpio` and
+`prepared.json`. Copy the generated loader to the RAM kernel build tree and
+build `Image` with `CONFIG_INITRAMFS_SOURCE` explicitly pointing to the new
+archive. Rebuild any private-structure test module against that kernel.
+The preparer preserves archive names, metadata and all contents except the
+two rebuilt firmware entries, and rejects duplicate paths, hard-linked
+firmware, trailing archives and mismatched loader hashes. It does not modify
+the baseline files or the packaged full-image firmware profile.
+
+On 2026-11-27 the accepted PON ELF
+`0b74984174d0c09f4f3fa4ede3a7fd1a61021931b363cc94e8081c9e815729d0`
+produced code hash
+`80af8190975befbda72022896b6cc87e4e17248cfc6820b93fba0bd19be49649`.
+The code occupies 39,052 bytes; local SRAM ends at `0x3e9037c4`, leaving
+four bytes below its reserved boundary. Preparing the accepted baseline
+preserved 1,101 entries and changed only the rebuilt RV32 code entry.
+Run the preparer tests with:
+
+```sh
+python3 -B -m unittest discover -s target/linux/airoha/tests/pon_offload \
+  -p test_prepare_npu_ram.py -v
+```
+
+### Build the loopback module
+
 Build against the exact source/configuration of the running RAM kernel; the
 test uses private driver structures. The test directory must have its own
 copy of the two module source files when using an external build directory.
