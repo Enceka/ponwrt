@@ -1,0 +1,143 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: prepare PON classifier rows for NPU authorization
+
+Prepare two source-exclusive plain-IP producers for PSE6 channel7 using
+the existing optical row transaction. Leave service selection to the
+firmware's full per-packet authorization and keep short packets on CPU.
+Verify every published TCAM and action word before the caller opens the
+source scope. Preserve ownership and pending I/O on publication or audit
+failure so the caller can close ingress and restore the original rows.
+
+The lifecycle caller must keep SPORT2 closed while preparing or restoring
+these rows, own both short-packet LUT dependencies, and keep the GDM2
+default on CPU. This patch supplies the row transaction, without enabling
+the optical qualifier or changing live ingress routes.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_ingress.h
+@@ -0,0 +1,125 @@
++#ifndef AIROHA_NPU_INGRESS_H
++#define AIROHA_NPU_INGRESS_H
++
++#include "airoha_ct_pon_ifc_owner.h"
++
++static inline int
++airoha_npu_ingress_encode(struct airoha_ct_pon_ifc_words *row,
++                          u16 protocol, unsigned int short_lut)
++{
++	if (!row || (protocol != ETH_P_IP && protocol != ETH_P_IPV6) || short_lut >= 32)
++		return -EINVAL;
++	*row = (struct airoha_ct_pon_ifc_words) {
++		.tcam = {
++			[0] = { BIT(2), U32_MAX },
++			[4] = { 0, BIT(short_lut) },
++			[5] = { protocol, 0xffff },
++			[7] = { 0, 0x430 },
++			[8] = { 0, 0xc0 },
++		},
++		.action = {
++			[0] = { 6 << 8, 0, 0 },
++			[1] = { 0, BIT(28), 7 << 10 },
++			[2] = { BIT(31) | BIT(30), 0, 0 },
++		},
++	};
++	return 0;
++}
++
++static inline int
++airoha_npu_ingress_rows(struct airoha_ct_pon_ifc_words rows[2],
++                        const unsigned int short_lut[2])
++{
++	if (!rows || !short_lut || short_lut[0] >= 32 || short_lut[1] >= 32 ||
++	    short_lut[0] == short_lut[1])
++		return -EINVAL;
++	airoha_npu_ingress_encode(&rows[0], ETH_P_IP, short_lut[0]);
++	airoha_npu_ingress_encode(&rows[1], ETH_P_IPV6, short_lut[1]);
++	return 0;
++}
++
++static inline int
++airoha_npu_ingress_check(struct airoha_ct_pon_ifc_owner *owner,
++                         const struct airoha_ct_pon_ifc_io *io,
++                         const unsigned int short_lut[2])
++{
++	struct airoha_ct_pon_ifc_words expected[2];
++	unsigned int index, page;
++	u32 actual[3];
++	int error;
++
++	if (!airoha_ct_pon_ifc_io_valid(owner, io))
++		return -EINVAL;
++	error = airoha_npu_ingress_rows(expected, short_lut);
++	if (error)
++		return error;
++	if (!owner->saved_valid || owner->active != 3 || owner->dirty != 3)
++		return -ESTALE;
++	error = airoha_ct_pon_ifc_sync(owner, io);
++	if (error)
++		return error;
++	for (index = 0; index < 2; ++index) {
++		for (page = 0; page < 9; ++page) {
++			error = io->read(io->ctx, 0, AIROHA_CT_PON_IFC_ROW_BASE + index,
++			                 page, actual, 2);
++			if (error)
++				goto pending;
++			if (memcmp(actual, expected[index].tcam[page], 2 * sizeof(u32)))
++				return -EUCLEAN;
++		}
++		for (page = 0; page < 3; ++page) {
++			unsigned int count = airoha_ct_pon_ifc_action_words[page];
++
++			error = io->read(io->ctx, 2, AIROHA_CT_PON_IFC_ROW_BASE + index,
++			                 page, actual, count);
++			if (error)
++				goto pending;
++			if (memcmp(actual, expected[index].action[page], count * sizeof(u32)))
++				return -EUCLEAN;
++		}
++	}
++	return 0;
++
++pending:
++	owner->pending = true;
++	return error;
++}
++
++static inline int
++airoha_npu_ingress_prepare(struct airoha_ct_pon_ifc_owner *owner,
++                           const struct airoha_ct_pon_ifc_io *io,
++                           const unsigned int short_lut[2])
++{
++	struct airoha_ct_pon_ifc_words rows[2];
++	int error;
++
++	if (!airoha_ct_pon_ifc_io_valid(owner, io))
++		return -EINVAL;
++	error = airoha_npu_ingress_rows(rows, short_lut);
++	if (error)
++		return error;
++	if ((owner->dirty | owner->active) & ~3)
++		return -EBUSY;
++	if (!owner->saved_valid) {
++		error = airoha_ct_pon_ifc_snapshot(owner, io);
++		if (error)
++			return error;
++	}
++	error = airoha_ct_pon_ifc_publish(owner, io, 0, rows);
++	if (error)
++		return error;
++	return airoha_npu_ingress_check(owner, io, short_lut);
++}
++
++static inline int
++airoha_npu_ingress_restore(struct airoha_ct_pon_ifc_owner *owner,
++                           const struct airoha_ct_pon_ifc_io *io)
++{
++	if (!airoha_ct_pon_ifc_io_valid(owner, io))
++		return -EINVAL;
++	if ((owner->dirty | owner->active) & ~3)
++		return -EBUSY;
++	return airoha_ct_pon_ifc_restore(owner, io);
++}
++
++#endif
