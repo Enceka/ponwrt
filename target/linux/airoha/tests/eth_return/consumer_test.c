@@ -1318,7 +1318,7 @@ static void test_observation(void)
 	struct airoha_er_observation observation, previous;
 	u32 sequence, word;
 
-	begin("optional observation preserves accepted descriptor and frame across ring wrap");
+	begin("optional observation preserves valid descriptors across ring wrap and host drops");
 	initialize(&fixture, ER_PON);
 	CHECK(create(&fixture) == 0);
 	publish(&fixture, 1, 64, fixture.live_service);
@@ -1342,13 +1342,31 @@ static void test_observation(void)
 		CHECK(!memcmp(observation.descriptor, descriptor, sizeof(descriptor)));
 		CHECK(!memcmp(observation.frame, expected, sizeof(expected)));
 	}
-	previous = observation;
 	fixture.live = false;
 	publish(&fixture, sequence, 128, fixture.live_service);
 	CHECK(er_poll(&fixture.ring->napi, 8) == 1);
 	airoha_er_observe(fixture.ring, &observation);
+	CHECK(observation.produced == sequence && observation.consumed == sequence);
+	CHECK(observation.descriptor[ER_D_SERVICE] == fixture.live_service);
+	CHECK(observation.frame_bytes == 128 && fixture.ring->dropped == 1);
+	CHECK(!memcmp(observation.frame, payload_for(fixture.ring, sequence), 128));
+	fixture.live = true;
+	host.fail_skb = true;
+	publish(&fixture, ++sequence, 64, fixture.live_service);
+	CHECK(er_poll(&fixture.ring->napi, 8) == 1);
+	airoha_er_observe(fixture.ring, &observation);
+	CHECK(observation.produced == sequence && observation.consumed == sequence);
+	CHECK(observation.frame_bytes == 64 && fixture.ring->dropped == 2);
+	CHECK(!memcmp(observation.frame, payload_for(fixture.ring, sequence), 64));
+	host.fail_skb = false;
+	previous = observation;
+	publish(&fixture, ++sequence, 128, fixture.live_service);
+	slot_for(fixture.ring, sequence)[ER_D_BUFFER] ^= cpu_to_le32(4);
+	CHECK(er_poll(&fixture.ring->napi, 8) == 0);
+	CHECK(fixture.ring->protocol_error && fixture.ring->fault_reason == 2);
+	airoha_er_observe(fixture.ring, &observation);
 	CHECK(!memcmp(&observation, &previous, sizeof(previous)));
-	destroy(&fixture);
+	reset_release(&fixture);
 }
 #endif
 

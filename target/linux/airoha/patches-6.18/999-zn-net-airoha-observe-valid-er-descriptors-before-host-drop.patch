@@ -1,0 +1,42 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: retain diagnostic ER packets rejected by host binding
+
+Capture the latest valid ER descriptor and bounded payload before host
+binding and skb allocation. Keep descriptor validation ahead of all
+payload access so diagnostics can explain host drops without changing
+packet admission or normal operation.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth_return.c
++++ b/drivers/net/ethernet/airoha/airoha_eth_return.c
+@@ -98,21 +98,21 @@
+ 		if (!er_descriptor_valid(&ring->config, snapshot, sequence))
+ 			goto fault;
+ 		size = snapshot[0] & 0xffff;
++		if (READ_ONCE(ring->observation_enabled)) {
++			spin_lock_bh(&ring->observation_lock);
++			memcpy(ring->observation.descriptor, snapshot, sizeof(snapshot));
++			ring->observation.produced = produced;
++			ring->observation.consumed = sequence;
++			ring->observation.frame_bytes = min_t(u32, size, sizeof(ring->observation.frame));
++			memset(ring->observation.frame, 0, sizeof(ring->observation.frame));
++			memcpy(ring->observation.frame, payload, ring->observation.frame_bytes);
++			spin_unlock_bh(&ring->observation_lock);
++		}
+ 		rcu_read_lock();
+ 		if (!ring->ops->binding_matches(ring->ctx, ring->lower,
+ 					       &ring->config, snapshot[ER_D_SERVICE])) {
+ 			++ring->dropped;
+ 		} else if ((skb = napi_alloc_skb(napi, size + NET_IP_ALIGN))) {
+-			if (READ_ONCE(ring->observation_enabled)) {
+-				spin_lock_bh(&ring->observation_lock);
+-				memcpy(ring->observation.descriptor, snapshot, sizeof(snapshot));
+-				ring->observation.produced = produced;
+-				ring->observation.consumed = sequence;
+-				ring->observation.frame_bytes = min_t(u32, size, sizeof(ring->observation.frame));
+-				memset(ring->observation.frame, 0, sizeof(ring->observation.frame));
+-				memcpy(ring->observation.frame, payload, ring->observation.frame_bytes);
+-				spin_unlock_bh(&ring->observation_lock);
+-			}
+ 			skb_reserve(skb, NET_IP_ALIGN);
+ 			skb_put_data(skb, payload, size);
+ 			skb->dev = ring->lower;
