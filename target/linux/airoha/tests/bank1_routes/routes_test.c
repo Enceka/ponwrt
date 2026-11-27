@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stddef.h>
 
 #ifndef EUCLEAN
 #define EUCLEAN 117
@@ -31,7 +32,16 @@ typedef struct { bool held; } spinlock_t;
 #define FE_PSE_PORT_DROP 15
 #define AIROHA_GDM1_IDX 1
 #define AIROHA_GDM2_IDX 2
+#define AIROHA_GDM3_IDX 3
 #define AIROHA_GDM4_IDX 4
+#define AIROHA_NUM_NETDEV_TX_RINGS 36
+#define AIROHA_DEV_F_WAN 1
+#define DECLARE_BITMAP(name, bits) unsigned long name[((bits) + 63) / 64]
+#define bitmap_zero(bitmap, bits) memset(bitmap, 0, (((bits) + 63) / 64) * sizeof(unsigned long))
+#define __set_bit(bit, bitmap) ((bitmap)[(bit) / 64] |= 1ul << ((bit) % 64))
+#define test_bit(bit, bitmap) (!!((bitmap)[(bit) / 64] & (1ul << ((bit) % 64))))
+#define set_bit(bit, bitmap) __set_bit(bit, bitmap)
+#define clear_bit(bit, bitmap) ((bitmap)[(bit) / 64] &= ~(1ul << ((bit) % 64)))
 #define AIROHA_MAX_NUM_GDM_PORTS 4
 #define REG_GDM_FWD_CFG(id) ((id) - 1)
 #define REG_FE_CSR_IFC_CFG 16
@@ -71,15 +81,25 @@ struct airoha_eth;
 struct airoha_gdm_port;
 struct airoha_qdma {
 	unsigned int users;
+	bool lro;
 	struct { int irq; } irq_banks[1];
 };
-struct net_device { bool running; unsigned int features; int irq; };
+struct netdev_queue { bool stopped; };
+struct net_device {
+	bool running;
+	unsigned int features, num_tx_queues;
+	int irq;
+	unsigned char dev_addr[6];
+	struct netdev_queue queues[AIROHA_NUM_NETDEV_TX_RINGS];
+};
 struct airoha_gdm_dev {
 	struct airoha_qdma *qdma;
 	struct airoha_eth *eth;
 	struct airoha_gdm_port *port;
 	struct net_device netdev;
 	bool lan;
+	bool use_flags;
+	unsigned long flags;
 	unsigned int nbq;
 	struct { u32 cpu_tx_packets, fwd_tx_packets; } qos_stats[2];
 };
@@ -121,7 +141,7 @@ static struct {
 	struct mmio_event events[512];
 	size_t length;
 	unsigned int writes[64], reads[64], total_writes, total_reads;
-	unsigned int failures, schedules;
+	unsigned int failures, schedules, rcu_syncs, wakes;
 	struct mmio_fault faults[2];
 	int pending_readback;
 	bool tracing, verify_snapshot;
@@ -136,6 +156,7 @@ static struct airoha_qdma foreign_qdma;
 static spinlock_t flow_offload_mutex = { true }, ppe_lock;
 static unsigned int rcu_depth, legacy_faults;
 static bool rtnl_held = true;
+static bool loopback_enabled, fail_loopback_restore;
 static const char owner_token, other_token;
 
 static void lockdep_assert_held(spinlock_t *lock) { CHECK(lock->held); }
@@ -143,7 +164,7 @@ static void spin_lock_bh(spinlock_t *lock) { CHECK(!lock->held); lock->held = tr
 static void spin_unlock_bh(spinlock_t *lock) { CHECK(lock->held); lock->held = false; }
 static void rcu_read_lock(void) { ++rcu_depth; }
 static void rcu_read_unlock(void) { CHECK(rcu_depth); --rcu_depth; }
-static void synchronize_rcu(void) { CHECK(!rcu_depth && !eth.ct_route_lock.held); }
+static void synchronize_rcu(void) { CHECK(!rcu_depth && !eth.ct_route_lock.held); ++host.rcu_syncs; }
 static struct net_device *netdev_from_priv(struct airoha_gdm_dev *dev) { return &dev->netdev; }
 static bool netif_running(struct net_device *dev) { return dev->running; }
 
@@ -229,12 +250,30 @@ static void schedule_delayed_work(int *work, unsigned int delay)
 	++host.schedules;
 }
 
-static bool airoha_is_lan_gdm_dev(struct airoha_gdm_dev *dev) { return dev->lan; }
+static bool airoha_is_lan_gdm_dev(struct airoha_gdm_dev *dev)
+{ return dev->use_flags ? !test_bit(AIROHA_DEV_F_WAN, &dev->flags) : dev->lan; }
 static struct airoha_qdma *airoha_qdma_deref(struct airoha_gdm_dev *dev) { return dev->qdma; }
-static void netif_tx_stop_all_queues(struct net_device *dev) { (void)dev; }
-static void netif_tx_wake_all_queues(struct net_device *dev) { (void)dev; }
-static void airoha_dev_lro_disable(struct airoha_gdm_dev *dev) { (void)dev; }
-static void airoha_dev_lro_enable(struct airoha_gdm_dev *dev) { (void)dev; }
+static void netif_tx_stop_all_queues(struct net_device *dev)
+{ for (unsigned int index = 0; index < dev->num_tx_queues; ++index) dev->queues[index].stopped = true; }
+static void netif_tx_wake_all_queues(struct net_device *dev)
+{ for (unsigned int index = 0; index < dev->num_tx_queues; ++index) dev->queues[index].stopped = false; ++host.wakes; }
+static void airoha_dev_lro_disable(struct airoha_gdm_dev *dev) { dev->qdma->lro = false; }
+static void airoha_dev_lro_enable(struct airoha_gdm_dev *dev) { dev->qdma->lro = true; }
+#ifdef TEST_PON_REOPEN
+static struct netdev_queue *netdev_get_tx_queue(struct net_device *dev, unsigned int index)
+{ CHECK(index < dev->num_tx_queues); return &dev->queues[index]; }
+static bool netif_tx_queue_stopped(struct netdev_queue *queue) { return queue->stopped; }
+static void netif_tx_wake_queue(struct netdev_queue *queue) { queue->stopped = false; ++host.wakes; }
+static bool airoha_fe_lro_is_enabled(struct airoha_eth *target, int index) { return target->qdma[index].lro; }
+static struct airoha_gdm_dev *netdev_priv(struct net_device *dev)
+{ return (struct airoha_gdm_dev *)((char *)dev - offsetof(struct airoha_gdm_dev, netdev)); }
+static int airoha_disable_gdm2_loopback(struct airoha_gdm_dev *dev)
+{ loopback_enabled = false; return 0; }
+static int airoha_enable_gdm2_loopback(struct airoha_gdm_dev *dev)
+{ if (fail_loopback_restore) return -EIO; loopback_enabled = true; return 0; }
+static void airoha_dev_set_xmit_frame_size(struct net_device *dev) { (void)dev; }
+static int airoha_set_macaddr(struct airoha_gdm_dev *dev, unsigned char *addr) { return 0; }
+#endif
 static bool airoha_ppe_is_enabled(struct airoha_eth *target, int bank) { return true; }
 static int airoha_get_fe_port(struct airoha_gdm_dev *dev) { return dev->lan ? 0 : 5; }
 static void airoha_ppe_set_cpu_port(struct airoha_gdm_dev *dev, int bank, int port) { (void)dev; }
@@ -275,6 +314,7 @@ static void reset(const char *name)
 	memset(devices, 0, sizeof(devices));
 	trace_reset();
 	legacy_faults = 0;
+	loopback_enabled = fail_loopback_restore = false;
 	eth.ppe = &ppe;
 	eth.soc = &soc;
 	ppe.eth = &eth;
@@ -293,6 +333,7 @@ static void reset(const char *name)
 		devices[index][0].port = &ports[index];
 		devices[index][0].lan = !(index % 2);
 		devices[index][0].netdev.running = true;
+		devices[index][0].netdev.num_tx_queues = 1;
 		eth.regs[index] = ((0xa510u + index) << 16) | low[index];
 	}
 	eth.regs[REG_FE_CSR_IFC_CFG] = 0xa5;
@@ -753,6 +794,10 @@ static void test_selectors(void)
 	}
 }
 
+#ifdef TEST_PON_REOPEN
+#include "reopen_test.inc"
+#endif
+
 int main(int argc, char **argv)
 {
 	static const struct { const char *name; void (*run)(void); } groups[] = {
@@ -761,6 +806,9 @@ int main(int argc, char **argv)
 		{ "updates", test_updates }, { "fallback", test_fallback },
 		{ "legacy", test_legacy }, { "selectors", test_selectors },
 		{ "qdma", test_qdma }, { "native", test_native },
+#ifdef TEST_PON_REOPEN
+		{ "reopen", test_reopen },
+#endif
 	};
 	size_t index;
 	bool matched = false;
@@ -774,7 +822,7 @@ int main(int argc, char **argv)
 		CHECK(!eth.ct_route_lock.held && !ppe_lock.held && !rcu_depth);
 	}
 	CHECK(matched);
-	printf("PASS %u cases; %u selector vectors; real 991 guard/fallback and extracted driver functions\n",
+	printf("PASS %u cases; %u selector vectors; production guard/fallback and extracted driver functions\n",
 	       cases, selector_vectors);
 	return 0;
 }

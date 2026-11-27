@@ -1,0 +1,318 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: reopen only the owned PON default route
+
+Keep exclusive bank1 route ownership while admitting GDM2. Revoke the
+opening before route or QDMA changes and retain CPU fallback on errors.
+Roll back QDMA publication when its guarded route cannot be updated,
+preserving queue state, shared LRO and the previous WAN role.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -858,7 +858,7 @@
+ struct airoha_bank1_routes {
+ 	const void *owner;
+ 	u16 desired[AIROHA_MAX_NUM_GDM_PORTS];
+-	bool ready;
++	bool ready, pon_open, revoked;
+ };
+ 
+ struct airoha_eth {
+@@ -996,6 +996,7 @@
+ 			     u32 mask, u32 value);
+ int airoha_bank1_routes_claim(struct airoha_eth *eth, const void *owner);
+ int airoha_bank1_routes_release(struct airoha_eth *eth, const void *owner);
++int airoha_bank1_routes_open(struct airoha_eth *eth, const void *owner);
+ int airoha_ct_cpu_fallback(struct airoha_eth *eth);
+ int airoha_ppe_npu_owner_claim_locked(struct airoha_eth *eth, u64 generation);
+ int airoha_ppe_npu_owner_close_locked(struct airoha_eth *eth);
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2883,16 +2883,18 @@
+ 
+ static int airoha_dev_set_qdma(struct airoha_gdm_dev *dev)
+ {
++	DECLARE_BITMAP(tx_stopped, AIROHA_NUM_NETDEV_TX_RINGS);
+ 	struct net_device *netdev = netdev_from_priv(dev);
+ 	struct airoha_qdma *cur_qdma, *qdma;
+ 	struct airoha_eth *eth = dev->eth;
++	bool lro_enabled = false;
+ 	int i, ppe_id, err;
+ 
+ 	/* QDMA0 is used for lan ports while QDMA1 is used for WAN ports */
+ 	qdma = &eth->qdma[!airoha_is_lan_gdm_dev(dev)];
+ 	cur_qdma = airoha_qdma_deref(dev);
+ 
+-	if (cur_qdma && cur_qdma != qdma) {
++	if (cur_qdma != qdma) {
+ 		err = airoha_ct_ifc_cpu_port_change(eth,
+ 			eth->soc->ops.get_sport(dev->port, dev->nbq));
+ 		if (err)
+@@ -2900,16 +2902,42 @@
+ 	}
+ 
+ 	if (cur_qdma) {
++		bitmap_zero(tx_stopped, AIROHA_NUM_NETDEV_TX_RINGS);
++		for (i = 0; i < netdev->num_tx_queues; ++i)
++			if (netif_tx_queue_stopped(netdev_get_tx_queue(netdev, i)))
++				__set_bit(i, tx_stopped);
++		lro_enabled = airoha_fe_lro_is_enabled(eth, cur_qdma - &eth->qdma[0]);
+ 		netif_tx_stop_all_queues(netdev);
+ 		airoha_dev_lro_disable(dev);
+ 	}
+ 
+ 	spin_lock_bh(&eth->ct_route_lock);
+ 	rcu_assign_pointer(dev->qdma, qdma);
++	err = 0;
+ 	if (eth->ct_cpu_fallback || eth->ct_bank1_routes.owner)
+-		airoha_ct_gdm_route_locked(eth, dev->port->id,
++		err = airoha_ct_gdm_route_locked(eth, dev->port->id,
+ 			airoha_fe_rr(eth, REG_GDM_FWD_CFG(dev->port->id)));
++	if (err) {
++		int rollback_error;
++
++		rcu_assign_pointer(dev->qdma, cur_qdma);
++		rollback_error = airoha_ct_gdm_route_locked(eth, dev->port->id,
++			airoha_fe_rr(eth, REG_GDM_FWD_CFG(dev->port->id)));
++		if (rollback_error)
++			dev_err_ratelimited(eth->dev, "QDMA route rollback failed: %d\n", rollback_error);
++	}
+ 	spin_unlock_bh(&eth->ct_route_lock);
++	if (err) {
++		synchronize_rcu();
++		if (cur_qdma) {
++			for (i = 0; i < netdev->num_tx_queues; ++i)
++				if (!test_bit(i, tx_stopped))
++					netif_tx_wake_queue(netdev_get_tx_queue(netdev, i));
++			if (lro_enabled)
++				airoha_dev_lro_enable(dev);
++		}
++		return err;
++	}
+ 	netdev->irq = qdma->irq_banks[0].irq;
+ 	qdma->users++;
+ 	synchronize_rcu();
+@@ -4284,6 +4312,7 @@
+ {
+ 	struct airoha_gdm_dev *dev = netdev_priv(netdev);
+ 	struct airoha_gdm_port *port = dev->port;
++	bool was_wan = test_bit(AIROHA_DEV_F_WAN, &dev->flags);
+ 	int err;
+ 
+ 	if (port->id != AIROHA_GDM3_IDX &&
+@@ -4296,8 +4325,18 @@
+ 
+ 	clear_bit(AIROHA_DEV_F_WAN, &dev->flags);
+ 	err = airoha_dev_set_qdma(dev);
+-	if (err)
++	if (err) {
++		if (was_wan) {
++			int rollback_error;
++
++			set_bit(AIROHA_DEV_F_WAN, &dev->flags);
++			rollback_error = airoha_enable_gdm2_loopback(dev);
++			if (rollback_error)
++				dev_err_ratelimited(dev->eth->dev,
++						    "QoS loopback rollback failed: %d\n", rollback_error);
++		}
+ 		return err;
++	}
+ 	airoha_dev_set_xmit_frame_size(netdev);
+ 
+ 	airoha_set_macaddr(dev, netdev->dev_addr);
+--- a/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
+@@ -5,11 +5,19 @@
+ /* Stop forceCPU users before either its source map or QDMA receiver changes.
+  * Failed gate readback leaves the old map and receiver in place.
+  */
++static int airoha_bank1_routes_revoke_locked(struct airoha_eth *eth);
++
+ static int airoha_ct_ifc_cpu_route_close_locked(struct airoha_eth *eth)
+ {
+ 	int err = 0;
+ 
+ 	lockdep_assert_held(&eth->ct_route_lock);
++	if (eth->ct_bank1_routes.owner &&
++	    (eth->ct_bank1_routes.pon_open || eth->ct_bank1_routes.revoked)) {
++		err = airoha_bank1_routes_revoke_locked(eth);
++		if (err)
++			return err;
++	}
+ 	if (eth->ppe && READ_ONCE(eth->ppe->ct_ifc.cfg_owned)) {
+ 		if (eth->ppe->ct_pon_ifc_route_owned) {
+ 			u32 value = (airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)) &
+@@ -34,7 +42,8 @@
+ 	int err = 0;
+ 
+ 	spin_lock_bh(&eth->ct_route_lock);
+-	if (sport == 24 || (sport == 2 && READ_ONCE(eth->ct_ifc_pon_ready)))
++	if (sport == 24 || (sport == 2 && (READ_ONCE(eth->ct_ifc_pon_ready) ||
++					 eth->ct_bank1_routes.owner)))
+ 		err = airoha_ct_ifc_cpu_route_close_locked(eth);
+ 	spin_unlock_bh(&eth->ct_route_lock);
+ 	return err;
+@@ -113,15 +122,24 @@
+ 	if (guarded && eth->ct_bank1_routes.owner) {
+ 		unsigned int shift;
+ 
+-		for (shift = 0; shift < 16; shift += 4)
+-			if (((cfg >> shift) & 0xf) == FE_PSE_PORT_PPE2)
+-				mask |= 0xf << shift;
++		if (id == AIROHA_GDM2_IDX && eth->ct_bank1_routes.pon_open) {
++			cfg = (cfg & ~GENMASK(15, 0)) | FE_PSE_PORT_PPE2 * 0x1111;
++			cpu = airoha_ct_gdm_cpu_locked(eth, id);
++			if (cpu != FE_PSE_PORT_CDM2) {
++				err = cpu < 0 ? cpu : -EXDEV;
++				mask = GENMASK(15, 0);
++			}
++		} else
++			for (shift = 0; shift < 16; shift += 4)
++				if (((cfg >> shift) & 0xf) == FE_PSE_PORT_PPE2)
++					mask |= 0xf << shift;
+ 	}
+ 	if (mask) {
+ 		cpu = airoha_ct_gdm_cpu_locked(eth, id);
+ 		if (cpu < 0) {
+ 			/* No configured device has no CPU receiver to preserve. */
+-			err = cpu == -ENODEV ? 0 : cpu;
++			if (!err)
++				err = cpu == -ENODEV ? 0 : cpu;
+ 			cpu = FE_PSE_PORT_DROP;
+ 		}
+ 		cfg = airoha_ct_cpu_selectors(cfg, mask, cpu);
+@@ -145,8 +163,12 @@
+ 			schedule_delayed_work(&eth->ppe->ct_fe.health_work,
+ 					      msecs_to_jiffies(100));
+ 	}
+-	if (err && eth->ct_bank1_routes.owner)
++	if (err && eth->ct_bank1_routes.owner) {
+ 		eth->ct_bank1_routes.ready = false;
++		eth->ct_bank1_routes.revoked = true;
++		if (eth->ct_bank1_routes.pon_open)
++			airoha_bank1_routes_revoke_locked(eth);
++	}
+ 	return err;
+ }
+ 
+@@ -174,6 +196,13 @@
+ 		previous = (previous & ~GENMASK(15, 0)) |
+ 			   eth->ct_bank1_routes.desired[id - 1];
+ 	cfg = (previous & ~mask) | (value & mask);
++	if (eth->ct_bank1_routes.owner &&
++	    (eth->ct_bank1_routes.pon_open || eth->ct_bank1_routes.revoked) &&
++	    ((cfg ^ previous) & GENMASK(15, 0))) {
++		err = airoha_bank1_routes_revoke_locked(eth);
++		if (err)
++			goto unlock;
++	}
+ 	if (id == AIROHA_GDM2_IDX && READ_ONCE(eth->ct_ifc_pon_ready) &&
+ 	    ((cfg ^ previous) & GENMASK(15, 0))) {
+ 		err = airoha_ct_ifc_cpu_route_close_locked(eth);
+@@ -206,6 +235,14 @@
+ 
+ 	spin_lock_bh(&eth->ct_route_lock);
+ 	WRITE_ONCE(eth->ct_cpu_fallback, true);
++	if (eth->ct_bank1_routes.owner) {
++		if (eth->ct_bank1_routes.pon_open) {
++			eth->ct_cpu_route_mask[AIROHA_GDM2_IDX - 1] = GENMASK(15, 0);
++			eth->ct_bank1_routes.ready = false;
++		}
++		eth->ct_bank1_routes.pon_open = false;
++		eth->ct_bank1_routes.revoked = true;
++	}
+ 	for (id = AIROHA_GDM1_IDX; id <= AIROHA_GDM4_IDX; id++) {
+ 		u32 cfg = airoha_fe_rr(eth, REG_GDM_FWD_CFG(id));
+ 
+--- a/drivers/net/ethernet/airoha/airoha_bank1_routes.h
++++ b/drivers/net/ethernet/airoha/airoha_bank1_routes.h
+@@ -18,6 +18,19 @@
+ 			error = result;
+ 	}
+ 	return error;
++}
++
++static int airoha_bank1_routes_revoke_locked(struct airoha_eth *eth)
++{
++	struct airoha_bank1_routes *routes = &eth->ct_bank1_routes;
++
++	lockdep_assert_held(&eth->ct_route_lock);
++	if (!routes->owner)
++		return 0;
++	routes->pon_open = false;
++	routes->revoked = true;
++	routes->ready = false;
++	return airoha_bank1_routes_write_all(eth, true);
+ }
+ 
+ int airoha_bank1_routes_claim(struct airoha_eth *eth, const void *owner)
+@@ -44,9 +57,53 @@
+ 				airoha_fe_rr(eth, REG_GDM_FWD_CFG(id));
+ 		routes->owner = owner;
+ 	}
++	routes->pon_open = false;
++	routes->revoked = false;
+ 	routes->ready = false;
+ 	error = airoha_bank1_routes_write_all(eth, true);
+ 	routes->ready = !error;
++unlock:
++	spin_unlock_bh(&eth->ct_route_lock);
++	return error;
++}
++
++int airoha_bank1_routes_open(struct airoha_eth *eth, const void *owner)
++{
++	struct airoha_bank1_routes *routes;
++	int error;
++
++	if (!eth || !eth->ppe || !owner)
++		return -EINVAL;
++	lockdep_assert_held(&flow_offload_mutex);
++	routes = &eth->ct_bank1_routes;
++	spin_lock_bh(&eth->ct_route_lock);
++	if (routes->owner != owner || !routes->ready || routes->revoked) {
++		error = -ESTALE;
++		goto unlock;
++	}
++	if (!eth->ppe->ct_pon_qualified || eth->ct_ordinary_full_test) {
++		error = -EOPNOTSUPP;
++		goto unlock;
++	}
++	if (eth->ct_cpu_fallback || eth->ct_cpu_route_mask[AIROHA_GDM2_IDX - 1] ||
++	    eth->ppe->ct_stopping || eth->ppe->ct_pon_ifc_route_owned) {
++		error = -EBUSY;
++		goto unlock;
++	}
++	error = airoha_ct_gdm_cpu_locked(eth, AIROHA_GDM2_IDX);
++	if (error != FE_PSE_PORT_CDM2) {
++		error = error < 0 ? error : -EXDEV;
++		goto unlock;
++	}
++	if (!(airoha_fe_rr(eth, REG_PPE_GLO_CFG(1)) & PPE_GLO_CFG_EN_MASK) ||
++	    !airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1))) {
++		error = -EIO;
++		goto unlock;
++	}
++	routes->pon_open = true;
++	error = airoha_bank1_routes_write_all(eth, true);
++	if (error)
++		airoha_bank1_routes_revoke_locked(eth);
+ unlock:
+ 	spin_unlock_bh(&eth->ct_route_lock);
+ 	return error;
+@@ -66,7 +123,7 @@
+ 		error = -ESTALE;
+ 		goto unlock;
+ 	}
+-	if (airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) ||
++	if (routes->pon_open || airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) ||
+ 	    (airoha_fe_rr(eth, REG_PPE_GLO_CFG(1)) & PPE_GLO_CFG_BUSY_MASK)) {
+ 		error = -EBUSY;
+ 		goto unlock;
+@@ -78,6 +135,7 @@
+ 		goto unlock;
+ 	}
+ 	routes->owner = NULL;
++	routes->revoked = false;
+ 	memset(routes->desired, 0, sizeof(routes->desired));
+ unlock:
+ 	spin_unlock_bh(&eth->ct_route_lock);

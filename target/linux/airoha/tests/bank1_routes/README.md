@@ -1,5 +1,25 @@
 # Bank1 GDM route guard host 回归
 
+`998` 加入持有 owner 的 PON 重开接口，仅开放 GDM2；其它 GDM 的 PPE2
+选择器继续送实际 CPU 接收队列。普通镜像、CPU 回退、冲突接收端和撤销状态
+均阻止重开。修改路由或发布新 QDMA 之前先关闭 PON，失败保留旧映射；
+读回失败立即撤销开放状态。重新 claim 完成关闭后才能再次准备重开。
+
+对包含 `996` 的内核源码运行重开回归：
+
+```sh
+python3 target/linux/airoha/tests/bank1_routes/verify.py --reopen \
+  --source /absolute/path/to/linux-after-996 \
+  --output /absolute/path/to/results/routes-reopen
+```
+
+此模式覆盖原有全部回归、118 个场景和 524,288 组选择器组合，使用 ASan/UBSan；
+十一个运行时变体覆盖错误 GDM、开放时释放 owner、忽略撤销、忽略 CPU 回退、
+遗漏回退选择器、跳过首次 QDMA 发布前关闭、忽略发布后的路由错误及遗漏
+QDMA 指针回滚、错误恢复 TX/LRO 状态及遗漏 WAN 标志回滚。发布后失败会
+恢复旧指针、等待 RCU，保持 users/IRQ 不变；测试同时覆盖回滚读回失败和
+后续重试。报告记录补丁、源码和测试 SHA。
+
 在 ponwrt 主仓库运行：
 
 ```sh

@@ -65,6 +65,8 @@ def main():
     parser.add_argument('--output', type=Path, default=tests / 'out')
     parser.add_argument('--cc', default=os.environ.get('CC', 'clang'))
     parser.add_argument('--case', help='Run one named test group')
+    parser.add_argument('--reopen', action='store_true',
+                        help='Apply 998 to --source through 996 and test PON reopening')
     args = parser.parse_args()
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     output = args.output.resolve()
@@ -72,8 +74,9 @@ def main():
     report_path = output / 'report.json'
     if report_path.exists():
         report_path.unlink()
-    patch = repo / ('target/linux/airoha/patches-6.18/'
-                    '991-net-airoha-own-gdm-default-routes-for-bank1-isolation.patch')
+    patch = repo / 'target/linux/airoha/patches-6.18' / (
+        '998-net-airoha-reopen-owned-pon-default-route.patch' if args.reopen else
+        '991-net-airoha-own-gdm-default-routes-for-bank1-isolation.patch')
     patch_bytes = patch.read_bytes()
     tree = output / 'kernel'
     driver = tree / DRIVER
@@ -83,13 +86,16 @@ def main():
         originals[name] = (args.source.resolve() / DRIVER / name).read_bytes()
         (driver / name).write_bytes(originals[name])
     added = driver / 'airoha_bank1_routes.h'
-    if added.exists():
+    if args.reopen:
+        originals[added.name] = (args.source.resolve() / DRIVER / added.name).read_bytes()
+        added.write_bytes(originals[added.name])
+    elif added.exists():
         added.unlink()
     patch_output = run(['patch', '--batch', '--forward', '--fuzz=0',
                         '--no-backup-if-mismatch', '-p1', '-i', str(patch)],
                        output, 'apply', cwd=tree)
     if re.search(r'fuzz|offset|FAILED|reversed', patch_output, re.IGNORECASE):
-        raise RuntimeError('991 must apply exactly to the 987 files:\n' + patch_output)
+        raise RuntimeError('patch must apply exactly to the input files:\n' + patch_output)
     modified = {name: (driver / name).read_bytes() for name in FILES + ('airoha_bank1_routes.h',)}
     header = modified['airoha_eth.h'].decode()
     layout = re.search(r'^struct airoha_bank1_routes \{\n.*?^\};', header, re.MULTILINE | re.DOTALL)
@@ -103,6 +109,9 @@ def main():
     for filename, names in FUNCTIONS.items():
         for name in names:
             extracted[name] = extract_function(modified[filename].decode(), name)
+    if args.reopen:
+        extracted['airoha_disable_qos_for_gdm34'] = extract_function(
+            modified['airoha_eth.c'].decode(), 'airoha_disable_qos_for_gdm34')
     (output / 'route_functions.inc').write_text('\n'.join(extracted.values()))
     compiler = shutil.which(args.cc)
     if not compiler:
@@ -115,12 +124,58 @@ def main():
              '-O1', '-g', '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
              '-fno-omit-frame-pointer', '-I', str(output), '-I', str(driver),
              str(tests / 'routes_test.c'), '-o', str(output / 'routes_test')]
+    if args.reopen:
+        build.insert(1, '-DTEST_PON_REOPEN')
     run(build, output, 'build')
     environment = dict(os.environ)
     environment['ASAN_OPTIONS'] = 'halt_on_error=1:abort_on_error=1'
     environment['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
     command = [str(output / 'routes_test')] + ([args.case] if args.case else [])
     result = run(command, output, 'routes_test', environment)
+    mutations = {}
+    if args.reopen and not args.case:
+        targets = {
+            'open_wrong_gdm': ('airoha_ct_cpu_fallback.h',
+                'id == AIROHA_GDM2_IDX && eth->ct_bank1_routes.pon_open',
+                'id == AIROHA_GDM1_IDX && eth->ct_bank1_routes.pon_open'),
+            'release_open_owner': ('airoha_bank1_routes.h',
+                'routes->pon_open || airoha_fe_rr', 'airoha_fe_rr'),
+            'ignore_revoke_latch': ('airoha_bank1_routes.h',
+                'routes->owner != owner || !routes->ready || routes->revoked',
+                'routes->owner != owner'),
+            'ignore_cpu_fallback': ('airoha_bank1_routes.h',
+                'eth->ct_cpu_fallback || eth->ct_cpu_route_mask[AIROHA_GDM2_IDX - 1]',
+                'false'),
+            'forget_open_fallback_mask': ('airoha_ct_cpu_fallback.h',
+                'eth->ct_cpu_route_mask[AIROHA_GDM2_IDX - 1] = GENMASK(15, 0);', ''),
+            'skip_new_qdma_close': ('route_functions.inc',
+                'if (cur_qdma != qdma)', 'if (cur_qdma && cur_qdma != qdma)'),
+            'ignore_published_route_error': ('route_functions.inc',
+                'err = airoha_ct_gdm_route_locked', 'airoha_ct_gdm_route_locked'),
+            'retain_failed_qdma_pointer': ('route_functions.inc',
+                'rcu_assign_pointer(dev->qdma, cur_qdma);', ''),
+            'wake_previously_stopped_queue': ('route_functions.inc',
+                'if (!test_bit(i, tx_stopped))', 'if (true)'),
+            'restore_lro_from_netdev_feature': ('route_functions.inc',
+                'if (lro_enabled)', 'if (lro_enabled && (netdev->features & NETIF_F_LRO))'),
+            'lose_previous_wan_role': ('route_functions.inc',
+                'set_bit(AIROHA_DEV_F_WAN, &dev->flags);', ''),
+        }
+        for name, (filename, before, after) in targets.items():
+            target = (output if filename.endswith('.inc') else driver) / filename
+            original = target.read_text()
+            if before not in original:
+                raise RuntimeError('missing mutation target: ' + name)
+            target.write_text(original.replace(before, after))
+            run(build, output, name + '-build')
+            attempt = subprocess.run([str(output / 'routes_test'), 'reopen'],
+                capture_output=True, text=True, cwd=output, env=environment)
+            (output / (name + '.log')).write_text(attempt.stdout + attempt.stderr)
+            target.write_text(original)
+            if attempt.returncode == 0 or 'case ' not in attempt.stderr:
+                raise RuntimeError('mutation did not hit runtime assertion: ' + name)
+            mutations[name] = 'caught'
+        run(build, output, 'build-final')
     if patch.read_bytes() != patch_bytes:
         raise RuntimeError('991 changed during testing; rerun against the completed patch')
     report = {
@@ -131,8 +186,8 @@ def main():
         'source_sha256': {name: digest(data) for name, data in modified.items()},
         'extracted_sha256': {name: digest(data.encode()) for name, data in extracted.items()},
         'test_sha256': {name: digest((tests / name).read_bytes())
-                        for name in ('verify.py', 'routes_test.c')},
-        'result': result,
+                        for name in ('verify.py', 'routes_test.c', 'reopen_test.inc')},
+        'result': result, 'mutations': mutations,
     }
     report_path.write_text(json.dumps(report, indent=2) + '\n')
     print(result)
