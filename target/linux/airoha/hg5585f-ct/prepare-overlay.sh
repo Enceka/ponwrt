@@ -102,6 +102,9 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/patches-6.18/991-net-airoha-own-gdm-default-routes-for-bank1-isolation.patch \
   target/linux/airoha/patches-6.18/992-net-airoha-arbitrate-native-fe-lifecycle-ownership.patch \
   target/linux/airoha/patches-6.18/993-net-airoha-connect-npu-owner-to-pon-update-close.patch \
+  target/linux/airoha/patches-6.18/994-net-airoha-own-pon-return-consumer-lifetimes.patch \
+  target/linux/airoha/patches-6.18/995-net-airoha-validate-pon-authorization-publication.patch \
+  target/linux/airoha/patches-6.18/996-net-airoha-bind-pon-authorization-to-owner.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config,NATIVE_PAIRS.md} \
   target/linux/airoha/tests/native_pair/*.{py,c} \
   target/linux/airoha/tests/native_pair/fixtures/*.inc \
@@ -111,7 +114,8 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/tests/npu_transaction_core/*.{py,c,md} \
   target/linux/airoha/tests/bank1_routes/*.{py,c,md} \
   target/linux/airoha/tests/npu_fe_owner/*.{py,c,inc,md} \
-  target/linux/airoha/tests/npu_owner/*.{py,c,md} \
+  target/linux/airoha/tests/npu_owner/*.{py,c,h,inc,md} \
+  target/linux/airoha/tests/npu_auth_publish/*.{py,c,md} \
   target/linux/airoha/tests/eth_return/*.{py,c,h,md} \
   target/linux/airoha/tests/tunnel/*.{py,c,sh,md} \
   target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed-full-test.dts}; do
