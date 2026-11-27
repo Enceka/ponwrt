@@ -73,6 +73,8 @@ python3 verify_ewan_ingress.py --stock-dir /path/to/stock/lib/modules \
 
 仅在实板确认分类生效、未匹配流量保持 WAN CPU 后，再让一个已配置的非零业务 A 进入独占 PPE 表，检查只有 A 推动绑定行计数并抵达目标。这个方案在 IFC 查表处使用业务号，无需 FE32 向 NPU 透传该字段。原厂字段名为 `GEM_LLID`，EPON 线侧输入值与其 CPU channel 的关系须单独测量。
 
+用目标平台的 C 编译器静态编译 `sport2_rx_snapshot.c`，在设备上先运行 `sport2-rx-snapshot --self-test`，再不带参数运行。工具通过只读映射采集源端口字及环 2、4 的 BASE、SIZE、CPU_IDX、DMA_IDX。2026-11-27 在 HG5585F-CT 普通 RAM 系统上读到 `sport2_map=0x00500500`、`cport=5`；两个环的 SIZE 都是 `0x00100080`，CPU/DMA 索引分别为 `127/2` 和 `0/3`。这次 `pon0_present=0`。带光控制器的测试须在自己的启动周期重新预检，再发送业务探针；环已初始化与编号包命中是两个独立步骤。
+
 `verify_path_order.py` 从真实 netfilter 路径生成、tuple 反转、action 生成和 Airoha action 解析一路执行到 PON GEM 选择。96 个场景覆盖两个方向、IPv4/IPv6、单/双 VLAN、PPPoE+单 VLAN，以及 PPPoE+双 VLAN 的现有两层容量拒绝。IPv6 测试执行驱动的出口准入判断，并检查物理端口、桥接、输入封装键、VLAN 剥离、优先级、保留 VID 和 PPPoE 会话号。
 
 `965` 把入方向 PPPoE 会话号、EtherType 和 PPP 协议加入 flowtable 交给驱动的精确匹配键。184 次入向检查涵盖 IPv4/IPv6、TCP/UDP、相同五元组下仅 SID 高位不同、裸 PPPoE 和外层 802.1Q、硬件处理外层 VLAN，以及保留 SID、倒置和超限封装。Airoha 的 IPv4/IPv6 FOE 当前无法匹配入方向 SID，驱动在发布前拒绝该类规则，保留原有普通 IP 路径和出方向 PPPoE 动作。测试在 CT 和普通 PPE 模式下均检查物理有线出口，另有四个运行期负控制。
