@@ -26,9 +26,12 @@ def main():
     parser.add_argument('--cc', default=os.environ.get('CC', 'clang'))
     parser.add_argument('--health', action='store_true',
                         help='Apply the 999-z owner health extension and run its fault matrix')
+    parser.add_argument('--bank1', action='store_true',
+                        help='Include 999-zc bank1 retirement and the owner health matrix')
     parser.add_argument('--source', type=Path, required=True,
                         help='Kernel tree with patches through 999 applied')
     args = parser.parse_args()
+    args.health |= args.bank1
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     report_path = output / 'report.json'
@@ -39,6 +42,8 @@ def main():
              for number in ('988', '989', '990', '993', '994', '995', '996', '999')}
     if args.health:
         paths['999-z'] = patches / '999-z-net-airoha-monitor-npu-owner-invalidation.patch'
+    if args.bank1:
+        paths['999-zc'] = patches / '999-zc-net-airoha-retire-host-bank1-before-npu-reuse.patch'
     inputs = {number: path.read_bytes() for number, path in paths.items()}
     sources = {}
     for name in (*helper.ABIS, 'airoha_npu_transaction.h'):
@@ -79,10 +84,10 @@ def main():
     publish_name = 'airoha_npu_auth_publish.h'
     sources[publish_name] = helper.added_file(inputs['995'].decode(), publish_name)
     health_name = 'airoha_npu_health.h'
-    if args.health:
+    for extension in (('999-z',) if args.health else ()) + (('999-zc',) if args.bank1 else ()):
         for name, data in sources.items():
             (expected / name).write_bytes(data)
-        sections = re.split(r'(?=^--- )', inputs['999-z'].decode(), flags=re.MULTILINE)
+        sections = re.split(r'(?=^--- )', inputs[extension].decode(), flags=re.MULTILINE)
         for section in sections:
             match = re.search(r'^\+\+\+ b/drivers/net/ethernet/airoha/(airoha_npu_\w+\.h)$',
                               section, flags=re.MULTILINE)
@@ -90,15 +95,15 @@ def main():
                 continue
             name = match[1]
             if name not in sources and not section.startswith('--- /dev/null\n'):
-                raise RuntimeError('health patch modifies an unknown header: ' + name)
+                raise RuntimeError(extension + ' modifies an unknown header: ' + name)
             if section.startswith('--- /dev/null\n'):
                 (expected / name).unlink(missing_ok=True)
             applied = subprocess.run(['patch', '--batch', '--forward', '--fuzz=0', '-p1'], input=section,
                                      cwd=output / 'expected', capture_output=True, text=True)
-            (output / ('apply-health-' + name + '.log')).write_text(
+            (output / ('apply-' + extension + '-' + name + '.log')).write_text(
                 applied.stdout + applied.stderr)
             if applied.returncode:
-                raise RuntimeError('cannot apply health header ' + name + ': ' +
+                raise RuntimeError('cannot apply ' + extension + ' header ' + name + ': ' +
                                    applied.stdout + applied.stderr)
             sources[name] = (expected / name).read_bytes()
         if health_name not in sources:
@@ -108,7 +113,9 @@ def main():
         raise RuntimeError('kernel owner differs from the selected owner patches')
     if (driver / return_name).read_bytes() != sources[return_name]:
         raise RuntimeError('kernel return owner differs from the selected owner patches')
-    for name in (admission_name, publish_name, reopen_name, *((health_name,) if args.health else ())):
+    for name in (admission_name, publish_name, reopen_name,
+                 *((health_name,) if args.health else ()),
+                 *(('airoha_npu_bank1.h',) if args.bank1 else ())):
         if (driver / name).read_bytes() != sources[name]:
             raise RuntimeError('kernel admission source differs: ' + name)
     ppe_source = (driver / 'airoha_ppe.c').read_text()
@@ -130,6 +137,8 @@ def main():
                '-o', str(output / 'owner_test')]
     if args.health:
         command.insert(1, '-DNPU_OWNER_HEALTH_TEST')
+    if args.bank1:
+        command.insert(1, '-DNPU_OWNER_BANK1_TEST')
     helper.execute(command, output, 'build')
     environment = dict(os.environ, ASAN_OPTIONS='halt_on_error=1:abort_on_error=1',
                        UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
@@ -144,6 +153,11 @@ def main():
         'reuse_return_epoch': ('if (owner->epoch_dirty && owner->txn.phase == NPU_TXN_CLOSED)',
                               'if (false)'),
     }
+    if args.bank1:
+        mutants['release_before_closed'] = (
+            'if (owner->txn.phase != NPU_TXN_CLOSED || !owner->bank1_saved ||\n'
+            '\t    owner->return_path || owner->epoch_dirty || !owner->bank1_host_retired ||\n'
+            '\t    owner->bank1_next_row != PPE_SRAM_NUM_ENTRIES)', 'if (false)')
     return_mutants = {
         'return_ignore_config': ('memcmp(config, &path->config, sizeof(*config))', 'false'),
         'return_ignore_mapping': ('rcu_dereference(dev->pon_flow_table) == path->table', 'true'),
@@ -264,8 +278,35 @@ def main():
         }
         mutants.update({name: (before, after)
                         for name, (_, before, after) in health_mutants.items()})
+    bank1_mutants = {}
+    if args.bank1:
+        bank1_mutants = {
+            'bank1_skip_cookie_retirement': (owner_name,
+                'error = airoha_ppe_bank1_retire_flows(owner->ppe);',
+                'error = false ? airoha_ppe_bank1_retire_flows(owner->ppe) : 0;'),
+            'bank1_repeat_cookie_retirement': (owner_name,
+                'if (!error && !owner->bank1_host_retired)', 'if (!error)'),
+            'bank1_skip_row_clear': (owner_name,
+                'error = airoha_ppe_bank1_clear_rows(owner->ppe, &owner->bank1_next_row);',
+                'error = false ? airoha_ppe_bank1_clear_rows(owner->ppe, &owner->bank1_next_row) : 0;'),
+            'bank1_ignore_retirement_failure': (owner_name,
+                'error = airoha_ppe_bank1_retire_flows(owner->ppe);',
+                'error = (airoha_ppe_bank1_retire_flows(owner->ppe), 0);'),
+            'bank1_ignore_row_failure': (owner_name,
+                'error = airoha_ppe_bank1_clear_rows(owner->ppe, &owner->bank1_next_row);',
+                'error = (airoha_ppe_bank1_clear_rows(owner->ppe, &owner->bank1_next_row), 0);'),
+            'bank1_no_sram_ownership': (owner_name, ' || !ppe->ct_owns_sram', ''),
+            'bank1_release_incomplete_rows': (owner_name,
+                'owner->bank1_next_row != PPE_SRAM_NUM_ENTRIES', 'false'),
+            'bank1_open_before_retirement': (reopen_name, ' || !owner->bank1_host_retired', ''),
+            'bank1_forget_reopen_cursor': (reopen_name,
+                'owner->bank1_next_row = 0;', '(void)owner;'),
+        }
+        mutants.update({name: (before, after)
+                        for name, (_, before, after) in bank1_mutants.items()})
     for name, (before, after) in mutants.items():
-        target_name = (health_mutants[name][0] if name in health_mutants else
+        target_name = (bank1_mutants[name][0] if name in bank1_mutants else
+                       health_mutants[name][0] if name in health_mutants else
                        'stop_entry.inc' if name.startswith('repeat_') else
                        return_name if name in return_mutants else
                        reopen_name if name in reopen_mutants else
@@ -291,7 +332,7 @@ def main():
             raise RuntimeError(number + ' changed during testing')
     sha256 = lambda data: hashlib.sha256(data).hexdigest()
     report = {
-        'passed': True, 'health': args.health,
+        'passed': True, 'health': args.health, 'bank1': args.bank1,
         'sanitizers': ['address', 'undefined'], 'result': result,
         'mutations': mutation_results,
         'patch_sha256': {number: sha256(data) for number, data in inputs.items()},
@@ -300,6 +341,7 @@ def main():
                         for name in ('verify.py', 'owner_test.c', 'return_types.h',
                                      'return_stubs.inc', 'return_test.inc', 'admission_test.inc',
                                      'reopen_test.inc',
+                                     *(('bank1_stubs.inc', 'bank1_test.inc') if args.bank1 else ()),
                                      *(('health_test.inc',) if args.health else ()))},
     }
     report_path.write_text(json.dumps(report, indent=2) + '\n')

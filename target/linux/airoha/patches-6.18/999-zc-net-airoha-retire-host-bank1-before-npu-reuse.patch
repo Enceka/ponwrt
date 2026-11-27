@@ -1,0 +1,188 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: retire host bank1 state before NPU reuse
+
+Detach old bank1 cookie and L2 subflow references after the producer and
+PPE drain. Keep bank0 bindings and unbound candidates intact, then clear
+and read back every owned bank1 row before allowing NPU reuse. Retain the
+failed row cursor and original register snapshot for retry. Reset the
+cursor before restoring bank1 so the next close also retires NPU rows.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_bank1.h
+@@ -0,0 +1,104 @@
++#ifndef AIROHA_NPU_BANK1_H
++#define AIROHA_NPU_BANK1_H
++
++static bool airoha_ppe_ct_sram_ack(struct airoha_eth *eth, u32 hash, bool write);
++
++static bool airoha_ppe_bank1_hash(u32 hash)
++{
++	return hash >= PPE_SRAM_NUM_ENTRIES && hash < 2 * PPE_SRAM_NUM_ENTRIES;
++}
++
++static void airoha_ppe_bank1_detach_entry(struct airoha_flow_table_entry *entry)
++{
++	struct airoha_flow_table_entry *subflow;
++	struct hlist_node *next;
++
++	lockdep_assert_held(&ppe_lock);
++	if (entry->type == FLOW_TYPE_L2) {
++		hlist_for_each_entry_safe(subflow, next, &entry->l2_flows, l2_subflow_node) {
++			if (!airoha_ppe_bank1_hash(subflow->hash))
++				continue;
++			hlist_del_init(&subflow->list);
++			hlist_del_init(&subflow->l2_subflow_node);
++			kfree(subflow);
++		}
++		return;
++	}
++	if (!airoha_ppe_bank1_hash(entry->hash))
++		return;
++	hlist_del_init(&entry->list);
++	entry->hash = 0xffff;
++	entry->data.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
++	if (entry->ct_bridge)
++		entry->ct_bridge_dead = true;
++}
++
++static int airoha_ppe_bank1_retire_flows(struct airoha_ppe *ppe)
++{
++	struct airoha_flow_table_entry *entry, *next;
++	struct rhashtable_iter iter;
++	LIST_HEAD(retire_list);
++	int error = 0;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	rhashtable_walk_enter(&ppe->eth->flow_table, &iter);
++	rhashtable_walk_start(&iter);
++	while ((entry = rhashtable_walk_next(&iter))) {
++		if (IS_ERR(entry)) {
++			if (PTR_ERR(entry) == -EAGAIN)
++				continue;
++			error = PTR_ERR(entry);
++			break;
++		}
++		if (list_empty(&entry->gc_node))
++			list_add_tail(&entry->gc_node, &retire_list);
++	}
++	rhashtable_walk_stop(&iter);
++	rhashtable_walk_exit(&iter);
++	list_for_each_entry_safe(entry, next, &retire_list, gc_node) {
++		list_del_init(&entry->gc_node);
++		if (error)
++			continue;
++		spin_lock_bh(&ppe_lock);
++		airoha_ppe_bank1_detach_entry(entry);
++		spin_unlock_bh(&ppe_lock);
++		cond_resched();
++	}
++	return error;
++}
++
++static int airoha_ppe_bank1_clear_rows(struct airoha_ppe *ppe, u32 *next_row)
++{
++	const struct airoha_foe_entry invalid = {};
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!ppe->ct_owns_sram || *next_row > PPE_SRAM_NUM_ENTRIES)
++		return -EINVAL;
++	while (*next_row < PPE_SRAM_NUM_ENTRIES) {
++		u32 hash = PPE_SRAM_NUM_ENTRIES + *next_row;
++		struct airoha_foe_entry *entry = ppe->foe + hash * sizeof(*entry);
++		int error;
++
++		spin_lock_bh(&ppe_lock);
++		memset(entry, 0, sizeof(*entry));
++		error = airoha_ppe_foe_commit_sram_entry(ppe, hash);
++		if (!error && !airoha_ppe_ct_sram_ack(ppe->eth, hash, true))
++			error = -EIO;
++		if (!error) {
++			entry = airoha_ppe_foe_get_entry_locked(ppe, hash);
++			if (!entry)
++				error = -ETIMEDOUT;
++			else if (!airoha_ppe_ct_sram_ack(ppe->eth, hash, false) ||
++				 memcmp(entry, &invalid, sizeof(invalid)))
++				error = -EIO;
++		}
++		spin_unlock_bh(&ppe_lock);
++		if (error)
++			return error;
++		++*next_row;
++		cond_resched();
++	}
++	return 0;
++}
++
++#endif
+--- a/drivers/net/ethernet/airoha/airoha_npu_owner.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_owner.h
+@@ -3,12 +3,15 @@
+ 
+ #include "airoha_npu_transaction.h"
+ #include "airoha_npu_auth_publish.h"
++#include "airoha_npu_bank1.h"
+ 
+ struct airoha_npu_owner {
+ 	struct airoha_ppe *ppe;
+ 	struct airoha_npu_txn txn;
+ 	struct airoha_npu_txn_identity gate_id;
+ 	u32 bank1_flow, bank1_tb;
++	u32 bank1_next_row;
++	bool bank1_host_retired;
+ 	bool bank1_saved, native_stopped, stop_completed;
+ 	struct airoha_npu_return *return_path;
+ 	bool epoch_dirty, auth_attempted;
+@@ -157,6 +160,13 @@
+ 		error = -EIO;
+ unlock:
+ 	spin_unlock_bh(&ppe_lock);
++	if (!error && !owner->bank1_host_retired) {
++		error = airoha_ppe_bank1_retire_flows(owner->ppe);
++		if (!error)
++			owner->bank1_host_retired = true;
++	}
++	if (!error)
++		error = airoha_ppe_bank1_clear_rows(owner->ppe, &owner->bank1_next_row);
+ 	return error;
+ }
+ 
+@@ -242,7 +252,8 @@
+ 		return -EOVERFLOW;
+ 	lockdep_assert_held(&flow_offload_mutex);
+ 	ppe = eth->ppe;
+-	if (!ppe->ct_host_ppe || !ppe->ct_restore_pending || eth->soc->num_ppe != 2)
++	if (!ppe->ct_host_ppe || !ppe->ct_restore_pending || !ppe->ct_owns_sram ||
++	    eth->soc->num_ppe != 2)
+ 		return -EOPNOTSUPP;
+ 	owner = ppe->ct_npu_owner;
+ 	if (owner) {
+@@ -309,7 +320,8 @@
+ 	if (!owner)
+ 		return 0;
+ 	if (owner->txn.phase != NPU_TXN_CLOSED || !owner->bank1_saved ||
+-	    owner->return_path || owner->epoch_dirty)
++	    owner->return_path || owner->epoch_dirty || !owner->bank1_host_retired ||
++	    owner->bank1_next_row != PPE_SRAM_NUM_ENTRIES)
+ 		return -EBUSY;
+ 	if (ppe->eth->ct_bank1_routes.owner) {
+ 		error = airoha_bank1_routes_release(ppe->eth, owner);
+--- a/drivers/net/ethernet/airoha/airoha_npu_reopen.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_reopen.h
+@@ -7,7 +7,8 @@
+ {
+ 	if (!owner->ppe->ct_pon_qualified || !owner->ppe->ct_pair_wired_registered)
+ 		return -EOPNOTSUPP;
+-	if (!owner->bank1_saved || !owner->auth_attempted || !owner->auth_count)
++	if (!owner->bank1_saved || !owner->bank1_host_retired ||
++	    !owner->auth_attempted || !owner->auth_count)
+ 		return -EACCES;
+ 	return airoha_npu_owner_return_state(owner, id, phase);
+ }
+@@ -35,6 +36,7 @@
+ 		error = -EIO;
+ 		goto unlock;
+ 	}
++	owner->bank1_next_row = 0;
+ 	airoha_fe_wr(eth, REG_PPE_TB_CFG(1), owner->bank1_tb);
+ 	if (airoha_fe_rr(eth, REG_PPE_TB_CFG(1)) != owner->bank1_tb) {
+ 		error = -EIO;

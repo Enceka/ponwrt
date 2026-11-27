@@ -294,6 +294,9 @@ static int airoha_ct_fe_owner_release(struct airoha_ppe *ppe, const void *owner)
 }
 
 #include "return_stubs.inc"
+#ifdef NPU_OWNER_BANK1_TEST
+#include "bank1_stubs.inc"
+#endif
 #include "airoha_npu_owner.h"
 
 static const u32 ct_bank0_regs[] = { 0, 1 };
@@ -439,6 +442,7 @@ static void setup(struct airoha_eth *eth, struct airoha_ppe *ppe,
     *soc = (struct airoha_soc) { .num_ppe = 2 };
     *npu = (struct airoha_npu) { .present = 1 };
     *ppe = (struct airoha_ppe) { .eth = eth, .ct_host_ppe = true,
+                               .ct_owns_sram = true,
                                .ct_restore_pending = true, .ct_pair_wired_epoch = 9,
                                .ct_pair_wired_registered = true };
     ppe->ct_fe.epoch = 7;
@@ -468,6 +472,12 @@ static void setup(struct airoha_eth *eth, struct airoha_ppe *ppe,
     route_claim_hook = NULL;
     before_free_hook = NULL;
     before_spin_lock_hook = NULL;
+#ifdef NPU_OWNER_BANK1_TEST
+    bank1_retire_calls = bank1_clear_calls = bank1_cleared_rows = 0;
+    bank1_clear_start = 0;
+    bank1_retire_error = 0;
+    bank1_fail_row = -1;
+#endif
 #ifdef NPU_OWNER_HEALTH_TEST
     fail_revoke = 0;
     route_revokes = 0;
@@ -482,6 +492,9 @@ static void check_closed(struct airoha_eth *eth)
     CHECK(owner->txn.id.epoch == (auth_epoch == 21 ? 22u : 12u) &&
           owner->txn.id.generation == 4);
     CHECK(owner->bank1_saved && owner->bank1_flow == 0xabcd && owner->bank1_tb == 0x1234);
+#ifdef NPU_OWNER_BANK1_TEST
+    CHECK(owner->bank1_host_retired && owner->bank1_next_row == PPE_SRAM_NUM_ENTRIES);
+#endif
     CHECK(eth->regs[0] == 0x1234 && eth->regs[1] == 0x9876 && eth->regs[2] == 1);
     CHECK(!eth->regs[3] && eth->regs[4] == 0x1236 && eth->regs[5] == 1);
     CHECK(eth->ct_bank1_routes.owner == owner && eth->ppe->ct_fe.owner == owner);
@@ -490,6 +503,9 @@ static void check_closed(struct airoha_eth *eth)
 #include "return_test.inc"
 #include "admission_test.inc"
 #include "reopen_test.inc"
+#ifdef NPU_OWNER_BANK1_TEST
+#include "bank1_test.inc"
+#endif
 #ifdef NPU_OWNER_HEALTH_TEST
 #include "health_test.inc"
 #endif
@@ -673,6 +689,9 @@ int main(void)
     check_returns();
     check_authorization();
     check_reopen();
+#ifdef NPU_OWNER_BANK1_TEST
+    check_bank1_retirement();
+#endif
 #ifdef NPU_OWNER_HEALTH_TEST
     check_health();
 #endif

@@ -56,10 +56,10 @@ a failed close preserves its phase and DMA resources for another close
 attempt. Normal activation remains gated by `ct_pon_qualified`. Patch `999-z`
 adds atomic admission revocation and periodic owner health checks; `999-za`
 blocks host learning into the claimed bank and validates native IP learning
-against its physical source bank. Activation still requires retiring old host
-bank1 cookies and rows before reuse, completing ingress-domain classification,
-and hardware-reset DMA retirement. Boot and ordinary PON configuration still
-use existing paths.
+against its physical source bank. Patch `999-zc` retires old host bank1 cookies
+and clears the owned bank before reuse. Activation still requires completing
+ingress-domain classification and hardware-reset DMA retirement. Boot and
+ordinary PON configuration still use existing paths.
 
 Run against a kernel source tree containing patches through `999`:
 
@@ -82,6 +82,36 @@ Omitting `--health` keeps the original `999` regression mode. The health mode
 reconstructs the added and changed production headers from `999-z`, applies
 them with zero patch fuzz, and compares them byte for byte with the supplied
 tree before compiling. Each run records the selected patch and source hashes.
+
+Use `--bank1` against a tree containing `999-zc` to include bank1 retirement
+and the health matrix:
+
+```sh
+python3 target/linux/airoha/tests/npu_owner/verify.py --bank1 \
+  --source /absolute/path/to/owner-source-bank1-retire \
+  --output /absolute/path/to/results/npu-owner-bank1
+```
+
+After GATE QUIET and the bank1 drain, the owner walks the complete host cookie
+table. Bank1 L4 cookies lose their candidate link and row hash; legacy L2
+parents retain only their non-bank1 subflows. Bank0 bindings and unbound
+candidates remain available. All cookie references are detached before the
+first row write. Each of the 8,192 bank1 rows is cleared under its own
+`ppe_lock` section, with exact read/write completion selectors and a complete
+zero readback. A failed row retains its cursor and the owner remains in
+PPE_DRAIN. The original register snapshot survives retries.
+
+Restoring bank1 resets the row cursor before the first register write, so
+partial reopen failures and later closes also retire NPU rows. Owner release
+requires completed cookie retirement and a cursor at the end of bank1. The
+claim requires SRAM ownership. These changes add host driver state only.
+
+The `--bank1` matrix exercises these integration boundaries with retirement
+and SRAM fault stubs: failed cookie traversal, first/middle/last row retries,
+unchanged epoch and snapshot, retained return DMA, repeated close, incomplete
+release, and clearing after partial or complete reopen. The separate
+`tests/npu_bank1` suite runs the actual cookie and SRAM helper code. Both
+suites use ASan/UBSan and require runtime assertions to catch their mutants.
 
 `999-z` embeds a delayed health worker and a monotonic invalidation sequence
 in the owner. An atomic invalidation holds `ppe_lock`, latches admission off,
