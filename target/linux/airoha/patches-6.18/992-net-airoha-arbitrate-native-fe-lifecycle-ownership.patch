@@ -1,0 +1,293 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: arbitrate shared native FE lifecycle ownership
+
+Reserve idle native FE state for a lifecycle owner under ppe_lock. Keep
+exact 64-bit generation and epoch across ambiguous QUIESCE completions,
+and require an owner-specific acknowledgement before releasing the claim.
+
+Block native policy activation, learning, health rearming and wired epoch
+changes while claimed. Once quiesced, retain ordinary FLUSH and WLAN
+retirement so global CT shutdown can finish before releasing the owner.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -795,6 +795,8 @@
+ 	bool ct_pair_wired_registered, ct_pair_wired_blocked;
+ 	u32 ct_pair_wired_epoch;
+-	struct {
+-		u32 tcam[2][9][2], action[2][3][3];
++	struct {
++		const void *owner;
++		bool owner_quiesced;
++		u32 tcam[2][9][2], action[2][3][3];
+ 		u32 epoch, pending_epoch, drain_flow, drain_tb;
+ 		u64 generation, pending_generation;
+--- a/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
+@@ -103,6 +103,7 @@
+ }
+ 
+-static int airoha_ct_fe_control_from(struct airoha_ppe *ppe, u16 op, u64 generation,
+-				     u32 epoch, const char *caller, unsigned int line)
++static int airoha_ct_fe_control_owned_from(struct airoha_ppe *ppe, const void *owner,
++					   u16 op, u64 generation, u32 epoch,
++					   const char *caller, unsigned int line)
+ {
+ 	struct airoha_ct_pair_msg msg = {
+@@ -113,7 +114,16 @@
+ 	};
+ 
+-	return airoha_ct_pair_send_from(ppe, &msg, caller, line);
+-}
+-#define airoha_ct_fe_control(ppe, op, generation, epoch) \
++	lockdep_assert_held(&ppe_lock);
++	if (ppe->ct_fe.owner != owner)
++		return -EBUSY;
++	return airoha_ct_pair_send_from(ppe, &msg, caller, line);
++}
++
++static int airoha_ct_fe_control_from(struct airoha_ppe *ppe, u16 op, u64 generation,
++				     u32 epoch, const char *caller, unsigned int line)
++{
++	return airoha_ct_fe_control_owned_from(ppe, NULL, op, generation, epoch, caller, line);
++}
++#define airoha_ct_fe_control(ppe, op, generation, epoch) \
+ 	airoha_ct_fe_control_from(ppe, op, generation, epoch, __func__, __LINE__)
+ 
+@@ -120,3 +130,82 @@
+-static int airoha_ct_fe_quiesce(struct airoha_ppe *ppe, u64 generation)
++static int __maybe_unused airoha_ct_fe_owner_claim(struct airoha_ppe *ppe,
++						 const void *owner)
++{
++	lockdep_assert_held(&ppe_lock);
++	if (!owner)
++		return -EINVAL;
++	if (ppe->ct_fe.owner)
++		return ppe->ct_fe.owner == owner ? 0 : -EBUSY;
++	if (ppe->ct_pair_failed || ppe->ct_stopping || ppe->ct_fe.health_stopping ||
++	    READ_ONCE(ppe->eth->ct_ifc_cpu_port_failed) ||
++	    READ_ONCE(ppe->eth->ct_cpu_fallback))
++		return -ESHUTDOWN;
++	if (ppe->ct_pair_policy_allowed ||
++	    (ppe->ct_pairs && airoha_ct_pair_any(ppe)) ||
++	    ppe->ct_fe.pending || ppe->ct_fe.arm_pending || ppe->ct_fe.armed ||
++	    ppe->ct_fe.active || ppe->ct_fe.touched || ppe->ct_fe.drain_pending)
++		return -EBUSY;
++	ppe->ct_fe.owner_quiesced = false;
++	ppe->ct_fe.owner = owner;
++	return 0;
++}
++
++static int __maybe_unused airoha_ct_fe_owner_quiesce(struct airoha_ppe *ppe,
++						   const void *owner, u64 generation,
++						   u32 epoch)
++{
++	int err;
++
++	lockdep_assert_held(&ppe_lock);
++	if (!owner || !generation || !epoch)
++		return -EINVAL;
++	if (ppe->ct_fe.owner != owner)
++		return -ESTALE;
++	if (ppe->ct_fe.pending) {
++		if (ppe->ct_fe.pending_epoch != epoch ||
++		    ppe->ct_fe.pending_generation != generation)
++			return -ESTALE;
++	} else {
++		if (epoch < ppe->ct_fe.epoch || epoch <= ppe->ct_pair_wired_epoch ||
++		    generation < ppe->ct_fe.generation ||
++		    (epoch == ppe->ct_fe.epoch && generation != ppe->ct_fe.generation))
++			return -ESTALE;
++		ppe->ct_fe.pending_epoch = epoch;
++		ppe->ct_fe.pending_generation = generation;
++		ppe->ct_fe.pending = true;
++	}
++	ppe->ct_fe.owner_quiesced = false;
++	err = airoha_ct_fe_control_owned_from(ppe, owner, AIROHA_CT_PAIR_FE_QUIESCE,
++					      generation, epoch, __func__, __LINE__);
++	if (err)
++		return err > 0 ? -EPROTO : err;
++	ppe->ct_fe.epoch = epoch;
++	ppe->ct_fe.generation = generation;
++	ppe->ct_pair_wired_epoch = epoch - 1;
++	ppe->ct_fe.pending = false;
++	ppe->ct_fe.arm_pending = false;
++	ppe->ct_fe.armed = false;
++	ppe->ct_fe.active = false;
++	ppe->ct_fe.owner_quiesced = true;
++	return 0;
++}
++
++static int __maybe_unused airoha_ct_fe_owner_release(struct airoha_ppe *ppe,
++						   const void *owner)
++{
++	lockdep_assert_held(&ppe_lock);
++	if (!owner)
++		return -EINVAL;
++	if (ppe->ct_fe.owner != owner)
++		return -ESTALE;
++	if (!ppe->ct_fe.owner_quiesced || ppe->ct_fe.pending || ppe->ct_fe.arm_pending ||
++	    ppe->ct_fe.armed || ppe->ct_fe.active || ppe->ct_fe.touched ||
++	    ppe->ct_fe.drain_pending)
++		return -EBUSY;
++	ppe->ct_fe.owner_quiesced = false;
++	ppe->ct_fe.owner = NULL;
++	return 0;
++}
++
++static int airoha_ct_fe_quiesce(struct airoha_ppe *ppe, u64 generation)
+ {
+ 	u32 epoch;
+@@ -123,6 +212,8 @@
+ 	int err;
+ 
+-	lockdep_assert_held(&ppe_lock);
+-	if (READ_ONCE(ppe->eth->ct_cpu_fallback)) {
++	lockdep_assert_held(&ppe_lock);
++	if (ppe->ct_fe.owner)
++		return -EBUSY;
++	if (READ_ONCE(ppe->eth->ct_cpu_fallback)) {
+ 		/* The global gate closes the producer. Preserve table shadows and
+ 		 * inflight references; fault retirement must not snapshot for ARM.
+@@ -171,6 +262,8 @@
+ 	int err;
+ 
+-	lockdep_assert_held(&ppe_lock);
+-	if (!ppe->ct_fe.epoch || ppe->ct_fe.pending || ppe->ct_fe.drain_pending ||
++	lockdep_assert_held(&ppe_lock);
++	if (ppe->ct_fe.owner)
++		return -EBUSY;
++	if (!ppe->ct_fe.epoch || ppe->ct_fe.pending || ppe->ct_fe.drain_pending ||
+ 	    ppe->ct_pair_failed || ppe->ct_stopping ||
+ 	    READ_ONCE(ppe->eth->ct_ifc_cpu_port_failed) || ppe->ct_fe.generation != generation)
+--- a/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
+@@ -185,7 +185,9 @@
+ 	int err;
+ 
+-	spin_lock_bh(&ppe_lock);
+-	if (!ppe->ct_fe.health_stopping &&
+-	    READ_ONCE(ppe->eth->ct_ifc_cpu_port_failed) && !ppe->ct_pair_failed)
++	spin_lock_bh(&ppe_lock);
++	if (ppe->ct_fe.owner)
++		goto unlock;
++	if (!ppe->ct_fe.health_stopping &&
++	    READ_ONCE(ppe->eth->ct_ifc_cpu_port_failed) && !ppe->ct_pair_failed)
+ 		airoha_ct_pair_fail(ppe, -EIO);
+ 	if (!ppe->ct_fe.health_stopping && ppe->ct_pair_failed &&
+@@ -217,7 +219,8 @@
+ 		(ppe->ct_pair_failed && (ppe->ct_fe.armed || ppe->ct_fe.pending || ppe->ct_fe.arm_pending)) ||
+ 		(ppe->ct_fe.armed && ppe->ct_fe.active && !ppe->ct_pair_failed && !ppe->ct_stopping));
+-	if (again)
+-		schedule_delayed_work(&ppe->ct_fe.health_work, msecs_to_jiffies(100));
+-	spin_unlock_bh(&ppe_lock);
++	if (again)
++		schedule_delayed_work(&ppe->ct_fe.health_work, msecs_to_jiffies(100));
++unlock:
++	spin_unlock_bh(&ppe_lock);
+ }
+ 
+@@ -251,7 +254,15 @@
+ 
+ 	lockdep_assert_held(&ppe_lock);
+-	if (!ppe->ct_native_pairs)
+-		return 0;
+-	if (ppe->ct_fe.armed || ppe->ct_fe.touched || ppe->ct_fe.pending || ppe->ct_fe.arm_pending) {
++	if (!ppe->ct_native_pairs)
++		return 0;
++	if (ppe->ct_fe.owner) {
++		if (band == AIROHA_CT_PAIR_LAN1_SELECTOR && wcid == AIROHA_CT_PAIR_LAN1_ID)
++			return 0;
++		if (!ppe->ct_fe.owner_quiesced || ppe->ct_fe.pending || ppe->ct_fe.arm_pending ||
++		    ppe->ct_fe.armed || ppe->ct_fe.active || ppe->ct_fe.touched)
++			return 0;
++	}
++	if (!ppe->ct_fe.owner &&
++	    (ppe->ct_fe.armed || ppe->ct_fe.touched || ppe->ct_fe.pending || ppe->ct_fe.arm_pending)) {
+ 		/* Bridge PRE notifications deliberately expose generation zero.
+ 		 * Retire the last armed generation, then rearm after POST. */
+@@ -445,6 +456,6 @@
+ 	int i, free_slot = -1, err;
+ 
+-	if (!READ_ONCE(ppe->ct_native_pairs) || !READ_ONCE(ppe->ct_pair_policy_allowed) ||
+-	    skb_vlan_tag_present(skb) ||
++	if (!READ_ONCE(ppe->ct_native_pairs) || !READ_ONCE(ppe->ct_pair_policy_allowed) ||
++	    READ_ONCE(ppe->ct_fe.owner) || skb_vlan_tag_present(skb) ||
+ 	    (hdr->h_proto != htons(ETH_P_IP) && hdr->h_proto != htons(ETH_P_IPV6)))
+ 		return;
+@@ -466,6 +477,7 @@
+ 	ether_addr_copy(msg.dmac, hdr->h_dest);
+ 	spin_lock_bh(&ppe_lock);
+-	if (!ppe->ct_pair_policy_allowed || !ppe->ct_host_ppe || ppe->ct_stopping || ppe->ct_pair_failed ||
+-	    generation != br_flow_offload_generation() ||
++	if (ppe->ct_fe.owner || !ppe->ct_pair_policy_allowed || !ppe->ct_host_ppe ||
++	    ppe->ct_stopping || ppe->ct_pair_failed ||
++	    generation != br_flow_offload_generation() ||
+ 	    !airoha_ct_pair_peers(ppe, idev, odev, hdr, &src, &dst) ||
+ 	    msg.src_selector != airoha_ct_pair_dst_selector(&src) || msg.dst_selector != airoha_ct_pair_dst_selector(&dst) ||
+@@ -542,6 +554,6 @@
+ 
+ 	lockdep_assert_held(&ppe_lock);
+-	if (!ppe->ct_pair_policy_allowed || ppe->ct_pair_failed || !generation ||
+-	    skb_vlan_tag_present(skb) ||
++	if (ppe->ct_fe.owner || !ppe->ct_pair_policy_allowed || ppe->ct_pair_failed ||
++	    !generation || skb_vlan_tag_present(skb) ||
+ 	    (hdr->h_proto != htons(ETH_P_IP) && hdr->h_proto != htons(ETH_P_IPV6)) ||
+ 	    hash >= PPE_SRAM_NUM_ENTRIES)
+@@ -661,7 +673,12 @@
+ 	}
+ 	spin_lock_bh(&ppe_lock);
+-	if (!ppe->ct_native_pairs || ppe->ct_stopping)
+-		goto out;
+-	if (revoke) {
++	if (!ppe->ct_native_pairs || ppe->ct_stopping)
++		goto out;
++	if (ppe->ct_fe.owner) {
++		if (revoke)
++			ppe->ct_pair_wired_blocked = true;
++		goto update_link;
++	}
++	if (revoke) {
+ 		ppe->ct_pair_wired_blocked = true;
+ 		fe_live = ppe->ct_fe.armed || ppe->ct_fe.touched || ppe->ct_fe.pending || ppe->ct_fe.arm_pending;
+@@ -679,6 +696,7 @@
+ 			ppe->ct_pair_wired_epoch++;
+ 	}
+-	if (!err && resume && netif_running(dev) && netif_carrier_ok(dev))
+-		ppe->ct_pair_wired_blocked = false;
++update_link:
++	if (!err && resume && netif_running(dev) && netif_carrier_ok(dev))
++		ppe->ct_pair_wired_blocked = false;
+ out:
+ 	spin_unlock_bh(&ppe_lock);
+--- a/drivers/net/ethernet/airoha/airoha_ct_pair_policy.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_pair_policy.h
+@@ -14,6 +14,6 @@
+ 	spin_lock_bh(&ppe_lock);
+ 	ppe->ct_pair_policy_allowed = false;
+-	if (event == NF_NATIVE_PAIR_PRE && (airoha_ct_pair_any(ppe) ||
+-	    ppe->ct_fe.armed || ppe->ct_fe.touched || ppe->ct_fe.pending || ppe->ct_fe.arm_pending))
++	if (!ppe->ct_fe.owner && event == NF_NATIVE_PAIR_PRE && (airoha_ct_pair_any(ppe) ||
++	    ppe->ct_fe.armed || ppe->ct_fe.touched || ppe->ct_fe.pending || ppe->ct_fe.arm_pending))
+ 		err = airoha_ct_native_pair_revoke(ppe, -1, 0);
+ 	spin_unlock_bh(&ppe_lock);
+@@ -114,6 +114,6 @@
+ 	if (sysfs_streq(buf, "off")) {
+ 		spin_lock_bh(&ppe_lock);
+-		ppe->ct_pair_policy_allowed = false;
+-		err = airoha_ct_native_pair_revoke(ppe, -1, 0);
++		ppe->ct_pair_policy_allowed = false;
++		err = ppe->ct_fe.owner ? 0 : airoha_ct_native_pair_revoke(ppe, -1, 0);
+ 		spin_unlock_bh(&ppe_lock);
+ 		return err ?: len;
+@@ -134,6 +134,8 @@
+ 	}
+ 	spin_lock_bh(&ppe_lock);
+-	if (!ppe->ct_host_ppe || ppe->ct_stopping || ppe->ct_pair_failed)
+-		err = -ESHUTDOWN;
++	if (ppe->ct_fe.owner)
++		err = -EBUSY;
++	else if (!ppe->ct_host_ppe || ppe->ct_stopping || ppe->ct_pair_failed)
++		err = -ESHUTDOWN;
+ 	else {
+ 		struct airoha_ct_pair_msg cap = { .op = cpu_to_le16(AIROHA_CT_PAIR_CAP) };
