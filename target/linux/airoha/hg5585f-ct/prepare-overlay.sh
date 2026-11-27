@@ -132,6 +132,7 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/patches-6.18/999-zt-net-airoha-bind-pon-diagnostic-row-to-lan1.patch \
   target/linux/airoha/patches-6.18/999-zu-net-airoha-retain-pon-bank0-ownership.patch \
   target/linux/airoha/patches-6.18/999-zv-net-airoha-retire-host-bank0-before-npu-reuse.patch \
+  target/linux/airoha/patches-6.18/999-zw-net-airoha-align-pon-auth-bank-metadata.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config,NATIVE_PAIRS.md} \
   target/linux/airoha/tests/native_pair/*.{py,c} \
   target/linux/airoha/tests/native_pair/fixtures/*.inc \

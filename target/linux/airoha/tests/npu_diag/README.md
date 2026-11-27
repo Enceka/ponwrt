@@ -66,6 +66,15 @@ both banks have drained and restored successfully, then frees the owner once.
   BEGIN, ADD, ARM, post-ARM readiness, then open. FLOW remains zero until
   learning-mode bank0 restoration; qualification stays off. Explicit
   diagnostic AUTH allows at most one rule in both modes 1 and 2.
+- AUTH bank metadata: diagnostics publish bank0 to match PSE4/PPE1
+  reinjection. Pure AUTH and learning use row zero as a placeholder;
+  binding publishes the selected bank0 `diag_hash`, including row zero
+  and row 8191. The PPE still selects the row from the packet tuple.
+  Invalid bound rows fail before binding lookup or mailbox traffic.
+  The shared ABI validator accepts bank0/1, while production authorization
+  explicitly requires bank1 for every rule before readiness checks,
+  mapping lookups or publication flags change. Mixed-bank batches fail
+  with either the first or the last rule selecting bank0.
 - AUTH admission/failures: oversized services in all three modes, low-bit and
   bit-15 binding mismatches, wrong identity/phase/mode, repeated attempts,
   missing return path and invalid DMACs. BEGIN/ADD/ARM timeouts, 16 malformed
@@ -164,7 +173,7 @@ reproduction uses the generated binary:
 /absolute/test-output/npu-diag --review-platform
 ```
 
-The final dual-bank matrix has 706 cases, 31,570 assertions and 112
+The final dual-bank matrix has 726 cases, 32,178 assertions and 118
 negative controls. The runner also checks that both host insertion paths
 use the stable bank0 ownership predicate.
 The report records the assertion count, all mutation results, the twelve

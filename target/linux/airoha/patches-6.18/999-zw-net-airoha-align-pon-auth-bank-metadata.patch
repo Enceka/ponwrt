@@ -1,0 +1,46 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: align diagnostic PON AUTH bank metadata
+
+Accept both SRAM banks in the common AUTH ABI validator, matching the
+firmware. Preserve the production owner's bank1 admission policy with
+an explicit preflight before readiness checks or publication side effects.
+
+Publish bank0 for diagnostic PON reinjection through PSE4/PPE1. After
+binding, publish the selected bank0 row instead of the learning placeholder
+row zero. Keep the existing global row/token/tuple uniqueness rules.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu_auth_publish.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_auth_publish.h
+@@ -37,7 +37,7 @@
+ 		auth_u32 ppp_protocol;
+ 
+ 		if (raw[0] != AUTH_MBOX_ABI || raw[1] != epoch || !raw[2] ||
+-		    raw[3] != 1u || raw[4] >= AIROHA_NPU_AUTH_FOE_ROWS ||
++		    raw[3] > 1u || raw[4] >= AIROHA_NPU_AUTH_FOE_ROWS ||
+ 		    raw[5] != 4u || raw[6] != 2u || raw[7] > 0xffffu ||
+ 		    raw[8] != generation || (key[1] != 6u && key[1] != 17u))
+ 			return -EINVAL;
+--- a/drivers/net/ethernet/airoha/airoha_npu_admission.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_admission.h
+@@ -79,6 +79,9 @@
+ 					      owner->txn.id.generation, rules, count);
+ 	if (error)
+ 		return error;
++	for (index = 0; index < count; ++index)
++		if (rules[index].raw[3] != 1u)
++			return -EOPNOTSUPP;
+ 	error = airoha_npu_owner_return_ready(owner, &owner->txn.id);
+ 	if (error)
+ 		return error;
+--- a/drivers/net/ethernet/airoha/airoha_npu_diag.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_diag.h
+@@ -92,7 +92,8 @@
+ static int airoha_npu_diag_authorize(struct airoha_npu_owner *owner, u32 service)
+ {
+ 	struct airoha_npu_auth_rule rule = {
+-		.raw = { AUTH_MBOX_ABI, owner->txn.id.epoch, 1, 1, 0, 4, 2, service,
++		.raw = { AUTH_MBOX_ABI, owner->txn.id.epoch, 1, 0,
++			 owner->diag_bound ? owner->diag_hash : 0, 4, 2, service,
+ 			 owner->txn.id.generation, 4, IPPROTO_UDP, 0xc0000201, 0, 0, 0,
+ 			 0xc0000202, 0, 0, 0, 0xc000c001 },
+ 	};

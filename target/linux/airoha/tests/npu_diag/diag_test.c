@@ -1092,6 +1092,74 @@ static void test_auth_isolation(void)
 	balanced();
 }
 
+static void test_production_auth_banks(void)
+{
+	const u32 banks[] = { 0, 1, 2, UINT32_MAX };
+
+	for (unsigned int position = 0; position < 2; position++) {
+		for (unsigned int index = 0; index < ARRAY_SIZE(banks); index++) {
+			struct airoha_npu_auth_rule rules[] = { valid_rule(), valid_rule() };
+			int expected = banks[index] == 1 ? 0 : banks[index] == 0 ? -EOPNOTSUPP : -EINVAL;
+
+			fixture();
+			ppe.ct_npu_owner = &session;
+			ppe.ct_pon_qualified = true;
+			session.return_path = &path;
+			rules[1].raw[2]++;
+			rules[1].raw[4]++;
+			rules[1].raw[11]++;
+			rules[position].raw[3] = banks[index];
+			CHECK(airoha_ppe_npu_owner_authorize_locked(&eth, rules, 2) == expected);
+			if (expected) {
+				CHECK(!ready_calls && !binding_calls && !trace_count);
+				CHECK(!auth_calls[AUTH_MBOX_BEGIN] && !auth_calls[AUTH_MBOX_ADD] && !auth_calls[AUTH_MBOX_ARM]);
+				CHECK(!session.auth_attempted && !session.epoch_dirty && !session.auth_count);
+			} else {
+				CHECK(ready_calls == 2 && binding_calls == 2);
+				CHECK(auth_calls[AUTH_MBOX_BEGIN] == 1 && auth_calls[AUTH_MBOX_ADD] == 2 && auth_calls[AUTH_MBOX_ARM] == 1);
+				CHECK(session.auth_attempted && session.epoch_dirty && session.auth_count == 2);
+				CHECK(auth_requests[AUTH_MBOX_ADD].w[AM_RULE + 3] == 1);
+			}
+			CHECK(!writes && !sram_reads && !sram_commits && !open_calls && !freed);
+			balanced();
+		}
+	}
+}
+
+static void test_diag_auth_rows(void)
+{
+	const u32 rows[] = { 0, 1, 0x458, 8191, 8192, UINT32_MAX };
+
+	for (unsigned int bound = 0; bound < 2; bound++) {
+		for (unsigned int index = 0; index < ARRAY_SIZE(rows); index++) {
+			bool valid = !bound || rows[index] < 8192;
+
+			fixture();
+			attach();
+			session.diag_auth = true;
+			session.return_path = &path;
+			session.diag_hash = rows[index];
+			if (bound) {
+				session.diag_bound = session.diag_learn = true;
+				session.diag_egress = &lan;
+				lan.references = 1;
+			}
+			CHECK(airoha_npu_diag_authorize(&session, binding_service) == (valid ? 0 : -EINVAL));
+			if (valid) {
+				CHECK(auth_requests[AUTH_MBOX_ADD].w[AM_RULE + 3] == 0);
+				CHECK(auth_requests[AUTH_MBOX_ADD].w[AM_RULE + 4] == (bound ? rows[index] : 0));
+				CHECK(auth_calls[AUTH_MBOX_BEGIN] == 1 && auth_calls[AUTH_MBOX_ADD] == 1 && auth_calls[AUTH_MBOX_ARM] == 1);
+				CHECK(session.auth_attempted && session.epoch_dirty && session.auth_count == 1);
+			} else {
+				CHECK(!trace_count && !binding_calls && !ready_calls);
+				CHECK(!session.auth_attempted && !session.epoch_dirty && !session.auth_count);
+			}
+			CHECK(!writes && !sram_reads && !sram_commits && !open_calls && !freed);
+			balanced();
+		}
+	}
+}
+
 static void test_auth_mode_active(void)
 {
 	for (unsigned int mode = 0; mode < 3; ++mode) {
@@ -1128,7 +1196,7 @@ static void test_auth_start(unsigned int mode)
 
 	for (unsigned int index = 0; index < ARRAY_SIZE(services); ++index) {
 		u32 expected_rule[32] = {
-			1, 7, 1, 1, 0, 4, 2, services[index], 19,
+			1, 7, 1, 0, 0, 4, 2, services[index], 19,
 			4, 17, 0xc0000201, 0, 0, 0, 0xc0000202, 0, 0, 0,
 			0xc000c001, 0, 0, 0, 0, 0, 0x02112233,
 			0x44550200u + (index << 16), 1, 0, 0, 0, 0,
@@ -1826,6 +1894,8 @@ static void test_bound_lifecycle(void)
 	CHECK(session.diag_bound && session.diag_egress == &lan && lan.references == 1);
 	CHECK(close_calls == 1 && open_calls == 1 && sram_reads == 3 && sram_commits == 1);
 	CHECK(session.txn.phase == NPU_TXN_OPEN && session.bank0_next_row == 0);
+	CHECK(auth_requests[AUTH_MBOX_ADD].w[AM_RULE + 3] == 0);
+	CHECK(auth_requests[AUTH_MBOX_ADD].w[AM_RULE + 4] == expected_hash);
 	CHECK(session.bank1_next_row == PPE_SRAM_NUM_ENTRIES && !registers[3]);
 	CHECK(FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, registers[4]) == 2);
 	CHECK(hardware_entry.ipv4.orig_tuple.src_ip == 0xc0000201 &&
@@ -1916,6 +1986,8 @@ static void test_bound_commands(void)
 		snprintf(command, sizeof(command), "0x%x 192.168.1.120 00:e0:4c:68:00:30", expected_hash);
 		CHECK(!airoha_npu_diag_bind_command(&ppe, command));
 		CHECK(session.diag_bound && session.diag_hash == expected_hash);
+		CHECK(auth_requests[AUTH_MBOX_ADD].w[AM_RULE + 3] == 0);
+		CHECK(auth_requests[AUTH_MBOX_ADD].w[AM_RULE + 4] == expected_hash);
 		CHECK(session.bank0_next_row == 0 && session.bank1_next_row == PPE_SRAM_NUM_ENTRIES);
 		close_clears_rows = true;
 		CHECK(!airoha_npu_diag_close(&ppe, true));
@@ -2225,6 +2297,8 @@ int main(int argc, char **argv)
 	test_active();
 	test_start();
 	test_auth_isolation();
+	test_production_auth_banks();
+	test_diag_auth_rows();
 	test_release();
 	test_bank1();
 	test_auth_mode_active();

@@ -87,11 +87,12 @@ def main():
               for name in [*FUNCTIONS, *HEADERS, 'airoha_eth.h', 'airoha_regs.h']}
     test_inputs = {name: (tests / name).read_bytes() for name in ('verify.py', 'diag_test.c')}
     binding = SourceBinding(repo / 'target/linux/airoha/patches-6.18', output,
-                            '999-zv-net-airoha-retire-host-bank0-before-npu-reuse.patch')
+                            '999-zw-net-airoha-align-pon-auth-bank-metadata.patch')
     binding_error = None
     try:
         binding.bind(driver, ('airoha_npu_owner.h', 'airoha_npu_diag.h',
-                             'airoha_npu_reopen.h', 'airoha_bank1_routes.h', 'airoha_npu_bank1.h'))
+                             'airoha_npu_reopen.h', 'airoha_bank1_routes.h', 'airoha_npu_bank1.h',
+                             'airoha_npu_admission.h', 'airoha_npu_auth_publish.h'))
     except ValueError as error:
         binding_error = str(error)
         print('Source binding failed: ' + binding_error, file=sys.stderr)
@@ -158,6 +159,12 @@ def main():
         'ignore_hog_flags': ('platform.inc', '!gpios[1]', 'true'),
         'ignore_netdev_parent': ('start_mode.inc', 'lower->dev.parent != eth->dev', 'false'),
         'allow_production_auth': ('authorize.inc', 'if (owner->diag_lower)', 'if (false)'),
+        'allow_production_bank0': ('authorize.inc', 'if (rules[index].raw[3] != 1u)', 'if (false)'),
+        'check_only_first_production_bank': ('authorize.inc', 'if (rules[index].raw[3] != 1u)', 'if (rules[0].raw[3] != 1u)'),
+        'reject_production_bank1': ('authorize.inc', 'if (rules[index].raw[3] != 1u)', 'if (rules[index].raw[3] != 0u)'),
+        'diag_auth_wrong_bank': ('diag_authorize.inc', 'AUTH_MBOX_ABI, owner->txn.id.epoch, 1, 0,', 'AUTH_MBOX_ABI, owner->txn.id.epoch, 1, 1,'),
+        'diag_auth_wrong_bound_row': ('diag_authorize.inc', 'owner->diag_bound ? owner->diag_hash : 0', '0'),
+        'diag_auth_learn_uses_stale_row': ('diag_authorize.inc', 'owner->diag_bound ? owner->diag_hash : 0', 'owner->diag_hash'),
         'ignore_empty_auth_reply': ('ready.inc', 'message.w[AM_COUNT] != owner->auth_count', 'false'),
         'ignore_restore_error': ('close.inc', 'return error ?: airoha_npu_owner_retire_locked(ppe);', 'return airoha_npu_owner_retire_locked(ppe);'),
         'ignore_release_ack': ('close.inc', '!owner->closed_ack ||', 'false ||'),
