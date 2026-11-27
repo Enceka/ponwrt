@@ -1,0 +1,350 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: consume source-specific NPU Ethernet Return rings
+
+Give each LAN or PON source an independent coherent allocation and NAPI
+consumer. Validate the complete descriptor and service before consulting
+the live binding, and retain every published handle through ambiguous
+mailbox outcomes until UNBIND or a source-specific reset fence succeeds.
+No producer is enabled by this patch.
+
+--- a/drivers/net/ethernet/airoha/Makefile
++++ b/drivers/net/ethernet/airoha/Makefile
+@@ -5,5 +5,5 @@
+ 
+ obj-$(CONFIG_NET_AIROHA) += airoha-eth.o
+-airoha-eth-y := airoha_eth.o airoha_ppe.o
++airoha-eth-y := airoha_eth.o airoha_ppe.o airoha_eth_return.o
+ airoha-eth-$(CONFIG_DEBUG_FS) += airoha_ppe_debugfs.o
+ obj-$(CONFIG_NET_AIROHA_NPU) += airoha_npu.o
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_eth_return.h
+@@ -0,0 +1,32 @@
++#ifndef AIROHA_ETH_RETURN_H
++#define AIROHA_ETH_RETURN_H
++
++#include <linux/device.h>
++#include <linux/netdevice.h>
++#include "npu_eth_return_abi.h"
++
++struct airoha_er;
++
++struct airoha_er_ops {
++	int (*command)(void *ctx, struct er_message *message);
++	int (*quiesce)(void *ctx);
++	bool (*binding_matches)(void *ctx, struct net_device *lower,
++				const struct er_config *config, u32 service);
++	void (*fault)(void *ctx, const struct er_config *config, u32 reason);
++	bool (*access_revoked)(void *ctx, const struct er_config *config);
++};
++
++struct airoha_er_stats {
++	u64 packets, bytes, dropped, polls, empty_polls;
++	u32 consumed, fault;
++};
++
++int airoha_er_create(struct airoha_er **out, struct device *dma_dev,
++		    struct net_device *lower, u32 sport, u32 generation,
++		    u32 epoch, u32 count, bool enabled,
++		    const struct airoha_er_ops *ops, void *ctx);
++int airoha_er_destroy(struct airoha_er **ring);
++int airoha_er_retire_after_reset(struct airoha_er **ring);
++void airoha_er_get_stats(struct airoha_er *ring, struct airoha_er_stats *stats);
++
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_eth_return.c
+@@ -0,0 +1,294 @@
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/etherdevice.h>
++#include <linux/hrtimer.h>
++#include <linux/slab.h>
++#include "airoha_eth_return.h"
++
++struct airoha_er {
++	struct device *dma_dev;
++	struct net_device *lower;
++	const struct airoha_er_ops *ops;
++	void *ctx, *allocation;
++	dma_addr_t dma;
++	struct er_config config;
++	struct napi_struct napi;
++	struct hrtimer timer;
++	u32 consumed, fault_reason;
++	bool enabled, protocol_error;
++	u64 packets, bytes, dropped, polls, empty_polls;
++};
++
++static __le32 *er_ctrl(struct airoha_er *ring)
++{
++	return ring->allocation;
++}
++
++static int er_command(struct airoha_er *ring, u32 operation)
++{
++	struct er_message message = {
++		.w = { ER_MAGIC, ER_ABI | operation << 16,
++		       ring->config.dma, ring->config.bytes, ring->config.epoch,
++		       ring->config.count, ring->config.sport, ring->config.generation,
++		       (u32)-EINPROGRESS },
++	};
++
++	return ring->ops->command(ring->ctx, &message);
++}
++
++static bool er_control_valid(struct airoha_er *ring)
++{
++	const struct er_config *config = &ring->config;
++	__le32 *control = er_ctrl(ring);
++
++	return le32_to_cpu(READ_ONCE(control[ER_C_MAGIC])) == ER_MAGIC &&
++	       le32_to_cpu(READ_ONCE(control[ER_C_ABI])) == ER_ABI &&
++	       le32_to_cpu(READ_ONCE(control[ER_C_EPOCH])) == config->epoch &&
++	       le32_to_cpu(READ_ONCE(control[ER_C_COUNT])) == config->count &&
++	       le32_to_cpu(READ_ONCE(control[ER_C_CONSUMER])) == ring->consumed &&
++	       le32_to_cpu(READ_ONCE(control[ER_C_HOST_ENABLED])) <= 1 &&
++	       le32_to_cpu(READ_ONCE(control[ER_C_STOPPED])) <= 1 &&
++	       le32_to_cpu(READ_ONCE(control[ER_C_GENERATION])) == config->generation &&
++	       le32_to_cpu(READ_ONCE(control[ER_C_SPORT])) == config->sport &&
++	       le32_to_cpu(READ_ONCE(control[ER_C_BUFFER])) == ER_BUFFER &&
++	       le32_to_cpu(READ_ONCE(control[ER_C_BYTES])) == config->bytes &&
++	       !READ_ONCE(control[ER_C_FAULT]) &&
++	       !READ_ONCE(control[ER_C_RESERVED0]) &&
++	       !READ_ONCE(control[ER_C_RESERVED1]) &&
++	       !READ_ONCE(control[ER_C_RESERVED2]);
++}
++
++static int er_poll(struct napi_struct *napi, int budget)
++{
++	struct airoha_er *ring = container_of(napi, struct airoha_er, napi);
++	__le32 *control = er_ctrl(ring);
++	u32 produced, fault_reason = 1;
++	int done = 0;
++
++	if (!budget)
++		return 0;
++	++ring->polls;
++	if (READ_ONCE(ring->protocol_error))
++		goto complete;
++	produced = le32_to_cpu(READ_ONCE(control[ER_C_PRODUCER]));
++	dma_rmb();
++	if (produced < ring->consumed ||
++	    produced - ring->consumed > ring->config.count ||
++	    !er_control_valid(ring))
++		goto fault;
++	while (done < budget && ring->consumed != produced) {
++		u32 sequence = ring->consumed + 1, snapshot[16], size;
++		__le32 *slot = ring->allocation +
++			(er_slot_dma(&ring->config, sequence) - ring->config.dma);
++		void *payload = (u8 *)ring->allocation +
++			(er_payload_dma(&ring->config, sequence) - ring->config.dma);
++		struct sk_buff *skb;
++		u32 word;
++
++		snapshot[0] = le32_to_cpu(READ_ONCE(slot[0]));
++		fault_reason = 2;
++		if (!(snapshot[0] & ER_DONE))
++			goto fault;
++		dma_rmb();
++		for (word = 1; word < ARRAY_SIZE(snapshot); ++word)
++			snapshot[word] = le32_to_cpu(READ_ONCE(slot[word]));
++		if (!er_descriptor_valid(&ring->config, snapshot, sequence))
++			goto fault;
++		size = snapshot[0] & 0xffff;
++		rcu_read_lock();
++		if (!ring->ops->binding_matches(ring->ctx, ring->lower,
++					       &ring->config, snapshot[ER_D_SERVICE])) {
++			++ring->dropped;
++		} else if ((skb = napi_alloc_skb(napi, size + NET_IP_ALIGN))) {
++			skb_reserve(skb, NET_IP_ALIGN);
++			skb_put_data(skb, payload, size);
++			skb->dev = ring->lower;
++			skb->ip_summed = CHECKSUM_NONE;
++			skb->protocol = eth_type_trans(skb, ring->lower);
++			napi_gro_receive(napi, skb);
++			++ring->packets;
++			ring->bytes += size;
++		} else {
++			++ring->dropped;
++		}
++		rcu_read_unlock();
++		dma_mb();
++		WRITE_ONCE(slot[0], 0);
++		dma_wmb();
++		WRITE_ONCE(control[ER_C_CONSUMER], cpu_to_le32(sequence));
++		WRITE_ONCE(ring->consumed, sequence);
++		++done;
++	}
++	if (!done)
++		++ring->empty_polls;
++	if (done == budget)
++		return done;
++complete:
++	napi_complete_done(napi, done);
++	return done;
++fault:
++	WRITE_ONCE(ring->fault_reason, fault_reason);
++	WRITE_ONCE(ring->protocol_error, true);
++	ring->ops->fault(ring->ctx, &ring->config, fault_reason);
++	goto complete;
++}
++
++static enum hrtimer_restart er_timer(struct hrtimer *timer)
++{
++	struct airoha_er *ring = container_of(timer, struct airoha_er, timer);
++
++	if (!READ_ONCE(ring->enabled) || READ_ONCE(ring->protocol_error))
++		return HRTIMER_NORESTART;
++	napi_schedule(&ring->napi);
++	hrtimer_forward_now(timer, ns_to_ktime(NSEC_PER_MSEC));
++	return HRTIMER_RESTART;
++}
++
++int airoha_er_create(struct airoha_er **out, struct device *dma_dev,
++		    struct net_device *lower, u32 sport, u32 generation,
++		    u32 epoch, u32 count, bool enabled,
++		    const struct airoha_er_ops *ops, void *ctx)
++{
++	struct airoha_er *ring;
++	__le32 *control;
++	u32 index;
++	int error;
++
++	if (!out || *out || !dma_dev || !lower || !ops || !ops->command ||
++	    !ops->quiesce || !ops->binding_matches || !ops->fault)
++		return -EINVAL;
++	if (!enabled || (sport != ER_LAN1 && sport != ER_PON))
++		return -EOPNOTSUPP;
++	if (!epoch || !generation || count < ER_MIN_COUNT || count > ER_MAX_COUNT ||
++	    (count & (count - 1)))
++		return -EINVAL;
++	ring = kzalloc(sizeof(*ring), GFP_KERNEL);
++	if (!ring)
++		return -ENOMEM;
++	ring->dma_dev = dma_dev;
++	ring->lower = lower;
++	ring->ops = ops;
++	ring->ctx = ctx;
++	ring->config = (struct er_config) {
++		.bytes = er_bytes(count), .epoch = epoch, .count = count,
++		.sport = sport, .generation = generation,
++	};
++	ring->allocation = dma_alloc_coherent(dma_dev, ring->config.bytes,
++					     &ring->dma, GFP_KERNEL);
++	if (!ring->allocation) {
++		kfree(ring);
++		return -ENOMEM;
++	}
++	ring->config.dma = lower_32_bits(ring->dma);
++	if (upper_32_bits(ring->dma) || !er_config_valid(&ring->config)) {
++		error = -ERANGE;
++		goto free;
++	}
++	memset(ring->allocation, 0, ring->config.bytes);
++	control = er_ctrl(ring);
++	control[ER_C_MAGIC] = cpu_to_le32(ER_MAGIC);
++	control[ER_C_ABI] = cpu_to_le32(ER_ABI);
++	control[ER_C_EPOCH] = cpu_to_le32(epoch);
++	control[ER_C_COUNT] = cpu_to_le32(count);
++	control[ER_C_HOST_ENABLED] = cpu_to_le32(1);
++	control[ER_C_GENERATION] = cpu_to_le32(generation);
++	control[ER_C_SPORT] = cpu_to_le32(sport);
++	control[ER_C_BUFFER] = cpu_to_le32(ER_BUFFER);
++	control[ER_C_BYTES] = cpu_to_le32(ring->config.bytes);
++	for (index = 0; index < count; ++index) {
++		__le32 *slot = ring->allocation + 64 + index * 64;
++
++		slot[ER_D_BUFFER] = cpu_to_le32(er_payload_dma(&ring->config, index + 1));
++	}
++	dev_hold(lower);
++	netif_napi_add(lower, &ring->napi, er_poll);
++	napi_enable(&ring->napi);
++	hrtimer_setup(&ring->timer, er_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	WRITE_ONCE(ring->enabled, true);
++	dma_wmb();
++	*out = ring;
++	hrtimer_start(&ring->timer, ns_to_ktime(NSEC_PER_MSEC), HRTIMER_MODE_REL);
++	return er_command(ring, ER_BIND);
++free:
++	dma_free_coherent(dma_dev, ring->config.bytes, ring->allocation, ring->dma);
++	kfree(ring);
++	return error;
++}
++
++static void er_release(struct airoha_er **owner)
++{
++	struct airoha_er *ring = *owner;
++
++	WRITE_ONCE(ring->enabled, false);
++	hrtimer_cancel(&ring->timer);
++	napi_disable(&ring->napi);
++	netif_napi_del(&ring->napi);
++	dev_put(ring->lower);
++	dma_free_coherent(ring->dma_dev, ring->config.bytes, ring->allocation, ring->dma);
++	kfree(ring);
++	*owner = NULL;
++}
++
++int airoha_er_destroy(struct airoha_er **owner)
++{
++	struct airoha_er *ring;
++	u32 attempt;
++	int error;
++
++	if (!owner)
++		return -EINVAL;
++	ring = *owner;
++	if (!ring)
++		return 0;
++	error = ring->ops->quiesce(ring->ctx);
++	if (error)
++		return error;
++	error = er_command(ring, ER_STOP);
++	if (error)
++		return error;
++	for (attempt = 0; attempt < 1000; ++attempt) {
++		if (READ_ONCE(ring->protocol_error))
++			return -EPROTO;
++		if (READ_ONCE(ring->consumed) ==
++		    le32_to_cpu(READ_ONCE(er_ctrl(ring)[ER_C_PRODUCER])))
++			break;
++		if (attempt == 999)
++			return -ETIMEDOUT;
++		napi_schedule(&ring->napi);
++		usleep_range(1000, 2000);
++	}
++	WRITE_ONCE(er_ctrl(ring)[ER_C_HOST_ENABLED], 0);
++	dma_wmb();
++	error = er_command(ring, ER_UNBIND);
++	if (error)
++		return error;
++	er_release(owner);
++	return 0;
++}
++
++int airoha_er_retire_after_reset(struct airoha_er **owner)
++{
++	struct airoha_er *ring;
++
++	if (!owner)
++		return -EINVAL;
++	ring = *owner;
++	if (!ring)
++		return 0;
++	if (!ring->ops->access_revoked ||
++	    !ring->ops->access_revoked(ring->ctx, &ring->config))
++		return -EBUSY;
++	er_release(owner);
++	return 0;
++}
++
++void airoha_er_get_stats(struct airoha_er *ring, struct airoha_er_stats *stats)
++{
++	stats->packets = READ_ONCE(ring->packets);
++	stats->bytes = READ_ONCE(ring->bytes);
++	stats->dropped = READ_ONCE(ring->dropped);
++	stats->polls = READ_ONCE(ring->polls);
++	stats->empty_polls = READ_ONCE(ring->empty_polls);
++	stats->consumed = READ_ONCE(ring->consumed);
++	stats->fault = READ_ONCE(ring->fault_reason);
++}
