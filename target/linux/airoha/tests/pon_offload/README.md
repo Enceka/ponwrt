@@ -214,11 +214,24 @@ CPU fallback 的路由及 IFC 写入失败在 owner 关闭后继续重试，状�
 上述测试使用 ASan/UBSan。完整 Linux 6.18.60 AArch64 vmlinux 编译、modpost
 和链接通过，无警告；九个改动源码与编译树逐文件一致。
 
-下一步补齐 DMA reset 退役，接着隔离
-同 tuple 的 LAN/PON 软件候选与硬件表项，再开放 PON 准入并构建镜像刷测。
-当前内部准备路径支持 GPON GEM 映射；EPON LLID 对应关系继续单独完善。
-DMA 退役需由 NPU provider 记录完整 ER 配置并撤销全部 harts 与独立 host DMA
-的 DRAM 访问，再结束 NAPI/work 并释放内存。实现 reset fence 前需核实
-`NPU_RST` 的复位覆盖范围、`0x1fb30000` DMA 的复位归属及 outstanding writes
-完成条件；Ethernet remove 的失败路径也需先结束 DMA，随后归还 devres。
-设备沿用之前通过验收的 RAM 镜像。
+后续 `999-za` 已隔离同 tuple 的 LAN/PON 候选与硬件表项；`999-zd/ze`
+将逐包授权的 IFC 入口接入 owner，GDM2 默认保持 CPU，只有身份、授权及
+分类器依赖全部核验后才开放 SPORT2。`999-zf` 开放 CPU service0 探针及
+回环发送，精确零值和 wildcard 分别编码，详情见 `service0/README.md`。
+
+`999-zg` 在 ER BIND 发出前登记完整六元组，串行处理两来源的生命周期，
+拒绝重复绑定、旧 epoch 和 NPU 地址窗别名重叠。STOP/UNBIND 只接受原配置，
+成功 UNBIND 后撤登记；超时、错误和畸形响应保留队列。私有 provider 扩展
+保持公共 NPU 结构布局，测试见 `../npu_er_provider/README.md`。
+
+`999-zh` 封住共享 mailbox 的迟到回执窗口：触发后遇到不确定传输错误，
+冻结 core0 buffer，撤 guard 并保留 ER 登记；后续 AUTH/ER/GATE/WLAN 发送
+都停止复用该 buffer。整机重启恢复。收到完整的普通负响应仍可重试，
+触发前的 regmap 错误也保留重试能力，测试见 `../npu_mailbox/README.md`。
+
+接下来处理 provider 成功绑定后的启动及固定 ETH/NPU/SCU 生命周期准入，
+随后进行无光纤回环验收和完整镜像构建。当前 GPON GEM 准备路径已接通；
+EPON 还需配对 wire LLID、channel、IFC service 和 FE service。
+硬件强制退役需补齐全部 hart 停止、GDMA 完成和 DRAM 总线排空条件；
+正常退役继续使用 QUIESCE→STOP→消费完成→UNBIND。
+PON 硬件准入仍关闭，设备沿用此前通过验收的 RAM 镜像。
