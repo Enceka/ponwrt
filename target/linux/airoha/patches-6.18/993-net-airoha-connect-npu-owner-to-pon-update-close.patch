@@ -1,0 +1,360 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: connect NPU owner to PON update close
+
+Keep a checked lifecycle owner across failed close attempts. Borrow the
+published provider under flow_offload_mutex and arbitrate the shared FE
+before closing GDM routes, bank1 gate and authorization. Drain only bank1
+after QUIET, retaining its original registers on every retry.
+
+An explicit claim requires idle native policy and a generation that fits
+the gate ABI. PON mapping updates close an existing owner before removing
+flows. Global stop retires ownership before provider teardown. Reopening
+and PON qualification remain disabled until service admission is wired.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -774,6 +774,7 @@
+ 		bool cfg_owned;
+ 	} ct_ifc;
+ 	bool ct_host_ppe;
++	struct airoha_npu_owner *ct_npu_owner;
+ 	/* Set only after hardware isolates ingress source and encapsulation for
+ 	 * shared IP FOE keys. No runtime enable path exists yet.
+ 	 */
+@@ -996,6 +997,8 @@
+ int airoha_bank1_routes_claim(struct airoha_eth *eth, const void *owner);
+ int airoha_bank1_routes_release(struct airoha_eth *eth, const void *owner);
+ int airoha_ct_cpu_fallback(struct airoha_eth *eth);
++int airoha_ppe_npu_owner_claim_locked(struct airoha_eth *eth, u64 generation);
++int airoha_ppe_npu_owner_close_locked(struct airoha_eth *eth);
+ int airoha_ppe_ct_shutdown(struct airoha_eth *eth);
+ int airoha_ppe_ct_prepare(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -942,6 +942,11 @@
+ 	struct airoha_npu *npu;
+ 	int err = 0;
+ 
++	if (ppe->ct_npu_owner && hash >= PPE_SRAM_NUM_ENTRIES &&
++	    hash < 2 * PPE_SRAM_NUM_ENTRIES &&
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, e->ib1) == AIROHA_FOE_STATE_BIND)
++		return -EBUSY;
++
+ 	memcpy(&hwe->d, &e->d, sizeof(*hwe) - sizeof(hwe->ib1));
+ 	wmb();
+ 
+@@ -2716,6 +2721,7 @@
+ 			 PPE_FLOW_CFG_IP6_5T_ROUTE_MASK)
+ 
+ #include "airoha_ct_pair_banks.h"
++#include "airoha_npu_owner.h"
+ 
+ bool airoha_ppe_ct_requested(struct airoha_eth *eth)
+ {
+@@ -3011,9 +3017,16 @@
+ 	bool live = rcu_access_pointer(eth->npu) && ppe->ct_owns_sram;
+ 	int bank, err;
+ 
++	err = airoha_ppe_npu_owner_close_locked(eth);
++	if (err)
++		return err;
++	if (ppe->ct_npu_owner && ppe->ct_npu_owner->stop_completed)
++		goto retire_owner;
+ 	WRITE_ONCE(ppe->ct_pair_policy_allowed, false);
+ 	WRITE_ONCE(ppe->ct_host_ppe, false);
++	if (ppe->ct_npu_owner && ppe->ct_npu_owner->native_stopped)
++		goto native_stopped;
+ 	if (ppe->ct_native_pairs && (ppe->ct_pair_token || ppe->ct_fe.armed ||
+ 	    ppe->ct_fe.touched || ppe->ct_fe.pending || ppe->ct_fe.arm_pending)) {
+ 		spin_lock_bh(&ppe_lock);
+ 		err = airoha_ct_native_pair_revoke(ppe, -1, 0);
+@@ -3030,6 +3043,9 @@
+ 		if (err)
+ 			return err;
+ 	}
++	if (ppe->ct_npu_owner)
++		ppe->ct_npu_owner->native_stopped = true;
++native_stopped:
+ 	err = live ? airoha_ppe_ct_stop_learning(ppe) : airoha_ppe_ct_quiesce(ppe);
+ 	if (err)
+ 		return err;
+@@ -3077,6 +3093,12 @@
+ 		if ((airoha_fe_rr(eth, REG_PPE_GLO_CFG(bank)) & PPE_GLO_CFG_EN_MASK) !=
+ 		    (ppe->ct_saved[bank].glo & PPE_GLO_CFG_EN_MASK))
+ 			return -EIO;
++	if (ppe->ct_npu_owner)
++		ppe->ct_npu_owner->stop_completed = true;
++retire_owner:
++	err = airoha_npu_owner_retire_locked(ppe);
++	if (err)
++		return err;
+ 	ppe->ct_restore_pending = false;
+ 	return 0;
+ }
+@@ -3090,6 +3112,11 @@
+ 		return 0;
+ 
+ 	mutex_lock(&flow_offload_mutex);
++	err = airoha_ppe_npu_owner_close_locked(eth);
++	if (err) {
++		mutex_unlock(&flow_offload_mutex);
++		return err;
++	}
+ 	spin_lock_bh(&ppe_lock);
+ 	ppe->ct_stopping = true;
+ 	ppe->ct_host_ppe = false;
+@@ -3641,6 +3668,11 @@
+ 
+ 	mutex_lock(&flow_offload_mutex);
+ 
++	err = airoha_ppe_npu_owner_close_locked(eth);
++	if (err) {
++		mutex_unlock(&flow_offload_mutex);
++		return err;
++	}
+ 	if (airoha_ppe_ct_requested(eth)) {
+ 		spin_lock_bh(&ppe_lock);
+ 		eth->ppe->ct_stopping = true;
+@@ -3655,6 +3687,10 @@
+ 			return err;
+ 		}
+ 	}
++	if (eth->ppe->ct_npu_owner) {
++		mutex_unlock(&flow_offload_mutex);
++		return -EBUSY;
++	}
+ 	npu = rcu_replace_pointer(eth->npu, NULL,
+ 				  lockdep_is_held(&flow_offload_mutex));
+ 	if (npu) {
+--- a/drivers/net/ethernet/airoha/airoha_pon_transaction.h
++++ b/drivers/net/ethernet/airoha/airoha_pon_transaction.h
+@@ -70,6 +70,9 @@
+ 				1000, 100000, false, &dev->pon_tx_pending);
+ 	if (err)
+ 		goto unlock;
++	err = airoha_ppe_npu_owner_close_locked(eth);
++	if (err)
++		goto unlock;
+ 	err = airoha_ppe_remove_egress_flows(dev);
+ 	if (err)
+ 		goto unlock;
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_owner.h
+@@ -0,0 +1,216 @@
++#ifndef AIROHA_NPU_OWNER_H
++#define AIROHA_NPU_OWNER_H
++
++#include "airoha_npu_transaction.h"
++
++struct airoha_npu_owner {
++	struct airoha_ppe *ppe;
++	struct airoha_npu_txn txn;
++	u32 bank1_flow, bank1_tb;
++	bool bank1_saved, native_stopped, stop_completed;
++};
++
++static struct airoha_npu *airoha_npu_owner_provider(struct airoha_npu_owner *owner)
++{
++	lockdep_assert_held(&flow_offload_mutex);
++	return rcu_dereference_protected(owner->ppe->eth->npu,
++					 lockdep_is_held(&flow_offload_mutex));
++}
++
++static int airoha_npu_owner_gate(void *ctx, struct npu_gate_message *message)
++{
++	struct airoha_npu *npu = airoha_npu_owner_provider(ctx);
++
++	return npu ? airoha_npu_gate_command(npu, message) : -ENODEV;
++}
++
++static int airoha_npu_owner_auth(void *ctx, struct npu_auth_message *message)
++{
++	struct airoha_npu *npu = airoha_npu_owner_provider(ctx);
++
++	return npu ? airoha_npu_auth_command(npu, message) : -ENODEV;
++}
++
++static int airoha_npu_owner_routes_close(void *ctx,
++					const struct airoha_npu_txn_identity *id)
++{
++	struct airoha_npu_owner *owner = ctx;
++
++	return airoha_bank1_routes_claim(owner->ppe->eth, owner);
++}
++
++static int airoha_npu_owner_fe_quiesce(void *ctx,
++				      const struct airoha_npu_txn_identity *id)
++{
++	struct airoha_npu_owner *owner = ctx;
++	int error;
++
++	spin_lock_bh(&ppe_lock);
++	error = airoha_ct_fe_owner_quiesce(owner->ppe, owner,
++					 id->generation, id->epoch);
++	spin_unlock_bh(&ppe_lock);
++	return error;
++}
++
++static int airoha_npu_owner_bank1_drain(void *ctx,
++				      const struct airoha_npu_txn_identity *id)
++{
++	struct airoha_npu_owner *owner = ctx;
++	struct airoha_eth *eth = owner->ppe->eth;
++	u32 status, no_foe = FIELD_PREP(PPE_TB_CFG_SEARCH_MISS_MASK, 2);
++	int error;
++
++	spin_lock_bh(&ppe_lock);
++	if (!owner->bank1_saved) {
++		owner->bank1_flow = airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1));
++		owner->bank1_tb = airoha_fe_rr(eth, REG_PPE_TB_CFG(1));
++		owner->bank1_saved = true;
++	}
++	airoha_fe_rmw(eth, REG_PPE_TB_CFG(1), PPE_TB_CFG_SEARCH_MISS_MASK, no_foe);
++	airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(1), 0);
++	if (airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) ||
++	    (airoha_fe_rr(eth, REG_PPE_TB_CFG(1)) & PPE_TB_CFG_SEARCH_MISS_MASK) != no_foe) {
++		error = -EIO;
++		goto unlock;
++	}
++	error = read_poll_timeout_atomic(airoha_fe_rr, status,
++					 !(status & PPE_GLO_CFG_BUSY_MASK),
++					 10, 100000, false, eth, REG_PPE_GLO_CFG(1));
++	if (!error && !(status & PPE_GLO_CFG_EN_MASK))
++		error = -EIO;
++unlock:
++	spin_unlock_bh(&ppe_lock);
++	return error;
++}
++
++static int airoha_npu_owner_open_unsupported(void *ctx,
++					  const struct airoha_npu_txn_identity *id)
++{
++	return -EOPNOTSUPP;
++}
++
++static const struct airoha_npu_txn_ops airoha_npu_owner_ops = {
++	.gate = airoha_npu_owner_gate,
++	.auth = airoha_npu_owner_auth,
++	.routes_close = airoha_npu_owner_routes_close,
++	.fe_quiesce = airoha_npu_owner_fe_quiesce,
++	.ppe_drain = airoha_npu_owner_bank1_drain,
++	.ready = airoha_npu_owner_open_unsupported,
++	.ppe_restore = airoha_npu_owner_open_unsupported,
++	.fe_arm = airoha_npu_owner_open_unsupported,
++	.routes_open = airoha_npu_owner_open_unsupported,
++};
++
++int airoha_ppe_npu_owner_close_locked(struct airoha_eth *eth)
++{
++	struct airoha_npu_owner *owner;
++
++	if (!eth || !eth->ppe)
++		return -EINVAL;
++	lockdep_assert_held(&flow_offload_mutex);
++	owner = eth->ppe->ct_npu_owner;
++	if (!owner)
++		return 0;
++	return airoha_npu_txn_close(&owner->txn, &airoha_npu_owner_ops, owner);
++}
++
++int airoha_ppe_npu_owner_claim_locked(struct airoha_eth *eth, u64 generation)
++{
++	struct npu_gate_message message = {
++		.w = {
++			[GM_MAGIC] = GATE_MAGIC,
++			[GM_ABI_OP] = GATE_ABI | GATE_QUERY << 16,
++			[GM_BYTES] = GATE_BYTES,
++			[GM_STATUS] = (gate_u32)-115,
++		},
++	};
++	struct airoha_npu_owner *owner;
++	struct airoha_ppe *ppe;
++	u32 epoch;
++	int error;
++
++	if (!eth || !eth->ppe || !generation)
++		return -EINVAL;
++	if (generation > U32_MAX)
++		return -EOVERFLOW;
++	lockdep_assert_held(&flow_offload_mutex);
++	ppe = eth->ppe;
++	if (!ppe->ct_host_ppe || !ppe->ct_restore_pending || eth->soc->num_ppe != 2)
++		return -EOPNOTSUPP;
++	owner = ppe->ct_npu_owner;
++	if (owner) {
++		if (generation != owner->txn.id.generation)
++			return -ESTALE;
++		return airoha_ppe_npu_owner_close_locked(eth);
++	}
++	owner = kzalloc(sizeof(*owner), GFP_KERNEL);
++	if (!owner)
++		return -ENOMEM;
++	owner->ppe = ppe;
++	error = airoha_npu_owner_gate(owner, &message);
++	if (error)
++		goto free_owner;
++	if (!(message.w[GM_CAPS] & GATE_CAP_PON2)) {
++		error = -EOPNOTSUPP;
++		goto free_owner;
++	}
++	spin_lock_bh(&ppe_lock);
++	spin_lock_bh(&eth->ct_route_lock);
++	error = (eth->ct_bank1_routes.owner || ppe->ct_pon_ifc_route_owned) ? -EBUSY : 0;
++	spin_unlock_bh(&eth->ct_route_lock);
++	if (error)
++		goto unlock;
++	epoch = max(message.w[GM_STATE_EPOCH], ppe->ct_fe.epoch);
++	epoch = max(epoch, message.w[GM_AUTH_EPOCH]);
++	epoch = max(epoch, ppe->ct_pair_wired_epoch);
++	if (epoch == U32_MAX) {
++		error = -EOVERFLOW;
++		goto unlock;
++	}
++	if (generation < ppe->ct_fe.generation ||
++	    generation < br_flow_offload_generation()) {
++		error = -ESTALE;
++		goto unlock;
++	}
++	error = airoha_npu_txn_begin(&owner->txn, epoch + 1, generation, GATE_PON2);
++	if (error)
++		goto unlock;
++	error = airoha_ct_fe_owner_claim(ppe, owner);
++	if (error)
++		goto unlock;
++	ppe->ct_npu_owner = owner;
++unlock:
++	spin_unlock_bh(&ppe_lock);
++	if (!error)
++		return airoha_ppe_npu_owner_close_locked(eth);
++free_owner:
++	kfree(owner);
++	return error;
++}
++
++static int airoha_npu_owner_retire_locked(struct airoha_ppe *ppe)
++{
++	struct airoha_npu_owner *owner = ppe->ct_npu_owner;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!owner)
++		return 0;
++	if (owner->txn.phase != NPU_TXN_CLOSED || !owner->bank1_saved)
++		return -EBUSY;
++	if (ppe->eth->ct_bank1_routes.owner) {
++		error = airoha_bank1_routes_release(ppe->eth, owner);
++		if (error)
++			return error;
++	}
++	spin_lock_bh(&ppe_lock);
++	error = airoha_ct_fe_owner_release(ppe, owner);
++	if (!error)
++		ppe->ct_npu_owner = NULL;
++	spin_unlock_bh(&ppe_lock);
++	if (!error)
++		kfree(owner);
++	return error;
++}
++
++#endif

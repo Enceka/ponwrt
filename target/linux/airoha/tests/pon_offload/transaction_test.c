@@ -35,6 +35,10 @@ static struct mutex flow_offload_mutex;
 static unsigned int calls, writes, fail_write, syncs, retired, reopened, revoke_calls;
 static int revoke_error, pending_error, late_submit, completions;
 static bool bad_order;
+#ifdef AIROHA_TEST_NPU_OWNER
+static unsigned int owner_calls;
+static int owner_error;
+#endif
 static u32 fe[0x2000/4], qdma_regs[0x2000/4];
 static const u32 age = (3U<<25)|(3U<<17);
 static struct airoha_gdm_dev *current;
@@ -79,9 +83,19 @@ static int atomic_read(atomic_t *p) {
 #define read_poll_timeout(fn,val,cond,delay,timeout,first,arg) ({ \
  int _ret=-ETIMEDOUT; (void)(delay);(void)(timeout);(void)(first); \
  for(int _i=0;_i<4;_i++){ (val)=fn(arg); if((cond)&&!pending_error){_ret=0;break;} } _ret; })
+#ifdef AIROHA_TEST_NPU_OWNER
+static int airoha_ppe_npu_owner_close_locked(struct airoha_eth *ethernet) {
+ assert(ethernet==current->eth && flow_offload_mutex.held && ethernet->pon_config_lock.held);
+ assert(current->pon_update_blocked && !current->pon_tx_pending && syncs);
+ owner_calls++; return owner_error;
+}
+#endif
 static int airoha_ppe_remove_egress_flows(struct airoha_gdm_dev *d) {
  assert(d->pon_update_blocked && !d->pon_tx_pending && syncs);
  assert(flow_offload_mutex.held && d->eth->pon_config_lock.held);
+#ifdef AIROHA_TEST_NPU_OWNER
+ assert(owner_calls && !owner_error);
+#endif
  revoke_calls++; return revoke_error;
 }
 static struct airoha_pon_flow_table *replace_table(struct airoha_pon_flow_table **p,struct airoha_pon_flow_table *n) {
@@ -125,6 +139,9 @@ static void reset(void) {
  memset(&net,0,sizeof(net));memset(fe,0,sizeof(fe));memset(qdma_regs,0,sizeof(qdma_regs));
  flow_offload_mutex.held=0;writes=fail_write=syncs=retired=reopened=revoke_calls=0;
  revoke_error=pending_error=late_submit=completions=0;bad_order=false;
+#ifdef AIROHA_TEST_NPU_OWNER
+ owner_calls=0;owner_error=0;
+#endif
  dev.eth=&eth;dev.flags=BIT(AIROHA_DEV_F_PON);dev.pon_retirement=&state;
  net.netdev_ops=&airoha_netdev_ops;net.priv=&dev;net.running=net.carrier=true;current=&dev;
  fe[0x1520/4]=age;fe[0x1524/4]=0x5555aaaa;fe[0x1528/4]=0xaaaa5555;
@@ -163,9 +180,22 @@ int main(void) {
  for(int ctrl=0;ctrl<2;ctrl++) {
   reset();dev.pon_tx_pending=1;assert(airoha_eth_pon_update_begin(&net,1)==-ETIMEDOUT);
   assert(dev.pon_update_blocked&&!writes&&!revoke_calls&&!dev.pon_update_ready);
+#ifdef AIROHA_TEST_NPU_OWNER
+  assert(!owner_calls);
+#endif
   assert(airoha_eth_pon_update_end(&net)==-EBUSY);
   completions=1;assert(!airoha_eth_pon_update_begin(&net,1));assert(!airoha_eth_pon_update_end(&net));check_end();
  }
+#ifdef AIROHA_TEST_NPU_OWNER
+ reset();owner_error=-ETIMEDOUT;dev.pon_flow_table=table(7);
+ assert(airoha_eth_pon_update_begin(&net,1)==-ETIMEDOUT);
+ assert(owner_calls==1 && !writes && !revoke_calls && !dev.pon_update_ready);
+ assert(dev.pon_update_blocked && dev.pon_flow_table && eth.pon_update_owner==&dev);
+ assert(airoha_eth_pon_update_end(&net)==-EBUSY);
+ owner_error=0;assert(!airoha_eth_pon_update_begin(&net,1));
+ assert(owner_calls==2 && revoke_calls==1);
+ assert(!airoha_eth_pon_update_end(&net));check_end();
+#endif
  reset();revoke_error=-ETIMEDOUT;dev.pon_flow_table=table(7);
  assert(airoha_eth_pon_update_begin(&net,1)==-ETIMEDOUT);
  assert(!writes&&dev.pon_flow_table&&dev.pon_update_blocked);
