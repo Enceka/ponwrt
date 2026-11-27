@@ -1,26 +1,27 @@
 # PON NPU diagnostic host review
 
 This suite exercises production functions from a generated kernel containing
-`999-zr-net-airoha-add-pon-ppe-learning-diagnostic.patch`. It reads the tree
+`999-zu-net-airoha-retain-pon-bank0-ownership.patch`. It reads the tree
 without modifying it. All generated includes, binaries, mutation copies and
 reports go to a new output directory outside ponwrt.
 
 ```sh
 python3 -B target/linux/airoha/tests/npu_diag/verify.py \
-  --source /Volumes/Workspace/5585f/build/pon-npu-diag-20261127/kernel-auth-learn \
-  --output /Volumes/Workspace/5585f/build/pon-npu-diag-20261127/npu-diag-learn-host-tests-v2
+  --source /workdir/pon-npu-989 \
+  --output /path/to/new/npu-diag-dualbank-tests
 ```
 
-The runner extracts seventeen complete production functions without editing
+The runner extracts complete production functions without editing
 their bodies: diagnostic identity and FLOW selection, platform admission, diagnostic authorization,
 mode-aware start and the legacy empty-AUTH wrapper, snapshot, close/release,
 owner retirement, production authorization, readiness, open checks, bank1
-restoration, route opening and ER observation/statistics.
+restoration, bank0 ownership/drain, LAN1 binding, SRAM acknowledgement,
+route opening and ER observation/statistics.
 The AUTH publish helpers and mailbox ABI headers are copied byte-for-byte.
 The shared `npu_ingress/source_binding.py` replays the ordered production
-patches through ZR with exact hunks, then byte-compares the complete
+patches through ZU with exact hunks, then byte-compares the complete
 `airoha_npu_owner.h`, `airoha_npu_diag.h`, `airoha_npu_reopen.h` and
-`airoha_bank1_routes.h` against the generated tree.
+`airoha_bank1_routes.h` and `airoha_npu_bank1.h` against the generated tree.
 The report lists each header's actual patch chain and SHA-256 hashes.
 Source and patch hashes are captured before the run and rechecked afterward
 to detect a concurrent production update.
@@ -31,12 +32,10 @@ The production diagnostic and retirement decisions execute against those
 boundaries. The existing owner/ER suites own the transaction state machine,
 DMA protocol, NAPI processing and real return mapping. This suite uses
 ASan/UBSan and warnings-as-errors; it performs no VM, device or Git actions.
-The learning-start tests connect the open boundary stub to the actual bank1
-restore and route-open functions. The close stub records the incoming row
-cursor and leaves it unchanged: tests require release to retain the owner
-while that cursor is zero, then supply completed row retirement and verify
-that the actual diagnostic close/release restores saved registers and frees
-the owner once.
+The learning-start tests connect the open boundary stub to the actual
+dual-bank restore and route-open functions. Close/drain tests check both
+retirement cursors and injected failures. Release retains ownership until
+both banks have drained and restored successfully, then frees the owner once.
 
 ## Coverage
 
@@ -65,7 +64,7 @@ the owner once.
   `02:00:00:00:00:01` and the retained lower device's DMAC. Each service
   uses a different valid DMAC. The trace requires readiness, full binding,
   BEGIN, ADD, ARM, post-ARM readiness, then open. FLOW remains zero until
-  learning-mode bank1 restoration; qualification stays off. Explicit
+  learning-mode bank0 restoration; qualification stays off. Explicit
   diagnostic AUTH allows at most one rule in both modes 1 and 2.
 - AUTH admission/failures: oversized services in all three modes, low-bit and
   bit-15 binding mismatches, wrong identity/phase/mode, repeated attempts,
@@ -81,10 +80,11 @@ the owner once.
 - Bank1: all diagnostic restores first require FLOW=0, PPE enabled, not
   busy, search-miss=2 and retirement cursor=8192. Modes 0 and 1 keep those
   settings without MMIO writes. Normal production restore and explicit
-  final release restore saved values. Every case checks bank0 remains unchanged.
+  final release restore saved values. Modes 0/1 leave bank0 unchanged;
+  learning mode owns bank0 separately.
 - PPE learning under one AUTH rule (mode 2): only an active owner with both `diag_auth` and
   `diag_learn` selects IPv4 NAPT, exactly BIT(13). Tests use the actual
-  search-miss field at bits 5:4. The MMIO trace requires cursor zero before
+  search-miss field at bits 5:4 in bank0. The MMIO trace requires cursor zero before
   the first write, TB miss=3 preserving other bits, exact TB readback,
   FLOW=BIT(13), then exact FLOW readback, all writes/readbacks under the PPE
   lock. Modes 0/1/2 run with services 0, 1, 0x8000 and 0xffff; invalid
@@ -93,21 +93,21 @@ the owner once.
   relevant and unrelated bits, and a failed post-write identity check keep
   cursor zero, owner and netdevice retained, and routes closed. Failed TB
   readback prevents the FLOW write. Release waits for completed retirement.
-- Learning routes: modes 0/1 require exact FLOW=0/miss=2; mode 2 requires
-  exact FLOW=BIT(13)/miss=3. The cross-product covers extra/missing/wrong
+- Learning routes: bank1 requires exact FLOW=0/miss=2 in all diagnostic
+  modes; mode 2 additionally requires bank0 FLOW=BIT(13)/miss=3. The cross-product covers extra/missing/wrong
   FLOW bits and all miss values; disabled/busy PPE and scope/route-write
   failures also reject opening.
 - Snapshot: the actual ER observation enable/getter and stats getter feed
   the diagnostic snapshot before close removes the ring.
 
-The single rule describes AUTH admission. PPE learning runs before AUTH:
-the board run learned all five IPv4 variants as UNB entries, with zero BND
-entries. The matching packet returned through QDMA with hash 2458;
-mismatches returned through ER. Board acceptance checks the exact five-tuple
-UNB set and requires the matching QDMA hash to identify the real target row,
-then verifies that retirement clears every learned row. This host suite
-checks the configuration, cursor, route and failure paths supporting that
-packet-level acceptance.
+Bank1 sends ingress through IFC/NPU authorization before bank0 learning.
+The board learned one authorized IPv4 tuple at `0x0458`; mismatches returned
+through ER. After LAN1 binding, exact matches reached the UDP receiver and
+the same tuple on another GEM returned through ER. The host suite covers
+binding identity, hash/tuple admission, SRAM ACK/readback, references and
+retirement. Ownership tests keep bank0 excluded during carrier loss,
+controller changes, invalidation and failed close/restore retries, then
+permit ordinary host use after owner release.
 
 All 38 existing separately compiled negative controls remain and must fail assertions. They
 remove identity, policy, qualification, netdevice parent and AUTH-count
@@ -156,8 +156,9 @@ reproduction uses the generated binary:
 /absolute/test-output/npu-diag --review-platform
 ```
 
-The functional matrix preserves all 210 original/ZQ cases and adds 179
-learning-mode regressions, for 389 cases and 60 negative controls.
+The final dual-bank matrix has 699 cases, 30,274 assertions and 104
+negative controls. The runner also checks that both host insertion paths
+use the stable bank0 ownership predicate.
 The report records the assertion count, all mutation results, the twelve
 invalid-hog admission results and source/patch/test hashes. Successful
 completion requires zero accepted invalid hogs and sets both pass fields
