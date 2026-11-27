@@ -1,0 +1,309 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: share transactional IFC tuple LUT ownership
+
+Share identical independent tuple predicates without borrowing enabled LUT
+rows from other owners. Reserve only required disabled rows, retain their
+shadows across transport failures, and publish leases after readback.
+Require consumer retirement before reference release and restore the last
+reference's original row. Leave serialization and kernel integration to
+the caller.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_ifc_tuple_pool.h
+@@ -0,0 +1,296 @@
++#ifndef AIROHA_CT_IFC_TUPLE_POOL_H
++#define AIROHA_CT_IFC_TUPLE_POOL_H
++
++#include "airoha_ct_ifc_tuple_words.h"
++
++#define AIROHA_CT_IFC_POOL_SLOTS 32
++
++struct airoha_ct_ifc_pool_lease {
++	struct airoha_ct_ifc_pool_lease *next;
++	u32 mask;
++	u8 slot[AIROHA_CT_IFC_TUPLE_MAX];
++	u8 count;
++};
++
++struct airoha_ct_ifc_pool {
++	u32 saved[AIROHA_CT_IFC_POOL_SLOTS][2];
++	u32 words[AIROHA_CT_IFC_POOL_SLOTS][2];
++	u32 refs[AIROHA_CT_IFC_POOL_SLOTS];
++	u32 reserved;
++	u32 dirty;
++	bool pending;
++	struct airoha_ct_ifc_pool_lease *leases;
++	struct airoha_ct_ifc_pool_lease *releasing;
++};
++
++struct airoha_ct_ifc_pool_io {
++	void *ctx;
++	int (*read)(void *ctx, unsigned int slot, u32 words[2]);
++	int (*put)(void *ctx, unsigned int slot, const u32 words[2]);
++	int (*drain)(void *ctx);
++};
++
++static inline bool
++airoha_ct_ifc_pool_valid(const struct airoha_ct_ifc_pool *pool,
++			 const struct airoha_ct_ifc_pool_io *io)
++{
++	return pool && io && io->read && io->put && io->drain;
++}
++
++static inline bool
++airoha_ct_ifc_pool_has(const struct airoha_ct_ifc_pool *pool,
++		       const struct airoha_ct_ifc_pool_lease *lease)
++{
++	const struct airoha_ct_ifc_pool_lease *cursor;
++
++	for (cursor = pool->leases; cursor; cursor = cursor->next)
++		if (cursor == lease)
++			return true;
++	return false;
++}
++
++static inline int
++airoha_ct_ifc_pool_sync(struct airoha_ct_ifc_pool *pool,
++			const struct airoha_ct_ifc_pool_io *io)
++{
++	int err;
++
++	if (!pool->pending)
++		return 0;
++	err = io->drain(io->ctx);
++	if (!err)
++		pool->pending = false;
++	return err;
++}
++
++static inline int
++airoha_ct_ifc_pool_read(struct airoha_ct_ifc_pool *pool,
++			const struct airoha_ct_ifc_pool_io *io,
++			unsigned int slot, u32 words[2])
++{
++	int err = io->read(io->ctx, slot, words);
++
++	if (err)
++		pool->pending = true;
++	return err;
++}
++
++static inline int
++airoha_ct_ifc_pool_write(struct airoha_ct_ifc_pool *pool,
++			 const struct airoha_ct_ifc_pool_io *io,
++			 unsigned int slot, const u32 words[2])
++{
++	u32 actual[2];
++	int err;
++
++	pool->dirty |= BIT(slot);
++	err = io->put(io->ctx, slot, words);
++	if (!err)
++		err = io->read(io->ctx, slot, actual);
++	if (!err && (actual[0] != words[0] || actual[1] != words[1]))
++		err = -EIO;
++	if (err)
++		pool->pending = true;
++	return err;
++}
++
++static inline u32
++airoha_ct_ifc_pool_orphans(const struct airoha_ct_ifc_pool *pool)
++{
++	u32 mask = 0;
++	unsigned int slot;
++
++	for (slot = 0; slot < AIROHA_CT_IFC_POOL_SLOTS; slot++)
++		if ((pool->reserved & BIT(slot)) && !pool->refs[slot])
++			mask |= BIT(slot);
++	return mask;
++}
++
++static inline int
++airoha_ct_ifc_pool_recover(struct airoha_ct_ifc_pool *pool,
++			   const struct airoha_ct_ifc_pool_io *io)
++{
++	struct airoha_ct_ifc_pool_lease *lease, **link;
++	u32 restore;
++	unsigned int slot;
++	int err;
++
++	if (!airoha_ct_ifc_pool_valid(pool, io))
++		return -EINVAL;
++	err = airoha_ct_ifc_pool_sync(pool, io);
++	if (err)
++		return err;
++	restore = airoha_ct_ifc_pool_orphans(pool);
++	lease = pool->releasing;
++	if (lease)
++		for (slot = 0; slot < AIROHA_CT_IFC_POOL_SLOTS; slot++)
++			if ((lease->mask & BIT(slot)) && pool->refs[slot] == 1)
++				restore |= BIT(slot);
++	for (slot = 0; slot < AIROHA_CT_IFC_POOL_SLOTS; slot++) {
++		if (!(restore & pool->dirty & BIT(slot)))
++			continue;
++		err = airoha_ct_ifc_pool_write(pool, io, slot, pool->saved[slot]);
++		if (err)
++			return err;
++	}
++	if (lease) {
++		for (slot = 0; slot < AIROHA_CT_IFC_POOL_SLOTS; slot++)
++			if (lease->mask & BIT(slot))
++				pool->refs[slot]--;
++		for (link = &pool->leases; *link != lease; link = &(*link)->next)
++			;
++		*link = lease->next;
++		*lease = (struct airoha_ct_ifc_pool_lease) {};
++		pool->releasing = NULL;
++	}
++	for (slot = 0; slot < AIROHA_CT_IFC_POOL_SLOTS; slot++) {
++		if (!(restore & BIT(slot)))
++			continue;
++		pool->saved[slot][0] = pool->saved[slot][1] = 0;
++		pool->words[slot][0] = pool->words[slot][1] = 0;
++	}
++	pool->reserved &= ~restore;
++	pool->dirty &= ~restore;
++	return 0;
++}
++
++static inline bool
++airoha_ct_ifc_pool_predicate(const u32 words[2])
++{
++	u32 field = words[1] & 0x3f;
++
++	if (field >= 3 && field <= 12)
++		return words[1] == (0xe000 | field);
++	if (field == 24 || field == 25)
++		return words[1] == (0xc000 | field) &&
++		       (words[0] == 0xff0006 || words[0] == 0xff0011);
++	if (field == 28 || field == 29)
++		return words[1] == (0xc000 | field) &&
++		       (words[0] >> 16) == 0xffff;
++	return false;
++}
++
++static inline int
++airoha_ct_ifc_pool_acquire(struct airoha_ct_ifc_pool *pool,
++			   const struct airoha_ct_ifc_pool_io *io,
++			   const struct airoha_ct_ifc_tuple_words *words,
++			   struct airoha_ct_ifc_pool_lease *lease)
++{
++	struct airoha_ct_ifc_pool_lease plan = {};
++	u32 snapshots[AIROHA_CT_IFC_TUPLE_MAX][2];
++	u32 missing[AIROHA_CT_IFC_TUPLE_MAX][2];
++	u8 assigned[AIROHA_CT_IFC_TUPLE_MAX];
++	u8 unique[AIROHA_CT_IFC_TUPLE_MAX];
++	u32 actual[2], fresh = 0;
++	unsigned int index, other, slot, count = 0, found = 0;
++	int err;
++
++	if (!airoha_ct_ifc_pool_valid(pool, io) || !words || !lease ||
++	    !words->count || words->count > AIROHA_CT_IFC_TUPLE_MAX)
++		return -EINVAL;
++	if (lease->count || lease->mask || lease->next ||
++	    airoha_ct_ifc_pool_has(pool, lease) || pool->releasing ||
++	    airoha_ct_ifc_pool_orphans(pool))
++		return -EBUSY;
++	for (index = 0; index < words->count; index++)
++		if (!airoha_ct_ifc_pool_predicate(words->lut[index]))
++			return -EINVAL;
++	err = airoha_ct_ifc_pool_sync(pool, io);
++	if (err)
++		return err;
++	plan.count = words->count;
++	for (index = 0; index < words->count; index++) {
++		for (slot = 0; slot < AIROHA_CT_IFC_POOL_SLOTS; slot++)
++			if (pool->refs[slot] &&
++			    pool->words[slot][0] == words->lut[index][0] &&
++			    pool->words[slot][1] == words->lut[index][1])
++				break;
++		if (slot < AIROHA_CT_IFC_POOL_SLOTS) {
++			if (pool->refs[slot] == U32_MAX)
++				return -EOVERFLOW;
++			plan.slot[index] = slot;
++			plan.mask |= BIT(slot);
++			continue;
++		}
++		for (other = 0; other < count; other++)
++			if (missing[other][0] == words->lut[index][0] &&
++			    missing[other][1] == words->lut[index][1])
++				break;
++		if (other == count) {
++			missing[count][0] = words->lut[index][0];
++			missing[count][1] = words->lut[index][1];
++			count++;
++		}
++		unique[index] = other;
++		plan.slot[index] = AIROHA_CT_IFC_POOL_SLOTS;
++	}
++	for (slot = 0; slot < AIROHA_CT_IFC_POOL_SLOTS && found < count; slot++) {
++		if (pool->reserved & BIT(slot))
++			continue;
++		err = airoha_ct_ifc_pool_read(pool, io, slot, actual);
++		if (err)
++			return err;
++		if (actual[1] & BIT(15))
++			continue;
++		snapshots[found][0] = actual[0];
++		snapshots[found][1] = actual[1];
++		assigned[found++] = slot;
++		fresh |= BIT(slot);
++	}
++	if (found != count)
++		return -ENOSPC;
++	for (slot = 0; slot < AIROHA_CT_IFC_POOL_SLOTS; slot++) {
++		if (!(plan.mask & BIT(slot)))
++			continue;
++		err = airoha_ct_ifc_pool_read(pool, io, slot, actual);
++		if (err)
++			return err;
++		if (actual[0] != pool->words[slot][0] || actual[1] != pool->words[slot][1])
++			return -EUCLEAN;
++	}
++	for (index = 0; index < count; index++) {
++		slot = assigned[index];
++		pool->saved[slot][0] = snapshots[index][0];
++		pool->saved[slot][1] = snapshots[index][1];
++		pool->words[slot][0] = missing[index][0];
++		pool->words[slot][1] = missing[index][1];
++	}
++	pool->reserved |= fresh;
++	for (index = 0; index < count; index++) {
++		slot = assigned[index];
++		err = airoha_ct_ifc_pool_write(pool, io, slot, pool->words[slot]);
++		if (err)
++			return err;
++	}
++	for (index = 0; index < words->count; index++)
++		if (plan.slot[index] == AIROHA_CT_IFC_POOL_SLOTS)
++			plan.slot[index] = assigned[unique[index]];
++	plan.mask |= fresh;
++	for (slot = 0; slot < AIROHA_CT_IFC_POOL_SLOTS; slot++)
++		if (plan.mask & BIT(slot))
++			pool->refs[slot]++;
++	plan.next = pool->leases;
++	*lease = plan;
++	pool->leases = lease;
++	return 0;
++}
++
++static inline int
++airoha_ct_ifc_pool_release(struct airoha_ct_ifc_pool *pool,
++			   const struct airoha_ct_ifc_pool_io *io,
++			   struct airoha_ct_ifc_pool_lease *lease,
++			   bool consumer_disabled)
++{
++	if (!airoha_ct_ifc_pool_valid(pool, io) || !lease ||
++	    !airoha_ct_ifc_pool_has(pool, lease))
++		return -EINVAL;
++	if (!consumer_disabled)
++		return -EBUSY;
++	if ((pool->releasing && pool->releasing != lease) ||
++	    airoha_ct_ifc_pool_orphans(pool))
++		return -EBUSY;
++	pool->releasing = lease;
++	return airoha_ct_ifc_pool_recover(pool, io);
++}
++
++#endif
