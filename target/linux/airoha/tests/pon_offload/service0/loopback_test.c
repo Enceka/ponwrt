@@ -177,6 +177,36 @@ static int dev_queue_xmit(struct sk_buff *skb)
 	return transmit_error;
 }
 
+static bool mapped_alt_configured;
+static u32 mapped_alt_service;
+
+#define VLAN_PRIO_SHIFT 13
+#define NETDEV_TX_OK 0
+typedef int netdev_tx_t;
+struct netdev_queue { int unused; };
+
+static struct netdev_queue *netdev_get_tx_queue(struct net_device *dev, unsigned int index)
+{
+	assert(false);
+	return NULL;
+}
+
+static void skb_set_queue_mapping(struct sk_buff *skb, u16 mapping) { assert(false); }
+static void __vlan_hwaccel_put_tag(struct sk_buff *skb, __be16 protocol, u16 tci) { assert(false); }
+static void local_bh_disable(void) { assert(false); }
+static void local_bh_enable(void) { assert(false); }
+static int smp_processor_id(void) { assert(false); return 0; }
+static void HARD_TX_LOCK(struct net_device *dev, struct netdev_queue *queue, int cpu) { assert(false); }
+static void HARD_TX_UNLOCK(struct net_device *dev, struct netdev_queue *queue) { assert(false); }
+static void dev_kfree_skb_any(struct sk_buff *skb) { assert(false); }
+
+static netdev_tx_t netdev_start_xmit(struct sk_buff *skb, struct net_device *dev,
+				    struct netdev_queue *queue, bool more)
+{
+	assert(false);
+	return NETDEV_TX_OK;
+}
+
 #include "loopback_production.inc"
 
 int main(void)
@@ -185,8 +215,11 @@ int main(void)
 
 	retained = opened = true;
 	for (unsigned int service = 0; service <= U16_MAX; service++) {
+		mapped_alt_configured = true;
+		mapped_alt_service = service;
 		assert(!mapping(service, true));
 		assert(configured && mapped_service == service && mapping_enable);
+		assert(!mapped_alt_configured && !mapped_alt_service);
 		assert(!mapping(0, false));
 		assert(!configured && !mapping_enable);
 		mapping_cases += 2;
@@ -206,14 +239,18 @@ int main(void)
 		unsigned int previous = submissions;
 
 		assert(!mapping(0, true));
+		mapped_alt_configured = true;
+		mapped_alt_service = 0xffff;
 		failure_phase = phase;
 		assert(transmit(0, PROBE_IPV4, 0) == -ETIMEDOUT);
 		assert(previous == submissions && mapping_phase == phase && retained && opened);
 		assert(configured && mapped_service == 0);
 		assert(mapping(0, false) == -ETIMEDOUT);
 		assert(configured && retained && opened);
+		assert(mapped_alt_configured && mapped_alt_service == 0xffff);
 		failure_phase = 0;
 		assert(!mapping(0, false) && !configured);
+		assert(!mapped_alt_configured && !mapped_alt_service);
 		failure_cases += 2;
 	}
 	device.pon_tx_pending = 1;

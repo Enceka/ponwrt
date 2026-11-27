@@ -1,5 +1,23 @@
 # RAM GDM2 service loopback
 
+The NPU runner can extend `--learn` with `--bind-host-ip ADDRESS` and
+`--bind-host-mac MAC` to exercise the learned row's LAN1 output. This needs
+the ZT RAM diagnostic patch and ZU ownership protection. The receiver opens an ordinary UDP socket on
+the supplied local IPv4 address and port 49153 before installing the row.
+The entry keeps the original test tuple and translates its destination to
+that receiver. Matching packets must arrive with the exact sequence and
+previously captured cookie, with no QDMA or ER delivery. Tuple, family and
+source-MAC and alternate-GEM mismatches must return through ER while the LAN
+socket stays empty. Each close retires both banks and checks CPU return.
+
+`bind-lan1 HASH ADDRESS MAC` accepts only a learned IPv4 UDP tuple in the
+active diagnostic session. It closes and drains that session, then installs
+one static BND entry into the verified empty row, checks write/read SRAM
+acknowledgements and the complete row, republishes AUTH and reopens ingress.
+`close` removes the binding; `release` also restores the saved bank settings
+and releases the retained interfaces. The owner keeps production bank0/bank1
+commit admission closed throughout the experiment.
+
 The current covered-route acceptance is recorded in `../IFC-PROBE.md`.
 With kernel patches through 984, the runner supports `--cover-slot 1`
 plus either `--packet-matrix` or `--withdraw-cycle`. Add `--require-native`
@@ -207,7 +225,7 @@ Both CPU and ER returns delivered to `pon0` can satisfy `rx`. Inspect the
 diagnostic ER counters and QDMA receive counters to distinguish those paths.
 Use `tx` when testing an output that does not return through `pon0`.
 The sender preserves the diagnostic's FLOW/no_learn settings. AUTH setup,
-PSE8/ER routing and later PPE learning remain kernel diagnostic operations.
+PSE4/ER routing and bank0 PPE learning remain kernel diagnostic operations.
 
 `rx` waits up to 100 ms for TX completion and then up to 100 ms for the
 matching sequence/cookie/kind/length RX marker. `tx` waits up to 100 ms for
@@ -245,11 +263,36 @@ and RX functions from `ct_pon_loopback.c`. Plain and ASan/UBSan runs cover
 and services 0/0x8000/0xffff. Tests verify the emitted MAC/IP/UDP/marker bytes,
 mapping preservation under an owner, 13 mapping drift cases for each sender,
 strict parsing, allocation/TX failures, separate TX/RX deadlines, sequence
-exhaustion and legacy random-MAC behavior. Seventeen mutation controls must
+exhaustion and legacy random-MAC behavior. Mutation controls must
 fail assertions, including changed MACs, lost variants, skipped TX waits,
 unwanted RX waits and relaxed parser/mapping guards. Kernel dependencies,
 including checksum helpers and device queues, use local stubs; build the
 module against the matching RAM kernel before board testing.
+
+`map-pair <service> <alt_service>` installs two mappings with pbit masks
+`0x7f` and `0x80`. Both services must fit 16 bits and differ, and mapping
+changes require owner release. `send-fixed-alt ipv4 0 rx` selects the second
+mapping using TX VLAN metadata (pbit 7) and submits the untagged fixed frame
+directly under the netdev TX lock. The frame retains the original tuple and
+MAC addresses. Tests cover stale alternate mappings, malformed commands,
+TX busy, and failure/retry at every mapping transaction stage.
+
+## Dual-bank board acceptance — 2026-11-28
+
+The dual-bank RAM FIT (`2f88fe7b548c239073944bb9a517eacd14d96756b88c17fdae584fddcc034fe8`)
+passed learning, LAN1 binding and cross-GEM isolation for services 0 and
+0x8000. Bank1 stayed closed to lookup/learning; bank0 learned only the
+authorized tuple at `0x0458`. Each service passed nine bound samples:
+two exact matches reached the LAN1 UDP receiver and seven mismatches
+returned through ER. Mismatches include an alternate GEM with the same
+tuple and source MAC. QDMA CPU receive counters stayed unchanged during
+the bound matrix. Close cleared both banks; release restored both banks'
+saved registers. Empty-AUTH and exact-AUTH regressions also passed.
+
+Evidence lives under workspace `build/pon-npu-diag-20261127/` in
+`board-dualbank-bound-v1/report.json`, `board-dualbank-empty-reg/report.json`
+and `board-dualbank-auth-reg/report.json`. Production integration next needs
+dynamic flow publication and bank0 sharing with ordinary/native traffic.
 
 ## Packet kinds
 

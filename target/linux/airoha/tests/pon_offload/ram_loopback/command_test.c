@@ -15,6 +15,17 @@
 #define REG_FE_IFC_PORT_EN 11U
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
 #define THIS_MODULE NULL
+#define VLAN_PRIO_SHIFT 13
+#define NETDEV_TX_OK 0
+#define NETDEV_TX_BUSY 1
+typedef int netdev_tx_t;
+struct netdev_queue { int dummy; };
+struct airoha_pon_flow_config {
+    u16 tcont;
+    u16 gem_id;
+    u16 vlan_id;
+    u8 pbit_mask;
+};
 
 #ifdef __APPLE__
 typedef off_t loff_t;
@@ -34,7 +45,14 @@ struct airoha_eth {
 static struct airoha_ppe ppe;
 static struct airoha_eth ethernet = { .ppe = &ppe };
 static struct airoha_pon_flow_table table;
-static bool controller, handler, registers_saved, sent_current, sent_fixed, sent_wait_rx;
+static struct airoha_pon_flow_table pending_pair;
+static bool pair_pending;
+static bool controller, handler, registers_saved, sent_current, sent_fixed, sent_alt, sent_wait_rx;
+static bool mapped_alt_configured;
+static u32 mapped_alt_service;
+static u16 last_vlan_tci;
+static bool last_vlan_tagged, alt_xmit_busy;
+static struct netdev_queue dummy_txq;
 static u32 saved_registers[10], saved_ifc_desired, saved_vip;
 static const u32 registers[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
 static const char * const kind_names[] = { "ipv4", "ipv6", "arp", "vlan", "pppoe", "fragment", "short" };
@@ -53,6 +71,13 @@ static rx_handler_result_t receive(struct sk_buff **packet);
 
 static void fixture_mapping(unsigned int service, bool enable)
 {
+    if (pair_pending && enable) {
+        table = pending_pair;
+        device.pon_flow_table = &table;
+        pair_pending = false;
+        return;
+    }
+    pair_pending = false;
     table.count = enable ? 1 : 0;
     table.entries[0] = (struct airoha_pon_flow_entry) {
         .vlan_id = AIROHA_PON_VID_ANY,
@@ -200,6 +225,56 @@ static int dev_queue_xmit(struct sk_buff *skb)
     return 0;
 }
 
+static int airoha_eth_pon_replace_flows(struct net_device *dev,
+                                        const struct airoha_pon_flow_config *flows,
+                                        size_t count)
+{
+    assert(dev == probe_netdev && count == 2 && mapping_phase == 1);
+    configure_calls++;
+    mapping_phase = 2;
+    if (failure_phase == 2)
+        return -ETIMEDOUT;
+    mapping_service = flows[0].gem_id;
+    mapping_enable = true;
+    pending_pair.count = count;
+    for (size_t index = 0; index < count; index++) {
+        pending_pair.entries[index].vlan_id = flows[index].vlan_id;
+        pending_pair.entries[index].pbit_mask = flows[index].pbit_mask;
+        pending_pair.entries[index].tag = AIROHA_PON_QDMA_VALID |
+            FIELD_PREP(AIROHA_PON_QDMA_GEM_MASK, flows[index].gem_id) |
+            FIELD_PREP(AIROHA_PON_QDMA_PBIT_MASK, flows[index].pbit_mask);
+    }
+    pair_pending = true;
+    return 0;
+}
+
+static struct netdev_queue *netdev_get_tx_queue(struct net_device *dev, unsigned int index)
+{
+    assert(dev == probe_netdev && index == 0);
+    return &dummy_txq;
+}
+static void skb_set_queue_mapping(struct sk_buff *skb, u16 mapping) { assert(mapping == 0); }
+static void __vlan_hwaccel_put_tag(struct sk_buff *skb, __be16 proto, u16 tci)
+{
+    assert(proto == htons(ETH_P_8021Q));
+    last_vlan_tagged = true;
+    last_vlan_tci = tci;
+}
+static void local_bh_disable(void) {}
+static void local_bh_enable(void) {}
+static int smp_processor_id(void) { return 0; }
+static void HARD_TX_LOCK(struct net_device *dev, struct netdev_queue *txq, int cpu) { assert(txq == &dummy_txq); }
+static void HARD_TX_UNLOCK(struct net_device *dev, struct netdev_queue *txq) { assert(txq == &dummy_txq); }
+static netdev_tx_t netdev_start_xmit(struct sk_buff *skb, struct net_device *dev,
+                                     struct netdev_queue *txq, bool more)
+{
+    assert(dev == probe_netdev && txq == &dummy_txq && !more);
+    if (alt_xmit_busy)
+        return NETDEV_TX_BUSY;
+    assert(!dev_queue_xmit(skb));
+    return NETDEV_TX_OK;
+}
+
 #include "loopback_production.inc"
 
 static void cleanup_packet(void)
@@ -225,7 +300,12 @@ static void reset(void)
     random_mac_calls = tx_delay = tx_due_us = last_frame_length = 0;
     probe_cookie = 0x10203040;
     awaiting = sent_current = allocation_failed = repair_packet = false;
-    sent_fixed = sent_wait_rx = tx_in_flight = copy_failed = false;
+    sent_fixed = sent_alt = sent_wait_rx = tx_in_flight = copy_failed = false;
+    mapped_alt_configured = false;
+    pair_pending = false;
+    mapped_alt_service = 0;
+    last_vlan_tagged = alt_xmit_busy = false;
+    last_vlan_tci = 0;
     receive_enabled = true;
     delivery_delay = 40000;
     assert(!mapping(0, true));
@@ -611,6 +691,48 @@ static void legacy_random(void)
     assert(received_sequence == sequence && !awaiting && begin_calls == 1);
 }
 
+static void pair_and_alt(void)
+{
+    reset();
+    command("map-pair 0 0", -EINVAL);
+    command("map-pair 0 65536", -EINVAL);
+    command("send-fixed-alt ipv4 0 rx", -EINVAL);
+    command("map-pair 0 1", 0);
+    assert(mapped_alt_configured && mapped_service == 0 && mapped_alt_service == 1);
+    assert(mapping_current());
+    table.entries[0].tag ^= 1;
+    command("send-fixed-alt ipv4 0 rx", -ESTALE);
+    table.entries[0].tag ^= 1;
+    table.entries[1].tag ^= 1;
+    command("send-fixed-alt ipv4 0 rx", -ESTALE);
+    table.entries[1].tag ^= 1;
+    command("send-fixed-alt ipv4 00 rx", -EINVAL);
+    command("send-fixed-alt ipv4 0 rx extra", -EINVAL);
+    ppe.ct_npu_owner = (void *)1;
+    command("map-pair 32768 32769", -EBUSY);
+    ppe.ct_npu_owner = NULL;
+    command("send-fixed-alt ipv4 0 rx", 0);
+    assert(sent_fixed && sent_alt && sent_wait_rx && last_vlan_tagged &&
+           last_vlan_tci == (7 << VLAN_PRIO_SHIFT));
+    check_frame(PROBE_IPV4, 0, true);
+    alt_xmit_busy = true;
+    command("send-fixed-alt ipv4 0 rx", -EBUSY);
+    alt_xmit_busy = false;
+    command("map 0", 0);
+    assert(!mapped_alt_configured && mapped_alt_service == 0);
+    for (unsigned int phase = 1; phase <= 3; phase++) {
+        reset();
+        failure_phase = phase;
+        command("map-pair 32768 32769", -ETIMEDOUT);
+        assert(!mapped_alt_configured && device.pon_update_blocked);
+        command("send-fixed-alt ipv4 0 rx", -ESTALE);
+        assert(!submissions);
+        failure_phase = 0;
+        command("map-pair 32768 32769", 0);
+        assert(mapping_current() && mapped_service == 32768 && mapped_alt_service == 32769);
+    }
+}
+
 int main(void)
 {
     parse_commands();
@@ -622,6 +744,7 @@ int main(void)
     fixed_wait();
     command_boundaries();
     legacy_random();
+    pair_and_alt();
     cleanup_packet();
     printf("{\"passed\":true,\"commands\":%u,\"parser_cases\":%u,\"mapping_rejections\":%u,"
            "\"receive_cases\":%u,\"owner_cases\":%u,\"fixed_cases\":%u,"

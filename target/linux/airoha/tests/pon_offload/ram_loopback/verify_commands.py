@@ -58,8 +58,8 @@ static void eth_random_addr(u8 *address)
     constants = '\n'.join(re.findall(r'(?m)^#define PROBE_.*$', source))
     constants += '\n' + enum.group() + '\n'
     names = ['marker_offset', 'receive', 'write_verified', 'mapping', 'map_service',
-             'mapping_current', 'restore', 'transmit', 'transmit_current_mode',
-             'transmit_current', 'command_write']
+             'mapping_pair', 'map_service_pair', 'mapping_current', 'restore', 'transmit',
+             'transmit_current_mode', 'transmit_current', 'command_write']
     receiver = re.search(r'(?ms)^static rx_handler_result_t receive\(.*?^}', source)
     assert receiver
     production = ''.join(receiver.group() + '\n' if name == 'receive' else
@@ -112,6 +112,8 @@ def main():
             ('mapping-service', 'table->entries[0].tag == tag',
              '!((table->entries[0].tag ^ tag) & ~AIROHA_PON_QDMA_GEM_MASK)'),
             ('mapping-count', 'table->count == 1', 'table->count >= 1'),
+            ('mapping-alt-service', 'table->entries[1].tag == alt_tag',
+             '!((table->entries[1].tag ^ alt_tag) & ~AIROHA_PON_QDMA_GEM_MASK)'),
             ('rx-timeout', 'if (!err && wait_rx && READ_ONCE(received_sequence) != sequence)',
              'err = 0;\n\tif (false && wait_rx && READ_ONCE(received_sequence) != sequence)'),
             ('fixed-random', 'ether_addr_copy(ethernet->h_source, fixed_source);',
@@ -132,8 +134,16 @@ def main():
             ('fixed-sequence-wrap', 'if (sequence == (u32)~0U)', 'if (false)'),
         ]
         for name, before, after in mutations:
-            (directory / 'loopback_production.inc').write_text(replace_once(production, before, after))
-            reports.append(run(directory, name, rejected=True))
+            occurrences = production.count(before)
+            assert occurrences, before
+            position = 0
+            for index in range(occurrences):
+                position = production.index(before, position)
+                mutant = production[:position] + after + production[position + len(before):]
+                (directory / 'loopback_production.inc').write_text(mutant)
+                suffix = f'-{index + 1}' if occurrences > 1 else ''
+                reports.append(run(directory, name + suffix, rejected=True))
+                position += len(before)
         print(json.dumps({'passed': True, 'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
                           'runs': reports}, indent=2))
 

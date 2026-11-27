@@ -23,6 +23,7 @@
 #define PROBE_MAX_BYTES 130
 #define PROBE_CURRENT_SERVICE (~0U)
 #define PROBE_FIXED_MAC BIT(8)
+#define PROBE_ALT_SERVICE BIT(9)
 #undef airoha_fe_rr
 #undef airoha_fe_wr
 #define airoha_fe_rr(eth, reg) readl((eth)->fe_regs + (reg))
@@ -35,8 +36,9 @@ static struct airoha_gdm_dev *probe_dev;
 static bool retained, controller, opened, handler;
 static bool registers_saved;
 static bool configured, sent_current;
-static bool sent_fixed, sent_wait_rx;
-static u32 mapped_service;
+static bool sent_fixed, sent_wait_rx, sent_alt;
+static bool mapped_alt_configured;
+static u32 mapped_service, mapped_alt_service;
 static u32 saved_ifc_desired, saved_vip;
 static u32 saved_registers[10];
 static u32 sequence;
@@ -258,6 +260,42 @@ static int mapping(unsigned int service, bool enable)
 	if (!err) {
 		configured = enable;
 		mapped_service = service;
+		mapped_alt_configured = false;
+		mapped_alt_service = 0;
+	}
+	return err;
+}
+
+static int mapping_pair(unsigned int service, unsigned int alt_service)
+{
+	struct airoha_pon_flow_config flows[2] = {
+		{
+			.tcont = 0,
+			.gem_id = service,
+			.vlan_id = AIROHA_PON_VID_ANY,
+			.pbit_mask = 0x7f,
+		},
+		{
+			.tcont = 0,
+			.gem_id = alt_service,
+			.vlan_id = AIROHA_PON_VID_ANY,
+			.pbit_mask = 0x80,
+		},
+	};
+	int err;
+
+	err = airoha_eth_pon_update_begin(probe_netdev, BIT(0));
+	if (err)
+		return err;
+	err = airoha_eth_pon_replace_flows(probe_netdev, flows, ARRAY_SIZE(flows));
+	if (err)
+		return err;
+	err = airoha_eth_pon_update_end(probe_netdev);
+	if (!err) {
+		configured = true;
+		mapped_service = service;
+		mapped_alt_configured = true;
+		mapped_alt_service = alt_service;
 	}
 	return err;
 }
@@ -271,24 +309,48 @@ static int map_service(unsigned int service)
 	return mapping(service, true);
 }
 
+static int map_service_pair(unsigned int service, unsigned int alt_service)
+{
+	if (!retained || !opened || service > U16_MAX || alt_service > U16_MAX ||
+	    service == alt_service)
+		return -EINVAL;
+	if (READ_ONCE(probe_dev->eth->ppe->ct_npu_owner))
+		return -EBUSY;
+	return mapping_pair(service, alt_service);
+}
+
 static bool mapping_current(void)
 {
 	const struct airoha_pon_flow_table *table;
 	bool matches;
-	u32 tag;
+	u32 tag, alt_tag;
 
 	if (!configured || smp_load_acquire(&probe_dev->pon_update_blocked) ||
 	    READ_ONCE(probe_dev->pon_qdma_tag) ||
 	    !netif_running(probe_netdev) || !netif_carrier_ok(probe_netdev))
 		return false;
-	tag = AIROHA_PON_QDMA_VALID |
-		FIELD_PREP(AIROHA_PON_QDMA_GEM_MASK, mapped_service) |
-		FIELD_PREP(AIROHA_PON_QDMA_PBIT_MASK, 0xff);
 	rcu_read_lock();
 	table = rcu_dereference(probe_dev->pon_flow_table);
-	matches = table && table->count == 1 &&
-		table->entries[0].vlan_id == AIROHA_PON_VID_ANY &&
-		table->entries[0].pbit_mask == 0xff && table->entries[0].tag == tag;
+	if (mapped_alt_configured) {
+		tag = AIROHA_PON_QDMA_VALID |
+			FIELD_PREP(AIROHA_PON_QDMA_GEM_MASK, mapped_service) |
+			FIELD_PREP(AIROHA_PON_QDMA_PBIT_MASK, 0x7f);
+		alt_tag = AIROHA_PON_QDMA_VALID |
+			FIELD_PREP(AIROHA_PON_QDMA_GEM_MASK, mapped_alt_service) |
+			FIELD_PREP(AIROHA_PON_QDMA_PBIT_MASK, 0x80);
+		matches = table && table->count == 2 &&
+			table->entries[0].vlan_id == AIROHA_PON_VID_ANY &&
+			table->entries[0].pbit_mask == 0x7f && table->entries[0].tag == tag &&
+			table->entries[1].vlan_id == AIROHA_PON_VID_ANY &&
+			table->entries[1].pbit_mask == 0x80 && table->entries[1].tag == alt_tag;
+	} else {
+		tag = AIROHA_PON_QDMA_VALID |
+			FIELD_PREP(AIROHA_PON_QDMA_GEM_MASK, mapped_service) |
+			FIELD_PREP(AIROHA_PON_QDMA_PBIT_MASK, 0xff);
+		matches = table && table->count == 1 &&
+			table->entries[0].vlan_id == AIROHA_PON_VID_ANY &&
+			table->entries[0].pbit_mask == 0xff && table->entries[0].tag == tag;
+	}
 	rcu_read_unlock();
 	return matches;
 }
@@ -454,12 +516,14 @@ static int transmit(unsigned int service, unsigned int kind, unsigned int varian
 	unsigned int length, network = ETH_HLEN, transport, udp_length;
 	__be16 protocol = htons(ETH_P_IP);
 	bool fixed_mac = variant & PROBE_FIXED_MAC;
+	bool alt_service = variant & PROBE_ALT_SERVICE;
 	int pending, err;
 
-	variant &= ~PROBE_FIXED_MAC;
+	variant &= ~(PROBE_FIXED_MAC | PROBE_ALT_SERVICE);
 	if (!retained || !opened ||
 	    (service > U16_MAX && service != PROBE_CURRENT_SERVICE) || kind >= PROBE_KIND_COUNT ||
 	    (fixed_mac && (service != PROBE_CURRENT_SERVICE || kind > PROBE_IPV6)) ||
+	    (alt_service && (!fixed_mac || !mapped_alt_configured)) ||
 	    variant > 4 || (variant && kind != PROBE_IPV4 && kind != PROBE_IPV6))
 		return -EINVAL;
 	if (service != PROBE_CURRENT_SERVICE) {
@@ -565,10 +629,31 @@ marker:
 	skb->protocol = protocol;
 	skb->ip_summed = CHECKSUM_NONE;
 	skb->dev = probe_netdev;
-	err = dev_queue_xmit(skb);
+	if (alt_service) {
+		struct netdev_queue *txq = netdev_get_tx_queue(probe_netdev, 0);
+		netdev_tx_t rc;
+
+		skb_set_queue_mapping(skb, 0);
+		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), 7 << VLAN_PRIO_SHIFT);
+		local_bh_disable();
+		HARD_TX_LOCK(probe_netdev, txq, smp_processor_id());
+		rc = netdev_start_xmit(skb, probe_netdev, txq, false);
+		HARD_TX_UNLOCK(probe_netdev, txq);
+		local_bh_enable();
+		if (rc != NETDEV_TX_OK) {
+			dev_kfree_skb_any(skb);
+			err = -EBUSY;
+		} else {
+			err = 0;
+		}
+	} else {
+		err = dev_queue_xmit(skb);
+		if (err)
+			err = net_xmit_errno(err);
+	}
 	if (err) {
 		smp_store_release(&awaiting, false);
-		return net_xmit_errno(err);
+		return err;
 	}
 	err = read_poll_timeout(atomic_read, pending, !pending, 1000, 100000,
 				false, &probe_dev->pon_tx_pending);
@@ -585,7 +670,7 @@ static int transmit_current_mode(unsigned int kind, unsigned int variant, bool w
 	int err;
 
 	if (!retained || !opened || (kind != PROBE_IPV4 && kind != PROBE_IPV6) ||
-	    (variant & ~PROBE_FIXED_MAC) > 4)
+	    (variant & ~(PROBE_FIXED_MAC | PROBE_ALT_SERVICE)) > 4)
 		return -EINVAL;
 	if (!mapping_current())
 		return -ESTALE;
@@ -593,6 +678,7 @@ static int transmit_current_mode(unsigned int kind, unsigned int variant, bool w
 		return -EOVERFLOW;
 	sent_current = true;
 	sent_fixed = !!(variant & PROBE_FIXED_MAC);
+	sent_alt = !!(variant & PROBE_ALT_SERVICE);
 	sent_wait_rx = wait_rx;
 	err = transmit(PROBE_CURRENT_SERVICE, kind, variant);
 	if (!err && wait_rx)
@@ -627,10 +713,12 @@ static int status_show(struct seq_file *file, void *unused)
 		kind_names[READ_ONCE(sent_kind)], READ_ONCE(sent_length),
 		kind_names[READ_ONCE(received_kind)], READ_ONCE(received_length));
 	seq_printf(file, "tx_variant=%u\n", READ_ONCE(sent_variant));
-	seq_printf(file, "tx_fixed=%u tx_wait_rx=%u\n", sent_fixed, sent_wait_rx);
+	seq_printf(file, "tx_fixed=%u tx_alt=%u tx_wait_rx=%u\n", sent_fixed, sent_alt, sent_wait_rx);
 	seq_printf(file, "configured=%u mapped_service=%u tx_current=%u npu_owner=%u\n",
 		configured, mapped_service, sent_current,
 		!!READ_ONCE(eth->ppe->ct_npu_owner));
+	seq_printf(file, "alt_configured=%u alt_service=%u\n",
+		mapped_alt_configured, mapped_alt_service);
 	seq_printf(file, "submitted=%llu completed=%llu dropped=%llu no_mapping=%llu rx_data=%llu rx_delivered=%llu last_tx=%08x/%08x last_rx=%08x/%08x\n",
 		stats.tx_packets_submitted, stats.tx_packets_completed, stats.tx_packets_hw_dropped,
 		stats.tx_no_mapping, stats.rx_data_packets, stats.rx_packets_delivered,
@@ -652,9 +740,9 @@ DEFINE_SHOW_ATTRIBUTE(status);
 static ssize_t command_write(struct file *file, const char __user *buffer,
 			      size_t length, loff_t *offset)
 {
-	char command[64], operation[16] = {}, kind_name[16] = "ipv4", variant_word[16], trailing;
+	char command[64], operation[20] = {}, kind_name[16] = "ipv4", variant_word[16], trailing;
 	char wait_name[16];
-	unsigned int service, kind, variant = 0;
+	unsigned int service, alt_service, kind, variant = 0;
 	int err, fields;
 
 	if (!length || length >= sizeof(command) || copy_from_user(command, buffer, length))
@@ -667,11 +755,17 @@ static ssize_t command_write(struct file *file, const char __user *buffer,
 		err = prepare();
 	else if (sysfs_streq(command, "restore"))
 		err = restore();
-	else if (sscanf(command, "%15s", operation) == 1 && !strcmp(operation, "map")) {
+	else if (sscanf(command, "%19s", operation) == 1 && !strcmp(operation, "map")) {
 		err = -EINVAL;
 		if (sscanf(command, "%*s %15s %c", variant_word, &trailing) == 1 &&
 		    !kstrtouint(variant_word, 0, &service))
 			err = map_service(service);
+	} else if (!strcmp(operation, "map-pair")) {
+		err = -EINVAL;
+		if (sscanf(command, "%*s %15s %15s %c", kind_name, variant_word, &trailing) == 2 &&
+		    !kstrtouint(kind_name, 0, &service) &&
+		    !kstrtouint(variant_word, 0, &alt_service))
+			err = map_service_pair(service, alt_service);
 	} else if (!strcmp(operation, "send-current")) {
 		err = -EINVAL;
 		if (sscanf(command, "%*s %15s %c", kind_name, &trailing) == 1) {
@@ -692,6 +786,18 @@ static ssize_t command_write(struct file *file, const char __user *buffer,
 			else if (!strcmp(kind_name, "ipv6"))
 				err = transmit_current_mode(PROBE_IPV6, variant, !strcmp(wait_name, "rx"));
 		}
+	} else if (!strcmp(operation, "send-fixed-alt")) {
+		err = -EINVAL;
+		if (sscanf(command, "%*s %15s %15s %15s %c", kind_name, variant_word,
+			   wait_name, &trailing) == 3 &&
+		    variant_word[0] >= '0' && variant_word[0] <= '4' && !variant_word[1] &&
+		    (!strcmp(wait_name, "rx") || !strcmp(wait_name, "tx"))) {
+			variant = PROBE_FIXED_MAC | PROBE_ALT_SERVICE | (variant_word[0] - '0');
+			if (!strcmp(kind_name, "ipv4"))
+				err = transmit_current_mode(PROBE_IPV4, variant, !strcmp(wait_name, "rx"));
+			else if (!strcmp(kind_name, "ipv6"))
+				err = transmit_current_mode(PROBE_IPV6, variant, !strcmp(wait_name, "rx"));
+		}
 	} else {
 		err = -EINVAL;
 		fields = sscanf(command, "send %u %15s %15s %c", &service, kind_name, variant_word, &trailing);
@@ -703,7 +809,7 @@ static ssize_t command_write(struct file *file, const char __user *buffer,
 						err = -EBUSY;
 					else {
 						sent_current = false;
-						sent_fixed = sent_wait_rx = false;
+						sent_fixed = sent_alt = sent_wait_rx = false;
 						err = transmit(service, kind, variant);
 					}
 					break;
