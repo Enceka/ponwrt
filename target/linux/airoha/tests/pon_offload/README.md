@@ -197,7 +197,24 @@ provider 未初始化的 reset 值和丢失的 regmap 错误，68 种初值下�
 个用例及七个负对照通过。联合 Linux 6.18.60 AArch64 vmlinux 编译、modpost、
 链接无警告；源码与编译树逐文件校验一致，overlay 的 269 个文件 SHA 校验通过。
 
-下一步补齐 owner 失效通知、持续健康检查和 DMA reset 退役，接着隔离
+`999-z` 接入 owner 失效通知和每 100ms 的健康检查。bridge PRE、LAN1/PON
+设备变化及 ER 映射失配先锁存失效，撤销 GDM 路由并按受锁保护的 gate 身份
+发送 CLOSE。后台继续完整 FE/QUIET/PPE/ER 排空，失败保留阶段和 DMA 后重试。
+只有 ER 完成 STOP/UNBIND 才发布完整关闭确认，单独 FE QUIESCE 继续等待。
+bridge 通知遇到 owner 尚未关闭时仍将旧候选标死并清理原 bridge 表项。
+
+健康检查读取固件 GATE/AUTH 状态，并在查询后复查映射、generation 和路由；
+显式 renew 在完整关闭后核对失效序号，期间新增通知会使本次恢复失败。
+worker 使用 mutex_trylock，owner 退役先清除发布指针、取消工作，再释放内存。
+普通启动及 PON qualification 保持原状态，新增路径通过内部 owner API 使用。
+CPU fallback 的路由及 IFC 写入失败在 owner 关闭后继续重试，状态完成后停止
+重复写入。健康模式通过 117,567 项检查和 58 个负对照；原版 owner 回归通过
+82,290 项检查和 24 个负对照。通知路径通过 34 个场景、361 项检查和八个
+负对照；路由撤销通过 127 个场景、524,288 个 selector 向量和十三个负对照。
+上述测试使用 ASan/UBSan。完整 Linux 6.18.60 AArch64 vmlinux 编译、modpost
+和链接通过，无警告；九个改动源码与编译树逐文件一致。
+
+下一步补齐 DMA reset 退役，接着隔离
 同 tuple 的 LAN/PON 软件候选与硬件表项，再开放 PON 准入并构建镜像刷测。
 当前内部准备路径支持 GPON GEM 映射；EPON LLID 对应关系继续单独完善。
 DMA 退役需由 NPU provider 记录完整 ER 配置并撤销全部 harts 与独立 host DMA
