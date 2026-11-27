@@ -22,6 +22,8 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--special-tag', action='store_true')
+    parser.add_argument('--service-zero', action='store_true',
+                        help='Probe exact service0 against service 0xa134 with --special-tag --cover-slot 1')
     parser.add_argument('--cover-slot', type=int, choices=(0, 1))
     parser.add_argument('--withdraw-cycle', action='store_true')
     parser.add_argument('--sif-sweep', action='store_true')
@@ -45,6 +47,13 @@ def main():
         parser.error('--tuple-variants requires --cover-slot 1; withdrawal requires --exact-tuple')
     if args.exact_tuple and (not args.tuple_variants or args.cover_slot != 1):
         parser.error('--exact-tuple requires --tuple-variants and --cover-slot 1')
+    if args.service_zero and (args.cover_slot != 1 or not args.special_tag or args.sif_sweep):
+        parser.error('--service-zero requires --special-tag --cover-slot 1 without --sif-sweep')
+    service_a = 0 if args.service_zero else 0x2134
+    service_b = 0xa134
+    service_word = '0' if args.service_zero else '0x2134'
+    classify_command = ('tuple' if args.exact_tuple else 'set') + ' ' + str(
+        args.cover_slot ^ 1 if args.cover_slot is not None else 0) + ' ' + service_word
     uuid.UUID(args.boot)
     blob = args.module.read_bytes()
     assert hashlib.sha256(blob).hexdigest() == args.sha256
@@ -82,6 +91,20 @@ def main():
         assert re.search(r'\bppe=0\b', state), 'PON PPE qualification must stay closed'
         return mask
 
+    def check_zero_classifier(state, service_active, cover_active, routed):
+        fields = dict(re.findall(r'\b(saved|active|pending|ready|service0|service1|ppe|cover|routed)='
+                                 r'([0-9a-f]+)\b', state))
+        expected = {'saved': int(service_active or cover_active),
+                    'active': (3 if service_active else 0) | (12 if cover_active else 0),
+                    'pending': 0, 'ready': int(service_active or cover_active),
+                    'service0': 0, 'service1': 0, 'ppe': 0,
+                    'cover': 2 if cover_active else 0, 'routed': int(routed)}
+        for key, value in expected.items():
+            assert key in fields and int(fields[key], 16 if key in ('active', 'cover') else 10) == value, (
+                'service0 classifier state mismatch: ' + key)
+        if not args.exact_tuple:
+            check_tuple_pool(state, False)
+
     before, _ = remote('before', 'cat /sys/kernel/debug/gpio; cat ' + classifier +
                        '; cat /sys/kernel/debug/ppe/config; ip -d link show pon0; cat ' +
                        '/sys/bus/platform/devices/1fb50000.ethernet/ct_native_pair_policy')
@@ -90,14 +113,16 @@ def main():
     assert 'ct_cpu_fallback: 0 ' in before
     assert 'state DOWN' in before
     tuple_clean = 'tuple=0 pool=00000000 pool_pending=0 leases=0'
-    if args.exact_tuple:
+    if args.exact_tuple or args.service_zero:
         assert tuple_clean in before, 'tuple pool is not idle'
+        assert re.search(r'\bppe=0\b', before), 'PON PPE qualification must stay closed'
     policy_pattern = r'^generation=\d+ allowed=' + ('1' if args.require_native else r'\d+') + r' failed=0$'
     assert re.search(policy_pattern, before, re.M)
     report = {'boot': args.boot, 'module_sha256': args.sha256, 'special_tag': args.special_tag,
               'cover_slot': args.cover_slot, 'sif_sweep': args.sif_sweep,
               'withdraw_cycle': args.withdraw_cycle,
               'tuple_variants': args.tuple_variants, 'exact_tuple': args.exact_tuple,
+              'service_zero': args.service_zero, 'service_a': service_a, 'service_b': service_b,
               'require_native': args.require_native,
               'observations': []}
     if not args.run:
@@ -117,25 +142,27 @@ def main():
         write('prepare', probe + 'command', 'prepare')
         remote('prepared', 'cat ' + probe + 'status; cat /sys/kernel/debug/ppe/config')
         if args.cover_slot is None:
-            write('classify-a', classifier, 'set 0 0x2134')
+            write('classify-a', classifier, classify_command)
             write('classify-b', classifier, 'set 1 0xa134')
         else:
             write('cover', classifier, 'cover ' + str(args.cover_slot))
-            classify_command = 'tuple' if args.exact_tuple else 'set'
-            write('classify-a', classifier, classify_command + ' ' + str(args.cover_slot ^ 1) + ' 0x2134')
+            write('classify-a', classifier, classify_command)
             write('route', classifier, 'route')
         classified, _ = remote('classified', 'cat ' + classifier + '; cat /sys/kernel/debug/ppe/config')
+        service_active = cover_active = True
+        if args.service_zero:
+            check_zero_classifier(classified, service_active, cover_active, True)
         if args.exact_tuple:
             tuple_owned = True
             tuple_mask = check_tuple_pool(classified, tuple_owned)
             assert 'active=0f' in classified
         cover_ring = 2 + 2 * (args.cover_slot or 0)
-        cases = [(service, (), True, 2 if service == 0x2134 else cover_ring)
-                 for service in (0x2134, 0xa134, 0x2134)]
+        cases = [(service, (), True, 2 if service == service_a else cover_ring)
+                 for service in (service_a, service_b, service_a)]
         if args.sif_sweep:
             cases = [(0x2134, (args.sif_mode + ' ' + str(source), 'route'), True, None)
                      for source in range(32)]
-        if args.withdraw_cycle and not args.exact_tuple:
+        if args.withdraw_cycle and not args.exact_tuple and not args.service_zero:
             cases += [
                 (0x2134, ('clear ' + str(args.cover_slot ^ 1), 'route'), True, cover_ring),
                 (0xa134, (), True, cover_ring),
@@ -145,44 +172,68 @@ def main():
             ]
         cases = [(service, commands, routed, 'ipv4', 0, expected_ring)
                  for service, commands, routed, expected_ring in cases]
+        if args.service_zero:
+            cases = [(service, (), True, kind, 0, 2 if service == service_a else 4)
+                     for kind in ('ipv4', 'ipv6') for service in (service_a, service_b, service_a)]
         if args.packet_matrix:
             cases = [(service, (), True, kind, 0,
-                      2 if kind in ('ipv4', 'ipv6', 'fragment') and service == 0x2134 else 4)
+                      2 if kind in ('ipv4', 'ipv6', 'fragment') and service == service_a else 4)
                      for kind in ('ipv4', 'ipv6', 'arp', 'vlan', 'pppoe', 'fragment', 'short')
-                     for service in (0x2134, 0xa134)]
+                     for service in (service_a, service_b)]
         if args.tuple_variants:
             cases = [(service, (), True, kind, variant,
-                      2 if service == 0x2134 and (not args.exact_tuple or variant == 0) else 4)
+                      2 if service == service_a and (not args.exact_tuple or variant == 0) else 4)
                      for kind in ('ipv4', 'ipv6') for variant in range(5)
-                     for service in (0x2134, 0xa134)]
+                     for service in (service_a, service_b)]
+        if args.service_zero and args.withdraw_cycle and not args.exact_tuple:
+            for service, commands, routed, expected_ring in (
+                (service_a, ('clear 0', 'route'), True, 4),
+                (service_a, (classify_command, 'route'), True, 2),
+                (service_a, ('clear 1',), False, 2),
+                (service_b, (), False, 0),
+                (service_a, ('clear 0',), False, 0),
+                (service_b, (), False, 0),
+            ):
+                cases += [(service, commands if kind == 'ipv4' else (), routed, kind, 0, expected_ring)
+                          for kind in ('ipv4', 'ipv6')]
         if args.exact_tuple and args.withdraw_cycle:
             cases += [
-                (0x2134, ('clear 0', 'route'), True, 'ipv4', 0, 4),
-                (0x2134, ('tuple 0 0x2134', 'route'), True, 'ipv4', 0, 2),
-                (0x2134, ('clear 1',), False, 'ipv4', 0, 2),
-                (0x2134, (), False, 'ipv6', 0, 2),
-                (0xa134, (), False, 'ipv4', 0, 0),
-                (0x2134, (), False, 'ipv6', 1, 0),
-                (0x2134, ('clear 0',), False, 'ipv4', 0, 0),
-                (0x2134, (), False, 'ipv6', 0, 0),
+                (service_a, ('clear 0', 'route'), True, 'ipv4', 0, 4),
+                (service_a, (classify_command, 'route'), True, 'ipv4', 0, 2),
+                (service_a, ('clear 1',), False, 'ipv4', 0, 2),
+                (service_a, (), False, 'ipv6', 0, 2),
+                (service_b, (), False, 'ipv4', 0, 0),
+                (service_a, (), False, 'ipv6', 1, 0),
+                (service_a, ('clear 0',), False, 'ipv4', 0, 0),
+                (service_a, (), False, 'ipv6', 0, 0),
             ]
         for index, (service, commands, routed, kind, variant, expected_ring) in enumerate(cases):
             label = 'send-' + str(index)
             for step, command in enumerate(commands):
                 transition = label + '-transition-' + str(step)
                 write(transition, classifier, command)
+                if command == 'clear 0':
+                    service_active = False
+                elif command == 'clear 1':
+                    cover_active = False
+                elif command == classify_command:
+                    service_active = True
                 if args.exact_tuple:
                     if command == 'clear 0':
                         tuple_owned, tuple_mask = False, 0
                     elif command.startswith('tuple '):
                         tuple_owned, tuple_mask = True, None
+                if args.exact_tuple or args.service_zero:
                     state, _ = remote(transition + '-state', 'cat ' + classifier + '; cat /sys/kernel/debug/ppe/config')
+                    if args.service_zero:
+                        check_zero_classifier(state, service_active, cover_active, command == 'route')
+                if args.exact_tuple:
                     actual_mask = check_tuple_pool(state, tuple_owned)
                     assert tuple_mask is None or actual_mask == tuple_mask, 'tuple pool mask changed'
                     tuple_mask = actual_mask
             previous, _ = remote(label + '-before', 'cat ' + probe + 'status')
             command = 'send ' + str(service)
-            if args.packet_matrix or args.tuple_variants:
+            if args.packet_matrix or args.tuple_variants or args.service_zero:
                 command += ' ' + kind
             if args.tuple_variants:
                 command += ' ' + str(variant)
@@ -209,6 +260,9 @@ def main():
                 raise RuntimeError(label + ' failed; see recorded status')
             assert 'ct_cpu_fallback: 0 ' in observed
             assert re.search(policy_pattern, observed, re.M)
+            if args.service_zero:
+                assert returned_service == service and returned_source == 2, 'special tag service mismatch'
+                check_zero_classifier(observed, service_active, cover_active, routed)
             if args.cover_slot is not None:
                 assert numbered_return and 'routed=' + str(int(routed)) in observed
                 assert len(changed_rings) == 1, 'expected a covered WAN CPU receive ring'
@@ -223,7 +277,7 @@ def main():
                 if args.tuple_variants:
                     assert 'tx_variant=' + str(variant) in observed
                     assert 'tx_kind=' + kind in observed and 'rx_kind=' + kind in observed
-                elif args.packet_matrix:
+                elif args.packet_matrix or args.service_zero:
                     assert 'tx_kind=' + kind in observed and 'rx_kind=' + kind in observed
         report['commands_completed'] = True
         report['numbered_packets_returned'] = all(item['numbered_return'] for item in report['observations'])
@@ -238,9 +292,11 @@ def main():
             initial_regs = re.findall(r'^([0-9a-f]{4})=([0-9a-f]{8}) ', baseline, re.M)
             final_regs = re.findall(r'^([0-9a-f]{4})=([0-9a-f]{8}) ', restored, re.M)
             assert initial_regs == final_regs and len(initial_regs) == 10
-            if args.exact_tuple:
+            if args.exact_tuple or args.service_zero:
                 assert tuple_clean in restored, 'tuple pool was not released'
                 report['tuple_pool_released'] = True
+            if args.service_zero:
+                check_zero_classifier(restored, False, False, False)
             report['registers_restored'] = True
             remote('unload', 'rmmod ct_pon_loopback')
         remote('ipv6-restore', 'echo ' + ipv6_state.strip() + ' > /proc/sys/net/ipv6/conf/pon0/disable_ipv6')
@@ -248,8 +304,10 @@ def main():
                           '; cat /sys/bus/platform/devices/1fb50000.ethernet/ct_native_pair_policy; dmesg | tail -45')
         assert 'ct_cpu_fallback: 0 ' in after
         assert 'saved=0 dirty=00 active=00 pending=0 scope=01000000 ready=0' in after
-        if args.exact_tuple:
+        if args.exact_tuple or args.service_zero:
             assert tuple_clean in after, 'tuple pool is not idle after cleanup'
+        if args.service_zero:
+            check_zero_classifier(after, False, False, False)
         assert re.search(policy_pattern, after, re.M)
         (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     assert report['numbered_packets_returned'], 'numbered loopback packets missing'

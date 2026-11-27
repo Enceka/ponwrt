@@ -28,6 +28,7 @@ CLEAN = 'saved=0 dirty=00 active=00 pending=0 scope=01000000 ready=0\n'
 HEALTH = 'ct_cpu_fallback: 0 healthy\ngeneration=49 allowed=1 failed=0\n'
 EXACT_OPTIONS = ['--run', '--special-tag', '--cover-slot', '1',
                  '--tuple-variants', '--exact-tuple', '--require-native']
+ZERO_OPTIONS = ['--run', '--special-tag', '--cover-slot', '1', '--service-zero', '--require-native']
 
 
 class BoardFixture:
@@ -46,19 +47,22 @@ class BoardFixture:
         self.cover = False
         self.cover_slot = 1
         self.classified = False
+        self.services = {}
         self.tuple_active = False
         self.ipv6 = '0'
         self.pool_clean = 'tuple=0 pool=00000000 pool_pending=0 leases=0'
+        self.owner_busy = False
 
     def classifier_status(self):
         if not self.cover and not self.classified:
             return CLEAN + 'service0=0 service1=0 ppe=0 errors=0 cover=00 routed=0\n' + self.pool_clean + '\n'
         active = (3 << (2 * self.cover_slot) if self.cover else 0)
-        active |= (3 << (2 * (self.cover_slot ^ 1)) if self.classified else 0)
+        active |= sum(3 << (2 * slot) for slot in self.services)
         cover = 1 << self.cover_slot if self.cover else 0
         pool = 'tuple=1 pool=00003fff pool_pending=0 leases=2' if self.tuple_active else self.pool_clean
         return (f'saved=1 dirty=0f active={active:02x} pending=0 scope=01000004 ready=1\n'
-                f'service0=8500 service1=0 ppe=0 errors=0 cover={cover:02x} routed=' +
+                f'service0={self.services.get(0, 0)} service1={self.services.get(1, 0)} '
+                f'ppe=0 errors=0 cover={cover:02x} routed=' +
                 str(int(self.routed)) + '\n ' + pool + '\n')
 
     def status(self):
@@ -79,12 +83,20 @@ class BoardFixture:
     def run(self, command_line, *, input, capture_output, timeout):
         if command_line[0] != 'ssh' or not capture_output or timeout != 25:
             raise AssertionError('unexpected subprocess invocation')
+        for option in ('BatchMode=yes', 'StrictHostKeyChecking=yes', 'ConnectTimeout=5',
+                       'ProxyCommand=/usr/bin/nc -4 -b en6 -G 4 %h %p'):
+            if option not in command_line:
+                raise AssertionError('missing SSH guard: ' + option)
+        if not any(option.startswith('UserKnownHostsFile=') for option in command_line):
+            raise AssertionError('missing SSH pin')
         guard = ('set -eu; test "$(cat /proc/sys/kernel/random/boot_id)" = ' + BOOT +
                  '; test "$(wc -l </proc/mtd)" = 1; ')
         if not command_line[-1].startswith(guard):
             raise AssertionError('missing boot/MTD guard')
         command = command_line[-1][len(guard):]
         self.commands.append(command)
+        if self.owner_busy and command.startswith('echo ') and command.endswith(' > ' + CLASSIFIER):
+            return subprocess.CompletedProcess(command_line, 1, b'', b'Device or resource busy\n')
         if command == self.fail_command and self.commands.count(command) == self.fail_occurrence:
             return subprocess.CompletedProcess(command_line, 1, b'', b'injected command failure\n')
         result = ''
@@ -112,12 +124,14 @@ class BoardFixture:
                 if value in ('cover 0', 'cover 1'):
                     self.cover = True
                     self.cover_slot = int(value.split()[1])
-                elif value in ('tuple 0 0x2134', 'set 0 0x2134', 'set 1 0x2134'):
-                    if not self.cover:
+                elif value.startswith(('tuple ', 'set ')):
+                    operation, slot, service = value.split()
+                    if operation == 'tuple' and not self.cover:
                         raise AssertionError('consumer installed before cover')
                     if value.startswith('tuple ') and self.tuple_active:
                         raise AssertionError('tuple reinstalled before release')
                     self.classified = True
+                    self.services[int(slot)] = int(service, 0)
                     self.tuple_active = value.startswith('tuple ')
                     self.routed = False
                 elif value == 'route':
@@ -128,10 +142,13 @@ class BoardFixture:
                     if int(value.split()[1]) == self.cover_slot:
                         self.cover = False
                     else:
-                        self.classified = self.tuple_active = False
+                        self.services.pop(int(value.split()[1]), None)
+                        self.classified = bool(self.services)
+                        self.tuple_active = False
                     self.routed = False
                 elif value == 'off':
                     self.routed = self.cover = self.classified = self.tuple_active = False
+                    self.services.clear()
                 else:
                     raise AssertionError('unexpected classifier command: ' + value)
             elif destination == PROBE + 'command':
@@ -147,14 +164,16 @@ class BoardFixture:
                     fields = value.split()
                     packet = (int(fields[1]), fields[2] if len(fields) > 2 else 'ipv4',
                               int(fields[3]) if len(fields) > 3 else 0)
-                    if self.cover and self.cover_slot == 0:
-                        ring = 2
-                    elif self.classified and packet[0] == 0x2134 and (not self.exact or packet[2] == 0):
-                        ring = 2 + 2 * (self.cover_slot ^ 1)
-                    elif self.cover:
-                        ring = 2 + 2 * self.cover_slot
-                    else:
-                        ring = 0
+                    ring = 0
+                    for slot in range(2):
+                        if self.cover and self.cover_slot == slot:
+                            ring = 2 + 2 * slot
+                            break
+                        if (slot in self.services and packet[0] == self.services[slot] and
+                            packet[1] in ('ipv4', 'ipv6', 'fragment') and
+                            (not self.tuple_active or packet[2] == 0)):
+                            ring = 2 + 2 * slot
+                            break
                     ring = self.ring_overrides.get(len(self.sent), ring)
                     self.sent.append(packet)
                     self.heads[ring] += 1
@@ -239,6 +258,211 @@ class LoopbackRunnerTests(unittest.TestCase):
         self.assertIn("echo 'tuple 0 0x2134' > " + CLASSIFIER, board.commands)
         self.assertNotIn("echo 'set 0 0x2134' > " + CLASSIFIER, board.commands)
         self.assert_restored(board)
+
+    def test_default_nonzero_three_packets(self):
+        board = BoardFixture(exact=False)
+        report = self.invoke(board, ['--run', '--special-tag'])
+        self.assertEqual(board.sent, [(0x2134, 'ipv4', 0), (0xa134, 'ipv4', 0), (0x2134, 'ipv4', 0)])
+        self.assertEqual([item['changed_rings'] for item in report['observations']], [[2], [4], [2]])
+        self.assertFalse(report['service_zero'])
+        self.assertEqual((report['service_a'], report['service_b']), (0x2134, 0xa134))
+        self.assertIn("echo 'set 0 0x2134' > " + CLASSIFIER, board.commands)
+        self.assertIn("echo 'set 1 0xa134' > " + CLASSIFIER, board.commands)
+        self.assertTrue(report['service_preserved'])
+        self.assert_restored(board)
+
+    def test_service_zero_both_families_aba(self):
+        board = BoardFixture(exact=False)
+        report = self.invoke(board, ZERO_OPTIONS)
+        self.assertTrue(report['service_zero'])
+        self.assertEqual((report['service_a'], report['service_b']), (0, 0xa134))
+        self.assertTrue(report['service_preserved'])
+        self.assertTrue(report['numbered_packets_returned'])
+        self.assertEqual(board.sent, [(service, kind, 0) for kind in ('ipv4', 'ipv6')
+                                     for service in (0, 0xa134, 0)])
+        self.assertEqual([item['expected_ring'] for item in report['observations']], [2, 4, 2] * 2)
+        self.assertIn("echo 'set 0 0' > " + CLASSIFIER, board.commands)
+        self.assertNotIn("echo 'set 0 0x2134' > " + CLASSIFIER, board.commands)
+        self.assertNotIn("echo 'set 1 0' > " + CLASSIFIER, board.commands)
+        for item in report['observations']:
+            self.assertIn('active=0f', item['state'])
+            self.assertIn('service0=0 service1=0', item['state'])
+            self.assertIn('cover=02', item['state'])
+        self.assert_restored(board)
+
+    def test_service_zero_wide_withdrawal_both_families(self):
+        board = BoardFixture(exact=False)
+        report = self.invoke(board, ZERO_OPTIONS + ['--withdraw-cycle'])
+        expected = [2, 4, 2] * 2 + [4, 4, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0]
+        self.assertEqual(len(board.sent), 18)
+        self.assertEqual([item['expected_ring'] for item in report['observations']], expected)
+        self.assertEqual([item['changed_rings'] for item in report['observations']], [[ring] for ring in expected])
+        self.assertEqual(board.sent[6:], [(service, kind, 0) for service in (0, 0, 0, 0xa134, 0, 0xa134)
+                                         for kind in ('ipv4', 'ipv6')])
+        self.assertEqual([item['transitions'] for item in report['observations'][6:]],
+                         [['clear 0', 'route'], [], ['set 0 0', 'route'], [],
+                          ['clear 1'], [], [], [], ['clear 0'], [], [], []])
+        for packet, active, cover in ((6, '0c', '02'), (8, '0f', '02'), (10, '03', '00'), (14, '00', '00')):
+            state = (self.output / f'send-{packet}-transition-0-state.stdout').read_text()
+            self.assertIn('active=' + active, state)
+            self.assertIn('cover=' + cover, state)
+            self.assertIn('service0=0 service1=0', state)
+        self.assert_restored(board)
+
+    def test_service_zero_existing_matrices(self):
+        for options, count, rings in (
+            (['--packet-matrix'], 14, [2, 4, 2, 4, 4, 4, 4, 4, 4, 4, 2, 4, 4, 4]),
+            (['--tuple-variants'], 20, [2, 4] * 10),
+            (['--tuple-variants', '--exact-tuple'], 20, [2] + [4] * 9 + [2] + [4] * 9),
+            (['--tuple-variants', '--exact-tuple', '--withdraw-cycle'], 28,
+             [2] + [4] * 9 + [2] + [4] * 9 + [4, 2, 2, 2, 0, 0, 0, 0]),
+        ):
+            with self.subTest(options=options):
+                board = BoardFixture()
+                report = self.invoke(board, ZERO_OPTIONS + options)
+                self.assertEqual(len(board.sent), count)
+                self.assertEqual({packet[0] for packet in board.sent}, {0, 0xa134})
+                self.assertEqual([item['expected_ring'] for item in report['observations']], rings)
+                self.assertEqual([item['changed_rings'] for item in report['observations']],
+                                 [[ring] for ring in rings])
+                self.assertEqual(report['exact_tuple'], '--exact-tuple' in options)
+                self.assertTrue(report['service_preserved'])
+                if '--exact-tuple' in options:
+                    self.assertIn("echo 'tuple 0 0' > " + CLASSIFIER, board.commands)
+                    self.assertNotIn("echo 'set 0 0' > " + CLASSIFIER, board.commands)
+                if '--withdraw-cycle' in options:
+                    self.assertEqual(report['observations'][21]['transitions'], ['tuple 0 0', 'route'])
+                    for packet in range(22, 26):
+                        self.assertIn('tuple=1 pool=00003fff pool_pending=0 leases=2',
+                                      report['observations'][packet]['state'])
+                self.assert_restored(board)
+
+    def test_service_zero_wrong_rings_stop_immediately(self):
+        matrices = [([], [2, 4, 2] * 2),
+                    (['--withdraw-cycle'], [2, 4, 2] * 2 + [4, 4, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0]),
+                    (['--tuple-variants', '--exact-tuple', '--withdraw-cycle'],
+                     [2] + [4] * 9 + [2] + [4] * 9 + [4, 2, 2, 2, 0, 0, 0, 0])]
+        for options, rings in matrices:
+            for index, ring in enumerate(rings):
+                with self.subTest(options=options, packet=index):
+                    board = BoardFixture(ring_overrides={index: 4 if ring != 4 else 2})
+                    with self.assertRaisesRegex(AssertionError, 'expected RX'):
+                        self.invoke(board, ZERO_OPTIONS + options)
+                    self.assertEqual(len(board.sent), index + 1)
+                    self.assert_restored(board)
+
+    def test_service_zero_packet_and_classifier_mismatches(self):
+        mutations = [
+            ('rx_msg0=00000000', 'rx_msg0=00004000', 0),
+            ('rx_msg0=284d0000', 'rx_msg0=00000000', 1),
+            ('rx_msg1=00400000', 'rx_msg1=00200000', 0),
+            ('rx_sequence=1 ', 'rx_sequence=0 ', 0),
+            ('received=1 ', 'received=0 ', 0),
+            ('tx_kind=ipv4 ', 'tx_kind=ipv6 ', 0),
+            ('rx_kind=ipv6 ', 'rx_kind=ipv4 ', 3),
+            ('active=0f', 'active=0c', 0),
+            ('cover=02', 'cover=03', 0),
+            ('service0=0 ', 'service0=8500 ', 0),
+            ('ppe=0 ', 'ppe=1 ', 0),
+            ('routed=1', 'routed=0', 0),
+            ('pool_pending=0', 'pool_pending=1', 0),
+            ('ct_cpu_fallback: 0 ', 'ct_cpu_fallback: 1 ', 0),
+            ('allowed=1 failed=0', 'allowed=0 failed=0', 0),
+        ]
+        for original, replacement, packet in mutations:
+            with self.subTest(field=original, packet=packet):
+                board = BoardFixture(corrupt=lambda index, state: state.replace(original, replacement)
+                                     if index == packet else state)
+                with self.assertRaises(AssertionError):
+                    self.invoke(board, ZERO_OPTIONS)
+                self.assertEqual(len(board.sent), packet + 1)
+                self.assert_restored(board)
+
+    def test_service_zero_state_checked_before_next_packet(self):
+        for command, occurrence, packet_count in (('set 0 0', 1, 0), ('clear 0', 1, 6),
+                                                 ('set 0 0', 2, 8), ('clear 1', 1, 10),
+                                                 ('clear 0', 2, 14)):
+            with self.subTest(command=command, occurrence=occurrence):
+                board = BoardFixture()
+                original_status = board.classifier_status
+                target = 'echo ' + shlex.quote(command) + ' > ' + CLASSIFIER
+
+                def wrong_state():
+                    state = original_status()
+                    if board.commands.count(target) == occurrence and len(board.sent) == packet_count:
+                        if board.commands[-1] == 'cat ' + CLASSIFIER + '; cat ' + CONFIG:
+                            return state.replace('service0=0', 'service0=8500')
+                    return state
+
+                board.classifier_status = wrong_state
+                with self.assertRaisesRegex(AssertionError, 'service0 classifier state mismatch'):
+                    self.invoke(board, ZERO_OPTIONS + ['--withdraw-cycle'])
+                self.assertEqual(len(board.sent), packet_count)
+                self.assert_restored(board)
+
+    def test_service_zero_command_failures_and_retention(self):
+        for value, destination, occurrence, count in (
+            ('set 0 0', CLASSIFIER, 1, 0), ('send 0 ipv4', PROBE + 'command', 1, 0),
+            ('send 0 ipv6', PROBE + 'command', 1, 3), ('clear 0', CLASSIFIER, 1, 6),
+            ('set 0 0', CLASSIFIER, 2, 8), ('clear 1', CLASSIFIER, 1, 10),
+        ):
+            with self.subTest(value=value, occurrence=occurrence):
+                board = BoardFixture(fail_command='echo ' + shlex.quote(value) + ' > ' + destination,
+                                     fail_occurrence=occurrence)
+                with self.assertRaises((subprocess.CalledProcessError, RuntimeError)):
+                    self.invoke(board, ZERO_OPTIONS + ['--withdraw-cycle'])
+                self.assertEqual(len(board.sent), count)
+                self.assert_restored(board)
+        for value, destination in (('off', CLASSIFIER), ('restore', PROBE + 'command')):
+            with self.subTest(cleanup=value):
+                board = BoardFixture(fail_command='echo ' + value + ' > ' + destination)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.invoke(board, ZERO_OPTIONS + ['--withdraw-cycle'])
+                self.assertTrue(board.loaded)
+                self.assertTrue(board.prepared)
+                self.assertEqual(board.ipv6, '1')
+                self.assertNotIn('rmmod ct_pon_loopback', board.commands)
+                self.assertFalse((self.output / 'report.json').exists())
+                label = 'classifier-off' if value == 'off' else 'restore'
+                self.assertEqual(json.loads((self.output / (label + '.status.json')).read_text())['returncode'], 1)
+
+    def test_service_zero_owner_busy_retains_module(self):
+        board = BoardFixture()
+        board.owner_busy = True
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.invoke(board, ZERO_OPTIONS)
+        self.assertTrue(board.loaded)
+        self.assertTrue(board.prepared)
+        self.assertEqual(board.sent, [])
+        self.assertNotIn('echo restore > ' + PROBE + 'command', board.commands)
+        self.assertNotIn('rmmod ct_pon_loopback', board.commands)
+        self.assertIn('Device or resource busy', (self.output / 'cover.stderr').read_text())
+
+    def test_service_zero_preflight_and_argument_guards(self):
+        board = BoardFixture()
+        self.assertIsNone(self.invoke(board, [option for option in ZERO_OPTIONS if option != '--run']))
+        self.assertEqual(len(board.commands), 1)
+        self.assertEqual(board.sent, [])
+        for options in (['--service-zero'], ['--service-zero', '--special-tag'],
+                        ['--service-zero', '--cover-slot', '1'],
+                        ['--service-zero', '--special-tag', '--cover-slot', '0'],
+                        ZERO_OPTIONS + ['--sif-sweep']):
+            with self.subTest(options=options):
+                board = BoardFixture()
+                with self.assertRaises(SystemExit) as error:
+                    self.invoke(board, options)
+                self.assertEqual(error.exception.code, 2)
+                self.assertEqual(board.commands, [])
+        for original, replacement in (('ppe=0', 'ppe=1'), ('pool=00000000', 'pool=00000001'),
+                                      ('pending=0', 'pending=1'), ('active=00', 'active=03')):
+            with self.subTest(preflight=original):
+                board = BoardFixture()
+                original_status = board.classifier_status
+                board.classifier_status = lambda: original_status().replace(original, replacement)
+                with self.assertRaises(AssertionError):
+                    self.invoke(board, ZERO_OPTIONS)
+                self.assertEqual(len(board.commands), 1)
+                self.assertFalse(board.loaded)
 
     def test_wide_service_regression(self):
         board = BoardFixture(exact=False)

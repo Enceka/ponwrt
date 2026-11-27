@@ -115,7 +115,89 @@ withdraws it with `enable=false`.
 Patch `999-zf` adds matching zero-service CPU diagnostics, including exact
 tuple checks and coexistence with typed wildcard covers. The independent
 host lifecycle, fault-injection and full transmit tests are documented in
-`../service0/README.md`. The existing board runner keeps its nonzero matrix.
+`../service0/README.md`. The board runner defaults to its existing nonzero
+matrix; `--service-zero` selects the zero-service matrix below.
+
+## Service0 without fiber
+
+Use a RAM kernel and matching loopback module containing the service0 fix
+from commit `af7a05b` (`999-zf`). Keep the optical TX_DISABLE hog high,
+MTD empty, PON PPE qualification closed, and the NPU owner released before
+starting the CPU diagnostic. The runner retains boot UUID and SSH host-key
+pins on every remote command, checks idle classifier state and tuple pool,
+and leaves owner arbitration to the existing kernel interfaces. An owner
+conflict returns an error; the runner does not release another owner.
+
+`--service-zero` requires `--special-tag --cover-slot 1` and rejects
+`--sif-sweep`. It sets A=0 and B=0xa134, installs `cover 1` followed by
+`set 0 0`, then enables the audited route. The exact rule selects RX2;
+the typed wildcard cover selects RX4. The default zero matrix sends
+A/B/A for IPv4, then A/B/A for IPv6: six packets with expected rings
+`2,4,2,2,4,2`. A zero service is always a configured key; explicit
+`clear` and `off` commands withdraw rules.
+
+Add `--withdraw-cycle` for 18 packets. After the six initial packets,
+each row below sends IPv4 followed by IPv6; its commands run once before
+the IPv4 packet:
+
+| Transition | Service | Expected ring for both families |
+| --- | --- | --- |
+| `clear 0`, `route` | 0 | RX4 |
+| `set 0 0`, `route` | 0 | RX2 |
+| `clear 1` | 0 | RX2 |
+| None | 0xa134 | RX0 |
+| `clear 0` | 0 | RX0 |
+| None | 0xa134 | RX0 |
+
+The runner checks active-row bits, cover bits, the zero service values,
+pending/ready state and closed qualification after every transition and
+packet. Each packet must return the current sequence, requested kind,
+complete 16-bit service, SPORT2 and expected receive ring. A wrong service,
+source or ring stops the matrix immediately and enters the existing cleanup
+path. `report.json` includes `service_zero`, numeric `service_a`/`service_b`,
+each transmitted and returned service, expected/observed ring and transition
+commands. Transition readbacks are saved before the next command or packet.
+
+Run from the ponwrt repository with the current RAM boot's pins and module:
+
+```sh
+python3 -B target/linux/airoha/tests/pon_offload/run_loopback_probe.py \
+  --pin /absolute/path/to/known-hosts --boot CURRENT_RAM_BOOT_UUID \
+  --identity /absolute/path/to/ssh-key \
+  --module /absolute/path/to/matching/ct_pon_loopback.ko --sha256 MODULE_SHA256 \
+  --output /absolute/path/to/new-service0-evidence \
+  --special-tag --cover-slot 1 --service-zero --withdraw-cycle --require-native
+```
+
+This command performs preflight only. Add `--run` to execute the 18-packet
+matrix. Omit `--identity` when the pinned SSH configuration already selects
+the key. Each invocation needs a new output directory.
+
+The existing tuple modes also accept `--service-zero`: add
+`--tuple-variants --exact-tuple` to run `tuple 0 0` with all five tuple
+variants for both services and families. This sends 20 packets, with only
+the two A/variant0 packets selecting RX2. Keep `--withdraw-cycle` for the
+existing 28-packet tuple withdrawal/reinstall matrix, using service0 for A.
+Its lease release, reacquisition and retention checks remain enabled.
+`--tuple-variants` without `--exact-tuple` runs 20 wide-service packets;
+`--packet-matrix` runs the existing 14 packet-kind cases with A=0. These
+two optional matrices replace the basic A/B/A matrix and retain their
+existing option restrictions.
+
+Cleanup sends classifier `off`, restores the module's mapping and ten
+registers, verifies idle classifier/pool state, unloads the module, and
+restores IPv6 configuration. Failed withdrawal or restoration retains
+the loaded module and per-command stdout/stderr/status evidence for recovery.
+Default runs without `--service-zero` keep A=0x2134, B=0xa134 and their
+existing packet sequences and commands.
+
+Host validation on 2026-11-27 passes 28 tests, including both zero-service
+families, all existing optional matrices, every wrong destination in the
+zero basic/withdrawal/exact-tuple matrices, service/source/sequence/state
+corruption, command failures, owner conflicts and failed cleanup retention.
+The tests mock SSH locally. The log is in the enclosing workspace at
+`build/pon-service0-runner-20261127/unittest-v1.log`; this change prepares
+the executable board procedure without running it on a device.
 
 All frames target the local `pon0` MAC and use a locally administered
 random source MAC. IPv4 uses documentation addresses 192.0.2.1/192.0.2.2;
