@@ -166,6 +166,25 @@ ASan/UBSan。PON 更新事务通过 74 个场景，含 27 个 MMIO 故障位置�
 旧版无 owner 路径保留独立回归。991–993 联合通过 Linux 6.18.60 AArch64
 vmlinux 编译、modpost 和链接，无警告。验收报告位于上述 build 目录。
 
-下一步完成来源/业务授权、ER 队列生命周期与重开回调，接着隔离同 tuple 的
-LAN/PON 软件候选与硬件表项，开放 PON PPE 准入后做实板验收。当前设备沿用
-之前通过验收的 RAM 镜像。
+`994` 接通 owner 与 PON ER 队列生命周期。准备阶段绑定 GDM2/WAN lower、
+完整 GEM 映射和 generation；交付时检查完整 ring 配置、映射对象、所有 16 位
+GEM 以及接口状态。BIND 丢 ACK 保留 DMA 和引用，关闭先提升 epoch 并完成
+FE/QUIET/drain，再用旧 ring 的精确配置 STOP/UNBIND。失败重试继续原阶段，
+最后一个 epoch 留给关闭。故障立即切换 CPU 路由，写失败由异步工作重试。
+
+`995` 在首个 AUTH BEGIN 前校验整批 1–32 条规则，拒绝重复硬件 tuple、token
+和 row，然后依次 ADD、ARM。`996` 将发布接到 CLOSED owner 和有效 ER，
+每条服务核对当前映射；BEGIN/ADD/ARM 的模糊失败须先关闭再提升 epoch。
+发布和 READY 查询后均复查 generation。新 renew 入口先完整关闭旧代次，
+释放旧队列，再按新 generation 建立关闭态，可继续准备并重新授权。
+
+AUTH 发布测试运行真实固件 parser/授权表，2,644 次发布和 11 项运行期负控制
+通过；owner/ER/授权组合通过 76,139 项检查（含全部 65,536 个 GEM 值）与
+17 项负控制。PON 更新事务维持 74 个场景、27 个 MMIO 故障位置和六项负控制。
+这些主机测试使用 ASan/UBSan；994–996 完整 AArch64 内核编译和链接纳入本轮
+验收，产物保存在 `build/pon-er-consumer-20261127/`。
+
+下一步补齐 PPE/FE/routes 重开、owner 失效通知和 DMA reset 退役，接着隔离
+同 tuple 的 LAN/PON 软件候选与硬件表项，再开放 PON 准入并构建镜像刷测。
+当前内部准备路径支持 GPON GEM 映射；EPON LLID 对应关系继续单独完善。
+设备沿用之前通过验收的 RAM 镜像。
