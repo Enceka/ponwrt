@@ -144,3 +144,46 @@ is at `0x1261c`; `ifc_lut1_rule_parser` is at `0x1da84` in the existing
 `build/private-ram-trials/ct230-ipv6/ifc.dis` investigation. Cross-type chains
 remain a separate path because the SINF branch at `0x2b34..0x2bc4` changes
 the parser's type and stop selection.
+
+## Service-aware loopback and recovery update
+
+The RAM loopback experiment now returns numbered packets from SPORT2 with
+the complete service ID. Default special-tag configuration returns service
+zero; independently reconstructed selectors 16..31 plus RX/TX mode1 return
+`2134/a134/2134` for three corresponding packets. Both control and tagged
+runs restore all ten observed GDM2 registers and unload the temporary module.
+Details and the reproducible runner are in `ram_loopback/README.md`.
+
+Default CPU routing still sends these packets to WAN RX0. A direct PPE2
+route experiment exposed the remaining unmatched-ingress problem: native
+firmware stopped its FE owner and the host entered sticky CPU fallback.
+The retained evidence is `build/pon-loopback-board.i9nyacd5/run-classifier/`
+in the enclosing workspace. Before repeating a classifier route experiment,
+publish all-source2 CPU protection and measure rule priority with CPU-only
+actions; native firmware currently expects its established source24 path.
+
+That fallback also exposed a cleanup bug: the sysfs dispatcher rejected
+`off` once `ct_stopping` was set. Patch 981 permits withdrawal in that state
+while continuing to reject set/clear. Its extracted production dispatcher,
+stop and pending-command recovery pass 1,462 cases in normal/ASan/UBSan runs
+and catch 28 runtime mutations. This includes six stopping-state withdrawal
+cases and six outstanding-command retry cases.
+
+Patch 981 was built into the new RAM FIT:
+`b9b52b1e557fc5513f0ade9633284d2221ee2c988f8520d2357b209310e0d0e2`.
+Kernel SHA256:
+`cfc6ebd5a600ce1ba30f8d0ef0d81e90c5f3a350c2996a39b2d5e34f2536b82d`.
+It preserves the baseline DTB and all 1,101 initramfs entries. Current boot
+`7c1b2f70-6b0e-438b-8286-7009343efdd9` passed three normal board classifier
+cycles and full withdrawal, Wi-Fi HTTPS 200, and native policy restoration
+to `generation=49 allowed=1 failed=0`. The stopping-state fault is covered
+by the extracted production tests; this board run checked the normal path.
+Evidence: `build/pon-cpu-probe-981.t_mqn98y/`.
+
+The full-packet stock oracle and pure tuple encoder are now separate
+reproducible artifacts. See `IFC-TUPLE-PACKET.md`, `IFC-TUPLE.md` and
+`IFC-FIELD-LAYOUT.md`. The field-layout audit corrected an invalid type0/
+type1 combination: type0 page7 bits9:8 are DMAC_TYPE, whereas the L4-valid
+flags at that position belong to type1. Packet-length/fragment guards and
+shared LUT lifetime still need implementation before tuple consumers become
+eligible for hardware publication.
