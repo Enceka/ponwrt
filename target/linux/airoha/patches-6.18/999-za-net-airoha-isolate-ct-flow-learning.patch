@@ -1,0 +1,88 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: isolate host learning from owned PON banks
+
+Check the physical RX bank before matching host IP candidates in native
+pair mode. PON candidates also retain their admitted wired or WLAN source
+class. Reject host learning from bank1 before reading SRAM whenever the
+NPU lifecycle owner has claimed it, including stale RX notifications.
+
+Keep native L2 learning on its dedicated path, prevent CT IP misses from
+falling through to the generic L2 table, and only retire a legacy subflow
+when its recorded hardware row is the row being inspected. Preserve the
+existing global tuple exclusion until all admitted ingress domains have
+an exclusive hardware classifier.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1656,6 +1656,27 @@
+ 	return true;
+ }
+ 
++static bool airoha_ppe_ct_flow_bank_matches(struct airoha_ppe *ppe,
++					  struct airoha_flow_table_entry *entry,
++					  u32 hash, bool rx_wlan)
++{
++	u32 bank = hash / PPE_SRAM_NUM_ENTRIES;
++	bool wired;
++
++	if (!ppe->ct_native_pairs)
++		return true;
++	if (bank != (rx_wlan ? 0 : 1))
++		return false;
++	if (entry->ct_bridge)
++		return rx_wlan;
++	if (!airoha_ppe_ct_pon_flow(entry))
++		return true;
++	if (!entry->pon_ingress_dev && !entry->ct_ingress_ifindex)
++		return false;
++	wired = entry->pon_ingress_dev || entry->ct_ingress_gdm;
++	return wired != rx_wlan;
++}
++
+ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 					struct sk_buff *skb,
+ 					u32 hash, bool rx_wlan,
+@@ -1672,6 +1693,10 @@
+ 	if (ppe->ct_stopping)
+ 		goto unlock;
+ 
++	if (ppe->ct_host_ppe &&
++	    (hash >= airoha_ppe_get_total_sram_num_entries(ppe) ||
++	     (ppe->ct_npu_owner && hash >= PPE_SRAM_NUM_ENTRIES)))
++		goto unlock;
+ 	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 	if (!hwe)
+ 		goto unlock;
+@@ -1694,6 +1719,8 @@
+ 	index = airoha_ppe_foe_get_entry_hash(ppe, hwe);
+ 	hlist_for_each_entry_safe(e, n, &ppe->foe_flow[index], list) {
+ 		if (e->type == FLOW_TYPE_L2_SUBFLOW) {
++			if (e->hash != hash)
++				continue;
+ 			state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe->ib1);
+ 			if (state != AIROHA_FOE_STATE_BIND) {
+ 				e->hash = 0xffff;
+@@ -1703,6 +1730,9 @@
+ 			continue;
+ 		}
+ 
++		if (ppe->ct_host_ppe &&
++		    !airoha_ppe_ct_flow_bank_matches(ppe, e, hash, rx_wlan))
++			continue;
+ 		if (ppe->ct_host_ppe && !airoha_ppe_ct_pon_flow_current(ppe, e, skb))
+ 			continue;
+ 		if (e->ct_bridge &&
+@@ -1725,10 +1755,12 @@
+ 		commit_done = true;
+ 	}
+ 
+-	if (commit_done)
++	if (commit_done || ppe->ct_host_ppe)
+ 		goto unlock;
+ 
+ l2_lookup:
++	if (ppe->ct_host_ppe)
++		goto unlock;
+ 	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 				   airoha_l2_flow_table_params);

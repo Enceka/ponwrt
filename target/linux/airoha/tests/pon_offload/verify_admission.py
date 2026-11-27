@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import resource
+import signal
 import subprocess
 
 def function(text, signature):
@@ -42,6 +43,7 @@ def main():
         'static u32 airoha_ppe_ct_epoch_locked(',
         'static u32 airoha_ppe_ct_route_wlan_epoch(',
         'static bool airoha_ppe_ct_pon_flow_current(',
+        'static bool airoha_ppe_ct_flow_bank_matches(',
         'static bool airoha_ppe_foe_compare_entry(',
         'static void airoha_ppe_foe_insert_entry(',
         'static int airoha_ppe_foe_flow_commit_entry(',
@@ -62,13 +64,16 @@ def main():
         c = out/(label+'.c'); c.write_text(template)
         exe = out/label
         build = subprocess.run(['cc', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
-                                '-Wno-unused-but-set-variable', '-Wno-sign-compare', '-fsanitize=address,undefined', str(c), '-o', str(exe)],
+                                '-Wno-unused-but-set-variable', '-Wno-sign-compare', '-fsanitize=address,undefined',
+                                '-I', str(Path(__file__).parent), str(c), '-o', str(exe)],
                                capture_output=True, text=True)
         (out/(label+'.build.log')).write_text(build.stdout+build.stderr)
         assert build.returncode == 0, build.stderr
         result = subprocess.run([str(exe)], capture_output=True, text=True)
         (out/(label+'.log')).write_text(result.stdout+result.stderr)
         assert (result.returncode == 0) == expected, (label, result.returncode, result.stdout, result.stderr)
+        if not expected:
+            assert result.returncode == -signal.SIGABRT and 'assert' in result.stderr.lower(), (label, result.returncode, result.stderr)
         return result.stdout.strip()
     result = run('admission', functions, True)
     mutations = {
@@ -95,6 +100,18 @@ def main():
         'omit-gdm-source-device': ('skb->dev != netdev_from_priv(e->ct_ingress_gdm)', 'false'),
         'permit-pon-tuple-collision': ('airoha_ppe_ct_pon_flow(e) || airoha_ppe_ct_pon_flow(prev)', '(airoha_ppe_ct_pon_flow(e), airoha_ppe_ct_pon_flow(prev), false)'),
         'mix-pon-lan1-source': ('*port = sport - 1;', '*port = sport == 2 ? 3 : sport - 1;'),
+        'learn-owned-bank': ('(ppe->ct_npu_owner && hash >= PPE_SRAM_NUM_ENTRIES)', 'false'),
+        'learn-outside-sram': ('hash >= airoha_ppe_get_total_sram_num_entries(ppe)',
+                              '((void)airoha_ppe_get_total_sram_num_entries(ppe), false)'),
+        'ignore-physical-bank': ('bank != (rx_wlan ? 0 : 1)', '((void)bank, false)'),
+        'bridge-from-wired': ('if (entry->ct_bridge)\n\t\treturn rx_wlan;',
+                             'if (entry->ct_bridge)\n\t\treturn true;'),
+        'ignore-pon-source-class': ('return wired != rx_wlan;', '(void)wired; return true;'),
+        'accept-unspecified-pon-source': ('!entry->pon_ingress_dev && !entry->ct_ingress_ifindex', 'false'),
+        'skip-bank-check-at-bind': ('!airoha_ppe_ct_flow_bank_matches(ppe, e, hash, rx_wlan)',
+                                   '(airoha_ppe_ct_flow_bank_matches(ppe, e, hash, rx_wlan), false)'),
+        'retire-another-subflow': ('if (e->hash != hash)', 'if (false)'),
+        'ct-l2-fallback': ('l2_lookup:\n\tif (ppe->ct_host_ppe)\n\t\tgoto unlock;', 'l2_lookup:'),
     }
     for signature, label in ((
             'static bool airoha_ppe_ct_pon_rule_supported(', 'omit-hardware-admission-qualifier'),
@@ -124,7 +141,10 @@ def main():
     report = dict(passed=True, result=result, negative_controls=list(mutations),
                   sanitizers=['address','undefined'], source=str(source),
                   source_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                                 for p in (driver/'airoha_ppe.c',driver/'airoha_eth.c',driver/'airoha_eth.h',source/'net/netfilter/nf_flow_table_path.c')})
+                                 for p in (driver/'airoha_ppe.c',driver/'airoha_eth.c',driver/'airoha_eth.h',source/'net/netfilter/nf_flow_table_path.c')},
+                  test_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                               for p in (Path(__file__), Path(__file__).with_name('admission_test.c'),
+                                         Path(__file__).with_name('learning_isolation_test.inc'))})
     (out/'report.json').write_text(json.dumps(report, indent=2)+'\n')
     print(result)
     print('PASS', len(mutations), 'runtime-caught negative controls')

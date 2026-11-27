@@ -25,6 +25,7 @@ typedef uint16_t __u16;
 #define READ_ONCE(v) (v)
 #define DECLARE_FLEX_ARRAY(t,n) t n[0]
 #define PPE_ENTRY_SIZE 80
+#define PPE_SRAM_NUM_ENTRIES 8192
 #define ETH_ALEN 6
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86dd
@@ -117,12 +118,16 @@ struct airoha_flow_table_entry {
 };
 struct airoha_ppe {
  struct airoha_eth *eth;bool ct_host_ppe,ct_pon_qualified,ct_stopping,ct_native_pairs,ct_bridge_failed;int ct_bridge_flows;
+ void *ct_npu_owner;
  struct airoha_flow_table_entry *foe_flow[1];int l2_flows;
  u32 ct_wlan_epoch[2][151];bool ct_wlan_blocked[2][151];
 };
 static int ppe_lock,airoha_l2_flow_table_params;
 static struct airoha_foe_entry learned;
 static unsigned commits,links,cookies,removed_cookies;
+static unsigned row_reads,subflow_removals,l2_lookups,subflow_commits,native_binds;
+static u32 selected_row=5;
+static struct airoha_flow_table_entry *l2_candidate;
 static int flow_offload_mutex=1,airoha_flow_table_params,index_error;
 #define lockdep_assert_held(p) assert(*(p))
 static void spin_lock_bh(int *l) {assert(!*l);*l=1;}
@@ -135,17 +140,18 @@ static int airoha_ppe_foe_l2_flow_commit_entry(struct airoha_ppe *p,struct airoh
 static int rhashtable_insert_fast(int *t,int *n,int p) {(void)t;(void)n;(void)p;if(index_error)return index_error;cookies++;return 0;}
 static void rhashtable_remove_fast(int *t,int *n,int p) {(void)t;(void)n;(void)p;assert(cookies);cookies--;removed_cookies++;}
 #define hlist_for_each_entry_safe(e,n,h,m) for((e)=*(h),(n)=NULL;(e);(e)=NULL)
-static struct airoha_foe_entry *airoha_ppe_foe_get_entry_locked(struct airoha_ppe *p,u32 hash) {(void)p;assert(ppe_lock && hash==5);return &learned;}
+static u32 airoha_ppe_get_total_sram_num_entries(struct airoha_ppe *ppe) {(void)ppe;return 2*PPE_SRAM_NUM_ENTRIES;}
+static struct airoha_foe_entry *airoha_ppe_foe_get_entry_locked(struct airoha_ppe *p,u32 hash) {(void)p;assert(ppe_lock && hash==selected_row);row_reads++;return &learned;}
 static bool airoha_is_7581(struct airoha_eth *eth) {(void)eth;return true;}
-static void airoha_ct_native_pair_bind(struct airoha_ppe *p,struct sk_buff *s,u32 h,const struct airoha_ct_bridge_peer *peer) {(void)p;(void)s;(void)h;(void)peer;assert(false);}
+static void airoha_ct_native_pair_bind(struct airoha_ppe *p,struct sk_buff *s,u32 h,const struct airoha_ct_bridge_peer *peer) {(void)p;(void)s;(void)h;(void)peer;native_binds++;}
 static u32 airoha_ppe_foe_get_entry_hash(struct airoha_ppe *p,const struct airoha_foe_entry *h) {(void)p;(void)h;return 0;}
-static void airoha_ppe_foe_remove_flow(struct airoha_ppe *p,struct airoha_flow_table_entry *e) {(void)p;(void)e;assert(false);}
+static void airoha_ppe_foe_remove_flow(struct airoha_ppe *p,struct airoha_flow_table_entry *e) {(void)p;assert(ppe_lock && e->hash==0xffff);subflow_removals++;}
 static bool airoha_ppe_ct_bridge_current(struct airoha_ppe *p,struct airoha_flow_table_entry *e,const struct airoha_ct_bridge_peer *peer,struct sk_buff *s) {(void)p;(void)e;(void)peer;(void)s;return true;}
-static int airoha_ppe_foe_commit_entry(struct airoha_ppe *p,struct airoha_foe_entry *h,u32 hash,bool wlan) {(void)p;(void)wlan;assert(ppe_lock && hash==5);learned=*h;commits++;return 0;}
+static int airoha_ppe_foe_commit_entry(struct airoha_ppe *p,struct airoha_foe_entry *h,u32 hash,bool wlan) {(void)p;(void)wlan;assert(ppe_lock && hash==selected_row);learned=*h;commits++;return 0;}
 static struct ethhdr *eth_hdr(struct sk_buff *s) {return &s->hdr;}
 static void airoha_ppe_foe_set_bridge_addrs(struct airoha_foe_bridge *b,struct ethhdr *h) {(void)b;(void)h;}
-static struct airoha_flow_table_entry *rhashtable_lookup_fast(int *t,struct airoha_foe_bridge *b,int p) {(void)t;(void)b;(void)p;return NULL;}
-static void airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *p,struct airoha_flow_table_entry *e,u32 h,bool w) {(void)p;(void)e;(void)h;(void)w;assert(false);}
+static struct airoha_flow_table_entry *rhashtable_lookup_fast(int *t,struct airoha_foe_bridge *b,int p) {(void)t;(void)b;(void)p;l2_lookups++;return l2_candidate;}
+static void airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *p,struct airoha_flow_table_entry *e,u32 h,bool w) {(void)p;(void)e;(void)h;(void)w;subflow_commits++;}
 
 #define NF_FLOW_TABLE_ENCAP_MAX 2
 enum {DEV_PATH_ETHERNET,DEV_PATH_IEEE80211,DEV_PATH_DSA,DEV_PATH_MTK_WDMA,DEV_PATH_VLAN,DEV_PATH_PPPOE,DEV_PATH_BRIDGE};
@@ -184,7 +190,7 @@ static unsigned run_bind(struct airoha_ppe *ppe,struct airoha_flow_table_entry *
  skb.hdr.h_proto=htons(rx_proto?rx_proto:(FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE,e->data.ib1)==PPE_PKT_TYPE_IPV6_ROUTE_5T?ETH_P_IPV6:ETH_P_IP));
  ppe->foe_flow[0]=e;learned=e->data;
  learned.ib1=(learned.ib1&~AIROHA_FOE_IB1_BIND_STATE)|FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,AIROHA_FOE_STATE_UNBIND);
- commits=0;airoha_ppe_foe_insert_entry(ppe,&skb,5,false,NULL);assert(!ppe_lock);return commits;
+ selected_row=5;commits=0;airoha_ppe_foe_insert_entry(ppe,&skb,5,false,NULL);assert(!ppe_lock);return commits;
 }
 
 static unsigned test_wlan_epoch(struct airoha_ppe *ppe, struct net_device *input,
@@ -240,6 +246,8 @@ static unsigned test_wlan_epoch(struct airoha_ppe *ppe, struct net_device *input
  assert(airoha_ppe_foe_flow_commit_entry(ppe, &flow) == -ESTALE && !ppe->foe_flow[0]);
  return 13;
 }
+
+#include "learning_isolation_test.inc"
 
 int main(void) {
  unsigned cases=0;
@@ -401,6 +409,7 @@ int main(void) {
   else if(!err)assert(portid!=1);
   cases++;
  }
+ cases += test_learning_isolation(&eth, &pon, &wired, &wifi);
  printf("PASS %u production PON admission, actual learn/bind, lower-path and source-port cases\n",cases);
  return 0;
 }

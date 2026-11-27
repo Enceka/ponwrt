@@ -5,19 +5,19 @@ by `--source`. They need a C compiler supporting AddressSanitizer and
 UndefinedBehaviorSanitizer. All outputs go into a fresh `--output` directory.
 
 ```sh
-python3 verify_admission.py --source /path/to/linux-after-964 --output /path/to/admission-results
+python3 verify_admission.py --source /path/to/linux-after-999-za --output /path/to/admission-results
 python3 verify_pon_flows.py --source /path/to/linux --output /path/to/flow-results
 ```
 
 Files to keep together:
 
-- `verify_admission.py` and `admission_test.c`
+- `verify_admission.py`, `admission_test.c` and `learning_isolation_test.inc`
 - `verify_pon_flows.py` and `pon_flows_test.c`
 
 The admission runner executes the production exact-match validator, ingress
 resolution, PON gate/admission functions, actual learn/bind function, cookie
 publication, duplicate-tuple exclusion, netfilter lower-path parser and EN7581
-source-port decoder. It covers 721 cases and 21 runtime mutation controls.
+source-port decoder. It covers 1,699 cases and 30 runtime mutation controls.
 The retirement runner executes checked row comparison/removal, the two-way
 device walk and the actual flow-destroy function. It covers 62 cases and 7
 runtime mutation controls. SRAM reads/writes, allocation indices and kernel
@@ -25,6 +25,26 @@ primitives use deterministic test doubles; ownership and retry decisions run
 the extracted production C. Host transaction/publication is tested separately
 by `verify_transaction.py`; the retirement runner does not depend on the host
 `airoha_eth_pon_commit_config()` implementation.
+
+## Learning bank isolation
+
+Patch `999-za` rejects host learning from bank1 as soon as the NPU lifecycle
+owner claims it, before any SRAM read or candidate hash update. Out-of-range
+SRAM rows are rejected at the same entry point. In native-pair mode, ordinary
+IP learning accepts WLAN notifications on bank0 and wired notifications on
+bank1. PON candidates additionally check their admitted physical source class;
+bridge candidates require WLAN. Native L2 rows retain their dedicated binder.
+
+A CT IP miss exits without looking up the generic L2 table. Legacy L2 subflow
+cleanup checks the exact saved hardware row, so a notification for another row
+in the same candidate bucket leaves that subflow intact. Legacy non-CT L2
+forwarding remains covered by positive tests. Global tuple exclusion remains
+in place, including across PON service identities.
+
+The added matrix covers IPv4/IPv6, TCP/UDP, both bank boundaries, out-of-range
+rows, owner-present and owner-absent states, wired/WLAN/PON inputs, native L2
+dispatch and subflow collisions. All mutation controls must trigger a runtime
+assertion; a compiler or sanitizer failure is not accepted as a detected mutant.
 
 ## Production gate
 
