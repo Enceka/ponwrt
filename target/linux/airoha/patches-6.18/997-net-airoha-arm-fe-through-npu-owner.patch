@@ -1,0 +1,66 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: arm shared FE through its lifecycle owner
+
+Arm only the exact acknowledged owner QUIESCE identity. Retain that
+identity and arm_pending across ambiguous mailbox results, and check the
+firmware acknowledgement on retries, including an already armed identity.
+Keep LAN IFC snapshots, rows and health work outside owner ARM.
+
+Require a newer QUIESCE epoch after any ARM attempt before recording a
+pending close. Reserve the final epoch for that close operation.
+
+--- a/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_fe_native.h
+@@ -169,6 +169,8 @@
+ 		    generation < ppe->ct_fe.generation ||
+ 		    (epoch == ppe->ct_fe.epoch && generation != ppe->ct_fe.generation))
+ 			return -ESTALE;
++		if ((ppe->ct_fe.arm_pending || ppe->ct_fe.armed) && epoch == ppe->ct_fe.epoch)
++			return -ESTALE;
+ 		ppe->ct_fe.pending_epoch = epoch;
+ 		ppe->ct_fe.pending_generation = generation;
+ 		ppe->ct_fe.pending = true;
+@@ -186,6 +188,43 @@
+ 	ppe->ct_fe.armed = false;
+ 	ppe->ct_fe.active = false;
+ 	ppe->ct_fe.owner_quiesced = true;
++	return 0;
++}
++
++static int __maybe_unused airoha_ct_fe_owner_arm(struct airoha_ppe *ppe,
++					       const void *owner, u64 generation,
++					       u32 epoch)
++{
++	int err;
++
++	lockdep_assert_held(&ppe_lock);
++	if (!owner || !generation || !epoch)
++		return -EINVAL;
++	if (ppe->ct_fe.owner != owner)
++		return -ESTALE;
++	if (ppe->ct_pair_failed || ppe->ct_stopping || ppe->ct_fe.health_stopping ||
++	    READ_ONCE(ppe->eth->ct_ifc_cpu_port_failed) ||
++	    READ_ONCE(ppe->eth->ct_cpu_fallback))
++		return -ESHUTDOWN;
++	if (ppe->ct_fe.pending || ppe->ct_fe.drain_pending ||
++	    ppe->ct_fe.touched || ppe->ct_fe.active || ppe->ct_pair_policy_allowed ||
++	    (ppe->ct_pairs && airoha_ct_pair_any(ppe)))
++		return -EBUSY;
++	if (ppe->ct_fe.epoch != epoch || ppe->ct_fe.generation != generation ||
++	    epoch <= ppe->ct_pair_wired_epoch ||
++	    (!ppe->ct_fe.owner_quiesced && !ppe->ct_fe.arm_pending && !ppe->ct_fe.armed))
++		return -ESTALE;
++	if (epoch == U32_MAX)
++		return -EOVERFLOW;
++	ppe->ct_fe.owner_quiesced = false;
++	ppe->ct_fe.arm_pending = true;
++	ppe->ct_fe.armed = false;
++	err = airoha_ct_fe_control_owned_from(ppe, owner, AIROHA_CT_PAIR_FE_ARM,
++					      generation, epoch, __func__, __LINE__);
++	if (err)
++		return err > 0 ? -EPROTO : err;
++	ppe->ct_fe.arm_pending = false;
++	ppe->ct_fe.armed = true;
+ 	return 0;
+ }
+ 
