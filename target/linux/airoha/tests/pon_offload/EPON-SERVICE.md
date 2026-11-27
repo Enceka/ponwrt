@@ -1,5 +1,16 @@
 # EPON FE service 核查（2026-11-27）
 
+## service0 实现进展（2026-11-27）
+
+基于 ponwrt `860580c`、生成源码到 `999-ze`，新增 `999-zf` 已开放
+CPU `set/tuple` 的 service0，tuple 存活检查使用 active、tuple 和 lease
+状态，精确零值可与 typed wildcard cover 并存。回环 mapping 显式传入
+配置/撤销标志，transmit 接受0。NPU owner 互斥及 PON PPE 资格关闭保持。
+生产函数普通版与 ASan/UBSan 均通过生命周期、全16位匹配、超时保留及
+旧非零回归；复现方式和逐项计数见 [service0/README.md](service0/README.md)。
+本次执行主机测试，RAM 内核的 service0 逐包验收留给后续集成。
+下文保留核查时的基线结论及真实 EPON 输入配对方案；其中第1项软件准备已完成。
+
 ## 明确结论
 
 **channel0 合法。wire LLID、EPON channel、IFC service、FE service 是四个需要分别记录的量。** 当前单 LLID 控制器使用 channel0，同时从 MAC 注册状态取得完整 16 位 LLID；主线已发布这两个身份。IFC 与 FE 的字段位置已明确，真实 EPON 输入的 `IFC service == FE service == wire LLID` 等式仍待测。

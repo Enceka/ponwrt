@@ -1,0 +1,47 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: support zero-service CPU probes
+
+Accept the full 16-bit service range in CPU service and tuple probes.
+Use active rows, tuple ownership and LUT leases to validate configured
+consumers, and exclude typed wildcard covers from service duplication.
+Keep the existing clear, pending-command recovery and NPU owner gates.
+
+--- a/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_cpu.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_cpu.h
+@@ -176,7 +176,7 @@
+ 	u32 actual[2];
+ 	int err;
+ 
+-	if (!ppe->ct_pon_ifc_tuple || !ppe->ct_pon_ifc_services[0] ||
++	if (!ppe->ct_pon_ifc_tuple || (ppe->ct_pon_ifc.active & 3) != 3 ||
+ 	    pool->pending || pool->releasing || airoha_ct_ifc_pool_orphans(pool))
+ 		return -ESHUTDOWN;
+ 	err = airoha_ct_pon_ifc_tuple_words(words);
+@@ -549,7 +549,7 @@
+ 
+ 	ASSERT_RTNL();
+ 	lockdep_assert_held(&flow_offload_mutex);
+-	if (slot >= 2 || (!cover && !service) || service > U16_MAX)
++	if (slot >= 2 || service > U16_MAX)
+ 		return -EINVAL;
+ 	if (!slot && airoha_ct_pon_ifc_tuple_busy(ppe))
+ 		return -EBUSY;
+@@ -562,7 +562,8 @@
+ 	    READ_ONCE(ppe->ct_pon_qualified) || !airoha_ifc_lan_ports_ready(eth) ||
+ 	    !airoha_ct_pon_ifc_route_ready(ppe))
+ 		return -ESHUTDOWN;
+-	if (!cover && (ppe->ct_pon_ifc.active & (3 << ((slot ^ 1) * 2))) &&
++	if (!cover && !(ppe->ct_pon_ifc_cover & BIT(slot ^ 1)) &&
++	    (ppe->ct_pon_ifc.active & (3 << ((slot ^ 1) * 2))) &&
+ 	    ppe->ct_pon_ifc_services[slot ^ 1] == service)
+ 		return -EEXIST;
+ 	for (family = 0; family < 2; family++) {
+@@ -618,7 +619,7 @@
+ 
+ 	ASSERT_RTNL();
+ 	lockdep_assert_held(&flow_offload_mutex);
+-	if (slot || !service || service > U16_MAX)
++	if (slot || service > U16_MAX)
+ 		return -EINVAL;
+ 	if (airoha_ct_pon_ifc_tuple_busy(ppe) ||
+ 	    (ppe->ct_pon_ifc.active & 3) || (ppe->ct_pon_ifc.dirty & 3) ||

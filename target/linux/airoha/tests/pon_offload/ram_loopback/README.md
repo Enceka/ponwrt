@@ -16,8 +16,9 @@ rows; the runner then requests the audited classifier route again.
 This optional external test module submits bounded numbered packets through
 the existing PON mapping and QDMA transmit interfaces. It owns a temporary
 controller for an otherwise down `pon0`, enables GDM2 internal loopback, and
-captures the returning packets through an RX handler. It is not part of the
-production image or overlay.
+captures the returning packets through an RX handler. Its source is included
+in the test overlay for reproducible host tests and optional external module
+builds. The production image does not install or load the module.
 
 The experiment established a no-fiber service-aware input path:
 
@@ -105,8 +106,16 @@ only `prepare`, `send <decimal-service> [kind [variant]]` and `restore`.
 
 Omitting `kind` preserves the existing `send <decimal-service>` command
 and selects `ipv4`. Kind names are case-sensitive; unknown kinds and
-trailing arguments fail with `-EINVAL`. The decimal service remains a
-nonzero 16-bit number. For example, `send 8500 ipv6` selects service 0x2134.
+trailing arguments fail with `-EINVAL`. The decimal service is in the
+inclusive range 0..65535. For example, `send 8500 ipv6` selects service
+0x2134, and `send 0 ipv6` selects service0. Mapping validity is explicit:
+preparation and sends configure a service with `enable=true`; restoration
+withdraws it with `enable=false`.
+
+Patch `999-zf` adds matching zero-service CPU diagnostics, including exact
+tuple checks and coexistence with typed wildcard covers. The independent
+host lifecycle, fault-injection and full transmit tests are documented in
+`../service0/README.md`. The existing board runner keeps its nonzero matrix.
 
 All frames target the local `pon0` MAC and use a locally administered
 random source MAC. IPv4 uses documentation addresses 192.0.2.1/192.0.2.2;

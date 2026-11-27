@@ -239,14 +239,14 @@ static int eligible(void)
 	return 0;
 }
 
-static int mapping(unsigned int service)
+static int mapping(unsigned int service, bool enable)
 {
 	int err;
 
 	err = airoha_eth_pon_update_begin(probe_netdev, BIT(0));
 	if (err)
 		return err;
-	err = airoha_eth_pon_configure(probe_netdev, 0, service, !!service);
+	err = airoha_eth_pon_configure(probe_netdev, 0, service, enable);
 	if (err)
 		return err;
 	return airoha_eth_pon_update_end(probe_netdev);
@@ -266,7 +266,7 @@ static int restore(void)
 	if (opened) {
 		netif_tx_disable(probe_netdev);
 		netif_carrier_off(probe_netdev);
-		err = mapping(0);
+		err = mapping(0, false);
 		if (err)
 			return err;
 	}
@@ -363,7 +363,7 @@ static int prepare(void)
 	rtnl_unlock();
 	if (err)
 		return err;
-	err = mapping(0x2134);
+	err = mapping(0x2134, true);
 	if (err)
 		return err;
 	spin_lock_bh(&eth->ct_route_lock);
@@ -410,10 +410,10 @@ static int transmit(unsigned int service, unsigned int kind, unsigned int varian
 	__be16 protocol = htons(ETH_P_IP);
 	int pending, err;
 
-	if (!retained || !opened || !service || service > U16_MAX || kind >= PROBE_KIND_COUNT ||
+	if (!retained || !opened || service > U16_MAX || kind >= PROBE_KIND_COUNT ||
 	    variant > 4 || (variant && kind != PROBE_IPV4 && kind != PROBE_IPV6))
 		return -EINVAL;
-	err = mapping(service);
+	err = mapping(service, true);
 	if (err)
 		return err;
 	length = kind == PROBE_SHORT ? ETH_HLEN + 56 :
