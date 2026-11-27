@@ -1,0 +1,307 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: check resident NPU suppliers before startup
+
+Check bound Ethernet, NPU and reset SCU drivers and their fixed device
+parents before rebuilt startup. Admit the chip-SCU as the driverless syscon
+used by clk-en7523, and establish the explicit NPU to SCU managed link.
+Hold trylocks through startup; defer contention and release all references.
+Keep this admission limited to the fixed product lifecycle.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -9,6 +9,8 @@
+ #include <linux/devm-helpers.h>
+ #include <linux/export.h>
+ #include <linux/firmware.h>
++#include <linux/mfd/syscon.h>
++#include <linux/of_device.h>
+ #include <linux/platform_device.h>
+ #include <linux/of_net.h>
+ #include <linux/of_platform.h>
+@@ -838,6 +840,7 @@
+ 
+ struct airoha_npu *airoha_npu_get(struct device *dev)
+ {
++	struct airoha_npu_resident_scope scope = {};
+ 	struct platform_device *pdev;
+ 	struct device_node *np;
+ 	struct airoha_npu *npu;
+@@ -893,6 +896,13 @@
+ 		npu = ERR_PTR(-ENODEV);
+ 		goto error_device_unlock;
+ 	}
++	if (resident) {
++		err = airoha_npu_resident_acquire(npu, consumer_locked ? dev : NULL, &scope);
++		if (err) {
++			npu = ERR_PTR(err);
++			goto error_device_unlock;
++		}
++	}
+ 	err = airoha_npu_start_bound(npu);
+ 	if (err) {
+ 		npu = ERR_PTR(err);
+@@ -907,12 +917,14 @@
+ 		goto error_device_unlock;
+ 	}
+ 
++	airoha_npu_resident_release(&scope);
+ 	device_unlock(&pdev->dev);
+ 	if (consumer_locked)
+ 		device_unlock(dev);
+ 	return npu;
+ 
+ error_device_unlock:
++	airoha_npu_resident_release(&scope);
+ 	device_unlock(&pdev->dev);
+ error_module_put:
+ 	module_put(THIS_MODULE);
+--- a/drivers/net/ethernet/airoha/airoha_npu_start.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_start.h
+@@ -29,6 +29,8 @@
+ 	       dev->driver && !dev->driver->owner && dev->driver->suppress_bind_attrs &&
+ 	       airoha_npu_fixed_node(dev->of_node);
+ }
++
++#include "airoha_npu_resident.h"
+ 
+ static int airoha_npu_boot(struct airoha_npu *npu)
+ {
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_resident.h
+@@ -0,0 +1,236 @@
++#ifndef AIROHA_NPU_RESIDENT_H
++#define AIROHA_NPU_RESIDENT_H
++
++#define AIROHA_NPU_RESIDENT_DEVICES 8
++
++struct airoha_npu_resident_scope {
++	struct device *devices[AIROHA_NPU_RESIDENT_DEVICES];
++	bool unlock[AIROHA_NPU_RESIDENT_DEVICES];
++	unsigned int count;
++};
++
++static void airoha_npu_resident_release(struct airoha_npu_resident_scope *scope)
++{
++	while (scope->count) {
++		unsigned int index = --scope->count;
++
++		if (scope->unlock[index])
++			device_unlock(scope->devices[index]);
++		put_device(scope->devices[index]);
++	}
++}
++
++static int airoha_npu_resident_hold(struct airoha_npu_resident_scope *scope,
++				   struct device *dev, bool locked)
++{
++	unsigned int index;
++
++	if (!dev)
++		return -EPROBE_DEFER;
++	for (index = 0; index < scope->count; index++)
++		if (scope->devices[index] == dev)
++			return 0;
++	if (scope->count == ARRAY_SIZE(scope->devices))
++		return -EOPNOTSUPP;
++	if (!locked && !device_trylock(dev))
++		return -EPROBE_DEFER;
++	device_lock_assert(dev);
++	scope->devices[index] = get_device(dev);
++	scope->unlock[index] = !locked;
++	scope->count++;
++	return device_is_registered(dev) ? 0 : -EPROBE_DEFER;
++}
++
++static bool airoha_npu_resident_resources(struct device_node *node, bool resets)
++{
++	static const char * const properties[] = {
++		"clocks", "power-domains", "iommus", "interconnects", "phys", "hwlocks",
++	};
++	unsigned int index;
++
++	for (index = 0; index < ARRAY_SIZE(properties); index++)
++		if (of_property_present(node, properties[index]))
++			return false;
++	return resets || !of_property_present(node, "resets");
++}
++
++static int airoha_npu_resident_driver(struct device *dev, const char *name,
++				     const char *compatible)
++{
++	device_lock_assert(dev);
++	if (!device_is_bound(dev))
++		return -EPROBE_DEFER;
++	if (!airoha_npu_resident_device(dev) || dev->bus != &platform_bus_type ||
++	    strcmp(dev->driver->name, name) ||
++	    !of_device_is_compatible(dev->of_node, compatible))
++		return -EOPNOTSUPP;
++	return 0;
++}
++
++static int airoha_npu_resident_parents(struct airoha_npu_resident_scope *scope,
++				      struct device *dev)
++{
++	const struct of_device_id *match;
++	struct device_node *node;
++	struct device *parent = dev->parent;
++	int err;
++
++	err = airoha_npu_resident_hold(scope, parent, false);
++	if (err)
++		return err;
++	node = of_get_parent(dev->of_node);
++	err = node && node == parent->of_node &&
++	      of_node_name_eq(node, "soc") &&
++	      of_device_is_compatible(node, "simple-bus") &&
++	      airoha_npu_fixed_node(node) &&
++	      airoha_npu_resident_resources(node, false) ? 0 : -EOPNOTSUPP;
++	of_node_put(node);
++	if (err)
++		return err;
++	if (parent->bus != &platform_bus_type || parent->parent != &platform_bus)
++		return -EOPNOTSUPP;
++	if (!device_is_bound(parent))
++		return -EPROBE_DEFER;
++	if (!parent->driver || parent->driver->owner ||
++	    strcmp(parent->driver->name, "simple-pm-bus") ||
++	    of_property_match_string(parent->of_node, "compatible", "simple-bus") != 0 ||
++	    device_has_driver_override(parent) || dev_get_drvdata(parent))
++		return -EOPNOTSUPP;
++	match = of_match_device(parent->driver->of_match_table, parent);
++	if (!match || !match->data || strcmp(match->compatible, "simple-bus"))
++		return -EOPNOTSUPP;
++	err = airoha_npu_resident_hold(scope, &platform_bus, false);
++	if (err)
++		return err;
++	return !platform_bus.driver && !platform_bus.parent ? 0 : -EOPNOTSUPP;
++}
++
++static struct device *
++airoha_npu_resident_find(struct airoha_npu_resident_scope *scope,
++			 struct device_node *node, struct device *locked)
++{
++	struct platform_device *pdev;
++	int err;
++
++	if (!airoha_npu_fixed_node(node))
++		return ERR_PTR(-EOPNOTSUPP);
++	pdev = of_find_device_by_node(node);
++	if (!pdev)
++		return ERR_PTR(-EPROBE_DEFER);
++	err = airoha_npu_resident_hold(scope, &pdev->dev, &pdev->dev == locked);
++	platform_device_put(pdev);
++	return err ? ERR_PTR(err) : &pdev->dev;
++}
++
++static struct device_node *airoha_npu_resident_resets(struct device_node *node)
++{
++	struct device_node *supplier = NULL;
++	struct of_phandle_args args;
++	int index, count;
++
++	count = of_count_phandle_with_args(node, "resets", "#reset-cells");
++	if (count < 3 || count != of_property_count_strings(node, "reset-names") ||
++	    of_property_match_string(node, "reset-names", "fe") < 0 ||
++	    of_property_match_string(node, "reset-names", "pdma") < 0 ||
++	    of_property_match_string(node, "reset-names", "qdma") < 0)
++		return ERR_PTR(-EOPNOTSUPP);
++	for (index = 0; index < count; index++) {
++		if (of_parse_phandle_with_args(node, "resets", "#reset-cells", index, &args))
++			goto unsupported;
++		if (args.args_count != 1 ||
++		    !of_device_is_compatible(args.np, "airoha,en7581-scu") ||
++		    (supplier && supplier != args.np)) {
++			of_node_put(args.np);
++			goto unsupported;
++		}
++		if (!supplier)
++			supplier = of_node_get(args.np);
++		of_node_put(args.np);
++	}
++	return supplier;
++
++unsupported:
++	of_node_put(supplier);
++	return ERR_PTR(-EOPNOTSUPP);
++}
++
++static int airoha_npu_resident_acquire(struct airoha_npu *npu,
++				     struct device *locked_consumer,
++				     struct airoha_npu_resident_scope *scope)
++{
++	struct device_node *node, *target;
++	struct device *eth, *scu, *chip;
++	struct regmap *map;
++	int err;
++
++	err = airoha_npu_resident_hold(scope, npu->dev, true);
++	if (err)
++		return err;
++	err = airoha_npu_resident_driver(npu->dev, "airoha-npu", "airoha,en7581-npu");
++	if (err)
++		return err;
++	if (!airoha_npu_resident_resources(npu->dev->of_node, false))
++		return -EOPNOTSUPP;
++	node = of_find_compatible_node(NULL, NULL, "airoha,en7581-eth");
++	eth = airoha_npu_resident_find(scope, node, locked_consumer);
++	if (IS_ERR(eth)) {
++		of_node_put(node);
++		return PTR_ERR(eth);
++	}
++	node = of_find_compatible_node(node, NULL, "airoha,en7581-eth");
++	if (node) {
++		of_node_put(node);
++		return -EOPNOTSUPP;
++	}
++	if (locked_consumer && eth != locked_consumer)
++		return -EOPNOTSUPP;
++	err = airoha_npu_resident_driver(eth, "airoha_eth", "airoha,en7581-eth");
++	if (err)
++		return err;
++	if (!airoha_npu_resident_resources(eth->of_node, true))
++		return -EOPNOTSUPP;
++	target = of_parse_phandle(eth->of_node, "airoha,npu", 0);
++	err = target == npu->dev->of_node ? 0 : -EOPNOTSUPP;
++	of_node_put(target);
++	if (err)
++		return err;
++	node = airoha_npu_resident_resets(eth->of_node);
++	if (IS_ERR(node))
++		return PTR_ERR(node);
++	scu = airoha_npu_resident_find(scope, node, NULL);
++	of_node_put(node);
++	if (IS_ERR(scu))
++		return PTR_ERR(scu);
++	err = airoha_npu_resident_driver(scu, "clk-en7523", "airoha,en7581-scu");
++	if (err)
++		return err;
++	if (!airoha_npu_resident_resources(scu->of_node, false))
++		return -EOPNOTSUPP;
++	node = of_parse_phandle(scu->of_node, "airoha,chip-scu", 0);
++	chip = airoha_npu_resident_find(scope, node, NULL);
++	of_node_put(node);
++	if (IS_ERR(chip))
++		return PTR_ERR(chip);
++	if (chip->driver || chip->bus != &platform_bus_type ||
++	    !of_device_is_compatible(chip->of_node, "airoha,en7581-chip-scu") ||
++	    !of_device_is_compatible(chip->of_node, "syscon") ||
++	    !airoha_npu_resident_resources(chip->of_node, false))
++		return -EOPNOTSUPP;
++	err = airoha_npu_resident_parents(scope, npu->dev);
++	if (!err)
++		err = airoha_npu_resident_parents(scope, eth);
++	if (!err)
++		err = airoha_npu_resident_parents(scope, scu);
++	if (!err)
++		err = airoha_npu_resident_parents(scope, chip);
++	if (err)
++		return err;
++	map = syscon_regmap_lookup_by_phandle(scu->of_node, "airoha,chip-scu");
++	if (IS_ERR(map))
++		return PTR_ERR(map);
++	if (!device_link_add(npu->dev, scu, DL_FLAG_AUTOREMOVE_SUPPLIER))
++		return -EINVAL;
++	return 0;
++}
++
++#endif
