@@ -1,0 +1,56 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: encode optical service CPU classifier rows
+
+Prepare type0 service rows for the shared classifier owner. Match SPORT2,
+the full service ID, plain IPv4 or IPv6 and the absence of the corresponding
+short-packet LUT hit. Select only the WAN CPU receive rings used by the
+two-service diagnostic. The owner must publish dependencies before enabling
+the action and retain its existing LUT reservation for the row lifetime.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_words.h
+@@ -0,0 +1,34 @@
++#ifndef AIROHA_CT_PON_IFC_WORDS_H
++#define AIROHA_CT_PON_IFC_WORDS_H
++
++struct airoha_ct_pon_ifc_words {
++	u32 tcam[9][2];
++	u32 action[3][3];
++};
++
++static inline int
++airoha_ct_pon_ifc_cpu_encode(struct airoha_ct_pon_ifc_words *row,
++			    u16 service, u16 protocol, unsigned int ring,
++			    unsigned int short_lut)
++{
++	if (!row || (protocol != ETH_P_IP && protocol != ETH_P_IPV6) ||
++	    (ring != 2 && ring != 4) || short_lut >= 32)
++		return -EINVAL;
++
++	*row = (struct airoha_ct_pon_ifc_words) {
++		.tcam = {
++			[0] = { BIT(2), BIT(2) },
++			[4] = { 0, BIT(short_lut) },
++			[5] = { protocol, 0xffff },
++			[7] = { (u32)service << 16, 0xffff0430 },
++			[8] = { 0, 0xc0 },
++		},
++		.action = {
++			[1] = { 0, 0, ring << 10 },
++			[2] = { BIT(31) | BIT(30) | BIT(28), 0, 0 },
++		},
++	};
++	return 0;
++}
++
++#endif
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -34,6 +34,7 @@
+ 
+ #include "airoha_ct_ifc.h"
+ #include "airoha_ct_gre4_port.h"
++#include "airoha_ct_pon_ifc_words.h"
+ #include "airoha_ct_smac.h"
+ 
+ static const struct rhashtable_params airoha_flow_table_params = {

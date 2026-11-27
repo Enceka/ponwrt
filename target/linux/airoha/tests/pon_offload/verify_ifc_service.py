@@ -74,10 +74,10 @@ class Classifier(Module):
         assert self.rows[2,row,1] == (0, 0, ring << 10)
         assert self.rows[2,row,2] == ((enabled << 31) | (1 << 30) | (1 << 28),)
 
-    def matches(self, row, gem, etype, source=2, encap=0):
+    def matches(self, row, gem, etype, source=2, encap=0, lut_hits=0):
         if not self.rows[2,row,2][0] & (1 << 31):
             return False
-        packet = {0: 1 << source, 5: etype, 7: gem << 16 | encap}
+        packet = {0: 1 << source, 4: lut_hits, 5: etype, 7: gem << 16 | encap}
         return all(not ((packet.get(i, 0) ^ key) & mask)
                    for i in range(9) for key, mask in [self.rows[0,row,i]])
 
