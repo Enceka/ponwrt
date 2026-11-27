@@ -63,7 +63,7 @@ python3 verify_ewan_ingress.py --stock-dir /path/to/stock/lib/modules \
 
 4,608 个场景从固定 SHA 的原厂函数入口执行至返回。覆盖 32 个 channel、18 种 `msg0[29:14]` 值和全部三位行标志组合，邻行有效位与目标行相反。结果为 1,152 次接收、1,152 次策略丢弃、2,304 次行未启用。此处记录的是 EPON CPU 数据路径；GDM2→FE32 的硬件业务来源和有效条件仍须独立核对。
 
-`971` 在主机 QDMA 收到 PPE 学习请求时，将完整 GEM 与已发布的单播映射比对，EPON 则只比对当前注册的 channel。映射更新中、描述符标错、控制包和跨描述符的光侧帧跳过学习，软件收发路径保留。RCU 读段覆盖映射查询和学习调用，沿用现有撤流事务的 `synchronize_net()`。运行 `python3 verify_rx_learn.py --source /path/to/linux-after-971` 可核对所有 65,536 个 GEM 值、32×32 对 EPON channel 及异常条件。这项检查用于 CPU 学习入口；已绑定硬件流的逐包业务隔离仍由 FE 分类器负责。
+`971` 在主机 QDMA 收到 PPE 学习请求时，将完整 GEM 与已发布的单播映射比对，EPON 则只比对当前注册的 channel。`973` 同时检查实际接收描述符的队列属于 WAN QDMA1。错误队列、映射更新中、描述符标错、控制包和跨描述符的光侧帧跳过学习，普通收包和控制帧仍按原路交付。RCU 读段覆盖映射查询和学习调用，沿用现有撤流事务的 `synchronize_net()`。运行 `python3 verify_rx_learn.py --source /path/to/linux-after-973` 在两套 QDMA 上核对所有 65,536 个 GEM 值、32×32 对 EPON channel 及异常条件，共 135,332 项；负对照移除队列检查，须捕获错误学习。这项检查用于 CPU 学习入口；已绑定硬件流的逐包业务隔离仍由 FE 分类器负责。
 
 `verify_ifc_service.py --stock-dir /path/to/stock/lib/modules` 执行原厂 `ifc.ko`：在同一 type-0 行组合 GDM2、16 位业务号、EtherType 和无 VLAN/PPPoE 条件，再用第二行隔离仅最高位不同的业务。IPv4/IPv6 各测一轮；按字段正序、逆序写入后核对全部九页，比较 263,168 组输入，并在另一行业务保留时停用、改号、重开第一行。TCAM page 0 的键/掩码是 `4/4`；page 5 是 EtherType/`0xffff`；page 7 是 `service << 16`/`0xffff0430`；page 8 是 `0/0xc0`。匹配检查使用原厂写入模拟 MMIO 的最终表项。
 

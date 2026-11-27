@@ -15,7 +15,8 @@ typedef uint16_t u16;
 #define netdev_from_priv(dev) (&(dev)->net)
 struct airoha_pon_flow_table { unsigned count; struct { u32 tag; } entries[3]; };
 struct ppe { int dev; };
-struct eth { struct ppe *ppe; };
+struct airoha_qdma { int index; };
+struct eth { struct ppe *ppe; struct airoha_qdma qdma[2]; };
 struct airoha_gdm_dev {
 	struct eth *eth;
 	int net;
@@ -42,15 +43,18 @@ static void airoha_ppe_check_skb(int *ppe, struct sk_buff *s, u32 hash, bool wla
 static void check(u32 msg, bool expected)
 {
 	unsigned before = learns;
-	airoha_qdma_learn_skb(&dev, &skb, 123, msg);
+	airoha_qdma_learn_skb(&dev, &dev.eth->qdma[0], &skb, 123, msg);
+	assert(!readers && learns == before + (expected && !dev.flags));
+	before = learns;
+	airoha_qdma_learn_skb(&dev, &dev.eth->qdma[1], &skb, 123, msg);
 	assert(!readers && learns == before + expected);
-	cases++;
+	cases += 2;
 }
 
 int main(void)
 {
 	struct ppe ppe = {0};
-	struct eth eth = { &ppe };
+	struct eth eth = { .ppe = &ppe };
 	struct airoha_pon_flow_table table = { 3, {{0x8000a501}, {0x100}, {0x8000ffff}} };
 	u32 msg = 0xa501u << 14;
 	dev.eth = &eth;

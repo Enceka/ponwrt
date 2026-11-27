@@ -1,0 +1,26 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: require the WAN receive queue for optical learning
+
+The source port in msg1 selects the PON netdev independently of the QDMA
+that delivered the descriptor. Require the physical WAN receiver as well
+as the published service before the packet can trigger PPE learning.
+Keep ordinary data and control delivery unchanged.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1045,2 +1045,3 @@
+ static void airoha_qdma_learn_skb(struct airoha_gdm_dev *dev,
++				 struct airoha_qdma *rx_qdma,
+ 				 struct sk_buff *skb, u32 hash, u32 msg0)
+@@ -1055,3 +1056,3 @@
+ 	/* Only one descriptor supplies provenance for the entire frame. */
+-	if (skb_is_nonlinear(skb))
++	if (rx_qdma != &dev->eth->qdma[1] || skb_is_nonlinear(skb))
+ 		return;
+@@ -1204,5 +1205,5 @@
+ 		reason = FIELD_GET(AIROHA_RXD4_PPE_CPU_REASON, msg1);
+ 		if (reason == PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED)
+-			airoha_qdma_learn_skb(dev, q->skb, hash, msg0);
++			airoha_qdma_learn_skb(dev, q->qdma, q->skb, hash, msg0);
+ 
+ 		done++;

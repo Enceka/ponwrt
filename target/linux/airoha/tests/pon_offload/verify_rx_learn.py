@@ -3,6 +3,7 @@
 import argparse
 from pathlib import Path
 import re
+import signal
 import subprocess
 import tempfile
 
@@ -20,11 +21,22 @@ def main():
     defines = [re.search(r'^#define ' + name + r'\s+[^\n]+', h, re.M)[0] for name in masks]
     with tempfile.TemporaryDirectory(prefix='pon-rx-learn-') as tmp:
         tmp = Path(tmp)
-        (tmp / 'production.h').write_text('\n'.join(defines) + '\n' + gate)
         src = Path(__file__).with_name('rx_learn_test.c')
-        subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-I', str(tmp),
-                        str(src), '-o', str(tmp / 'test')], check=True)
+        def build(body):
+            (tmp / 'production.h').write_text('\n'.join(defines) + '\n' + body)
+            subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-I', str(tmp),
+                            str(src), '-o', str(tmp / 'test')], check=True)
+
+        build(gate)
         subprocess.run([str(tmp / 'test')], check=True)
+        guard = 'rx_qdma != &dev->eth->qdma[1]'
+        if gate.count(guard) != 1:
+            raise ValueError('expected one optical RX queue guard')
+        build(gate.replace(guard, '((void)rx_qdma, false)'))
+        result = subprocess.run([str(tmp / 'test')], cwd=tmp, capture_output=True)
+        if result.returncode != -signal.SIGABRT or b'learns == before' not in result.stderr:
+            raise RuntimeError('wrong-queue negative control missed its assertion')
+        print('Wrong-queue negative control detected')
 
 
 if __name__ == '__main__':
