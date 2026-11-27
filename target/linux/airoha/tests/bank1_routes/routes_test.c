@@ -121,6 +121,10 @@ struct airoha_ppe {
 };
 struct airoha_eth {
 	spinlock_t ct_route_lock;
+#ifdef TEST_PON_INGRESS
+	spinlock_t ifc_port_lock;
+	u32 ifc_port_desired;
+#endif
 	struct airoha_bank1_routes ct_bank1_routes;
 	u16 ct_cpu_route_mask[4];
 	bool ct_cpu_fallback, ct_cpu_ifc_disabled, ct_cpu_routes_ready;
@@ -135,7 +139,12 @@ struct airoha_eth {
 };
 
 enum failure_kind { NO_FAILURE, DROP_WRITE, BAD_READBACK };
-struct mmio_event { bool write; unsigned int reg; u32 value; };
+struct mmio_event {
+	bool write;
+	unsigned int reg;
+	u32 value;
+	bool route_locked, port_locked;
+};
 struct mmio_fault { enum failure_kind kind; unsigned int reg, write; bool active; };
 static struct {
 	struct mmio_event events[512];
@@ -144,6 +153,7 @@ static struct {
 	unsigned int failures, schedules, rcu_syncs, wakes;
 	struct mmio_fault faults[2];
 	int pending_readback;
+	u32 readback_mask;
 	bool tracing, verify_snapshot;
 	u16 snapshot[4];
 } host;
@@ -160,8 +170,26 @@ static bool loopback_enabled, fail_loopback_restore;
 static const char owner_token, other_token;
 
 static void lockdep_assert_held(spinlock_t *lock) { CHECK(lock->held); }
-static void spin_lock_bh(spinlock_t *lock) { CHECK(!lock->held); lock->held = true; }
-static void spin_unlock_bh(spinlock_t *lock) { CHECK(lock->held); lock->held = false; }
+static void spin_lock_bh(spinlock_t *lock)
+{
+	CHECK(!lock->held);
+#ifdef TEST_PON_INGRESS
+	if (lock == &eth.ct_route_lock)
+		CHECK(!eth.ifc_port_lock.held);
+	if (lock == &ppe_lock)
+		CHECK(!eth.ct_route_lock.held && !eth.ifc_port_lock.held);
+#endif
+	lock->held = true;
+}
+static void spin_unlock_bh(spinlock_t *lock)
+{
+	CHECK(lock->held);
+#ifdef TEST_PON_INGRESS
+	if (lock == &eth.ct_route_lock)
+		CHECK(!eth.ifc_port_lock.held);
+#endif
+	lock->held = false;
+}
 static void rcu_read_lock(void) { ++rcu_depth; }
 static void rcu_read_unlock(void) { CHECK(rcu_depth); --rcu_depth; }
 static void synchronize_rcu(void) { CHECK(!rcu_depth && !eth.ct_route_lock.held); ++host.rcu_syncs; }
@@ -172,7 +200,13 @@ static void event(bool write, unsigned int reg, u32 value)
 {
 	if (host.tracing) {
 		CHECK(host.length < ARRAY_SIZE(host.events));
-		host.events[host.length++] = (struct mmio_event) { write, reg, value };
+		host.events[host.length++] = (struct mmio_event) {
+			.write = write, .reg = reg, .value = value,
+			.route_locked = eth.ct_route_lock.held,
+#ifdef TEST_PON_INGRESS
+			.port_locked = eth.ifc_port_lock.held,
+#endif
+		};
 	}
 }
 
@@ -185,7 +219,7 @@ static u32 airoha_fe_rr(struct airoha_eth *target, unsigned int reg)
 	++host.reads[reg];
 	++host.total_reads;
 	if ((int)reg == host.pending_readback) {
-		value ^= 1;
+		value ^= host.readback_mask;
 		host.pending_readback = -1;
 	}
 	event(false, reg, value);
@@ -197,7 +231,12 @@ static void airoha_fe_wr(struct airoha_eth *target, unsigned int reg, u32 value)
 	unsigned int index;
 
 	CHECK(target == &eth && reg < ARRAY_SIZE(eth.regs));
-	CHECK(reg >= CT_IFC_CONTROL ? ppe_lock.held : eth.ct_route_lock.held);
+#ifdef TEST_PON_INGRESS
+	if (reg == REG_FE_IFC_PORT_EN)
+		CHECK(eth.ifc_port_lock.held);
+	else
+#endif
+		CHECK(reg >= CT_IFC_CONTROL ? ppe_lock.held : eth.ct_route_lock.held);
 	if (host.verify_snapshot) {
 		CHECK(eth.ct_bank1_routes.owner == &owner_token && !eth.ct_bank1_routes.ready);
 		for (index = 0; index < 4; ++index) {
@@ -259,7 +298,7 @@ static void netif_tx_wake_all_queues(struct net_device *dev)
 { for (unsigned int index = 0; index < dev->num_tx_queues; ++index) dev->queues[index].stopped = false; ++host.wakes; }
 static void airoha_dev_lro_disable(struct airoha_gdm_dev *dev) { dev->qdma->lro = false; }
 static void airoha_dev_lro_enable(struct airoha_gdm_dev *dev) { dev->qdma->lro = true; }
-#ifdef TEST_PON_REOPEN
+#if defined(TEST_PON_REOPEN) || defined(TEST_PON_INGRESS)
 static struct netdev_queue *netdev_get_tx_queue(struct net_device *dev, unsigned int index)
 { CHECK(index < dev->num_tx_queues); return &dev->queues[index]; }
 static bool netif_tx_queue_stopped(struct netdev_queue *queue) { return queue->stopped; }
@@ -296,6 +335,7 @@ static void trace_reset(void)
 {
 	memset(&host, 0, sizeof(host));
 	host.pending_readback = -1;
+	host.readback_mask = 1;
 	host.tracing = true;
 }
 
@@ -305,6 +345,9 @@ static void reset(const char *name)
 	static const u16 low[] = { 0x84f8, 0x4808, 0xf848, 0x8888 };
 
 	CHECK(!rcu_depth && !eth.ct_route_lock.held && !ppe_lock.held && flow_offload_mutex.held);
+#ifdef TEST_PON_INGRESS
+	CHECK(!eth.ifc_port_lock.held);
+#endif
 	current_case = name;
 	++cases;
 	memset(&eth, 0, sizeof(eth));
@@ -361,9 +404,16 @@ static void assert_routes(const u32 desired[4], bool guard, bool fallback, bool 
 {
 	unsigned int index;
 
-	for (index = 0; index < 4; ++index)
+	for (index = 0; index < 4; ++index) {
+#ifdef TEST_PON_INGRESS
+		if (guard && index == AIROHA_GDM2_IDX - 1) {
+			CHECK(eth.regs[index] == ((desired[index] & 0xffff0000) | 0x5555));
+			continue;
+		}
+#endif
 		CHECK(eth.regs[index] == expected_route(desired[index], index % 2 ? 5 : 0,
 			guard, fallback, ordinary && index == 1));
+	}
 }
 
 static void snapshot(u32 values[4]) { memcpy(values, eth.regs, 4 * sizeof(*values)); }
@@ -421,6 +471,7 @@ static void inject(enum failure_kind kind, unsigned int reg, unsigned int after_
 	CHECK(false);
 }
 
+#ifndef TEST_PON_INGRESS
 static void test_basic(void)
 {
 	u32 desired[4];
@@ -800,10 +851,16 @@ static void test_selectors(void)
 #ifdef TEST_OWNER_INVALIDATION
 #include "invalidation_test.inc"
 #endif
+#else
+#include "ingress_test.inc"
+#endif
 
 int main(int argc, char **argv)
 {
 	static const struct { const char *name; void (*run)(void); } groups[] = {
+#ifdef TEST_PON_INGRESS
+		{ "ingress", test_ingress },
+#else
 		{ "basic", test_basic }, { "parameters", test_parameters },
 		{ "mmio", test_mmio_failures }, { "receivers", test_receivers },
 		{ "updates", test_updates }, { "fallback", test_fallback },
@@ -814,6 +871,7 @@ int main(int argc, char **argv)
 #endif
 #ifdef TEST_OWNER_INVALIDATION
 		{ "invalidation", test_invalidation },
+#endif
 #endif
 	};
 	size_t index;
@@ -826,6 +884,9 @@ int main(int argc, char **argv)
 		matched = true;
 		groups[index].run();
 		CHECK(!eth.ct_route_lock.held && !ppe_lock.held && !rcu_depth);
+#ifdef TEST_PON_INGRESS
+		CHECK(!eth.ifc_port_lock.held);
+#endif
 	}
 	CHECK(matched);
 	printf("PASS %u cases; %u selector vectors; production guard/fallback and extracted driver functions\n",

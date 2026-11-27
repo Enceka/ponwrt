@@ -57,8 +57,8 @@ attempt. Normal activation remains gated by `ct_pon_qualified`. Patch `999-z`
 adds atomic admission revocation and periodic owner health checks; `999-za`
 blocks host learning into the claimed bank and validates native IP learning
 against its physical source bank. Patch `999-zc` retires old host bank1 cookies
-and clears the owned bank before reuse. Activation still requires completing
-ingress-domain classification and hardware-reset DMA retirement. Boot and
+and clears the owned bank before reuse. Patch `999-ze` connects ingress-domain
+classification to this owner. Activation still requires hardware-reset DMA retirement. Boot and
 ordinary PON configuration still use existing paths.
 
 Run against a kernel source tree containing patches through `999`:
@@ -91,6 +91,41 @@ python3 target/linux/airoha/tests/npu_owner/verify.py --bank1 \
   --source /absolute/path/to/owner-source-bank1-retire \
   --output /absolute/path/to/results/npu-owner-bank1
 ```
+
+Use `--ingress` against a tree containing `999-ze` to test the ingress owner
+integration. This option includes both `--bank1` and `--health`:
+
+```sh
+python3 target/linux/airoha/tests/npu_owner/verify.py --ingress \
+  --source /absolute/path/to/owner-source-ingress-lifecycle \
+  --output /absolute/path/to/results/npu-owner-ingress
+```
+
+The runner reconstructs the classifier words, row owner and CPU probe header
+from `975` through `991`, then applies `999-zd` and `999-ze` to the selected
+owner headers. Header patches apply with zero fuzz. Every reconstructed header
+is compared byte for byte with the supplied tree before compilation and checked
+again after the run. The report names these headers and records the selected
+patch hashes, including `999-ze`.
+
+The ingress matrix executes the production owner, reopen and health code. It
+also executes the extracted CPU probe dispatcher and probe-busy predicate.
+Component stubs model ingress prepare/check/restore, route scope and firmware
+boundaries, record their call order, and inject failures and invalidations.
+The separate `npu_ingress` and `npu_ingress_owner` suites exercise the actual
+classifier and ingress I/O components.
+
+Tests require route claim to close SPORT2 before restoring rows, preparation
+and verification to precede ingress readiness and scope opening, and the final
+readiness/open pair to hold `ppe_lock`. Faults cover untouched preparation,
+partial snapshots and publication, classifier checks, route readiness and
+scope checks. Failed restoration retains the shadow, owner, original close
+identity and return DMA until a retry completes. Retirement rejects each
+remaining ingress state independently. OPEN health failures revoke admission
+and complete close, with retries when restore fails. Invalidation during
+preparation, verification and the final lock window prevents scope opening.
+Every legacy CPU probe command returns `-EBUSY` for a closed or OPEN NPU owner.
+Runtime mutants remove or reorder these connections and must fail assertions.
 
 After GATE QUIET and the bank1 drain, the owner walks the complete host cookie
 table. Bank1 L4 cookies lose their candidate link and row hash; legacy L2
@@ -153,7 +188,7 @@ exact epoch advancement, notification status, no repeated close after success,
 and invalidations during queries, BIND, renewal, and the lock windows before
 FE ARM and GATE OPEN. Runtime negative controls independently remove the
 latch, sequence, synchronous closure, health checks, retry, renewal fences or
-retirement cancellation and must fail an executable assertion. Both modes use
+retirement cancellation and must fail an executable assertion. All modes use
 ASan and UBSan.
 
 The runner extracts the production owner and transaction headers from the

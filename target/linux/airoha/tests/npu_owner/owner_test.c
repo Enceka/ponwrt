@@ -8,6 +8,10 @@
 
 typedef uint32_t u32;
 typedef uint64_t u64;
+#ifdef NPU_OWNER_INGRESS_TEST
+typedef uint8_t u8;
+typedef uint16_t u16;
+#endif
 
 #include "return_types.h"
 
@@ -16,6 +20,20 @@ static unsigned int checks;
     fprintf(stderr, "CHECK failed: %s at %d\n", #condition, __LINE__); exit(1); } } while (0)
 #define U32_MAX UINT32_MAX
 #define U64_MAX UINT64_MAX
+#ifdef NPU_OWNER_INGRESS_TEST
+#ifndef EUCLEAN
+#define EUCLEAN 117
+#endif
+#define BIT(index) (1u << (index))
+#define ETH_P_IP 0x0800
+#define ETH_P_IPV6 0x86dd
+#define REG_FE_CSR_IFC_CFG 6
+#define REG_FE_IFC_PORT_EN 7
+#define REG_FE_VIP_PORT_EN 8
+#define FE_IFC_EN_MASK BIT(0)
+#define XSI_ETH_VIP_PORT_MASK BIT(1)
+#include "airoha_ct_pon_ifc_owner.h"
+#endif
 #define GFP_KERNEL 0
 #define PPE_TB_CFG_SEARCH_MISS_MASK 3u
 #define PPE_GLO_CFG_BUSY_MASK 2u
@@ -63,6 +81,11 @@ struct airoha_ppe {
     bool ct_pair_wired_registered;
     bool ct_pon_ifc_route_owned;
     bool ct_pon_qualified;
+#ifdef NPU_OWNER_INGRESS_TEST
+    struct airoha_ct_pon_ifc_owner ct_pon_ifc;
+    bool ct_pon_ifc_tuple;
+    bool ct_pon_ifc_registered, ct_pon_ifc_work_stopping;
+#endif
     u32 ct_pair_token;
     struct { u32 regs[2], glo; } ct_saved[2];
     u32 ct_pair_wired_epoch;
@@ -78,13 +101,17 @@ struct airoha_eth {
     struct airoha_npu *npu;
     struct airoha_soc *soc;
     int ct_route_lock;
-    struct { const void *owner; bool ready, pon_open, revoked; } ct_bank1_routes;
-    u32 regs[6];
+    struct { const void *owner; bool ready, pon_open, revoked, ingress_ready; } ct_bank1_routes;
+    u32 regs[9];
     void *dev;
     struct airoha_qdma qdma[2];
     struct airoha_gdm_dev *pon;
     bool ct_cpu_fallback, ct_ifc_cpu_port_failed;
     bool ct_cpu_routes_ready, ct_cpu_ifc_disabled;
+#ifdef NPU_OWNER_INGRESS_TEST
+    u32 ct_ifc_port_mask;
+    bool ct_ifc_pon_ready;
+#endif
 };
 
 static int flow_offload_mutex = 1, ppe_lock;
@@ -108,6 +135,9 @@ static void (*auth_reply_hook)(struct npu_auth_message *);
 static void (*route_claim_hook)(struct airoha_eth *);
 static void (*before_free_hook)(void *);
 static void (*before_spin_lock_hook)(int *);
+#ifdef NPU_OWNER_INGRESS_TEST
+#include "ingress_stubs.inc"
+#endif
 #ifdef NPU_OWNER_HEALTH_TEST
 static int fail_revoke;
 static unsigned int route_revokes;
@@ -173,12 +203,12 @@ static void kfree(void *pointer)
 static u64 br_flow_offload_generation(void) { return bridge_generation; }
 static u32 airoha_fe_rr(struct airoha_eth *eth, unsigned int address)
 {
-    CHECK(flow_offload_mutex && address < 6);
+    CHECK(flow_offload_mutex && address < ARRAY_SIZE(eth->regs));
     return eth->regs[address];
 }
 static void airoha_fe_wr(struct airoha_eth *eth, unsigned int address, u32 value)
 {
-    CHECK(flow_offload_mutex && address < 6);
+    CHECK(flow_offload_mutex && address < ARRAY_SIZE(eth->regs));
     if ((int)address == fail_write)
         return;
     eth->regs[address] = value;
@@ -196,8 +226,20 @@ static int airoha_bank1_routes_claim(struct airoha_eth *eth, const void *owner)
     eth->ct_bank1_routes.ready = !fail_route;
     eth->ct_bank1_routes.pon_open = false;
     eth->ct_bank1_routes.revoked = false;
+#ifdef NPU_OWNER_INGRESS_TEST
+    ingress_note(INGRESS_ROUTES_CLAIM);
+    eth->ct_bank1_routes.ingress_ready = eth->ct_ifc_pon_ready = false;
+    if (!fail_route && !ingress_claim_scope_stuck) {
+        eth->ct_ifc_port_mask &= ~BIT(2);
+        eth->regs[REG_FE_IFC_PORT_EN] &= ~BIT(2);
+    }
+#endif
     if (route_claim_hook)
         route_claim_hook(eth);
+#ifdef NPU_OWNER_INGRESS_TEST
+    if (ingress_claim_scope_stuck)
+        return -EIO;
+#endif
     return fail_route ? -EIO : 0;
 }
 #ifdef NPU_OWNER_HEALTH_TEST
@@ -213,6 +255,14 @@ static int airoha_bank1_routes_revoke(struct airoha_eth *eth, const void *owner)
     eth->ct_bank1_routes.pon_open = false;
     eth->ct_bank1_routes.ready = false;
     eth->ct_bank1_routes.revoked = true;
+#ifdef NPU_OWNER_INGRESS_TEST
+    ingress_note(INGRESS_ROUTES_REVOKE);
+    eth->ct_bank1_routes.ingress_ready = eth->ct_ifc_pon_ready = false;
+    if (!fail_revoke) {
+        eth->ct_ifc_port_mask &= ~BIT(2);
+        eth->regs[REG_FE_IFC_PORT_EN] &= ~BIT(2);
+    }
+#endif
     spin_unlock_bh(&eth->ct_route_lock);
     if (route_revoke_hook)
         route_revoke_hook(eth);
@@ -222,6 +272,9 @@ static int airoha_bank1_routes_revoke(struct airoha_eth *eth, const void *owner)
 static int airoha_bank1_routes_release(struct airoha_eth *eth, const void *owner)
 {
     CHECK(flow_offload_mutex && !ppe_lock && eth->ct_bank1_routes.owner == owner);
+#ifdef NPU_OWNER_INGRESS_TEST
+    ingress_note(INGRESS_ROUTES_RELEASE);
+#endif
     if (fail_release)
         return -EIO;
     eth->ct_bank1_routes.owner = NULL;
@@ -230,12 +283,23 @@ static int airoha_bank1_routes_release(struct airoha_eth *eth, const void *owner
 }
 static int airoha_bank1_routes_open(struct airoha_eth *eth, const void *owner)
 {
+#ifdef NPU_OWNER_INGRESS_TEST
+    CHECK(flow_offload_mutex && ppe_lock && eth->ct_bank1_routes.owner == owner);
+    CHECK(eth->ct_bank1_routes.ingress_ready);
+    ingress_note(INGRESS_ROUTES_OPEN);
+#else
     CHECK(flow_offload_mutex && !ppe_lock && eth->ct_bank1_routes.owner == owner);
+#endif
     CHECK(eth->ct_bank1_routes.ready && !eth->ct_bank1_routes.revoked);
     CHECK(eth->regs[REG_PPE_PPE_FLOW_CFG(1)] && gate_calls[GATE_OPEN]);
     if (fail_route)
         return -EIO;
     eth->ct_bank1_routes.pon_open = true;
+#ifdef NPU_OWNER_INGRESS_TEST
+    eth->ct_ifc_port_mask |= BIT(2);
+    eth->regs[REG_FE_IFC_PORT_EN] |= BIT(2);
+    eth->ct_ifc_pon_ready = true;
+#endif
     if (route_change_generation)
         bridge_generation++;
     return 0;
@@ -271,6 +335,9 @@ static int airoha_ct_fe_owner_arm(struct airoha_ppe *ppe, const void *owner,
                                  u64 generation, u32 epoch)
 {
     fe_arm_calls++;
+#ifdef NPU_OWNER_INGRESS_TEST
+    ingress_note(INGRESS_FE_ARM);
+#endif
     CHECK(ppe_lock && ppe->ct_fe.owner == owner && !ppe->ct_fe.pending);
     CHECK(generation == ppe->ct_fe.generation && epoch == ppe->ct_fe.epoch);
     ppe->ct_fe.owner_quiesced = false;
@@ -298,6 +365,9 @@ static int airoha_ct_fe_owner_release(struct airoha_ppe *ppe, const void *owner)
 #include "bank1_stubs.inc"
 #endif
 #include "airoha_npu_owner.h"
+#ifdef NPU_OWNER_INGRESS_TEST
+#include "ingress_component.inc"
+#endif
 
 static const u32 ct_bank0_regs[] = { 0, 1 };
 static bool airoha_ppe_ct_requested(struct airoha_eth *eth) { return true; }
@@ -323,7 +393,13 @@ static int airoha_ppe_ct_quiesce(struct airoha_ppe *ppe)
     return 0;
 }
 static int airoha_ppe_ct_check_sram(struct airoha_ppe *ppe, int operation) { return 0; }
-static int airoha_ct_pon_ifc_cpu_stop(struct airoha_ppe *ppe) { return fail_stop == 1 ? -EIO : 0; }
+static int airoha_ct_pon_ifc_cpu_stop(struct airoha_ppe *ppe)
+{
+#ifdef NPU_OWNER_INGRESS_TEST
+    ingress_probe_operations++;
+#endif
+    return fail_stop == 1 ? -EIO : 0;
+}
 static int airoha_ppe_ct_ifc_stop(struct airoha_ppe *ppe) { return fail_stop == 2 ? -EIO : 0; }
 static int airoha_ppe_ct_smac_stop(struct airoha_ppe *ppe) { return fail_stop == 3 ? -EIO : 0; }
 static int airoha_ct_pair_gdm_stop(struct airoha_ppe *ppe) { return fail_stop == 4 ? -EIO : 0; }
@@ -350,6 +426,14 @@ int airoha_npu_gate_command(struct airoha_npu *npu, struct npu_gate_message *mes
     CHECK(!ppe_lock && flow_offload_mutex);
 #endif
     gate_calls[operation]++;
+#ifdef NPU_OWNER_INGRESS_TEST
+    if (operation == GATE_OPEN)
+        ingress_note(INGRESS_GATE_OPEN);
+    else if (operation == GATE_CLOSE)
+        ingress_note(INGRESS_GATE_CLOSE);
+    else if (operation == GATE_QUERY)
+        ingress_note(INGRESS_GATE_QUERY);
+#endif
     if ((int)operation == fail_gate)
         return -ETIMEDOUT;
     if (operation == GATE_QUERY)
@@ -393,6 +477,10 @@ int airoha_npu_auth_command(struct airoha_npu *npu, struct npu_auth_message *mes
     unsigned int operation = message->w[AM_ABI_OP] >> 16;
     CHECK(npu && !ppe_lock && flow_offload_mutex && operation < 8);
     auth_calls[operation]++;
+#ifdef NPU_OWNER_INGRESS_TEST
+    if (operation == AUTH_MBOX_QUERY)
+        ingress_note(INGRESS_AUTH_QUERY);
+#endif
     if ((int)operation == fail_auth && !auth_lose_ack)
         return -ETIMEDOUT;
     CHECK(gate_calls[GATE_CLOSE]);
@@ -472,6 +560,9 @@ static void setup(struct airoha_eth *eth, struct airoha_ppe *ppe,
     route_claim_hook = NULL;
     before_free_hook = NULL;
     before_spin_lock_hook = NULL;
+#ifdef NPU_OWNER_INGRESS_TEST
+    ingress_reset(eth);
+#endif
 #ifdef NPU_OWNER_BANK1_TEST
     bank1_retire_calls = bank1_clear_calls = bank1_cleared_rows = 0;
     bank1_clear_start = 0;
@@ -508,6 +599,10 @@ static void check_closed(struct airoha_eth *eth)
 #endif
 #ifdef NPU_OWNER_HEALTH_TEST
 #include "health_test.inc"
+#endif
+#ifdef NPU_OWNER_INGRESS_TEST
+#include "ingress_probe_stubs.inc"
+#include "ingress_test.inc"
 #endif
 
 static void check_binding(struct airoha_eth *eth)
@@ -694,6 +789,9 @@ int main(void)
 #endif
 #ifdef NPU_OWNER_HEALTH_TEST
     check_health();
+#endif
+#ifdef NPU_OWNER_INGRESS_TEST
+    check_ingress();
 #endif
     printf("npu owner: %u checks passed\n", checks);
     return 0;

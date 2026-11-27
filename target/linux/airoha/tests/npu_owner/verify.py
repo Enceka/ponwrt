@@ -28,9 +28,12 @@ def main():
                         help='Apply the 999-z owner health extension and run its fault matrix')
     parser.add_argument('--bank1', action='store_true',
                         help='Include 999-zc bank1 retirement and the owner health matrix')
+    parser.add_argument('--ingress', action='store_true',
+                        help='Include 999-zd/999-ze ingress lifecycle and the bank1 matrix')
     parser.add_argument('--source', type=Path, required=True,
                         help='Kernel tree with patches through 999 applied')
     args = parser.parse_args()
+    args.bank1 |= args.ingress
     args.health |= args.bank1
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -44,6 +47,11 @@ def main():
         paths['999-z'] = patches / '999-z-net-airoha-monitor-npu-owner-invalidation.patch'
     if args.bank1:
         paths['999-zc'] = patches / '999-zc-net-airoha-retire-host-bank1-before-npu-reuse.patch'
+    if args.ingress:
+        for number in ('975', '976', '977', '981', '982', '983', '984', '986', '987', '991'):
+            paths[number] = next(patches.glob(number + '-net-airoha-*.patch'))
+        paths['999-zd'] = patches / '999-zd-net-airoha-prepare-authorized-pon-npu-ingress.patch'
+        paths['999-ze'] = patches / '999-ze-net-airoha-connect-pon-npu-ingress-lifecycle.patch'
     inputs = {number: path.read_bytes() for number, path in paths.items()}
     sources = {}
     for name in (*helper.ABIS, 'airoha_npu_transaction.h'):
@@ -60,7 +68,7 @@ def main():
         owner_patch = '--- a/drivers/net/ethernet/airoha/' + owner_name + '\n'
         owner_patch += re.split(r'^--- ', inputs[number].decode().split(owner_patch, 1)[1],
                                maxsplit=1, flags=re.MULTILINE)[0]
-        applied = subprocess.run(['patch', '--batch', '-p1'], input=owner_patch,
+        applied = subprocess.run(['patch', '--batch', '--forward', '--fuzz=0', '-p1'], input=owner_patch,
                                  cwd=output / 'expected', capture_output=True, text=True)
         (output / ('apply-' + number + '.log')).write_text(applied.stdout + applied.stderr)
         if applied.returncode:
@@ -74,7 +82,7 @@ def main():
     admission_patch = '--- a/drivers/net/ethernet/airoha/' + admission_name + '\n'
     admission_patch += re.split(r'^--- ', inputs['999'].decode().split(admission_patch, 1)[1],
                                maxsplit=1, flags=re.MULTILINE)[0]
-    applied = subprocess.run(['patch', '--batch', '-p1'], input=admission_patch,
+    applied = subprocess.run(['patch', '--batch', '--forward', '--fuzz=0', '-p1'], input=admission_patch,
                              cwd=output / 'expected', capture_output=True, text=True)
     if applied.returncode:
         raise RuntimeError('cannot apply admission: ' + applied.stdout + applied.stderr)
@@ -84,12 +92,22 @@ def main():
     publish_name = 'airoha_npu_auth_publish.h'
     sources[publish_name] = helper.added_file(inputs['995'].decode(), publish_name)
     health_name = 'airoha_npu_health.h'
-    for extension in (('999-z',) if args.health else ()) + (('999-zc',) if args.bank1 else ()):
+    if args.ingress:
+        for number, name in (('975', 'airoha_ct_pon_ifc_words.h'),
+                             ('976', 'airoha_ct_pon_ifc_owner.h'),
+                             ('977', 'airoha_ct_pon_ifc_cpu.h')):
+            sources[name] = helper.added_file(inputs[number].decode(), name)
+    extensions = ((('981', '982', '983', '984', '986', '987', '991') if args.ingress else ()) +
+                  (('999-z',) if args.health else ()) +
+                  (('999-zc',) if args.bank1 else ()) +
+                  (('999-zd', '999-ze') if args.ingress else ()))
+    for extension in extensions:
         for name, data in sources.items():
             (expected / name).write_bytes(data)
         sections = re.split(r'(?=^--- )', inputs[extension].decode(), flags=re.MULTILINE)
         for section in sections:
-            match = re.search(r'^\+\+\+ b/drivers/net/ethernet/airoha/(airoha_npu_\w+\.h)$',
+            match = re.search(r'^\+\+\+ b/drivers/net/ethernet/airoha/'
+                              r'(airoha_(?:npu|ct_pon_ifc)_\w+\.h)$',
                               section, flags=re.MULTILINE)
             if not match:
                 continue
@@ -106,7 +124,7 @@ def main():
                 raise RuntimeError('cannot apply ' + extension + ' header ' + name + ': ' +
                                    applied.stdout + applied.stderr)
             sources[name] = (expected / name).read_bytes()
-        if health_name not in sources:
+        if extension == '999-z' and health_name not in sources:
             raise RuntimeError('health patch does not add ' + health_name)
     driver = args.source.resolve() / 'drivers/net/ethernet/airoha'
     if (driver / owner_name).read_bytes() != sources[owner_name]:
@@ -118,6 +136,18 @@ def main():
                  *(('airoha_npu_bank1.h',) if args.bank1 else ())):
         if (driver / name).read_bytes() != sources[name]:
             raise RuntimeError('kernel admission source differs: ' + name)
+    checked_headers = {}
+    if args.ingress:
+        if 'airoha_npu_ingress.h' not in sources:
+            raise RuntimeError('ingress patch does not add airoha_npu_ingress.h')
+        for name, data in sources.items():
+            checked_headers[name] = (driver / name).read_bytes()
+            if checked_headers[name] != data:
+                raise RuntimeError('kernel ingress source differs: ' + name)
+        for name, function in (('ingress_busy.inc', 'airoha_ct_pon_ifc_busy'),
+                               ('ingress_probe.inc', 'ct_pon_cpu_probe_store')):
+            sources[name] = route_helper.extract_function(
+                sources['airoha_ct_pon_ifc_cpu.h'].decode(), function).encode()
     ppe_source = (driver / 'airoha_ppe.c').read_text()
     sources['commit_entry.inc'] = route_helper.extract_function(
         ppe_source, 'airoha_ppe_foe_commit_entry').encode()
@@ -139,6 +169,8 @@ def main():
         command.insert(1, '-DNPU_OWNER_HEALTH_TEST')
     if args.bank1:
         command.insert(1, '-DNPU_OWNER_BANK1_TEST')
+    if args.ingress:
+        command.insert(1, '-DNPU_OWNER_INGRESS_TEST')
     helper.execute(command, output, 'build')
     environment = dict(os.environ, ASAN_OPTIONS='halt_on_error=1:abort_on_error=1',
                        UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
@@ -158,6 +190,13 @@ def main():
             'if (owner->txn.phase != NPU_TXN_CLOSED || !owner->bank1_saved ||\n'
             '\t    owner->return_path || owner->epoch_dirty || !owner->bank1_host_retired ||\n'
             '\t    owner->bank1_next_row != PPE_SRAM_NUM_ENTRIES)', 'if (false)')
+    if args.ingress:
+        mutants['release_before_closed'] = (
+            'if (owner->txn.phase != NPU_TXN_CLOSED || !owner->bank1_saved ||\n'
+            '\t    owner->return_path || owner->epoch_dirty || !owner->bank1_host_retired ||\n'
+            '\t    owner->bank1_next_row != PPE_SRAM_NUM_ENTRIES ||\n'
+            '\t    owner->ingress.saved_valid || owner->ingress.dirty ||\n'
+            '\t    owner->ingress.active || owner->ingress.pending)', 'if (false)')
     return_mutants = {
         'return_ignore_config': ('memcmp(config, &path->config, sizeof(*config))', 'false'),
         'return_ignore_mapping': ('rcu_dereference(dev->pon_flow_table) == path->table', 'true'),
@@ -304,8 +343,66 @@ def main():
         }
         mutants.update({name: (before, after)
                         for name, (_, before, after) in bank1_mutants.items()})
+    ingress_mutants = {}
+    if args.ingress:
+        ingress_mutants = {
+            'ingress_restore_before_claim': (owner_name,
+                'error = airoha_bank1_routes_claim(owner->ppe->eth, owner);\n'
+                '\treturn error ?: airoha_npu_owner_ingress_restore(owner);',
+                'error = airoha_npu_owner_ingress_restore(owner);\n'
+                '\treturn error ?: airoha_bank1_routes_claim(owner->ppe->eth, owner);'),
+            'ingress_skip_restore': (owner_name,
+                'return error ?: airoha_npu_owner_ingress_restore(owner);',
+                'return error ?: (false ? airoha_npu_owner_ingress_restore(owner) : 0);'),
+            'ingress_ignore_claim_failure': (owner_name,
+                'return error ?: airoha_npu_owner_ingress_restore(owner);',
+                'return (void)error, airoha_npu_owner_ingress_restore(owner);'),
+            'ingress_ignore_restore_failure': (owner_name,
+                'return error ?: airoha_npu_owner_ingress_restore(owner);',
+                'return error ?: (airoha_npu_owner_ingress_restore(owner), 0);'),
+            'ingress_skip_prepare': (reopen_name,
+                'error = airoha_npu_owner_ingress_prepare(owner);',
+                'error = false ? airoha_npu_owner_ingress_prepare(owner) : 0;'),
+            'ingress_ignore_prepare_failure': (reopen_name,
+                'error = airoha_npu_owner_ingress_prepare(owner);',
+                'error = (airoha_npu_owner_ingress_prepare(owner), 0);'),
+            'ingress_skip_open_check': (reopen_name,
+                'error = airoha_npu_owner_ingress_check(owner);', 'error = 0;'),
+            'ingress_ignore_open_check_failure': (reopen_name,
+                'error = airoha_npu_owner_ingress_check(owner);',
+                'error = (airoha_npu_owner_ingress_check(owner), 0);'),
+            'ingress_skip_ready': (reopen_name,
+                'airoha_bank1_routes_ingress_ready(owner->ppe->eth, owner);',
+                '(false ? airoha_bank1_routes_ingress_ready(owner->ppe->eth, owner) : 0);'),
+            'ingress_ignore_locked_invalidation': (reopen_name,
+                'error = owner->invalidated ? -ESTALE :\n'
+                '\t\tairoha_bank1_routes_ingress_ready',
+                'error = false ? -ESTALE :\n\t\tairoha_bank1_routes_ingress_ready'),
+            'ingress_skip_health_check': (health_name,
+                'error = airoha_npu_owner_ingress_check(owner);', 'error = 0;'),
+            'ingress_skip_health_routes': (health_name,
+                'error = airoha_bank1_routes_check(owner->ppe->eth, owner, true);', 'error = 0;'),
+            'ingress_ignore_health_failure': (health_name,
+                'error = airoha_npu_owner_ingress_check(owner);',
+                'error = (airoha_npu_owner_ingress_check(owner), 0);'),
+            'ingress_claim_over_cpu_probe': (owner_name,
+                'if (airoha_ct_pon_ifc_busy(ppe))', 'if (false && airoha_ct_pon_ifc_busy(ppe))'),
+            'ingress_release_saved_shadow': (owner_name,
+                'owner->ingress.saved_valid ||', ''),
+            'ingress_release_dirty_rows': (owner_name,
+                'owner->ingress.dirty ||', ''),
+            'ingress_release_active_rows': (owner_name,
+                'owner->ingress.active ||', ''),
+            'ingress_release_pending_command': (owner_name,
+                ' || owner->ingress.pending)', ')'),
+            'ingress_legacy_probe_ignores_owner': ('ingress_probe.inc',
+                'if (ppe->ct_npu_owner)', 'if (false)'),
+        }
+        mutants.update({name: (before, after)
+                        for name, (_, before, after) in ingress_mutants.items()})
     for name, (before, after) in mutants.items():
-        target_name = (bank1_mutants[name][0] if name in bank1_mutants else
+        target_name = (ingress_mutants[name][0] if name in ingress_mutants else
+                       bank1_mutants[name][0] if name in bank1_mutants else
                        health_mutants[name][0] if name in health_mutants else
                        'stop_entry.inc' if name.startswith('repeat_') else
                        return_name if name in return_mutants else
@@ -330,11 +427,15 @@ def main():
     for number, path in paths.items():
         if path.read_bytes() != inputs[number]:
             raise RuntimeError(number + ' changed during testing')
+    for name, data in checked_headers.items():
+        if (driver / name).read_bytes() != data:
+            raise RuntimeError('kernel ingress source changed during testing: ' + name)
     sha256 = lambda data: hashlib.sha256(data).hexdigest()
     report = {
-        'passed': True, 'health': args.health, 'bank1': args.bank1,
+        'passed': True, 'health': args.health, 'bank1': args.bank1, 'ingress': args.ingress,
         'sanitizers': ['address', 'undefined'], 'result': result,
         'mutations': mutation_results,
+        'byte_checked_headers': sorted(checked_headers),
         'patch_sha256': {number: sha256(data) for number, data in inputs.items()},
         'source_sha256': {name: sha256(data) for name, data in sources.items()},
         'test_sha256': {name: sha256((tests / name).read_bytes())
@@ -342,6 +443,9 @@ def main():
                                      'return_stubs.inc', 'return_test.inc', 'admission_test.inc',
                                      'reopen_test.inc',
                                      *(('bank1_stubs.inc', 'bank1_test.inc') if args.bank1 else ()),
+                                     *(('ingress_stubs.inc', 'ingress_component.inc',
+                                        'ingress_probe_stubs.inc', 'ingress_test.inc')
+                                       if args.ingress else ()),
                                      *(('health_test.inc',) if args.health else ()))},
     }
     report_path.write_text(json.dumps(report, indent=2) + '\n')

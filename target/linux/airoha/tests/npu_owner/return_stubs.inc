@@ -69,6 +69,12 @@ int airoha_npu_er_command(struct airoha_npu *npu, struct er_message *message)
                                 message->w[5], message->w[6], message->w[7] };
     CHECK(npu && flow_offload_mutex && !ppe_lock && operation <= ER_UNBIND);
     er_calls[operation]++;
+#ifdef NPU_OWNER_INGRESS_TEST
+    if (operation == ER_STOP)
+        ingress_note(INGRESS_ER_STOP);
+    else if (operation == ER_UNBIND)
+        ingress_note(INGRESS_ER_UNBIND);
+#endif
     if ((int)operation == er_failure && !er_lose_ack)
         return -ETIMEDOUT;
     if (operation != ER_QUERY) {

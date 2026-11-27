@@ -101,3 +101,56 @@ python3 target/linux/airoha/tests/bank1_routes/verify.py --invalidation \
   --source /absolute/path/to/linux-after-996 \
   --output /absolute/path/to/results/bank1-invalidation
 ```
+
+## PON NPU ingress 生命周期
+
+`--ingress` 独立使用应用至 `999-zd` 的基线，复制后严格应用
+`999-ze-net-airoha-connect-pon-npu-ingress-lifecycle.patch` 中路由测试涉及的文件。
+默认基线为 `/Volumes/Workspace/5585f/build/pon-er-consumer-20261127/owner-source-npu-ingress`，
+默认产物为本目录的 `out/ingress/`。原有默认、`--reopen`、`--invalidation` 模式
+保持各自基线、断言与运行时变体；不能和 `--ingress` 同时指定。
+
+```sh
+python3 target/linux/airoha/tests/bank1_routes/verify.py --ingress
+```
+
+该模式直接 include 修改后的生产 `airoha_bank1_routes.h`、
+`airoha_ct_cpu_fallback.h`、`airoha_npu_ingress.h` 与其 IFC owner/words 头文件，
+从生产 `airoha_eth.h` 提取 route 结构体。保留既有 GDM/QDMA/native/旧 PON 函数提取，
+另提取 `airoha_ifc_update_ports`、`airoha_ifc_scope_ports`、
+`airoha_ifc_scope_update` 和 `airoha_ifc_lan_ports_ready` 的完整函数体。
+`ingress_ready(eth, owner)`、`check(eth, owner, opened)`、scope helper 均执行生产实现。
+
+当前包含 **93 个场景、655,360 组 selector 向量、16 个运行时负对照**，启用
+ASan/UBSan。覆盖内容包括：
+
+- claim/revoke 在 route lock → IFC port lock 下先关闭 SPORT2 并回读，再写 GDM；
+  open 保持 GDM2 四个 selector 为实际 CPU，最后开放 source2。
+- 首次 claim、重新 claim、open、revoke 的 scope 丢写和已生效写入后的坏读回；
+  open 失败叠加关闭失败、随后重复关闭、重新 prepare/open，保留 owner、desired 和
+  真实 ingress rows 的 saved/active/dirty 状态。
+- GDM 各位置的丢写/坏读回，以及 release 恢复失败保留 owner 并重新 guard。
+  IFC 仍打开 SPORT2 时，即使 FLOW_CFG 已清零也拒绝释放 owner。
+- fallback/stopping 中关闭重试，`ct_host_ppe` 已清除时既有 owner 重新 claim，
+  错误 scope 位收敛到 LAN1，未建立 scope 但 IFC 开启时拒绝视作成功关闭。
+- ingress_ready、原有资格、CPU 接收者、PPE enable/flow、IFC 配置、实际端口读回的
+  拒绝路径；公开 check 对硬件/软件状态变化的只读检测。
+- 其他 scope_update writer 在 owner 存在时零写入拒绝；scope_ports 阻止新 scope
+  及 prepared/open 状态的释放，允许关闭后 shared IFC stop。普通 port writer
+  更新 desired 时继续遵循已关闭的 scope。
+- 实际 QDMA 切换先完成关闭，失败保留旧指针/users/IRQ；native/QoS 路由更新继续
+  保持 CPU default。四 GDM 全 selector 组合覆盖普通策略；另穷举 GDM2 的 QDMA0
+  关闭态和 QDMA1 开放态。
+- 用真实 ingress 编码结果驱动最小 TCAM 匹配模型：IPv4/IPv6 命中送 NPU port 6，
+  short、其他协议、source 不匹配及关闭态走 CPU default；任何默认 selector 都不
+  直接送 PPE2，AUTH 前的数据包不会经 GDM default 绕过 NPU。
+
+负对照在复制出的生产函数中分别破坏 CPU default、ingress_ready、scope 回读、
+关闭顺序、fallback 重试、owner 检查、硬件 check、其他 scope writer 防护、
+SPORT2 释放防护和恢复失败保留 owner 等行为；要求每个变体触发运行时断言。
+变体结束恢复原函数，再重新编译并运行完整 ingress 测试。
+
+`out/ingress/report.json` 记录模式、完整生产补丁 SHA-256、基线/应用后源码 SHA、
+提取函数 SHA、测试 SHA 和负对照结果；`ingress-routes.patch` 保留实际应用的补丁片段。
+运行结束同时核对基线和生产补丁未变化。`--case ingress` 可只执行正向及故障场景，
+跳过运行时负对照；失败运行删除旧报告并保留日志供定位。

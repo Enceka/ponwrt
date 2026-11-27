@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply 991 to copied 987 driver files and exercise real route helpers with MMIO faults."""
+"""Exercise copied production route helpers with MMIO faults and sanitizer checks."""
 
 import argparse
 import hashlib
@@ -23,10 +23,13 @@ FUNCTIONS = {
     'airoha_ct_fe_native.h': ('airoha_ct_fe_table',),
     'airoha_ct_pon_ifc_cpu.h': ('airoha_ct_pon_ifc_read', 'airoha_ct_pon_ifc_route_open'),
 }
+INGRESS_FILES = ('airoha_npu_ingress.h', 'airoha_ct_pon_ifc_owner.h')
+INGRESS_FUNCTIONS = ('airoha_ifc_update_ports', 'airoha_ifc_scope_ports',
+                     'airoha_ifc_scope_update', 'airoha_ifc_lan_ports_ready')
 
 
 def extract_function(source, name):
-    matches = list(re.finditer(r'^static [^;{}]*\b' + re.escape(name) + r'\([^;{}]*\)\n\{',
+    matches = list(re.finditer(r'^(?:static )?[A-Za-z_][\w \t*]*\b' + re.escape(name) + r'\([^;{}]*\)\n\{',
                                source, re.MULTILINE))
     if len(matches) != 1:
         raise ValueError('expected one function definition: ' + name)
@@ -55,22 +58,112 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def select_patch(patch_bytes, filenames):
+    sections = re.findall(r'^--- [^\n]+\n\+\+\+ b/([^\n]+)\n(.*?)(?=^--- |\Z)',
+                          patch_bytes.decode(), re.MULTILINE | re.DOTALL)
+    selected = []
+    for filename, hunks in sections:
+        if filename in {str(DRIVER / name) for name in filenames}:
+            selected.append('--- a/' + filename + '\n+++ b/' + filename + '\n' + hunks)
+    if not selected:
+        raise RuntimeError('patch contains no selected production files')
+    return ''.join(selected)
+
+
+def ingress_mutations(output, driver, build, environment):
+    targets = {
+        'guard_gdm2_only_while_open': ('airoha_ct_cpu_fallback.h',
+            'airoha_ct_gdm_route_write_locked', 'if (id == AIROHA_GDM2_IDX) {',
+            'if (id == AIROHA_GDM2_IDX && eth->ct_bank1_routes.pon_open) {'),
+        'default_bypasses_auth': ('airoha_ct_cpu_fallback.h',
+            'airoha_ct_gdm_route_write_locked', 'mask = GENMASK(15, 0);',
+            'cfg = (cfg & ~GENMASK(15, 0)) | FE_PSE_PORT_PPE2 * 0x1111; mask = 0;'),
+        'open_without_ingress_ready': ('airoha_bank1_routes.h',
+            'airoha_bank1_routes_open', 'if (!routes->ingress_ready || routes->pon_open)',
+            'if (routes->pon_open)'),
+        'keep_ingress_ready_on_close': ('airoha_bank1_routes.h',
+            'airoha_bank1_scope_locked', 'eth->ct_bank1_routes.ingress_ready = false;', ''),
+        'skip_scope_readback': ('airoha_bank1_routes.h',
+            'airoha_bank1_scope_locked',
+            'if (airoha_fe_rr(eth, REG_FE_IFC_PORT_EN) != ports)', 'if (false)'),
+        'revoke_without_scope_close': ('airoha_bank1_routes.h',
+            'airoha_bank1_routes_revoke_locked',
+            'error = airoha_bank1_scope_locked(eth, false);', 'error = 0;'),
+        'forbid_fallback_close': ('airoha_bank1_routes.h',
+            'airoha_bank1_scope_locked', 'scope = eth->ct_ifc_port_mask;',
+            'scope = eth->ct_ifc_port_mask; if (eth->ct_cpu_fallback || eth->ppe->ct_stopping) '
+            '{ error = -ESHUTDOWN; goto unlock; }'),
+        'revoke_foreign_ingress_owner': ('airoha_bank1_routes.h',
+            'airoha_bank1_routes_revoke', 'eth->ct_bank1_routes.owner == owner ?', 'true ?'),
+        'check_ignores_cpu_defaults': ('airoha_bank1_routes.h',
+            'airoha_bank1_routes_check', 'FE_PSE_PORT_CDM2 * 0x1111',
+            '(airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)) & GENMASK(15, 0))'),
+        'allow_other_scope_update': ('route_functions.inc',
+            'airoha_ifc_scope_update', 'if (eth->ct_bank1_routes.owner) {', 'if (false) {'),
+        'allow_other_scope_ports': ('route_functions.inc',
+            'airoha_ifc_scope_ports', 'if (eth->ct_bank1_routes.owner &&',
+            'if (false && eth->ct_bank1_routes.owner &&'),
+        'release_live_source2': ('airoha_bank1_routes.h',
+            'airoha_bank1_routes_release',
+            '(airoha_fe_rr(eth, REG_FE_IFC_PORT_EN) & BIT(2))', 'false'),
+        'retain_unexpected_scope_ports': ('airoha_bank1_routes.h',
+            'airoha_bank1_scope_locked', 'scope &= XSI_ETH_VIP_PORT_MASK;', 'scope &= ~BIT(2);'),
+        'drop_owner_on_restore_failure': ('airoha_bank1_routes.h',
+            'airoha_bank1_routes_release', 'airoha_bank1_routes_write_all(eth, true);',
+            'routes->owner = NULL; airoha_bank1_routes_write_all(eth, true);'),
+        'fallback_ignores_scope_failure': ('airoha_ct_cpu_fallback.h',
+            'airoha_ct_cpu_fallback', 'err = airoha_bank1_routes_revoke_locked(eth);',
+            'airoha_bank1_routes_revoke_locked(eth);'),
+        'claim_requires_host_ppe_during_stop': ('airoha_bank1_routes.h',
+            'airoha_bank1_routes_claim', 'if (!eth->ppe || eth->soc->num_ppe < 2)',
+            'if (!eth->ppe || !eth->ppe->ct_host_ppe || eth->soc->num_ppe < 2)'),
+    }
+    caught = {}
+    for name, (filename, function, before, after) in targets.items():
+        target = (output if filename.endswith('.inc') else driver) / filename
+        original = target.read_text()
+        definition = extract_function(original, function)
+        if definition.count(before) != 1:
+            raise RuntimeError('expected one ingress mutation target: ' + name)
+        try:
+            target.write_text(original.replace(definition, definition.replace(before, after), 1))
+            run(build, output, name + '-build')
+            attempt = subprocess.run([str(output / 'routes_test'), 'ingress'],
+                                     capture_output=True, text=True, cwd=output, env=environment)
+            (output / (name + '.log')).write_text(attempt.stdout + attempt.stderr)
+            if attempt.returncode == 0 or 'case ' not in attempt.stderr:
+                raise RuntimeError('ingress mutation did not hit runtime assertion: ' + name)
+            caught[name] = 'caught'
+        finally:
+            target.write_text(original)
+    run(build, output, 'build-final')
+    return caught
+
+
 def main():
     tests = Path(__file__).resolve().parent
     repo = tests.parents[4]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path,
-                        default=repo.parent / 'pon-ifc-tuple-987-source',
-                        help='Read-only kernel source through 987')
-    parser.add_argument('--output', type=Path, default=tests / 'out')
+                        help='Read-only kernel source through 987, 996, or 999-zd for ingress')
+    parser.add_argument('--output', type=Path)
     parser.add_argument('--cc', default=os.environ.get('CC', 'clang'))
     parser.add_argument('--case', help='Run one named test group')
     parser.add_argument('--reopen', action='store_true',
                         help='Apply 998 to --source through 996 and test PON reopening')
     parser.add_argument('--invalidation', action='store_true',
                         help='Also apply 999-z route revocation; implies --reopen')
+    parser.add_argument('--ingress', action='store_true',
+                        help='Apply 999-ze to source through 999-zd and test ingress lifecycle')
     args = parser.parse_args()
+    if args.ingress and (args.reopen or args.invalidation):
+        parser.error('--ingress is independent of --reopen and --invalidation')
     args.reopen |= args.invalidation
+    if args.source is None:
+        args.source = repo.parent / ('pon-er-consumer-20261127/owner-source-npu-ingress'
+                                     if args.ingress else 'pon-ifc-tuple-987-source')
+    if args.output is None:
+        args.output = tests / 'out' / 'ingress' if args.ingress else tests / 'out'
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -78,6 +171,7 @@ def main():
     if report_path.exists():
         report_path.unlink()
     patch = repo / 'target/linux/airoha/patches-6.18' / (
+        '999-ze-net-airoha-connect-pon-npu-ingress-lifecycle.patch' if args.ingress else
         '998-net-airoha-reopen-owned-pon-default-route.patch' if args.reopen else
         '991-net-airoha-own-gdm-default-routes-for-bank1-isolation.patch')
     patch_bytes = patch.read_bytes()
@@ -85,17 +179,22 @@ def main():
     driver = tree / DRIVER
     driver.mkdir(parents=True, exist_ok=True)
     originals = {}
-    for name in FILES:
+    files = FILES + (INGRESS_FILES if args.ingress else ())
+    for name in files:
         originals[name] = (args.source.resolve() / DRIVER / name).read_bytes()
         (driver / name).write_bytes(originals[name])
     added = driver / 'airoha_bank1_routes.h'
-    if args.reopen:
+    if args.reopen or args.ingress:
         originals[added.name] = (args.source.resolve() / DRIVER / added.name).read_bytes()
         added.write_bytes(originals[added.name])
     elif added.exists():
         added.unlink()
+    applied_patch = patch
+    if args.ingress:
+        applied_patch = output / 'ingress-routes.patch'
+        applied_patch.write_text(select_patch(patch_bytes, files + (added.name,)))
     patch_output = run(['patch', '--batch', '--forward', '--fuzz=0',
-                        '--no-backup-if-mismatch', '-p1', '-i', str(patch)],
+                        '--no-backup-if-mismatch', '-p1', '-i', str(applied_patch)],
                        output, 'apply', cwd=tree)
     if re.search(r'fuzz|offset|FAILED|reversed', patch_output, re.IGNORECASE):
         raise RuntimeError('patch must apply exactly to the input files:\n' + patch_output)
@@ -113,7 +212,7 @@ def main():
         if result.returncode or re.search(r'fuzz|offset|FAILED|reversed', result.stdout,
                                           re.IGNORECASE):
             raise RuntimeError('route invalidation must apply exactly: ' + result.stdout + result.stderr)
-    modified = {name: (driver / name).read_bytes() for name in FILES + ('airoha_bank1_routes.h',)}
+    modified = {name: (driver / name).read_bytes() for name in files + ('airoha_bank1_routes.h',)}
     header = modified['airoha_eth.h'].decode()
     layout = re.search(r'^struct airoha_bank1_routes \{\n.*?^\};', header, re.MULTILINE | re.DOTALL)
     if not layout or not re.search(r'struct airoha_bank1_routes\s+ct_bank1_routes;', header):
@@ -126,9 +225,12 @@ def main():
     for filename, names in FUNCTIONS.items():
         for name in names:
             extracted[name] = extract_function(modified[filename].decode(), name)
-    if args.reopen:
+    if args.reopen or args.ingress:
         extracted['airoha_disable_qos_for_gdm34'] = extract_function(
             modified['airoha_eth.c'].decode(), 'airoha_disable_qos_for_gdm34')
+    if args.ingress:
+        for name in INGRESS_FUNCTIONS:
+            extracted[name] = extract_function(eth, name)
     (output / 'route_functions.inc').write_text('\n'.join(extracted.values()))
     compiler = shutil.which(args.cc)
     if not compiler:
@@ -145,6 +247,8 @@ def main():
         build.insert(1, '-DTEST_PON_REOPEN')
     if args.invalidation:
         build.insert(1, '-DTEST_OWNER_INVALIDATION')
+    if args.ingress:
+        build.insert(1, '-DTEST_PON_INGRESS')
     run(build, output, 'build')
     environment = dict(os.environ)
     environment['ASAN_OPTIONS'] = 'halt_on_error=1:abort_on_error=1'
@@ -203,12 +307,22 @@ def main():
                 raise RuntimeError('mutation did not hit runtime assertion: ' + name)
             mutations[name] = 'caught'
         run(build, output, 'build-final')
+    if args.ingress and not args.case:
+        mutations = ingress_mutations(output, driver, build, environment)
+        result = run(command, output, 'routes_test-final', environment)
+    if args.ingress:
+        for name, data in originals.items():
+            if (args.source.resolve() / DRIVER / name).read_bytes() != data:
+                raise RuntimeError('baseline changed during testing: ' + name)
     if patch.read_bytes() != patch_bytes:
-        raise RuntimeError('991 changed during testing; rerun against the completed patch')
+        raise RuntimeError(patch.name + ' changed during testing; rerun against the completed patch')
     if health_patch and health_patch.read_bytes() != health_bytes:
         raise RuntimeError('999-z changed during testing; rerun against the completed patch')
     report = {
         'passed': True, 'case': args.case or 'all', 'source': str(args.source.resolve()),
+        'mode': 'ingress' if args.ingress else 'invalidation' if args.invalidation else
+                'reopen' if args.reopen else 'default',
+        'patch': str(patch),
         'compiler': version.splitlines()[0], 'sanitizers': ['address', 'undefined'],
         'sanitize_recover': False, 'patch_sha256': digest(patch_bytes),
         'invalidation_patch_sha256': digest(health_bytes) if health_bytes else None,
@@ -217,7 +331,8 @@ def main():
         'extracted_sha256': {name: digest(data.encode()) for name, data in extracted.items()},
         'test_sha256': {name: digest((tests / name).read_bytes())
                         for name in ('verify.py', 'routes_test.c', 'reopen_test.inc',
-                                     'invalidation_test.inc')},
+                                     'invalidation_test.inc') +
+                                    (('ingress_test.inc',) if args.ingress else ())},
         'result': result, 'mutations': mutations,
     }
     report_path.write_text(json.dumps(report, indent=2) + '\n')
