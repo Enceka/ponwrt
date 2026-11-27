@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "profile": "hg5585f-ct-pon-full",
+  "author": "Enceka <enceka@yeah.net>",
+  "source_revision": "f121da5f83a870e4fc7f39157db707a7334f7c0d",
+  "validation_scope": "dualbank-owner RAM internal-loopback; package input only",
+  "installed_names": {
+    "code": "npu_pon_full_rv32.bin",
+    "data": "npu_pon_full_data.bin"
+  },
+  "manifest": {
+    "elf": {
+      "name": "lab.elf",
+      "bytes": 343992,
+      "sha256": "8d90d9ba0a76fb20c45f99584352f0d76a2b7bebabaa9bf9fa41e11001348b47"
+    },
+    "code": {
+      "name": "ram-npu_rv32.bin",
+      "bytes": 39084,
+      "sha256": "3a42a068d058a602ef6f9f3f47d531bf5a04e4fd6f84e76dc28c1306136a5fab",
+      "npu_address": "0x84000000"
+    },
+    "data": {
+      "name": "ram-npu_data.bin",
+      "bytes": 4,
+      "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+      "npu_address": "0x3e900000",
+      "host_address": "0x1e900000"
+    },
+    "ct_bridge_guard": true,
+    "ct_bridge_guard_profile": 2,
+    "ct_short_pad": true,
+    "ct_tdma_bank_profile": 2,
+    "ct_native_pairs": true,
+    "ct_fe_native": true,
+    "native_abi": 3,
+    "native_caps": 63,
+    "features": {
+      "fe_pon_generic": true,
+      "fe_pon_auth": true,
+      "fe_pipeline": true,
+      "fe_auth": true,
+      "fe_auth_mailbox": true,
+      "bank1_gate": true,
+      "eth_return": true,
+      "eth_return_dma": false
+    },
+    "local_sram": {
+      "bss_end": "0x3e9037c4",
+      "remaining_bytes": 4
+    },
+    "ct_fe_generic": {
+      "source_port": 24,
+      "minimum_frame": 14,
+      "maximum_frame": 1518,
+      "output_pse": 8,
+      "output_nbq": 1,
+      "channel": 7,
+      "protocols": ["IPv4", "IPv6"],
+      "padding_operation": 5
+    }
+  },
+  "evidence": {
+    "workspace_directory": "build/pon-npu-diag-20261127",
+    "fit": {
+      "path": "pack-dualbank-owner/pon-npu-diag-ram.itb",
+      "sha256": "ea0db8619dca81032414b4d0fb130aa3de09e0215784a9b681ec759f676364a9"
+    },
+    "sealed": {
+      "path": "pack-dualbank-owner/sealed.json",
+      "sha256": "b3accc4a6acae61d61fd04f176dc7f68b228fbe1cda4e8ac2916f72c943bc96e"
+    },
+    "bound_report": {
+      "path": "board-dualbank-owner-bound/report.json",
+      "sha256": "4ffd4be8f3cf38d1f86a65325353d15c0d8fca00162381b2baa35fbe88c3a685",
+      "passed": true,
+      "restored": true
+    }
+  }
+}
