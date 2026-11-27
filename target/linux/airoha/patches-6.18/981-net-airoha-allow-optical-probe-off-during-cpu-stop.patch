@@ -1,0 +1,28 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: allow optical probe off during CPU stop
+
+NPU health failure sets ct_stopping before userspace can withdraw its
+optical CPU probes. Rejecting off in that state leaves the saved rows
+owned and prevents the RAM loopback module from restoring its state.
+
+Allow off while the probe is registered and its teardown work is live.
+Keep set and clear blocked during ct_stopping. The existing CPU stop path
+closes IFC locally if needed and restores the owner without firmware work;
+an outstanding IFC command retains the shadow for a later off retry.
+
+--- a/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_cpu.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_pon_ifc_cpu.h
+@@ -330,10 +330,12 @@ static ssize_t ct_pon_cpu_probe_store(struct device *dev,
+ 	rtnl_lock();
+ 	mutex_lock(&flow_offload_mutex);
+ 	if (!READ_ONCE(ppe->ct_pon_ifc_registered) ||
+-	    READ_ONCE(ppe->ct_pon_ifc_work_stopping) || READ_ONCE(ppe->ct_stopping))
++	    READ_ONCE(ppe->ct_pon_ifc_work_stopping))
+ 		err = -ESHUTDOWN;
+ 	else if (sysfs_streq(buf, "off"))
+ 		err = airoha_ct_pon_ifc_cpu_stop(ppe);
++	else if (READ_ONCE(ppe->ct_stopping))
++		err = -ESHUTDOWN;
+ 	else if (!strcmp(command, "set"))
+ 		err = airoha_ct_pon_ifc_cpu_set(ppe, slot, service);
+ 	else

@@ -12,7 +12,7 @@ import subprocess
 
 
 def function(text, name):
-    match = re.search(r'(?m)^(?:static )?(?:int|bool|void|u16|u32|struct \w+)\s+' +
+    match = re.search(r'(?m)^(?:static )?(?:int|bool|void|u16|u32|ssize_t|struct \w+)\s+' +
                       re.escape(name) + r'\(', text)
     assert match, name
     opening = text.index('{', match.end())
@@ -45,7 +45,8 @@ def main():
             'airoha_ct_pon_ifc_io', 'airoha_ct_pon_ifc_route_ready',
             'airoha_ct_pon_ifc_dependencies', 'airoha_ct_pon_ifc_authorize',
             'airoha_ct_pon_ifc_fault', 'airoha_ct_pon_ifc_cpu_stop',
-            'airoha_ct_pon_ifc_cpu_set', 'airoha_ct_pon_ifc_cpu_clear'],
+            'airoha_ct_pon_ifc_cpu_set', 'airoha_ct_pon_ifc_cpu_clear',
+            'ct_pon_cpu_probe_store'],
     }
     complete = ['airoha_ct_pon_ifc_words.h', 'airoha_ct_pon_ifc_owner.h',
                 'airoha_ct_ifc_command.h']
@@ -74,6 +75,7 @@ def main():
         (directory / 'probe_constants.inc').write_text(constants)
         (directory / 'probe_production.inc').write_text(code)
         command = ['clang', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
+                   '-Wno-unused-parameter',
                    '-I', str(directory), str(test), '-o', str(directory / 'test')]
         if sanitized:
             command += ['-fsanitize=address,undefined', '-fno-sanitize-recover=all',
@@ -98,11 +100,27 @@ def main():
         assert result['scope_cases'] == 28 and result['fallback_stop_cases'] == 3
         assert result['rejected_set_retries'] == 1276
         assert result['sport_cases'] == 72 and result['sport_close_cases'] == 2
+        assert result['store_dispatch_cases'] == 32 and result['store_stop_cases'] == 6
+        assert result['store_pending_cases'] == 6
         results.append(dict(mode=mode, **result))
     assert {key: value for key, value in results[0].items() if key != 'mode'} == {
         key: value for key, value in results[1].items() if key != 'mode'}
 
     mutations = [
+        ('store_blocks_stopping_off', 'ct_pon_cpu_probe_store',
+         'READ_ONCE(ppe->ct_pon_ifc_work_stopping))',
+         'READ_ONCE(ppe->ct_pon_ifc_work_stopping) || READ_ONCE(ppe->ct_stopping))'),
+        ('store_allows_stopping_clear', 'ct_pon_cpu_probe_store',
+         'else if (READ_ONCE(ppe->ct_stopping))', 'else if (false)'),
+        ('store_ignores_registration', 'ct_pon_cpu_probe_store',
+         '!READ_ONCE(ppe->ct_pon_ifc_registered)', 'false'),
+        ('store_ignores_work_stop', 'ct_pon_cpu_probe_store',
+         'READ_ONCE(ppe->ct_pon_ifc_work_stopping)', 'false'),
+        ('store_off_skips_restore', 'ct_pon_cpu_probe_store',
+         'err = airoha_ct_pon_ifc_cpu_stop(ppe);', 'err = 0;'),
+        ('store_off_hides_pending', 'ct_pon_cpu_probe_store',
+         'err = airoha_ct_pon_ifc_cpu_stop(ppe);',
+         '{ err = airoha_ct_pon_ifc_cpu_stop(ppe); if (err == -ETIMEDOUT) err = 0; }'),
         ('missing_gdm2_sport', 'airoha_en7581_get_sport',
          'case AIROHA_GDM2_IDX:\n\t\tif (!nbq)\n\t\t\treturn 2;\n\t\tbreak;\n', ''),
         ('gdm2_accepts_other_nbq', 'airoha_en7581_get_sport', 'if (!nbq)', 'if (true)'),

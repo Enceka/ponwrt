@@ -4,7 +4,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 
 #ifndef EUCLEAN
 #define EUCLEAN 117
@@ -77,6 +79,38 @@ static void spin_unlock_bh(struct lock *lock)
 }
 static void rcu_read_lock(void) { rcu_depth++; }
 static void rcu_read_unlock(void) { assert(rcu_depth); rcu_depth--; }
+static void rtnl_lock(void) { assert(!rtnl); rtnl = true; }
+static void rtnl_unlock(void) { assert(rtnl && !flow_offload_mutex.held); rtnl = false; }
+static void mutex_lock(struct lock *lock) { assert(rtnl && !lock->held); lock->held = true; }
+static void mutex_unlock(struct lock *lock) { assert(rtnl && lock->held); lock->held = false; }
+struct device { struct airoha_eth *data; };
+struct device_attribute { unsigned int unused; };
+static void *dev_get_drvdata(struct device *dev) { return dev->data; }
+static bool sysfs_streq(const char *first, const char *second)
+{
+	while (*first && *first == *second) {
+		first++;
+		second++;
+	}
+	return (!*first || (*first == '\n' && !first[1])) &&
+	       (!*second || (*second == '\n' && !second[1]));
+}
+static int kstrtouint(const char *text, unsigned int base, unsigned int *value)
+{
+	char *end;
+	unsigned long parsed;
+
+	if (*text == '-')
+		return -EINVAL;
+	errno = 0;
+	parsed = strtoul(text, &end, base);
+	if (errno == ERANGE || parsed > UINT_MAX)
+		return -ERANGE;
+	if (end == text || (*end && (*end != '\n' || end[1])))
+		return -EINVAL;
+	*value = parsed;
+	return 0;
+}
 struct work { unsigned int scheduled; };
 static void schedule_delayed_work(struct work *work, unsigned int delay)
 {
@@ -132,6 +166,7 @@ static struct simulation mock;
 static unsigned int cases, transport_faults, blocked_retries, dependency_faults, readback_faults;
 static unsigned int scope_cases, fallback_stop_cases, rejected_set_retries;
 static unsigned int sport_cases, sport_close_cases;
+static unsigned int store_dispatch_cases, store_stop_cases, store_pending_cases;
 
 static unsigned int page_words(unsigned int bank, unsigned int page)
 {
@@ -861,6 +896,149 @@ static void source_port_mapping(void)
 	}
 }
 
+static ssize_t store(struct fixture *fixture, const char *command)
+{
+	struct device dev = { .data = &fixture->eth };
+	ssize_t result;
+
+	assert(rtnl && flow_offload_mutex.held && !lock_depth);
+	flow_offload_mutex.held = rtnl = false;
+	result = ct_pon_cpu_probe_store(&dev, NULL, command, strlen(command));
+	assert(!rtnl && !flow_offload_mutex.held && !lock_depth && !rcu_depth);
+	flow_offload_mutex.held = rtnl = true;
+	return result;
+}
+
+static void store_dispatch(void)
+{
+	const char *commands[] = { "off", "off\n", "set 0 0x2468\n", "clear 0\n" };
+	struct fixture fixture;
+
+	for (unsigned int state = 0; state < 8; state++)
+		for (unsigned int command = 0; command < ARRAY_SIZE(commands); command++) {
+			struct airoha_ct_pon_ifc_owner saved;
+			u16 services[2];
+			bool rejected;
+
+			prepare(&fixture);
+			saved = fixture.ppe.ct_pon_ifc;
+			memcpy(services, fixture.ppe.ct_pon_ifc_services, sizeof(services));
+			fixture.ppe.ct_pon_ifc_registered = !!(state & BIT(0));
+			fixture.ppe.ct_pon_ifc_work_stopping = !!(state & BIT(1));
+			fixture.ppe.ct_stopping = !!(state & BIT(2));
+			rejected = !(state & BIT(0)) || (state & BIT(1)) ||
+				   ((state & BIT(2)) && command >= 2);
+			assert(store(&fixture, commands[command]) ==
+			       (rejected ? -ESHUTDOWN : (ssize_t)strlen(commands[command])));
+			if (rejected) {
+				assert(!mock.commands && !mock.data_writes && !mock.control_writes);
+				assert(!mock.port_writes && !mock.gate_clears && fixture.eth.ct_ifc_pon_ready);
+				assert(!memcmp(&saved, &fixture.ppe.ct_pon_ifc, sizeof(saved)));
+				assert(!memcmp(services, fixture.ppe.ct_pon_ifc_services, sizeof(services)));
+			} else if (command < 2) {
+				check_restored(&fixture);
+			} else if (command == 2) {
+				assert(fixture.ppe.ct_pon_ifc_services[0] == 0x2468);
+				assert(fixture.ppe.ct_pon_ifc_services[1] == 0xa134);
+				assert(fixture.ppe.ct_pon_ifc.active == 15);
+			} else {
+				assert(!fixture.ppe.ct_pon_ifc_services[0]);
+				assert(fixture.ppe.ct_pon_ifc_services[1] == 0xa134);
+				assert(fixture.ppe.ct_pon_ifc.active == 12);
+			}
+			store_dispatch_cases++;
+			cases++;
+		}
+}
+
+static void store_stopping_off(void)
+{
+	struct fixture fixture;
+
+	for (unsigned int host = 0; host < 2; host++)
+		for (unsigned int gate = 0; gate < 3; gate++) {
+			struct airoha_ct_pon_ifc_owner saved;
+
+			prepare(&fixture);
+			saved = fixture.ppe.ct_pon_ifc;
+			fixture.ppe.ct_stopping = fixture.eth.ct_cpu_fallback = true;
+			fixture.ppe.ct_fe.health_stopping = true;
+			fixture.ppe.ct_host_ppe = host;
+			mock.registers[REG_FE_CSR_IFC_CFG / 4] = gate ? FE_IFC_EN_MASK : 0;
+			mock.gate_stuck = gate == 2;
+			mock.require_gate_closed = true;
+			assert(store(&fixture, "off\n") == (gate == 2 ? -EIO : 4));
+			assert(!mock.port_writes && !fixture.ppe.ct_fe.health_work.scheduled);
+			assert(!!mock.gate_clears == !!gate);
+			if (gate == 2) {
+				assert(!mock.commands && !mock.data_writes && !mock.control_writes);
+				assert(!memcmp(&saved, &fixture.ppe.ct_pon_ifc, sizeof(saved)));
+				assert(fixture.eth.ct_ifc_pon_ready);
+				assert(fixture.ppe.ct_pon_ifc_services[0] == 0x2134 &&
+				       fixture.ppe.ct_pon_ifc_services[1] == 0xa134);
+				mock.gate_stuck = false;
+				assert(store(&fixture, "off\n") == 4);
+			}
+			assert(mock.commands == 104 && !mock.port_writes);
+			assert(!(mock.registers[REG_FE_CSR_IFC_CFG / 4] & FE_IFC_EN_MASK));
+			assert(fixture.ppe.ct_stopping && fixture.eth.ct_cpu_fallback);
+			assert(!fixture.ppe.ct_fe.health_work.scheduled);
+			check_restored(&fixture);
+			reset_counts();
+			assert(store(&fixture, "off") == 3);
+			assert(!mock.commands && !mock.port_writes && !mock.gate_clears);
+			store_stop_cases++;
+			cases++;
+		}
+	for (unsigned int shared = 0; shared < 2; shared++)
+		for (unsigned int mode = BEFORE; mode <= DEFERRED; mode++) {
+			struct airoha_ct_pon_ifc_owner saved;
+			unsigned int data_writes, control_writes;
+			u32 words[2];
+
+			prepare(&fixture);
+			fixture.ppe.ct_stopping = fixture.eth.ct_cpu_fallback = true;
+			fixture.ppe.ct_fe.health_stopping = true;
+			mock.registers[REG_FE_CSR_IFC_CFG / 4] = 0;
+			mock.require_gate_closed = true;
+			mock.fault = mode;
+			mock.fail_at = 1;
+			if (shared) {
+				assert(ct_ifc_access(&fixture.eth, 0, 54, 0, false, words, 2) == -ETIMEDOUT);
+				assert(fixture.eth.ct_ifc_command_pending && !fixture.ppe.ct_pon_ifc.pending);
+			}
+			data_writes = mock.data_writes;
+			control_writes = mock.control_writes;
+			assert(store(&fixture, "off") == -ETIMEDOUT);
+			assert(mock.commands == 1 && fixture.eth.ct_ifc_command_pending);
+			assert(fixture.ppe.ct_pon_ifc.pending && fixture.ppe.ct_pon_ifc.saved_valid);
+			assert(fixture.ppe.ct_pon_ifc.dirty == 15 && !fixture.eth.ct_ifc_pon_ready);
+			if (shared)
+				assert(mock.data_writes == data_writes && mock.control_writes == control_writes);
+			check_shadow(&fixture);
+			saved = fixture.ppe.ct_pon_ifc;
+			data_writes = mock.data_writes;
+			control_writes = mock.control_writes;
+			for (unsigned int attempt = 0; attempt < 2; attempt++) {
+				assert(store(&fixture, "off\n") == -ETIMEDOUT);
+				assert(!memcmp(&saved, &fixture.ppe.ct_pon_ifc, sizeof(saved)));
+				assert(mock.data_writes == data_writes && mock.control_writes == control_writes);
+				assert(fixture.ppe.ct_pon_ifc_services[0] == 0x2134 &&
+				       fixture.ppe.ct_pon_ifc_services[1] == 0xa134);
+			}
+			mock.fail_at = 0;
+			mock.release = true;
+			assert(store(&fixture, "off") == 3);
+			assert(!fixture.eth.ct_ifc_command_pending && !mock.busy);
+			assert(!mock.port_writes);
+			assert(!(mock.registers[REG_FE_CSR_IFC_CFG / 4] & FE_IFC_EN_MASK));
+			assert(!fixture.ppe.ct_fe.health_work.scheduled);
+			check_restored(&fixture);
+			store_pending_cases++;
+			cases++;
+		}
+}
+
 int main(void)
 {
 	source_port_mapping();
@@ -873,11 +1051,15 @@ int main(void)
 	shared_transport();
 	scope_interoperation();
 	fallback_stop();
+	store_dispatch();
+	store_stopping_off();
 	printf("{\"passed\":true,\"cases\":%u,\"transport_faults\":%u,\"blocked_retries\":%u,"
 	       "\"dependency_faults\":%u,\"readback_faults\":%u,\"scope_cases\":%u,"
 	       "\"fallback_stop_cases\":%u,\"rejected_set_retries\":%u,"
-	       "\"sport_cases\":%u,\"sport_close_cases\":%u}\n",
+	       "\"sport_cases\":%u,\"sport_close_cases\":%u,\"store_dispatch_cases\":%u,"
+	       "\"store_stop_cases\":%u,\"store_pending_cases\":%u}\n",
 	       cases, transport_faults, blocked_retries, dependency_faults, readback_faults,
-	       scope_cases, fallback_stop_cases, rejected_set_retries, sport_cases, sport_close_cases);
+	       scope_cases, fallback_stop_cases, rejected_set_retries, sport_cases, sport_close_cases,
+	       store_dispatch_cases, store_stop_cases, store_pending_cases);
 	return 0;
 }
