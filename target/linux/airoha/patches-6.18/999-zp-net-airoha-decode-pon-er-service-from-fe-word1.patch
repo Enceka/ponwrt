@@ -1,0 +1,33 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: decode PON ER service from the measured FE prefix
+
+Match firmware AUTH and ER decoding to internal-loopback captures: FE
+word1 bits15:0 carry the service ID. Word4 contains MTU and entry metadata.
+Keep the separate QDMA RX/TX message layout unchanged.
+
+--- a/drivers/net/ethernet/airoha/npu_eth_return_abi.h
++++ b/drivers/net/ethernet/airoha/npu_eth_return_abi.h
+@@ -64,11 +64,11 @@
+     return bytes >= 14u && bytes <= 1518u && (raw[0] & 0xffffu) == bytes &&
+            raw[2] == 7u && (raw[5] >> 28u) == 6u && (raw[6] & 31u) == sport;
+ }
+-/* The experimental PON producer encodes its saved FE word4, not a VLAN
+- * ID. ER_SERVICE_VALID is an ER publication flag, not a silicon RX flag. */
+-static inline er_u32 er_pon_service(er_u32 word4)
++/* The PON producer uses FE word1 bits15:0, verified by internal loopback.
++ * ER_SERVICE_VALID is an ER publication flag, not a silicon RX flag. */
++static inline er_u32 er_pon_service(er_u32 word1)
+ {
+-    return ER_SERVICE_VALID | ((word4 >> 14u) & 0xffffu);
++    return ER_SERVICE_VALID | (word1 & 0xffffu);
+ }
+ /* Called only after DONE acquire/dma_rmb and a stable descriptor snapshot. */
+ static inline int er_descriptor_valid(const struct er_config *c, const er_u32 d[16],
+@@ -80,6 +80,6 @@
+         d[4] != c->generation || d[6] != er_payload_dma(c, sequence) || d[7] ||
+         !er_prefix_valid(d + 8, bytes, c->sport)) return 0;
+     return d[ER_D_SERVICE] == (c->sport == ER_PON ?
+-           er_pon_service(d[ER_D_PREFIX + 4]) : 0u);
++           er_pon_service(d[ER_D_PREFIX + 1]) : 0u);
+ }
+ #endif

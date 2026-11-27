@@ -535,12 +535,12 @@ static void publish(struct fixture *fixture, u32 sequence, u32 bytes, u32 servic
 	struct airoha_er *ring = fixture->ring;
 	__le32 *slot = slot_for(ring, sequence);
 	u8 *payload = payload_for(ring, sequence);
-	u32 word4 = ((service & 0xffffu) << 14) | 0x80000015u;
+	u32 word1 = 0x00e00000u | (service & 0xffffu);
 	u32 words[16] = {
 		ER_DONE | bytes, ring->config.epoch, sequence, ring->config.sport,
 		ring->config.generation, service,
 		ring->config.dma + (u32)(payload - (u8 *)ring->allocation), 0,
-		bytes, 0, 7, 0, word4, 6u << 28, ring->config.sport, 0,
+		bytes, word1, 7, 0, 0x05dc7fffu, 6u << 28, ring->config.sport, 0,
 	};
 	u32 index;
 
@@ -795,7 +795,7 @@ static void test_descriptor_faults(void)
 		{ "descriptor reserved", ER_D_RESERVED, 1 },
 		{ "prefix length", ER_D_PREFIX, 1 },
 		{ "prefix packet type", ER_D_PREFIX + 2, 1 },
-		{ "prefix PON FE word4 service", ER_D_PREFIX + 4, 1u << 26 },
+		{ "prefix PON FE word1 service", ER_D_PREFIX + 1, 1u << 12 },
 		{ "prefix format", ER_D_PREFIX + 5, 1u << 28 },
 		{ "prefix source", ER_D_PREFIX + 6, 1 },
 	};
@@ -809,7 +809,7 @@ static void test_descriptor_faults(void)
 			u32 word = corruptions[corruption].word;
 			u32 original;
 
-			if (sources[source] == ER_LAN1 && word == ER_D_PREFIX + 4)
+			if (sources[source] == ER_LAN1 && word == ER_D_PREFIX + 1)
 				continue;
 			begin(corruptions[corruption].name);
 			setup(&fixture, sources[source]);

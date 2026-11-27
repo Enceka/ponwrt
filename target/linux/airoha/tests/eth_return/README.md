@@ -6,31 +6,48 @@
 python3 target/linux/airoha/tests/eth_return/verify.py
 ```
 
-依赖 Python 3 和 clang。默认产物位于本目录已忽略的 `out/`，可重复运行。
+依赖 Python 3、clang 和 patch。默认产物位于本目录已忽略的 `out/`，可重复运行。
 `--cc` 可选择 clang 路径，`--firmware` 可指定 firmware 仓库；默认使用工作区
 `an7581-npu-firmware/include/npu_eth_return_abi.h`。`--output` 可选择输出目录。
 
-runner 从当前 989 patch 的完整新增文件 hunk 提取 `airoha_eth_return.c/.h`，
-校验 hunk 行数，并直接 `#include "airoha_eth_return.c"` 编译测试。
-ABI 优先取当前 988 patch，并逐字节核对 firmware 头文件；988 尚未包含该头时
-直接使用 firmware 头。消费者逻辑、ABI 校验函数、生命周期函数和静态
-`er_poll` 全部使用实际源码。
+runner 按文件名顺序扫描 `patches-6.18/*.patch`，从首次新增开始重建
+`airoha_eth_return.c`、`airoha_eth_return.h`、`npu_eth_return_abi.h`，应用所有
+涉及这三文件的后续 production patch，包括 ZK/ZN 观察逻辑与 ZP word1 服务号。
+只读复用 `npu_ingress/source_binding.py` 的 section 选择与 `exact_hunks` 校验，
+逐 hunk 检查位置、上下文、行数，再以 `patch --fuzz=0` 应用；offset、fuzz、
+缺少或重复新增均报错。重建在输出目录内的临时树执行，结束后清理临时树。
+
+默认和 `--source` 均编译这份重建结果，直接 `#include "airoha_eth_return.c"`；
+指定 `--source` 时，三文件必须与输入 kernel 树逐字节相同。两种模式均要求
+重建 ABI 与 firmware 头文件逐字节相同。消费者逻辑、ABI 校验函数、生命周期
+函数和静态 `er_poll` 全部使用实际源码。
+
+核对已生成的 kernel 树：
+
+```sh
+python3 target/linux/airoha/tests/eth_return/verify.py \
+  --source /Volumes/Workspace/5585f/build/pon-npu-diag-20261127/kernel-service-word1 \
+  --output target/linux/airoha/tests/eth_return/out/source-check
+```
 
 clang 启用 `-Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined`
 及 `-fno-sanitize-recover=all -fno-omit-frame-pointer`。测试运行 native 和
 swapped 两种模式；swapped 通过交换 `cpu_to_le32/le32_to_cpu` 模拟另一种共享
-word 表示，覆盖遗漏字节序转换。当前每种模式 **107 个独立用例**，共 **214 次**。
+word 表示，覆盖遗漏字节序转换。每种模式的实际用例数量记录在报告和运行日志中。
 
-`out/report.json` 保存编译器版本、988/989 patch、提取源码、测试源码 SHA-256、
-ABI 来源和两种模式结果；编译及执行日志位于 `out/*-build.log` 和
-`out/native.log`、`out/swapped.log`。runner 若发现运行期间 patch 改变则失败，
-要求对完整的新版本重跑。
+`out/report.json` 保存实际参与重建的完整 patch 文件名、应用顺序和 SHA-256、
+每份源码的补丁链与最终 SHA-256、可选输入 kernel 路径与三文件 SHA-256、
+firmware ABI 路径与 SHA-256，以及共享校验模块、测试源码、编译器和两种模式结果。
+选中的 patch sections 及应用日志位于 `out/applied-patches/`；编译及执行日志
+位于 `out/*-build.log` 和 `out/native.log`、`out/swapped.log`。
+每次启动清除旧成功报告，仅在全部检查通过后写新报告。运行期间相关补丁链、
+输入源码、重建结果、firmware ABI 或共享校验模块改变均报错，要求重跑。
 
 ## 覆盖范围
 
 - 两个独立 LAN/PON handle、DMA、NAPI、timer、lower 引用和包统计；销毁或 fault
   一个 source 后，另一个 source 继续接收。
-- LAN service 必须为 0；PON 必须保留完整 service-valid 标记和 FE word4 的
+- LAN service 必须为 0；PON 必须保留完整 service-valid 标记和 FE word1 低16位的
   16-bit service，检查前缀和 descriptor 一致性。descriptor 的 source、epoch、
   generation、sequence、buffer、长度、reserved 及格式错误在 binding/copy 前终止。
 - binding 在 RCU 内收到精确 lower/config/full-service；旧 lower、source、
