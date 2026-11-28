@@ -8,6 +8,25 @@ recorded in `pon-full.json`. The package installs separate
 and NPU nodes must carry the same exclusive `airoha,connac2-pon-full` profile.
 Optical ingress uses WAN CPU while production admission remains unqualified.
 
+The PON profile accepts exact IPv4 TCP/UDP downstream software candidates
+from a live GDM2/WAN receiver to a live local wired output. Candidate cookies
+retain their original ingress identity and remain excluded from ordinary
+host row learning, including after a qualification transition. QDMA reception
+and validated production ER returns both feed identity observation. The
+production owner must bind and retire these candidates explicitly; candidate
+acceptance alone leaves their hardware hash unbound.
+
+Each candidate publication allocates a non-reusable serial. A production worker
+can acquire a referenced snapshot of the original key, service mapping and NAT
+action, then revalidate the cookie, serial, generation and live endpoints before
+acting. The current snapshot contract accepts GPON IPv4 TCP/UDP; EPON candidate
+snapshots are deferred until the return mapping supports their identity.
+Shared Bank0 helpers check a real UNB row's tuple and install only into a fully
+empty row, with SRAM ACK and complete readback verification. A submitted write
+retains its cleanup obligation even when completion times out. The diagnostic
+bind/install path exercises these helpers. The production worker, per-row
+ownership and native WLAN coexistence lifecycle remain to be integrated.
+
 The source revision is `f121da5f83a870e4fc7f39157db707a7334f7c0d`.
 The recorded RAM test exercised Bank0 UNB-to-BND forwarding to LAN1,
 cross-GEM isolation and owner restoration. Evidence paths are relative to
