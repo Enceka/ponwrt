@@ -48,6 +48,12 @@ handled separately.
 
 ## Coverage
 
+The cookie-reuse fixture requires flow types through the ZZ ingress-identity
+patch. Bank retirement preserves the observed PON identity; PON withdrawal
+clears its seen flag before deletion. The allocation stub captures that flag
+immediately before freeing the entry, so post-destroy assertions use the
+captured value without accessing released storage.
+
 The complete matrix runs once for Bank0 and once for Bank1 through their real
 retirement and row-clear wrappers. Expected bank membership is computed in the
 fixture independently of the production predicate.

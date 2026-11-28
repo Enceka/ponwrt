@@ -46,6 +46,9 @@ static void test_cookie_reuse(void)
 					unsigned type = types[type_index];
 					u32 hash = hashes[position];
 					struct airoha_flow_table_entry *entry = new_flow(hash, FLOW_TYPE_L4, cookies[cookie_index]);
+					entry->pon_ingress_seen = true;
+					entry->pon_ingress_service = 0x8000;
+					memset(entry->pon_ingress_key, 0x59, sizeof(entry->pon_ingress_key));
 					entry->data.ib1 = (entry->data.ib1 & ~AIROHA_FOE_IB1_BIND_PACKET_TYPE) |
 							 FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE, type);
 					ppe.ct_host_ppe = true;
@@ -77,6 +80,7 @@ static void test_cookie_reuse(void)
 					check_entry(entry, before, false);
 					walk_count = 1;
 					CHECK(retire() == 0 && entry->hash == 0xffff);
+					CHECK(entry->pon_ingress_seen && entry->pon_ingress_service == 0x8000);
 					hardware[hash] = shadow[hash] = original;
 					protect_reused_rows();
 					struct flow_cls_offload request = { .cookie = entry->cookie };
@@ -92,6 +96,7 @@ static void test_cookie_reuse(void)
 					CHECK(airoha_ppe_flow_offload_destroy(&eth, &request) == 0);
 					mutex_unlock(&flow_offload_mutex);
 					CHECK(frees == 1 && removed_cookies == 1 && !removed_l2);
+					CHECK(allocated[0].pon_seen_at_free == (path != 1 && path != 2));
 					CHECK(!reuse_reads && !reuse_writes && !reuse_stats && list_empty(&bridges));
 					check_reused_rows();
 					mutex_lock(&flow_offload_mutex);

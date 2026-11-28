@@ -158,6 +158,7 @@ static unsigned walk_count;
 static struct {
 	struct airoha_flow_table_entry *entry;
 	bool freed;
+	bool pon_seen_at_free;
 	bool removed, l2_removed;
 } allocated[64];
 static unsigned allocation_count, frees;
@@ -272,6 +273,7 @@ static void kfree(void *pointer)
 		else
 			CHECK(!entry->list.pprev && !entry->l2_subflow_node.pprev);
 		CHECK(list_empty(&entry->gc_node));
+		allocated[index].pon_seen_at_free = entry->pon_ingress_seen;
 		allocated[index].entry = NULL;
 		allocated[index].freed = true;
 		frees++;

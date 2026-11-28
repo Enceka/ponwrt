@@ -1,0 +1,245 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: associate original PON ingress identity with flows
+
+Observe complete CPU-received PON data frames before GRO and normal PPE
+learning. Validate descriptor provenance and the current bearer mapping
+under RCU, then attach the canonical original IPv4 key and service to the
+matching flow cookie under ppe_lock. Keep output NAT/MAC actions separate.
+
+Conflicting GEM, MAC or encapsulation identities quarantine the candidate
+until deletion. Withdrawal invalidates the observation before attempting
+hardware retirement; successful bearer updates remove the old cookies.
+Observation performs no mailbox operation and never binds a hardware row.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_flow_observe.h
+@@ -0,0 +1,92 @@
++#ifndef AIROHA_NPU_FLOW_OBSERVE_H
++#define AIROHA_NPU_FLOW_OBSERVE_H
++
++#include "airoha_npu_flow_key.h"
++
++static inline auth_u32 airoha_npu_frame_be16(const unsigned char *bytes)
++{
++	return (auth_u32)bytes[0] << 8 | bytes[1];
++}
++
++static inline auth_u32 airoha_npu_frame_be32(const unsigned char *bytes)
++{
++	return airoha_npu_frame_be16(bytes) << 16 | airoha_npu_frame_be16(bytes + 2);
++}
++
++static inline int
++airoha_npu_ingress_parse_ipv4(const unsigned char *frame, auth_u32 bytes,
++			     auth_u32 service,
++			     struct airoha_npu_ipv4_identity *identity)
++{
++	struct airoha_npu_ipv4_identity parsed = {};
++	auth_u32 offset = 14, protocol, available, length, transport, ppp_length = 0;
++	auth_u32 source_any = 0, destination_any = 0, index;
++
++	if (!frame || !identity || bytes < 14 || bytes > 1518 || service > 0xffffu)
++		return -EINVAL;
++	if ((frame[0] | frame[6]) & 1u)
++		return -EINVAL;
++	for (index = 0; index < 6; index++) {
++		parsed.destination_mac[index] = frame[index];
++		parsed.source_mac[index] = frame[6 + index];
++		destination_any |= frame[index];
++		source_any |= frame[6 + index];
++	}
++	if (!source_any || !destination_any)
++		return -EINVAL;
++	protocol = airoha_npu_frame_be16(frame + 12);
++	while (protocol == 0x8100 || protocol == 0x88a8) {
++		if (parsed.vlan_count == 2 || bytes - offset < 4)
++			return -EINVAL;
++		parsed.vlan[parsed.vlan_count++] = protocol << 16 |
++			airoha_npu_frame_be16(frame + offset);
++		protocol = airoha_npu_frame_be16(frame + offset + 2);
++		offset += 4;
++	}
++	available = bytes - offset;
++	if (protocol == 0x8864) {
++		if (available < 8 || frame[offset] != 0x11 || frame[offset + 1])
++			return -EINVAL;
++		parsed.pppoe_session = airoha_npu_frame_be16(frame + offset + 2);
++		ppp_length = airoha_npu_frame_be16(frame + offset + 4);
++		if (!parsed.pppoe_session || ppp_length < 2 || ppp_length > available - 6 ||
++		    airoha_npu_frame_be16(frame + offset + 6) != 0x21)
++			return -EINVAL;
++		protocol = 0x0800;
++		offset += 8;
++		available = ppp_length - 2;
++	}
++	if (protocol != 0x0800 || available < 20 || frame[offset] != 0x45)
++		return -EINVAL;
++	length = airoha_npu_frame_be16(frame + offset + 2);
++	if (length < 20 || length > available ||
++	    (airoha_npu_frame_be16(frame + offset + 6) & 0xbfffu) ||
++	    (ppp_length && length != available))
++		return -EINVAL;
++	parsed.protocol = frame[offset + 9];
++	parsed.source_ip = airoha_npu_frame_be32(frame + offset + 12);
++	parsed.destination_ip = airoha_npu_frame_be32(frame + offset + 16);
++	transport = offset + 20;
++	length -= 20;
++	if (parsed.protocol == 6) {
++		auth_u32 header;
++
++		if (length < 20)
++			return -EINVAL;
++		header = (frame[transport + 12] >> 4) * 4;
++		if (header < 20 || header > length || (frame[transport + 13] & 5u))
++			return -EINVAL;
++	} else if (parsed.protocol == 17) {
++		if (length < 8 || airoha_npu_frame_be16(frame + transport + 4) != length)
++			return -EINVAL;
++	} else {
++		return -EINVAL;
++	}
++	parsed.source_port = airoha_npu_frame_be16(frame + transport);
++	parsed.destination_port = airoha_npu_frame_be16(frame + transport + 2);
++	parsed.service = service;
++	*identity = parsed;
++	return 0;
++}
++
++#endif
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -587,6 +587,8 @@
+ 	/* Retire both directions when a PON bearer mapping changes. */
+ 	struct airoha_gdm_dev *egress_dev;
+ 	struct airoha_gdm_dev *pon_ingress_dev;
++	u32 pon_ingress_key[19], pon_ingress_service;
++	bool pon_ingress_seen, pon_ingress_conflict;
+ 	struct airoha_gdm_dev *ct_ingress_gdm;
+ 	int ct_ingress_dsa_port;
+ 	struct list_head gc_node;
+@@ -984,6 +986,8 @@
+ void airoha_ppe_set_cpu_port(struct airoha_gdm_dev *dev, u8 ppe_id, u8 fport);
+ int airoha_ppe_remove_egress_flows(struct airoha_gdm_dev *dev);
+ bool airoha_ppe_is_enabled(struct airoha_eth *eth, int index);
++void airoha_ppe_pon_observe_frame(struct airoha_gdm_dev *dev,
++				const unsigned char *frame, u32 bytes, u32 service);
+ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 			  u16 hash, bool rx_wlan);
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -22,6 +22,7 @@
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
+ #include "airoha_npu_transaction_core.h"
++#include "airoha_npu_flow_observe.h"
+ 
+ /* Serialize airoha_gdm_dev flags, QDMA pointer and PPE CPU port
+  * configuration.
+@@ -1069,6 +1070,7 @@
+ 		return -EOPNOTSUPP;
+ 	spin_lock_bh(&ppe_lock);
+ 	/* A failed withdrawal keeps its cookie/hash but cannot learn again. */
++	e->pon_ingress_seen = false;
+ 	hlist_del_init(&e->list);
+ 	if (e->hash == 0xffff)
+ 		goto unlock;
+@@ -1660,6 +1662,55 @@
+ 		}
+ 	}
+ 	return true;
++}
++
++void airoha_ppe_pon_observe_frame(struct airoha_gdm_dev *dev,
++				const unsigned char *frame, u32 bytes, u32 service)
++{
++	struct airoha_ppe *ppe = dev->eth->ppe;
++	struct airoha_npu_ipv4_identity identity;
++	struct airoha_npu_auth_rule rule;
++	struct airoha_flow_table_entry *entry;
++	struct airoha_foe_entry tuple = {};
++	u32 bucket;
++
++	if (!ppe || !ppe->ct_host_ppe || !ppe->foe_flow ||
++	    !test_bit(AIROHA_DEV_F_PON, &dev->flags) ||
++	    dev->port->id != AIROHA_GDM2_IDX || dev->nbq ||
++	    airoha_npu_ingress_parse_ipv4(frame, bytes, service, &identity) ||
++	    airoha_npu_auth_encode_ipv4(&rule, 1, 1, 1, 0, &identity))
++		return;
++	tuple.ib1 = FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE, PPE_PKT_TYPE_IPV4_HNAPT);
++	if (identity.protocol == IPPROTO_UDP)
++		tuple.ib1 |= AIROHA_FOE_IB1_BIND_UDP;
++	tuple.ipv4.orig_tuple.src_ip = identity.source_ip;
++	tuple.ipv4.orig_tuple.dest_ip = identity.destination_ip;
++	tuple.ipv4.orig_tuple.src_port = identity.source_port;
++	tuple.ipv4.orig_tuple.dest_port = identity.destination_port;
++	bucket = airoha_ppe_foe_get_entry_hash(ppe, &tuple);
++	spin_lock_bh(&ppe_lock);
++	if (ppe->ct_stopping || !airoha_ppe_ct_pon_dev_ready(dev))
++		goto unlock;
++	hlist_for_each_entry(entry, &ppe->foe_flow[bucket], list) {
++		if (entry->type != FLOW_TYPE_L4 || entry->ct_bridge ||
++		    entry->pon_ingress_dev != dev || entry->pon_ingress_conflict ||
++		    !airoha_ppe_foe_compare_entry(entry, &tuple))
++			continue;
++		if (entry->pon_ingress_seen) {
++			if (entry->pon_ingress_service != service ||
++			    memcmp(entry->pon_ingress_key, rule.raw + 9,
++				   sizeof(entry->pon_ingress_key))) {
++				entry->pon_ingress_conflict = true;
++				entry->pon_ingress_seen = false;
++			}
++			continue;
++		}
++		memcpy(entry->pon_ingress_key, rule.raw + 9, sizeof(entry->pon_ingress_key));
++		entry->pon_ingress_service = service;
++		entry->pon_ingress_seen = true;
++	}
++unlock:
++	spin_unlock_bh(&ppe_lock);
+ }
+ 
+ static bool airoha_ppe_ct_flow_bank_matches(struct airoha_ppe *ppe,
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1147,6 +1147,32 @@
+ 	return false;
+ }
+ 
++static void airoha_qdma_observe_pon_skb(struct airoha_gdm_dev *dev,
++				       struct airoha_qdma *rx_qdma,
++				       struct sk_buff *skb, u32 msg0)
++{
++	u32 tag, service;
++	const unsigned char *frame;
++
++	if (!test_bit(AIROHA_DEV_F_PON, &dev->flags) ||
++	    rx_qdma != &dev->eth->qdma[1] || skb->dev != netdev_from_priv(dev) ||
++	    skb_is_nonlinear(skb) || skb_vlan_tag_present(skb) ||
++	    !skb_mac_header_was_set(skb))
++		return;
++	frame = skb_mac_header(skb);
++	if (frame < skb->head || frame + ETH_HLEN != skb->data)
++		return;
++	rcu_read_lock();
++	if (airoha_qdma_pon_learnable(dev, msg0)) {
++		tag = READ_ONCE(dev->pon_qdma_tag);
++		service = tag & AIROHA_PON_QDMA_EPON ?
++			FIELD_GET(AIROHA_PON_QDMA_LLID_MASK, tag) :
++			FIELD_GET(QDMA_ETH_RXMSG_GEM_MASK, msg0);
++		airoha_ppe_pon_observe_frame(dev, frame, skb->len + ETH_HLEN, service);
++	}
++	rcu_read_unlock();
++}
++
+ static void airoha_qdma_learn_skb(struct airoha_gdm_dev *dev,
+ 				 struct airoha_qdma *rx_qdma,
+ 				 struct sk_buff *skb, u32 hash, u32 msg0)
+@@ -1308,6 +1334,7 @@
+ 				     PKT_HASH_TYPE_L4);
+ 
+ 		reason = FIELD_GET(AIROHA_RXD4_PPE_CPU_REASON, msg1);
++		airoha_qdma_observe_pon_skb(dev, q->qdma, q->skb, msg0);
+ 		if (reason == PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED)
+ 			airoha_qdma_learn_skb(dev, q->qdma, q->skb, hash, msg0);
+ 
