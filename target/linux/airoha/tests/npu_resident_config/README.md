@@ -7,6 +7,16 @@ the image's final merged DTB. OpenWrt's top-level `.config` and target config
 fragments are different inputs. The checker records input SHA-256 values so the
 image preflight can associate its result with those exact inputs.
 
+Select `--profile pon-full` for the independent production-image loader profile.
+The default remains `--profile rebuilt-ram-lab`. PON-full requires both the NPU
+and Ethernet nodes to carry only the boolean `airoha,connac2-pon-full`; mixed,
+missing, valued or mismatched selectors fail. The RAM mode requires the NPU RAM
+selector exclusively. Its Ethernet native-pairs selector remains optional;
+when present it must select RAM exclusively. Ordinary-full-test is outside the
+resident startup profiles. All configuration, supplier and memory checks below
+also run for PON-full. JSON records the requested `selector_profile` and reports
+PON profile failures as `dt.pon-full-profile`.
+
 ```sh
 python3 -B /Volumes/Workspace/5585f/build/ponwrt/target/linux/airoha/tests/npu_resident_config/verify.py \
   --config /absolute/kernel-build/.config \
@@ -59,6 +69,8 @@ configuration symbol. Independent checks continue after a policy failure.
   with fixed nonempty `reg`, `no-map`, and no `reusable`. Their ancestors are
   checked too. Pool sizing, overlap, firmware hashes and image contents belong
   to their existing firmware/memory qualification checks.
+  With `--profile pon-full`, the NPU and ETH selectors are instead checked as
+  described above; the same four reserved-memory references are required.
 - Reject `/plugin/` in DTS and overlay fragments, `__overlay__`, `__fixups__`
   or `__local_fixups__` nodes in the submitted tree. A normal `__symbols__`
   table is allowed. Phandles, including `linux,phandle`, must be unambiguous.
@@ -113,5 +125,8 @@ tuple shape. Real dtc compiles each DTB case, and tests invoke the production
 CLI with expected exit status and exact failure IDs. Regressions cover each
 configuration gate, links/suppliers, unavailable ancestors, rebuilt selection,
 pool references, overlay artifacts, malformed inputs and output placement.
+PON-full coverage includes all 64 combinations of the three NPU and three ETH
+selectors, valued booleans, profile mismatch, supplier/config/memory failures
+and DTB, DTS, fdtdump-text and fdtdump-backend inputs.
 Positive cases cover symbols, both phandle encodings, omitted statuses,
 decompiled DTS, the fdtdump backend and fallback when dtc is unavailable.

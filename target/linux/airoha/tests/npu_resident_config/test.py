@@ -81,6 +81,12 @@ def main():
             problems.append("missing runtime lifecycle boundary")
         if report.get("exit_code") != expected:
             problems.append("JSON exit code mismatch")
+        profile = extra[extra.index("--profile") + 1] if "--profile" in extra else "rebuilt-ram-lab"
+        if report.get("selector_profile") != profile:
+            problems.append("JSON selector profile mismatch")
+        expected_profile = "hg5585f-ct-pon-full" if profile == "pon-full" else "hg5585f-ct-rebuilt"
+        if report.get("profile") != expected_profile:
+            problems.append("JSON board profile mismatch")
         if report.get("inputs", {}).get("config", {}).get("sha256") != hashlib.sha256(
                 config_path.read_bytes()).hexdigest():
             problems.append("configuration hash mismatch")
@@ -107,6 +113,50 @@ def main():
     case("valid-comment-mentions-plugin", dts=baseline_dts + '\n/* /plugin/ is documentation */\n')
     case("valid-unrelated-node", dts=baseline_dts +
          '\n/ { unrelated { status = "disabled"; compatible = "test,unrelated"; }; };\n')
+
+    pon_dts = baseline_dts.replace("airoha,connac2-rebuilt-ram-lab;", "airoha,connac2-pon-full;")
+    pon_dts += '\n&eth { airoha,connac2-pon-full; };\n'
+    pon_args = ("--profile", "pon-full")
+    for kind in ("dtb", "dts", "dump"):
+        case("pon-valid-" + kind, dts=pon_dts, kind=kind, extra=pon_args)
+    case("pon-valid-fdtdump", dts=pon_dts, extra=pon_args + ("--backend", "fdtdump"))
+    case("pon-rejected-by-default", dts=pon_dts, expected=1, failures=("dt.rebuilt-profile",))
+    case("ram-explicit-profile", extra=("--profile", "rebuilt-ram-lab"))
+    case("ram-rejected-by-pon", extra=pon_args, expected=1, failures=("dt.pon-full-profile",))
+    bare_dts = baseline_dts.replace('\t\t\tairoha,connac2-rebuilt-ram-lab;\n', '')
+    for npu_mask in range(8):
+        for eth_mask in range(8):
+            selected_dts = bare_dts
+            for label, mask, ram in (("npu", npu_mask, "rebuilt-ram-lab"),
+                                     ("eth", eth_mask, "ram-native-pairs")):
+                names = (ram, "ordinary-full-test", "pon-full")
+                properties = " ".join("airoha,connac2-" + name + ";"
+                                      for index, name in enumerate(names) if mask & (1 << index))
+                selected_dts += f'\n&{label} {{ {properties} }};\n'
+            valid = npu_mask == eth_mask == 4
+            case(f"pon-selectors-npu-{npu_mask}-eth-{eth_mask}", dts=selected_dts,
+                 extra=pon_args, expected=0 if valid else 1,
+                 failures=() if valid else ("dt.pon-full-profile",))
+    for label in ("npu", "eth"):
+        case("pon-valued-" + label,
+             dts=pon_dts + f'\n&{label} {{ airoha,connac2-pon-full = <0>; }};\n',
+             extra=pon_args, expected=1, failures=("dt.pon-full-profile",))
+    for name, change, check in (
+            ("pool", ('"connac2-pkt"', '"pkt"'), "dt.pon-full-profile"),
+            ("board", ("fiberhome,hg5585f-ct", "fiberhome,hg5585f"), "dt.board"),
+            ("supplier", ("airoha,chip-scu = <&chip_scu>", "airoha,chip-scu = <&npu>"), "dt.scu-chip-scu")):
+        case("pon-invalid-" + name, dts=pon_dts.replace(*change),
+             extra=pon_args, expected=1, failures=(check,))
+    case("pon-modular-npu", dts=pon_dts, extra=pon_args,
+         config=baseline_config.replace("CONFIG_NET_AIROHA_NPU=y", "CONFIG_NET_AIROHA_NPU=m"),
+         expected=1, failures=("config.NET_AIROHA_NPU",))
+    case("ram-mixed-ordinary", dts=baseline_dts +
+         '\n&npu { airoha,connac2-ordinary-full-test; };\n',
+         expected=1, failures=("dt.rebuilt-profile",))
+    case("ram-matched-native", dts=baseline_dts +
+         '\n&eth { airoha,connac2-ram-native-pairs; };\n')
+    case("ram-mismatched-eth", dts=baseline_dts + '\n&eth { airoha,connac2-pon-full; };\n',
+         expected=1, failures=("dt.rebuilt-profile",))
 
     for symbol in ("NET_AIROHA", "NET_AIROHA_NPU", "COMMON_CLK_EN7523"):
         for value in ("m", "n", '"y"'):

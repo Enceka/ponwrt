@@ -27,6 +27,11 @@ DEVICES = {
     CHIP_SCU: (("airoha,en7581-chip-scu", "syscon"),
                (0, 0x1fa20000, 0, 0x388)),
 }
+PROFILES = {
+    "rebuilt-ram-lab": ("airoha,connac2-rebuilt-ram-lab", "airoha,connac2-ram-native-pairs"),
+    "ordinary-full-test": ("airoha,connac2-ordinary-full-test", "airoha,connac2-ordinary-full-test"),
+    "pon-full": ("airoha,connac2-pon-full", "airoha,connac2-pon-full"),
+}
 RUNTIME_REQUIREMENTS = [
     "Under device locks, check bound driver identity, owner == NULL and "
     "suppress_bind_attrs for the admitted devices and relevant suppliers.",
@@ -228,7 +233,7 @@ class FlatTree:
         return result
 
 
-def check_tree(audit, tree, source_plugin):
+def check_tree(audit, tree, source_plugin, profile="rebuilt-ram-lab"):
     def no_overlay():
         require(not source_plugin, "DTS has /plugin/; supply the final merged tree")
         for path in tree.nodes:
@@ -299,8 +304,15 @@ def check_tree(audit, tree, source_plugin):
         return "all ETH reset specifiers resolve to the fixed one-cell SCU supplier"
 
     def rebuilt():
-        require(tree.property(NPU, "airoha,connac2-rebuilt-ram-lab") == b"",
-                "NPU rebuilt selector must be a boolean")
+        for index, path in enumerate((NPU, ETH)):
+            selected = [name for name, selectors in PROFILES.items()
+                        if selectors[index] in tree.nodes.get(path, {})]
+            optional = profile == "rebuilt-ram-lab" and path == ETH and not selected
+            require(optional or selected == [profile],
+                    f"{path}: expected only {profile} selector, found {selected}")
+            for name in selected:
+                require(tree.property(path, PROFILES[name][index]) == b"",
+                        f"{path}: {name} selector must be a boolean")
         names = tree.strings(NPU, "memory-region-names")
         require(names == ("binary", "ba", "connac2-pkt", "connac2-host-rx"),
                 "NPU memory-region-names must select the CT Connac2 profile")
@@ -324,13 +336,13 @@ def check_tree(audit, tree, source_plugin):
             registers = tree.cells(destination, "reg")
             require(len(registers) == 4 and (registers[2] or registers[3]),
                     f"{destination}: expected one nonempty fixed reg range")
-        return "rebuilt selector and four static CT Connac2 pool references"
+        return profile + " selectors and four static CT Connac2 pool references"
 
     audit.check("dt.phandles", phandles)
     audit.check("dt.eth-npu", lambda: link(ETH, "airoha,npu", NPU))
     audit.check("dt.scu-chip-scu", lambda: link(SCU, "airoha,chip-scu", CHIP_SCU))
     audit.check("dt.eth-resets", resets)
-    audit.check("dt.rebuilt-profile", rebuilt)
+    audit.check("dt.pon-full-profile" if profile == "pon-full" else "dt.rebuilt-profile", rebuilt)
 
 
 def run_tool(command, data=None, cwd=None):
@@ -376,6 +388,8 @@ def main():
     parser = argparse.ArgumentParser(description="HG5585F CT rebuilt static config/DT preflight")
     parser.add_argument("--config", required=True, type=Path, help="final kernel .config")
     parser.add_argument("--dt", required=True, type=Path, help="final DTB or preprocessed DTS")
+    parser.add_argument("--profile", choices=("rebuilt-ram-lab", "pon-full"),
+                        default="rebuilt-ram-lab", help="expected resident firmware profile")
     parser.add_argument("--format", choices=("auto", "dtb", "dts"), default="auto")
     parser.add_argument("--backend", choices=("auto", "dtc", "fdtdump"), default="auto")
     parser.add_argument("--dtc", default=os.environ.get("DTC", "dtc"))
@@ -391,7 +405,8 @@ def main():
         parser.error(str(error))
     audit = Audit()
     report = {"schema": 1, "scope": "static-config-and-final-dt",
-              "profile": "hg5585f-ct-rebuilt", "checks": audit.checks,
+              "profile": "hg5585f-ct-pon-full" if args.profile == "pon-full" else "hg5585f-ct-rebuilt",
+              "selector_profile": args.profile, "checks": audit.checks,
               "runtime_lifecycle": "requires-separate-qualification",
               "runtime_requirements": RUNTIME_REQUIREMENTS,
               "checker_sha256": sha256(Path(__file__).read_bytes()), "inputs": {}}
@@ -407,7 +422,7 @@ def main():
             else:
                 args.dt = path
                 tree, source_plugin = load_tree(args, raw, metadata)
-                check_tree(audit, tree, source_plugin)
+                check_tree(audit, tree, source_plugin, args.profile)
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
             input_error = True
             audit.checks.append({"id": "input." + name, "ok": False, "detail": str(error)})
