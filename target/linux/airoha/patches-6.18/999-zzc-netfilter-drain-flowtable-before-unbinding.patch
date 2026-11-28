@@ -1,0 +1,66 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] netfilter: drain flowtable entries before unbinding callbacks
+
+Deleting a flowtable unbinds its devices before the deferred table free
+queues FLOW_CLS_DESTROY. Keep the callbacks attached until the affected
+flows have completed hardware deletion. Match either ingress direction
+and the device namespace, preserving unrelated flows and callback refs.
+
+Drain old packet readers and pending ADD/STATS/DEL work before forcing a
+fresh GC work invocation. Use the existing serialized GC worker rather
+than running a second collector concurrently. Wait outside the callback
+write lock. Remove a deleted hook from route discovery before this wait
+so new flows cannot enter through a hook being detached.
+
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -794,6 +794,9 @@ void nf_flow_table_gc_cleanup(struct nf_flowtable *flowtable,
+ 			      struct net_device *dev)
+ {
+ 	nf_flow_table_iterate(flowtable, nf_flow_table_do_cleanup, dev);
++	synchronize_net();
++	nf_flow_table_offload_flush(flowtable);
++	mod_delayed_work(system_power_efficient_wq, &flowtable->gc_work, 0);
+ 	flush_delayed_work(&flowtable->gc_work);
+ 	nf_flow_table_offload_flush(flowtable);
+ }
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1350,6 +1350,11 @@ int nf_flow_table_offload_setup(struct nf_flowtable *flowtable,
+ 	if (!nf_flowtable_hw_offload(flowtable))
+ 		return nf_flow_offload_xdp_setup(flowtable, dev, cmd);
+ 
++	if (cmd == FLOW_BLOCK_UNBIND) {
++		synchronize_net();
++		nf_flow_table_gc_cleanup(flowtable, dev);
++	}
++
+ 	if (dev->netdev_ops->ndo_setup_tc)
+ 		err = nf_flow_table_offload_cmd(&bo, flowtable, dev, cmd,
+ 						&extack);
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -9077,10 +9077,11 @@ static void nft_flowtable_unregister_trans_hook(struct net *net,
+ 
+ 	list_for_each_entry_safe(trans_hook, next, hook_list, list) {
+ 		hook = trans_hook->hook;
++		list_del_rcu(&hook->list);
+ 		list_for_each_entry(ops, &hook->ops_list, list)
+ 			nft_unregister_flowtable_ops(net, flowtable, ops);
+ 
+-		nft_netdev_hook_unlink_free_rcu(hook);
++		nft_netdev_hook_free_rcu(hook);
+ 		nft_trans_hook_destroy(trans_hook);
+ 	}
+ }
+@@ -9767,9 +9768,9 @@ static int nft_flowtable_event(unsigned long event, struct net_device *dev,
+ 				continue;
+ 
+ 			/* flow_offload_netdev_event() cleans up entries for us. */
++			list_del_rcu(&ops->list);
+ 			nft_unregister_flowtable_ops(dev_net(dev),
+ 						     flowtable, ops);
+-			list_del_rcu(&ops->list);
+ 			kfree_rcu(ops, rcu);
+ 			break;
+ 		case NETDEV_REGISTER:
