@@ -51,7 +51,7 @@ classifier-hit and PPE acceptance.
 
 ## Guards and lifecycle
 
-The module accepts only the HG5585F-CT EN7581 RAM native profile, PON PPE
+By default the module accepts the HG5585F-CT EN7581 RAM native profile, PON PPE
 qualification closed, no CPU fallback, GDM2 NBQ0 mapped to CPU5, disabled
 parallel NAND and optical controller nodes, and the high TX_DISABLE GPIO
 hog. Preparation requires a down interface, no existing controller/mapping,
@@ -67,6 +67,8 @@ observes RX for another 20 ms. The handler accepts marked packets during
 this send window. Its marker contains magic, sequence, a per-load random
 cookie, kind and transmitted frame length, each a big-endian 32-bit word.
 Only a marker matching the currently submitted packet is consumed.
+With `production_session=1`, matching packets are counted and passed to the
+network stack instead, as described below.
 
 `restore` first requires optical classifier withdrawal, stops transmission,
 removes mappings through the transaction API, disables loopback, removes
@@ -195,6 +197,91 @@ PON PPE qualification stays closed throughout. The module exposes
 `prepare`, `map <service>`, `send <decimal-service> [kind [variant]]`,
 `send-current <ipv4|ipv6>`, `send-fixed <ipv4|ipv6> <0..4> <rx|tx>` and
 `restore`.
+
+## Production candidate RAM session
+
+`production_session` is a read-only module parameter, defaults to false,
+and is reported in `status`. Load with `production_session=1 special_tag=1`
+to feed real GPON packets through netfilter and the selected production
+session interface. Both the Ethernet node and its `airoha,npu` phandle
+target must have `airoha,connac2-pon-full`. Either node having
+`airoha,connac2-rebuilt-ram-lab`, `airoha,connac2-ram-native-pairs`,
+`airoha,connac2-ordinary-full-test` or `airoha,connac2-pon-er-diagnostic`
+rejects this mode. The Ethernet driver's production profile must also be
+active, with ordinary-full disabled.
+
+The existing board, native-pair, qualification, fallback, GDM2/NBQ0 and
+CPU5 guards apply in both modes. The TX_DISABLE GPIO hog must still declare
+`gpio-hog` and `output-high`; parallel NAND and the optical controller must
+be present and disabled, and every discovered serial NAND controller must
+be disabled. Use a RAM image that also keeps NAND ECC, PCS and BOSA disabled,
+and verify the live TX_DISABLE output is high and MTD is empty before use.
+The production firmware and matching kernel modules must be available from
+the RAM root filesystem.
+
+The production RX handler preserves all marker validation and statistics.
+After a match it clears `awaiting` and returns `RX_HANDLER_PASS` without
+freeing or modifying the skb. Unmatched packets also pass without updating
+statistics. The default diagnostic mode continues to consume matched packets.
+
+Build this external module against the exact canonical kernel source,
+configuration and generated build artifacts used for the RAM Image:
+
+```sh
+make -C /workdir/pon-production-session-20261128 \
+  ARCH=arm64 CROSS_COMPILE=aarch64-openwrt-linux-musl- \
+  M=/absolute/path/to/ram_loopback modules
+```
+
+The `M` directory must contain this directory's `Makefile` and updated
+`ct_pon_loopback.c`. Keep its generated objects outside the source checkout
+when using a separate build directory.
+
+For a single plain IPv4 UDP downstream flow:
+
+1. Configure a physical LAN receiver, IPv4 forwarding, routes, static
+   neighbors and a hardware-enabled nft flowtable on `pon0` and `lan1`.
+   DNAT `192.0.2.2:49153` to the receiver if needed. Permit the test flow
+   and its reply; arrange for the receiver to reply during initial packet
+   sends to establish conntrack. Disable native-pair
+   policy and leave all pair slots empty before starting the session.
+2. Load `ct_pon_loopback.ko production_session=1 special_tag=1`. Write
+   `prepare`, then `map 0x2134`, to
+   `/sys/kernel/debug/ct_pon_loopback/command`. GDM2 starts on CPU5.
+3. Send `send-fixed ipv4 0 rx` until `/sys/kernel/debug/ppe/flow_admission` reports the
+   downstream candidate with `errno=0 present=1 hash=ffff`. Send another
+   identical packet so RX observes the existing candidate. Read
+   `/sys/kernel/debug/ppe/pon_npu_flow` for its cookie, serial and service.
+   Keep the source MAC fixed; `send-current` randomizes it.
+4. Write `start COOKIE SERIAL` to `pon_npu_flow`. Send bounded batches of
+   `send-fixed ipv4 0 tx` until a real hardware UNB event drives the session
+   to `bound=1 error=0`. Check the bank0 BND row and numbered packets at the
+   LAN receiver. Use `tx` because bound packets leave through LAN without
+   returning to this RX handler. Let the session owner control GDM2 routes.
+5. Stop injection and delete the exact conntrack tuple. Wait for netfilter
+   destruction to remove the candidate and BND row and close the session.
+   Check CPU return with another packet, write `release` to `pon_npu_flow`,
+   then `restore` to the loopback command file before unloading the module.
+
+The production interface accepts `start COOKIE SERIAL` and `release`; the
+diagnostic runner and its `start-auth`, `bind-lan1` and `close` commands
+remain specific to the diagnostic profile. Mapping changes and loopback
+restoration still require NPU owner release. Keep NAND and optical TX
+disabled throughout this internal-loopback test.
+
+Run the existing host harness locally:
+
+```sh
+python3 -B target/linux/airoha/tests/pon_offload/ram_loopback/verify_commands.py
+```
+
+It extracts the actual profile, eligibility, RX and command functions and
+runs plain and AddressSanitizer/UndefinedBehaviorSanitizer builds.
+Coverage includes all combinations of
+the five profile properties on both nodes, missing NPU and runtime profile
+mismatches, both modes' safety guards, RX statistics and skb ownership, and
+the existing command, mapping and owner lifecycle cases. Mutation checks
+exercise production profile rejection and matched-packet pass-through.
 
 ## Fixed-MAC packets on the current mapping
 

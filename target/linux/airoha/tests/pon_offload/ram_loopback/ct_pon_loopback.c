@@ -57,6 +57,8 @@ static bool awaiting;
 static int last_error;
 static bool special_tag;
 module_param(special_tag, bool, 0400);
+static bool production_session;
+module_param(production_session, bool, 0400);
 static const u32 registers[] = {
 	REG_GDM_FWD_CFG(2), REG_GDM_INGRESS_CFG(2), REG_GDM_LEN_CFG(2),
 	REG_GDM_LPBK_CFG(2), REG_GDM_TXCHN_EN(2), REG_GDM_RXCHN_EN(2),
@@ -196,6 +198,8 @@ static rx_handler_result_t receive(struct sk_buff **packet)
 	WRITE_ONCE(received_msg1, READ_ONCE(probe_dev->pon_stats.last_rx_msg1));
 	atomic_inc(&received);
 	smp_store_release(&awaiting, false);
+	if (production_session)
+		return RX_HANDLER_PASS;
 	dev_kfree_skb_any(skb);
 	return RX_HANDLER_CONSUMED;
 }
@@ -204,6 +208,32 @@ static int write_verified(struct airoha_eth *eth, u32 reg, u32 value)
 {
 	airoha_fe_wr(eth, reg, value);
 	return airoha_fe_rr(eth, reg) == value ? 0 : -EIO;
+}
+
+static bool profile_matches(struct airoha_eth *eth)
+{
+	static const char * const excluded[] = {
+		"airoha,connac2-rebuilt-ram-lab",
+		"airoha,connac2-ram-native-pairs",
+		"airoha,connac2-ordinary-full-test",
+		"airoha,connac2-pon-er-diagnostic",
+	};
+	struct device_node *node;
+	unsigned int index;
+	bool matches;
+
+	if (!production_session)
+		return of_property_read_bool(eth->dev->of_node, "airoha,connac2-ram-native-pairs");
+	node = of_parse_phandle(eth->dev->of_node, "airoha,npu", 0);
+	matches = node && eth->ct_pon_full && !eth->ct_ordinary_full_test &&
+		of_property_read_bool(node, "airoha,connac2-pon-full") &&
+		of_property_read_bool(eth->dev->of_node, "airoha,connac2-pon-full");
+	for (index = 0; index < ARRAY_SIZE(excluded); index++)
+		if (of_property_read_bool(node, excluded[index]) ||
+		    of_property_read_bool(eth->dev->of_node, excluded[index]))
+			matches = false;
+	of_node_put(node);
+	return matches;
 }
 
 static int eligible(void)
@@ -215,7 +245,7 @@ static int eligible(void)
 	if (!of_machine_is_compatible("fiberhome,hg5585f-ct") ||
 	    !eth->ppe || !eth->ppe->ct_native_pairs || eth->ppe->ct_pon_qualified ||
 	    eth->ct_cpu_fallback || eth->ct_ifc_cpu_port_failed ||
-	    !of_property_read_bool(eth->dev->of_node, "airoha,connac2-ram-native-pairs") ||
+	    !profile_matches(eth) ||
 	    probe_dev->port->id != AIROHA_GDM2_IDX || probe_dev->nbq ||
 	    !test_bit(AIROHA_DEV_F_PON, &probe_dev->flags) ||
 	    (airoha_fe_rr(eth, REG_GDM_FWD_CFG(2)) & GENMASK(15, 0)) != 0x5555 ||
@@ -705,6 +735,7 @@ static int status_show(struct seq_file *file, void *unused)
 
 	mutex_lock(&probe_lock);
 	airoha_eth_pon_get_datapath_stats(probe_netdev, &stats);
+	seq_printf(file, "production_session=%u\n", production_session);
 	seq_printf(file, "retained=%u controller=%u opened=%u saved=%u error=%d pending=%d sequence=%u received=%d rx_sequence=%u rx_msg0=%08x rx_msg1=%08x\n",
 		retained, controller, opened, registers_saved, last_error,
 		atomic_read(&probe_dev->pon_tx_pending), sequence, atomic_read(&received),

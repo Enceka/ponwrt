@@ -18,6 +18,14 @@
 #define VLAN_PRIO_SHIFT 13
 #define NETDEV_TX_OK 0
 #define NETDEV_TX_BUSY 1
+#define AIROHA_GDM2_IDX 2
+#define AIROHA_DEV_F_PON 0
+#define REG_GDM_FWD_CFG(port) 0U
+#define REG_SP_DFT_CPORT(port) 1U
+#define SP_CPORT_MASK(port) 0xfU
+#define GENMASK(high, low) ((~0U >> (31 - (high))) & (~0U << (low)))
+#define FIELD_GET(mask, value) (((value) & (mask)) >> __builtin_ctz(mask))
+#define test_bit(bit, address) (!!(*(address) & BIT(bit)))
 typedef int netdev_tx_t;
 struct netdev_queue { int dummy; };
 struct airoha_pon_flow_config {
@@ -34,9 +42,18 @@ typedef enum { RX_HANDLER_PASS, RX_HANDLER_CONSUMED } rx_handler_result_t;
 struct file {};
 struct airoha_pon_flow_entry { u16 vlan_id; u8 pbit_mask; u32 tag; };
 struct airoha_pon_flow_table { u32 count; struct airoha_pon_flow_entry entries[2]; };
-struct airoha_ppe { void *ct_npu_owner; struct { bool saved_valid; } ct_pon_ifc; };
+struct device_node { unsigned int properties; bool present, available; int references; };
+struct device { struct device_node *of_node; };
+struct airoha_gdm_port { unsigned int id; };
+struct airoha_ppe {
+    void *ct_npu_owner;
+    struct { bool saved_valid; } ct_pon_ifc;
+    bool ct_native_pairs, ct_pon_qualified;
+};
 struct airoha_eth {
     struct airoha_ppe *ppe;
+    struct device *dev;
+    bool ct_pon_full, ct_ordinary_full_test, ct_cpu_fallback, ct_ifc_cpu_port_failed;
     bool ct_ifc_pon_ready;
     u32 ifc_port_desired, ct_ifc_port_mask, registers[16];
     int ct_route_lock, ifc_port_lock;
@@ -44,6 +61,11 @@ struct airoha_eth {
 
 static struct airoha_ppe ppe;
 static struct airoha_eth ethernet = { .ppe = &ppe };
+static struct device_node nodes[7];
+static struct device platform_device = { .of_node = &nodes[0] };
+static struct airoha_gdm_port port;
+static bool board_matches, production_session;
+static unsigned int profile_cases, safety_cases, production_receive_cases;
 static struct airoha_pon_flow_table table;
 static struct airoha_pon_flow_table pending_pair;
 static bool pair_pending;
@@ -68,6 +90,65 @@ static bool receive_enabled, repair_packet, tx_in_flight, copy_failed;
 static struct sk_buff *queued_packet;
 
 static rx_handler_result_t receive(struct sk_buff **packet);
+
+static struct device_node *node_get(unsigned int index)
+{
+    if (!nodes[index].present) return NULL;
+    nodes[index].references++;
+    return &nodes[index];
+}
+static void of_node_put(struct device_node *node)
+{
+    if (node) {
+        assert(node->references > 0);
+        node->references--;
+    }
+}
+static bool of_property_read_bool(struct device_node *node, const char *name)
+{
+    const char *names[] = {
+        "airoha,connac2-pon-full", "airoha,connac2-rebuilt-ram-lab",
+        "airoha,connac2-ram-native-pairs", "airoha,connac2-ordinary-full-test",
+        "airoha,connac2-pon-er-diagnostic", "gpio-hog", "output-high",
+    };
+    for (unsigned int index = 0; index < ARRAY_SIZE(names); index++)
+        if (!strcmp(name, names[index]))
+            return node && (node->properties & BIT(index));
+    assert(false);
+    return false;
+}
+static struct device_node *of_parse_phandle(struct device_node *node, const char *name, int index)
+{
+    assert(node == &nodes[0] && !strcmp(name, "airoha,npu") && index == 0);
+    return node_get(1);
+}
+static bool of_machine_is_compatible(const char *name)
+{
+    assert(!strcmp(name, "fiberhome,hg5585f-ct"));
+    return board_matches;
+}
+static struct device_node *of_find_node_by_path(const char *path)
+{
+    const char *paths[] = {
+        "/soc/system-controller@1fbf0200/pinctrl/ram-tx-disable-hog",
+        "/soc/nand-controller@1fa11000", "/soc/ethernet@1fb64000",
+    };
+    for (unsigned int index = 0; index < ARRAY_SIZE(paths); index++)
+        if (!strcmp(path, paths[index])) return node_get(index + 2);
+    assert(false);
+    return NULL;
+}
+static bool of_device_is_available(struct device_node *node) { return node->available; }
+static struct device_node *next_snand(struct device_node *node)
+{
+    unsigned int index = node ? (unsigned int)(node - nodes) + 1 : 5;
+    of_node_put(node);
+    for (; index < ARRAY_SIZE(nodes); index++)
+        if (nodes[index].present) return node_get(index);
+    return NULL;
+}
+#define for_each_compatible_node(node, type, compatible) \
+    for ((node) = next_snand(NULL); (node); (node) = next_snand(node))
 
 static void fixture_mapping(unsigned int service, bool enable)
 {
@@ -302,6 +383,7 @@ static void reset(void)
     awaiting = sent_current = allocation_failed = repair_packet = false;
     sent_fixed = sent_alt = sent_wait_rx = tx_in_flight = copy_failed = false;
     mapped_alt_configured = false;
+    production_session = false;
     pair_pending = false;
     mapped_alt_service = 0;
     last_vlan_tagged = alt_xmit_busy = false;
@@ -733,8 +815,155 @@ static void pair_and_alt(void)
     }
 }
 
+static void reset_eligibility(bool production)
+{
+    reset();
+    memset(nodes, 0, sizeof(nodes));
+    memset(&ethernet, 0, sizeof(ethernet));
+    for (unsigned int index = 0; index < ARRAY_SIZE(nodes); index++)
+        nodes[index].present = true;
+    production_session = production;
+    nodes[0].properties = production ? BIT(0) : BIT(2);
+    nodes[1].properties = production ? BIT(0) : BIT(1);
+    nodes[2].properties = BIT(5) | BIT(6);
+    ethernet.dev = &platform_device;
+    ethernet.ppe = &ppe;
+    ethernet.ct_pon_full = production;
+    ethernet.registers[REG_GDM_FWD_CFG(2)] = 0x5555;
+    ethernet.registers[REG_SP_DFT_CPORT(0)] = 5;
+    ppe.ct_native_pairs = board_matches = true;
+    device.port = &port;
+    port.id = AIROHA_GDM2_IDX;
+    device.flags = BIT(AIROHA_DEV_F_PON);
+}
+
+static void check_eligibility(int expected)
+{
+    assert(eligible() == expected);
+    assert(!register_writes && !begin_calls && !submissions);
+    for (unsigned int index = 0; index < ARRAY_SIZE(nodes); index++)
+        assert(!nodes[index].references);
+}
+
+static void profiles(void)
+{
+    for (unsigned int mode = 0; mode < 2; mode++)
+        for (unsigned int eth_profile = 0; eth_profile < 32; eth_profile++)
+            for (unsigned int npu_profile = 0; npu_profile < 32; npu_profile++) {
+                bool accepted = mode ? eth_profile == BIT(0) && npu_profile == BIT(0) :
+                                       !!(eth_profile & BIT(2));
+                reset_eligibility(mode);
+                nodes[0].properties = eth_profile;
+                nodes[1].properties = npu_profile;
+                check_eligibility(accepted ? 0 : -EPERM);
+                profile_cases++;
+            }
+    for (unsigned int scenario = 0; scenario < 3; scenario++) {
+        reset_eligibility(true);
+        if (scenario == 0) nodes[1].present = false;
+        if (scenario == 1) ethernet.ct_pon_full = false;
+        if (scenario == 2) ethernet.ct_ordinary_full_test = true;
+        check_eligibility(-EPERM);
+        profile_cases++;
+    }
+    for (unsigned int mode = 0; mode < 2; mode++)
+        for (unsigned int scenario = 0; scenario < 19; scenario++) {
+            reset_eligibility(mode);
+            switch (scenario) {
+            case 0: board_matches = false; break;
+            case 1: ethernet.ppe = NULL; break;
+            case 2: ppe.ct_native_pairs = false; break;
+            case 3: ppe.ct_pon_qualified = true; break;
+            case 4: ethernet.ct_cpu_fallback = true; break;
+            case 5: ethernet.ct_ifc_cpu_port_failed = true; break;
+            case 6: port.id = 1; break;
+            case 7: device.nbq = 1; break;
+            case 8: device.flags = 0; break;
+            case 9: ethernet.registers[REG_GDM_FWD_CFG(2)] = 0x7777; break;
+            case 10: ethernet.registers[REG_SP_DFT_CPORT(0)] = 6; break;
+            case 11: nodes[2].present = false; break;
+            case 12: nodes[2].properties &= ~BIT(5); break;
+            case 13: nodes[2].properties &= ~BIT(6); break;
+            case 14: nodes[3].present = false; break;
+            case 15: nodes[3].available = true; break;
+            case 16: nodes[4].present = false; break;
+            case 17: nodes[4].available = true; break;
+            case 18: nodes[6].available = true; break;
+            }
+            check_eligibility(-EPERM);
+            safety_cases++;
+        }
+}
+
+static void receive_ownership(void)
+{
+    for (unsigned int mode = 0; mode < 2; mode++)
+        for (unsigned int kind = 0; kind < PROBE_KIND_COUNT; kind++)
+            for (unsigned int scenario = 0; scenario < 8; scenario++) {
+                struct sk_buff *packet, saved;
+                u8 contents[PROBE_MAX_BYTES];
+                unsigned int marker;
+                bool matched = scenario == 0;
+                rx_handler_result_t result;
+
+                reset();
+                production_session = mode;
+                device.pon_stats.last_rx_msg0 = 0x12345678;
+                device.pon_stats.last_rx_msg1 = 0x87654321;
+                assert(!transmit(PROBE_CURRENT_SERVICE, kind, 0));
+                packet = queued_packet;
+                packet->data += ETH_HLEN;
+                packet->len -= ETH_HLEN;
+                assert(marker_offset(packet, kind) >= 0);
+                marker = marker_offset(packet, kind);
+                if (scenario >= 1 && scenario <= 5) packet->data[marker + (scenario - 1) * 4] ^= 1;
+                if (scenario == 6) awaiting = false;
+                if (scenario == 7) sent_kind = PROBE_KIND_COUNT;
+                saved = *packet;
+                memcpy(contents, packet->data, packet->len);
+                result = receive(&packet);
+                assert(result == (matched && !mode ? RX_HANDLER_CONSUMED : RX_HANDLER_PASS));
+                assert(received == (matched ? 1 : 0));
+                if (matched) {
+                    assert(!awaiting && received_sequence == sequence && received_kind == kind);
+                    assert(received_length == saved.len && received_msg0 == 0x12345678 &&
+                           received_msg1 == 0x87654321);
+                } else {
+                    assert(awaiting == (scenario != 6));
+                    assert(!received_sequence);
+                }
+                if (result == RX_HANDLER_PASS) {
+                    assert(packet == queued_packet && allocation_count == 1);
+                    assert(!memcmp(packet, &saved, sizeof(saved)));
+                    assert(!memcmp(packet->data, contents, packet->len));
+                    if (matched) {
+                        assert(receive(&packet) == RX_HANDLER_PASS && received == 1);
+                    }
+                    cleanup_packet();
+                } else {
+                    queued_packet = NULL;
+                    assert(!allocation_count);
+                }
+                production_receive_cases++;
+            }
+    reset();
+    production_session = true;
+    command("send-fixed ipv4 0 rx", 0);
+    assert(received == 1 && received_sequence == sequence && !awaiting && queued_packet);
+    cleanup_packet();
+    receive_enabled = false;
+    tx_delay = 7000;
+    ppe.ct_npu_owner = &ppe;
+    command("send-fixed ipv4 0 tx", 0);
+    assert(sequence == 2 && received == 1 && !awaiting && !device.pon_tx_pending);
+    assert(!begin_calls && ppe.ct_npu_owner == &ppe);
+    production_receive_cases += 2;
+}
+
 int main(void)
 {
+    profiles();
+    receive_ownership();
     parse_commands();
     owners();
     reject_mapping();
@@ -748,8 +977,9 @@ int main(void)
     cleanup_packet();
     printf("{\"passed\":true,\"commands\":%u,\"parser_cases\":%u,\"mapping_rejections\":%u,"
            "\"receive_cases\":%u,\"owner_cases\":%u,\"fixed_cases\":%u,"
-           "\"tx_only_cases\":%u,\"failure_checks\":%u}\n",
+           "\"tx_only_cases\":%u,\"failure_checks\":%u,\"profile_cases\":%u,"
+           "\"safety_cases\":%u,\"production_receive_cases\":%u}\n",
            checks, parser_cases, mapping_rejections, receive_cases, owner_cases,
-           fixed_cases, tx_only_cases, failure_checks);
+           fixed_cases, tx_only_cases, failure_checks, profile_cases, safety_cases, production_receive_cases);
     return 0;
 }

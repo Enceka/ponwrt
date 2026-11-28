@@ -30,6 +30,9 @@ def generate(directory):
         '''struct airoha_gdm_dev {
     int pon_tx_pending;
     struct airoha_eth *eth;
+    struct airoha_gdm_port *port;
+    unsigned long flags;
+    unsigned int nbq;
     struct airoha_pon_flow_table *pon_flow_table;
     bool pon_update_blocked;
     u32 pon_qdma_tag;
@@ -57,7 +60,8 @@ static void eth_random_addr(u8 *address)
     assert enum
     constants = '\n'.join(re.findall(r'(?m)^#define PROBE_.*$', source))
     constants += '\n' + enum.group() + '\n'
-    names = ['marker_offset', 'receive', 'write_verified', 'mapping', 'map_service',
+    names = ['marker_offset', 'receive', 'write_verified', 'profile_matches', 'eligible',
+             'mapping', 'map_service',
              'mapping_pair', 'map_service_pair', 'mapping_current', 'restore', 'transmit',
              'transmit_current_mode', 'transmit_current', 'command_write']
     receiver = re.search(r'(?ms)^static rx_handler_result_t receive\(.*?^}', source)
@@ -103,6 +107,16 @@ def main():
         source, production = generate(directory)
         reports = [run(directory, 'plain'), run(directory, 'sanitized', sanitized=True)]
         mutations = [
+            ('production-consumes', 'if (production_session)\n\t\treturn RX_HANDLER_PASS;',
+             'if (false)\n\t\treturn RX_HANDLER_PASS;'),
+            ('production-profile', 'if (of_property_read_bool(node, excluded[index]) ||',
+             'if (false ||'),
+            ('production-eth-profile',
+             'of_property_read_bool(eth->dev->of_node, excluded[index]))', 'false)'),
+            ('production-npu-selector',
+             'of_property_read_bool(node, "airoha,connac2-pon-full") &&', 'true &&'),
+            ('production-eth-selector',
+             'of_property_read_bool(eth->dev->of_node, "airoha,connac2-pon-full");', 'true;'),
             ('map-owner', 'if (READ_ONCE(probe_dev->eth->ppe->ct_npu_owner))\n\t\treturn -EBUSY;',
              'if (false)\n\t\treturn -EBUSY;'),
             ('send-owner', 'if (READ_ONCE(probe_dev->eth->ppe->ct_npu_owner))\n\t\t\t\t\t\terr = -EBUSY;',
