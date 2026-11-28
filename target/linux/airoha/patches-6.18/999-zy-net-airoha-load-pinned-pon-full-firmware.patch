@@ -1,0 +1,196 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: load pinned PON full-image firmware
+
+Select the dualbank-owner payload with an independent PON full-image
+profile. Reject mixed rebuilt profiles before probe resources or firmware
+requests. Extend native and transaction transport admission, resident
+supplier checks and deferred startup to the pinned profile. Keep ordinary
+startup and its native-only transport policy, and leave PON qualification
+to the Ethernet owner lifecycle.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -279,6 +279,46 @@
+ 					"connac2-pkt") >= 0;
+ }
+ 
++enum airoha_npu_profile {
++	AIROHA_NPU_PROFILE_STOCK,
++	AIROHA_NPU_PROFILE_RAM,
++	AIROHA_NPU_PROFILE_ORDINARY,
++	AIROHA_NPU_PROFILE_PON_FULL,
++};
++
++static int airoha_npu_profile(struct device_node *node)
++{
++	bool ram = of_property_read_bool(node, "airoha,connac2-rebuilt-ram-lab");
++	bool ordinary = of_property_read_bool(node, "airoha,connac2-ordinary-full-test");
++	bool pon = of_property_read_bool(node, "airoha,connac2-pon-full");
++
++	if (ram + ordinary + pon > 1)
++		return -EINVAL;
++	if (pon)
++		return AIROHA_NPU_PROFILE_PON_FULL;
++	if (ordinary)
++		return AIROHA_NPU_PROFILE_ORDINARY;
++	return ram ? AIROHA_NPU_PROFILE_RAM : AIROHA_NPU_PROFILE_STOCK;
++}
++
++static bool airoha_npu_deferred_profile(struct device_node *node)
++{
++	int profile = airoha_npu_profile(node);
++
++	return profile == AIROHA_NPU_PROFILE_RAM || profile == AIROHA_NPU_PROFILE_PON_FULL;
++}
++
++static bool airoha_npu_native_profile(struct device *dev)
++{
++	return airoha_npu_is_connac2_ct(dev) &&
++	       airoha_npu_profile(dev->of_node) > AIROHA_NPU_PROFILE_STOCK;
++}
++
++static bool airoha_npu_transaction_profile(struct device *dev)
++{
++	return airoha_npu_is_connac2_ct(dev) && airoha_npu_deferred_profile(dev->of_node);
++}
++
+ static int airoha_npu_load_firmware(struct device *dev, void __iomem *addr,
+ 				    const char *fw_name, int fw_max_size,
+ 				    const u8 *expected_digest, bool ct_guard)
+@@ -349,21 +389,33 @@
+ 		0xf5, 0xde, 0x8f, 0xd4, 0x99, 0x19, 0xab, 0x61,
+ 		0x0a, 0xd0, 0x65, 0x72, 0x54, 0xea, 0xdb, 0x7a,
+ 	};
+-	bool full = of_property_read_bool(dev->of_node, "airoha,connac2-ordinary-full-test");
+-	bool ram = of_property_read_bool(dev->of_node, "airoha,connac2-rebuilt-ram-lab");
++	static const u8 pon_sha256[SHA256_DIGEST_SIZE] = {
++		0x3a, 0x42, 0xa0, 0x68, 0xd0, 0x58, 0xa6, 0x02,
++		0xef, 0x6f, 0x9f, 0x3f, 0x47, 0xd5, 0x31, 0xbf,
++		0x5a, 0x04, 0xe4, 0xfd, 0x6f, 0x84, 0xe7, 0x6d,
++		0xc2, 0x8c, 0x13, 0x06, 0x13, 0x6a, 0x5f, 0xab,
++	};
++	int profile = airoha_npu_profile(dev->of_node);
+ 	bool ct = airoha_npu_is_connac2_ct(dev);
+ 	const char *fw_names[2];
+ 	int ret;
+ 
+-	if (ram || full) {
+-		if (!ct || (ram && full))
++	if (profile < 0)
++		return profile;
++	if (profile != AIROHA_NPU_PROFILE_STOCK) {
++		bool full = profile == AIROHA_NPU_PROFILE_ORDINARY;
++		bool pon = profile == AIROHA_NPU_PROFILE_PON_FULL;
++
++		if (!ct)
+ 			return -EINVAL;
+-		ret = airoha_npu_load_firmware(dev, addr, full ?
++		ret = airoha_npu_load_firmware(dev, addr, pon ?
++			"airoha/hg5585f-ct/npu_pon_full_rv32.bin" : full ?
+ 			"airoha/hg5585f-ct/npu_full_test_rv32.bin" : "airoha/hg5585f-ct/npu_rebuilt_rv32.bin",
+-			0x18000, full ? ordinary_sha256 : lab_sha256[0], false);
++			0x18000, pon ? pon_sha256 : full ? ordinary_sha256 : lab_sha256[0], false);
+ 		if (ret)
+ 			return ret;
+ 		return airoha_npu_load_firmware(dev, base + REG_NPU_LOCAL_SRAM,
++					       pon ? "airoha/hg5585f-ct/npu_pon_full_data.bin" :
+ 					       full ? "airoha/hg5585f-ct/npu_full_test_data.bin" :
+ 					       "airoha/hg5585f-ct/npu_rebuilt_data.bin",
+ 					       4, lab_sha256[1], false);
+@@ -410,7 +462,8 @@
+ 	/* Try to load firmware images using the firmware names provided via
+ 	 * dts if available.
+ 	 */
+-	if (airoha_npu_is_connac2_ct(dev) || of_find_property(dev->of_node, "firmware-name", NULL))
++	if (airoha_npu_profile(dev->of_node) != AIROHA_NPU_PROFILE_STOCK ||
++	    airoha_npu_is_connac2_ct(dev) || of_find_property(dev->of_node, "firmware-name", NULL))
+ 		return airoha_npu_load_firmware_from_dts(dev, addr, base);
+ 
+ 	/* Load rv32 npu firmware */
+@@ -456,8 +509,7 @@
+ 	int err;
+ 
+ 	if (!airoha_npu_wlan_short_guard_ready(npu) ||
+-	    !(of_property_read_bool(npu->dev->of_node, "airoha,connac2-rebuilt-ram-lab") ||
+-	      of_property_read_bool(npu->dev->of_node, "airoha,connac2-ordinary-full-test")))
++	    !airoha_npu_native_profile(npu->dev))
+ 		return -EOPNOTSUPP;
+ 	packet.data.magic = cpu_to_le32(AIROHA_CT_PAIR_MAGIC);
+ 	packet.data.abi = cpu_to_le16(AIROHA_CT_PAIR_ABI);
+@@ -861,7 +913,12 @@
+ 	np = of_parse_phandle(dev->of_node, "airoha,npu", 0);
+ 	if (!np)
+ 		return ERR_PTR(-ENODEV);
+-	resident = of_property_read_bool(np, "airoha,connac2-rebuilt-ram-lab");
++	err = airoha_npu_profile(np);
++	if (err < 0) {
++		of_node_put(np);
++		return ERR_PTR(err);
++	}
++	resident = airoha_npu_deferred_profile(np);
+ 
+ 	pdev = of_find_device_by_node(np);
+ 
+@@ -1001,7 +1058,12 @@
+ 	void __iomem *base;
+ 	int i, irq, err;
+ 
+-	if (of_property_read_bool(dev->of_node, "airoha,connac2-rebuilt-ram-lab") &&
++	err = airoha_npu_profile(dev->of_node);
++	if (err < 0)
++		return err;
++	if (err != AIROHA_NPU_PROFILE_STOCK && !airoha_npu_is_connac2_ct(dev))
++		return -EINVAL;
++	if (airoha_npu_deferred_profile(dev->of_node) &&
+ 	    !airoha_npu_resident_device(dev))
+ 		return -EOPNOTSUPP;
+ 
+@@ -1015,8 +1077,7 @@
+ 
+ 	npu = &instance->npu;
+ 	npu->dev = dev;
+-	instance->deferred_start = of_property_read_bool(dev->of_node,
+-						       "airoha,connac2-rebuilt-ram-lab");
++	instance->deferred_start = airoha_npu_deferred_profile(dev->of_node);
+ 	mutex_init(&instance->er.lock);
+ 	npu->ops.ppe_init = airoha_npu_ppe_init;
+ 	npu->ops.ppe_deinit = airoha_npu_ppe_deinit;
+--- a/drivers/net/ethernet/airoha/airoha_npu_transaction.inc
++++ b/drivers/net/ethernet/airoha/airoha_npu_transaction.inc
+@@ -14,7 +14,7 @@
+ 	int err;
+ 
+ 	if (!npu || !msg || !airoha_npu_wlan_short_guard_ready(npu) ||
+-	    !of_property_read_bool(npu->dev->of_node, "airoha,connac2-rebuilt-ram-lab"))
++	    !airoha_npu_transaction_profile(npu->dev))
+ 		return -EOPNOTSUPP;
+ 
+ 	for (index = 0; index < AUTH_MBOX_WORDS; index++)
+@@ -65,7 +65,7 @@
+ 	int err;
+ 
+ 	if (!npu || !msg || !airoha_npu_wlan_short_guard_ready(npu) ||
+-	    !of_property_read_bool(npu->dev->of_node, "airoha,connac2-rebuilt-ram-lab"))
++	    !airoha_npu_transaction_profile(npu->dev))
+ 		return -EOPNOTSUPP;
+ 
+ 	for (index = 0; index < 16; index++)
+@@ -104,6 +104,9 @@
+ 
+ 	if (!npu || !msg)
+ 		return -EOPNOTSUPP;
++	if (!airoha_npu_wlan_short_guard_ready(npu) ||
++	    !airoha_npu_transaction_profile(npu->dev))
++		return -EOPNOTSUPP;
+ 	instance = container_of(npu, struct airoha_npu_instance, npu);
+ 	provider = &instance->er;
+ 	mutex_lock(&provider->lock);
+@@ -130,7 +133,7 @@
+ 	int err;
+ 
+ 	if (!npu || !msg || !airoha_npu_wlan_short_guard_ready(npu) ||
+-	    !of_property_read_bool(npu->dev->of_node, "airoha,connac2-rebuilt-ram-lab"))
++	    !airoha_npu_transaction_profile(npu->dev))
+ 		return -EOPNOTSUPP;
+ 
+ 	for (index = 0; index < GATE_WORDS; index++)
