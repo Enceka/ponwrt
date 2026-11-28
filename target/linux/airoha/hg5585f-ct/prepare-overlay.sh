@@ -154,6 +154,11 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/patches-6.18/999-zz6-net-airoha-invalidate-pon-bank0-unbound-row.patch \
   target/linux/airoha/patches-6.18/999-zz7-net-airoha-record-trusted-pon-unbound-events.patch \
   target/linux/airoha/patches-6.18/999-zz8-net-airoha-run-selected-pon-candidate-session.patch \
+  target/linux/airoha/patches-6.18/999-zz9-net-airoha-report-pon-session-activity.patch \
+  target/linux/airoha/patches-6.18/999-zza-net-airoha-preserve-pon-session-on-wlan-revoke.patch \
+  target/linux/airoha/patches-6.18/999-zzb-net-airoha-refresh-production-pon-row-timestamps.patch \
+  target/linux/airoha/patches-6.18/999-zzc-netfilter-drain-flowtable-before-unbinding.patch \
+  target/linux/airoha/patches-6.18/999-zzd-net-airoha-relearn-idle-production-pon-rows.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config,NATIVE_PAIRS.md} \
   target/linux/airoha/tests/native_pair/*.{py,c} \
   target/linux/airoha/tests/native_pair/fixtures/*.inc \
@@ -190,6 +195,11 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/tests/npu_flow_row/*.{py,c,h,inc,md} \
   target/linux/airoha/tests/npu_pon_unbound_event/*.{py,c,h,inc,md} \
   target/linux/airoha/tests/npu_pon_production/*.{py,c,h,inc,md} \
+  target/linux/airoha/tests/npu_pon_activity/*.{py,c,h,inc,md} \
+  target/linux/airoha/tests/npu_pon_wlan_revoke/*.{py,c,h,inc,md} \
+  target/linux/airoha/tests/npu_pon_timestamp/*.{py,c,h,inc,md} \
+  target/linux/airoha/tests/flowtable_unbind/*.{py,c,h,inc,md} \
+  target/linux/airoha/tests/npu_pon_relearn/*.{py,c,h,inc,md} \
   target/linux/airoha/tests/eth_return/*.{py,c,h,md} \
   target/linux/airoha/tests/tunnel/*.{py,c,sh,md} \
   target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed-full-test.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed-pon-full.dts}; do

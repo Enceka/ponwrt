@@ -49,6 +49,26 @@ checks the actual UNB row, then installs the candidate's NAT/output action
 through the closed Bank0 transaction. Flow deletion and device/mapping
 invalidation close the session; `release` restores the saved bank settings
 and releases its references. Failed cleanup retains the owner for retry.
+`FLOW_CLS_STATS` reads the owned row timestamp after checking the candidate,
+open session, SRAM completion and full row identity. It leaves the candidate
+and snapshot unchanged. Unrelated WLAN station cleanup keeps a valid exclusive
+session open while the caller advances the station epoch and removes old
+WLAN flows; global and LAN1 revocation still close the owner.
+Owned rows clear STATIC so packet hits advance their hardware timestamps.
+The 2026-11-28 production RAM test exercised a real netfilter UDP candidate
+through GDM2 loopback, double NAT and LAN1 delivery. Forty consecutive samples
+kept the same bound session beyond the flowtable timeout, advanced the hardware
+timestamp and left PON CPU receive counters unchanged. Exact conntrack deletion
+removed the candidate and bound row; the next packet used CPU forwarding.
+Trusted UNB events also trigger relearning after hardware aging. A queued event
+whose actual row still matches the complete owned BND entry is ignored; a
+matching aged UNB row uses the close/drain/install/reopen transaction with a
+fresh epoch. The RAM test resumed after a 20-second idle, kept the same
+candidate, relearned its row and delivered eight further packets without
+incrementing PON CPU counters.
+Flowtable teardown drains pending work and destroys affected hardware flows
+before removing driver callbacks. Deleting the entire test table also passed
+candidate retirement, row removal, CPU forwarding and owner release on board.
 This session requires native pair policy to be disabled and no active native
 pairs; the start command returns `EBUSY` while that policy is active. It does
 not change the policy itself. Shared PON/WLAN operation and automatic session
