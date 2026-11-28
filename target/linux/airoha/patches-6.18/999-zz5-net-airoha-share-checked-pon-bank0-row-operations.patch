@@ -1,0 +1,167 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: share checked PON Bank0 row operations
+
+Extract the diagnostic UNB identity check and empty-row installation into
+Bank0 helpers for production flow ownership. Check the original IPv4 tuple,
+packet type and protocol, SRAM acknowledgements and the complete row.
+
+Report write attempts before submitting SRAM writes, including failed writes
+that may have reached hardware. Keep the diagnostic cleanup cursor dirty
+through write and readback failures while preserving its outer admission
+and lifecycle checks.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_flow_row.h
+@@ -0,0 +1,70 @@
++#ifndef AIROHA_NPU_FLOW_ROW_H
++#define AIROHA_NPU_FLOW_ROW_H
++
++static int airoha_npu_bank0_check_unbound(struct airoha_ppe *ppe, u32 hash,
++					const struct airoha_foe_entry *expected)
++{
++	struct airoha_foe_entry bound, *learned;
++
++	if (!ppe || !expected || !airoha_ppe_bank0_hash(hash))
++		return -EINVAL;
++	lockdep_assert_held(&ppe_lock);
++	bound = *expected;
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, bound.ib1) != AIROHA_FOE_STATE_BIND ||
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, bound.ib1) != PPE_PKT_TYPE_IPV4_HNAPT)
++		return -EINVAL;
++	learned = airoha_ppe_foe_get_entry_locked(ppe, hash);
++	if (!learned)
++		return -ETIMEDOUT;
++	if (!airoha_ppe_ct_sram_ack(ppe->eth, hash, false))
++		return -EIO;
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, learned->ib1) != AIROHA_FOE_STATE_UNBIND ||
++	    ((learned->ib1 ^ bound.ib1) &
++	     (AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP)) ||
++	    memcmp(&learned->ipv4.orig_tuple, &bound.ipv4.orig_tuple,
++		   sizeof(bound.ipv4.orig_tuple)))
++		return -ESTALE;
++	return 0;
++}
++
++static int airoha_npu_bank0_install_checked(struct airoha_ppe *ppe, u32 hash,
++					  const struct airoha_foe_entry *entry,
++					  bool *write_attempted)
++{
++	const struct airoha_foe_entry invalid = {};
++	struct airoha_foe_entry bound, *row;
++	int error;
++
++	if (!write_attempted)
++		return -EINVAL;
++	*write_attempted = false;
++	if (!ppe || !entry || !airoha_ppe_bank0_hash(hash))
++		return -EINVAL;
++	lockdep_assert_held(&ppe_lock);
++	bound = *entry;
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, bound.ib1) != AIROHA_FOE_STATE_BIND ||
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, bound.ib1) != PPE_PKT_TYPE_IPV4_HNAPT)
++		return -EINVAL;
++	row = airoha_ppe_foe_get_entry_locked(ppe, hash);
++	if (!row)
++		return -ETIMEDOUT;
++	if (!airoha_ppe_ct_sram_ack(ppe->eth, hash, false) ||
++	    memcmp(row, &invalid, sizeof(invalid)))
++		return -EIO;
++	*write_attempted = true;
++	*row = bound;
++	error = airoha_ppe_foe_commit_sram_entry(ppe, hash);
++	if (error)
++		return error;
++	if (!airoha_ppe_ct_sram_ack(ppe->eth, hash, true))
++		return -EIO;
++	row = airoha_ppe_foe_get_entry_locked(ppe, hash);
++	if (!row)
++		return -ETIMEDOUT;
++	if (!airoha_ppe_ct_sram_ack(ppe->eth, hash, false) ||
++	    memcmp(row, &bound, sizeof(bound)))
++		return -EIO;
++	return 0;
++}
++
++#endif
+--- a/drivers/net/ethernet/airoha/airoha_npu_diag.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_diag.h
+@@ -2,13 +2,14 @@
+ #define AIROHA_NPU_DIAG_H
+ 
+ #include <linux/inet.h>
++#include "airoha_npu_flow_row.h"
+ 
+ static int airoha_npu_diag_install(struct airoha_npu_owner *owner)
+ {
+-	const struct airoha_foe_entry invalid = {};
+ 	struct airoha_ppe *ppe = owner->ppe;
+-	struct airoha_foe_entry *entry;
+-	int error = 0;
++	u32 previous_next_row;
++	bool write_attempted;
++	int error;
+ 
+ 	lockdep_assert_held(&flow_offload_mutex);
+ 	if (!owner->diag_bound || !owner->diag_auth || !owner->diag_learn ||
+@@ -24,27 +25,12 @@
+ 		spin_unlock_bh(&ppe_lock);
+ 		return -ESTALE;
+ 	}
+-	entry = airoha_ppe_foe_get_entry_locked(ppe, owner->diag_hash);
+-	if (!entry)
+-		error = -ETIMEDOUT;
+-	else if (!airoha_ppe_ct_sram_ack(ppe->eth, owner->diag_hash, false) ||
+-		 memcmp(entry, &invalid, sizeof(invalid)))
+-		error = -EIO;
+-	if (!error) {
+-		owner->bank0_next_row = 0;
+-		*entry = owner->diag_entry;
+-		error = airoha_ppe_foe_commit_sram_entry(ppe, owner->diag_hash);
+-		if (!error && !airoha_ppe_ct_sram_ack(ppe->eth, owner->diag_hash, true))
+-			error = -EIO;
+-	}
+-	if (!error) {
+-		entry = airoha_ppe_foe_get_entry_locked(ppe, owner->diag_hash);
+-		if (!entry)
+-			error = -ETIMEDOUT;
+-		else if (!airoha_ppe_ct_sram_ack(ppe->eth, owner->diag_hash, false) ||
+-			 memcmp(entry, &owner->diag_entry, sizeof(*entry)))
+-			error = -EIO;
+-	}
++	previous_next_row = owner->bank0_next_row;
++	owner->bank0_next_row = 0;
++	error = airoha_npu_bank0_install_checked(ppe, owner->diag_hash,
++						 &owner->diag_entry, &write_attempted);
++	if (!write_attempted)
++		owner->bank0_next_row = previous_next_row;
+ 	spin_unlock_bh(&ppe_lock);
+ 	return error;
+ }
+@@ -282,7 +268,7 @@
+ 	struct airoha_npu_owner *owner = ppe->ct_npu_owner;
+ 	struct airoha_eth *eth = ppe->eth;
+ 	struct airoha_flow_data data = {};
+-	struct airoha_foe_entry bound, *learned;
++	struct airoha_foe_entry bound;
+ 	struct airoha_gdm_dev *egress;
+ 	struct net_device *netdev;
+ 	u32 ip = ntohl(destination);
+@@ -329,17 +315,7 @@
+ 	bound.ib1 |= AIROHA_FOE_IB1_BIND_STATIC |
+ 		FIELD_PREP(AIROHA_FOE_IB1_BIND_TIMESTAMP, airoha_ppe_get_timestamp(ppe));
+ 	spin_lock_bh(&ppe_lock);
+-	learned = airoha_ppe_foe_get_entry_locked(ppe, hash);
+-	if (!learned)
+-		error = -ETIMEDOUT;
+-	else if (!airoha_ppe_ct_sram_ack(eth, hash, false))
+-		error = -EIO;
+-	else if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, learned->ib1) != AIROHA_FOE_STATE_UNBIND ||
+-		 ((learned->ib1 ^ bound.ib1) &
+-		  (AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP)) ||
+-		 memcmp(&learned->ipv4.orig_tuple, &bound.ipv4.orig_tuple,
+-			sizeof(bound.ipv4.orig_tuple)))
+-		error = -ESTALE;
++	error = airoha_npu_bank0_check_unbound(ppe, hash, &bound);
+ 	spin_unlock_bh(&ppe_lock);
+ 	if (error)
+ 		goto put;
