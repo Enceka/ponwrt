@@ -1,0 +1,785 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: run a selected GPON candidate session
+
+Connect trusted downstream learning to the checked Bank0 transaction.
+Keep the session explicit and exclusive, and retain cleanup ownership on
+failures until withdrawal and register restoration complete.
+
+--- a/drivers/net/ethernet/airoha/airoha_bank1_routes.h
++++ b/drivers/net/ethernet/airoha/airoha_bank1_routes.h
+@@ -143,15 +143,17 @@
+ int airoha_bank1_routes_open(struct airoha_eth *eth, const void *owner)
+ {
+ 	struct airoha_bank1_routes *routes;
+-	u32 diagnostic_flow;
+-	bool diagnostic;
++	u32 exclusive_flow;
++	bool exclusive, production;
+ 	int error;
+ 
+ 	if (!eth || !eth->ppe || !owner)
+ 		return -EINVAL;
+ 	lockdep_assert_held(&flow_offload_mutex);
+-	diagnostic = airoha_ppe_npu_diag_active(eth->ppe, owner);
+-	diagnostic_flow = airoha_ppe_npu_diag_flow(eth->ppe, owner);
++	production = airoha_ppe_npu_production_active(eth->ppe, owner);
++	exclusive = production || airoha_ppe_npu_diag_active(eth->ppe, owner);
++	exclusive_flow = production ? PPE_FLOW_CFG_IP4_NAPT_MASK :
++		airoha_ppe_npu_diag_flow(eth->ppe, owner);
+ 	routes = &eth->ct_bank1_routes;
+ 	spin_lock_bh(&eth->ct_route_lock);
+ 	if (routes->owner != owner || !routes->ready || routes->revoked) {
+@@ -162,7 +164,7 @@
+ 		error = -EACCES;
+ 		goto unlock;
+ 	}
+-	if ((!eth->ppe->ct_pon_qualified && !diagnostic) || eth->ct_ordinary_full_test) {
++	if ((!eth->ppe->ct_pon_qualified && !exclusive) || eth->ct_ordinary_full_test) {
+ 		error = -EOPNOTSUPP;
+ 		goto unlock;
+ 	}
+@@ -177,15 +179,15 @@
+ 		goto unlock;
+ 	}
+ 	if (!(airoha_fe_rr(eth, REG_PPE_GLO_CFG(1)) & PPE_GLO_CFG_EN_MASK) ||
+-	    (diagnostic ?
++	    (exclusive ?
+ 	     airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) ||
+ 	     FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, airoha_fe_rr(eth, REG_PPE_TB_CFG(1))) != 2 ||
+ 	     (airoha_fe_rr(eth, REG_PPE_GLO_CFG(1)) & PPE_GLO_CFG_BUSY_MASK) :
+ 	     !airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1))) ||
+-	    (diagnostic && diagnostic_flow &&
++	    (exclusive && exclusive_flow &&
+ 	     (!(airoha_fe_rr(eth, REG_PPE_GLO_CFG(0)) & PPE_GLO_CFG_EN_MASK) ||
+ 	      (airoha_fe_rr(eth, REG_PPE_GLO_CFG(0)) & PPE_GLO_CFG_BUSY_MASK) ||
+-	      airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) != diagnostic_flow ||
++	      airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) != exclusive_flow ||
+ 	      FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, airoha_fe_rr(eth, REG_PPE_TB_CFG(0))) != 3))) {
+ 		error = -EIO;
+ 		goto unlock;
+--- a/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
+@@ -152,7 +152,9 @@
+ 	 */
+ 	if (id == AIROHA_GDM2_IDX &&
+ 	    (eth->ct_ordinary_full_test ||
+-	     (eth->ct_pon_full && (!eth->ppe || !eth->ppe->ct_pon_qualified))))
++	     (eth->ct_pon_full && (!eth->ppe || (!eth->ppe->ct_pon_qualified &&
++	      !(pon_classify && airoha_ppe_npu_production_active(eth->ppe,
++							      eth->ct_bank1_routes.owner)))))))
+ 		cfg = airoha_ct_cpu_selectors(cfg, airoha_ct_ppe_selectors(cfg), FE_PSE_PORT_CDM2);
+ 	airoha_fe_wr(eth, REG_GDM_FWD_CFG(id), cfg);
+ 	if (airoha_fe_rr(eth, REG_GDM_FWD_CFG(id)) != cfg)
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -1036,6 +1036,7 @@
+ int airoha_bank1_routes_check(struct airoha_eth *eth, const void *owner, bool opened);
+ int airoha_ct_cpu_fallback(struct airoha_eth *eth);
+ bool airoha_ppe_npu_diag_active(struct airoha_ppe *ppe, const void *token);
++bool airoha_ppe_npu_production_active(struct airoha_ppe *ppe, const void *token);
+ u32 airoha_ppe_npu_diag_flow(struct airoha_ppe *ppe, const void *token);
+ int airoha_ppe_npu_owner_claim_locked(struct airoha_eth *eth, u64 generation);
+ int airoha_ppe_npu_owner_close_locked(struct airoha_eth *eth);
+--- a/drivers/net/ethernet/airoha/airoha_npu_admission.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_admission.h
+@@ -73,7 +73,7 @@
+ 	owner = eth->ppe->ct_npu_owner;
+ 	if (!owner || owner->txn.phase != NPU_TXN_CLOSED || owner->auth_attempted)
+ 		return -EBUSY;
+-	if (owner->diag_lower)
++	if (owner->diag_lower || owner->production.serial)
+ 		return -EOPNOTSUPP;
+ 	error = airoha_npu_auth_rules_validate(owner->txn.id.epoch,
+ 					      owner->txn.id.generation, rules, count);
+@@ -123,8 +123,14 @@
+ 	int error;
+ 
+ 	if (!owner->ppe->ct_pon_qualified &&
+-	    !airoha_ppe_npu_diag_active(owner->ppe, owner))
++	    !airoha_ppe_npu_diag_active(owner->ppe, owner) &&
++	    !airoha_ppe_npu_production_active(owner->ppe, owner))
+ 		return -EOPNOTSUPP;
++	if (owner->production.serial) {
++		error = airoha_npu_production_validate(owner);
++		if (error)
++			return error;
++	}
+ 	error = airoha_npu_owner_return_ready(owner, id);
+ 	if (error)
+ 		return error;
+--- a/drivers/net/ethernet/airoha/airoha_npu_health.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_health.h
+@@ -82,7 +82,13 @@
+ 		error = close_pending ? -ESTALE : 0;
+ 	else
+ 		error = airoha_npu_owner_health_check(owner);
++	if (!error && !invalidated && owner->production.serial &&
++	    owner->txn.phase == NPU_TXN_OPEN)
++		error = airoha_npu_production_step(owner);
+ 	if (error) {
++		int failure = owner->production.serial && invalidated && owner->txn.last_error ?
++			owner->txn.last_error : error;
++
+ 		spin_lock_bh(&ppe_lock);
+ 		if (!owner->invalidated)
+ 			airoha_npu_owner_invalidate(ppe);
+@@ -92,7 +98,7 @@
+ 		route_error = airoha_bank1_routes_revoke(ppe->eth, owner);
+ 		if (!error)
+ 			error = route_error;
+-		owner->txn.last_error = error;
++		owner->txn.last_error = error ?: (owner->production.serial ? failure : 0);
+ 		spin_lock_bh(&ppe_lock);
+ 		if (!error && owner->invalidation_seq == invalidation_seq)
+ 			owner->close_pending = false;
+--- a/drivers/net/ethernet/airoha/airoha_npu_owner.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_owner.h
+@@ -35,6 +35,12 @@
+ 	struct airoha_foe_entry diag_entry;
+ 	struct airoha_er_stats diag_stats;
+ 	struct airoha_er_observation diag_observation;
++	struct airoha_pon_candidate_snapshot production;
++	const struct airoha_pon_link_ops *production_controller;
++	void *production_priv;
++	bool production_bound;
++	u32 production_hash;
++	struct airoha_foe_entry production_entry;
+ };
+ 
+ static bool airoha_ppe_npu_bank0_owned(struct airoha_ppe *ppe)
+@@ -42,7 +48,47 @@
+ 	struct airoha_npu_owner *owner = ppe->ct_npu_owner;
+ 
+ 	lockdep_assert_held(&ppe_lock);
+-	return owner && (owner->bank0_saved || owner->diag_learn);
++	return owner && (owner->bank0_saved || owner->diag_learn || owner->production.serial);
++}
++
++bool airoha_ppe_npu_production_active(struct airoha_ppe *ppe, const void *token)
++{
++	struct airoha_npu_owner *owner = READ_ONCE(ppe->ct_npu_owner);
++	struct airoha_gdm_dev *ingress, *egress;
++	unsigned int index;
++
++	if (!owner || owner != token || !owner->production.serial || owner->diag_lower ||
++	    owner->retiring || READ_ONCE(owner->invalidated) ||
++	    READ_ONCE(owner->close_pending) || READ_ONCE(ppe->ct_pair_failed) ||
++	    READ_ONCE(ppe->eth->ct_cpu_fallback) || !ppe->eth->ct_pon_full ||
++	    ppe->eth->ct_ordinary_full_test ||
++	    ppe->ct_pon_qualified || READ_ONCE(ppe->ct_pair_policy_allowed) ||
++	    !ppe->ct_native_pairs || !ppe->ct_pairs || ppe->ct_stopping ||
++	    !owner->production.ingress || !owner->production.egress ||
++	    owner->production.generation != br_flow_offload_generation() ||
++	    of_property_read_bool(ppe->eth->dev->of_node, "airoha,connac2-pon-er-diagnostic"))
++		return false;
++	for (index = 0; index < AIROHA_CT_PAIR_SLOTS; index++)
++		if (READ_ONCE(ppe->ct_pairs[index].used))
++			return false;
++	ingress = netdev_priv(owner->production.ingress);
++	egress = netdev_priv(owner->production.egress);
++	return airoha_is_valid_gdm_dev(ppe->eth, ingress) &&
++	       airoha_is_valid_gdm_dev(ppe->eth, egress) &&
++	       test_bit(AIROHA_DEV_F_PON, &ingress->flags) &&
++	       !test_bit(AIROHA_DEV_F_PON, &egress->flags) &&
++	       ingress->port->id == AIROHA_GDM2_IDX && !ingress->nbq &&
++	       ingress->pon_link_ops == owner->production_controller &&
++	       ingress->pon_link_priv == owner->production_priv &&
++	       owner->production_controller && owner->production_priv &&
++	       !READ_ONCE(ingress->pon_update_blocked) &&
++	       !READ_ONCE(egress->pon_update_blocked) &&
++	       netif_running(owner->production.ingress) &&
++	       netif_carrier_ok(owner->production.ingress) &&
++	       netif_running(owner->production.egress) &&
++	       netif_carrier_ok(owner->production.egress) &&
++	       !READ_ONCE(ingress->pon_qdma_tag) &&
++	       rcu_access_pointer(ingress->qdma) == &ppe->eth->qdma[1];
+ }
+ 
+ bool airoha_ppe_npu_diag_active(struct airoha_ppe *ppe, const void *token)
+@@ -267,7 +313,7 @@
+ 	}
+ 	if (!error)
+ 		error = airoha_ppe_bank1_clear_rows(owner->ppe, &owner->bank1_next_row);
+-	if (!error && (owner->bank0_saved || owner->diag_learn))
++	if (!error && (owner->bank0_saved || owner->diag_learn || owner->production.serial))
+ 		error = airoha_npu_diag_bank0_drain(owner);
+ 	return error;
+ }
+@@ -276,6 +322,9 @@
+ 				  const struct airoha_npu_txn_identity *id);
+ 
+ static int airoha_npu_diag_install(struct airoha_npu_owner *owner);
++static int airoha_npu_production_validate(struct airoha_npu_owner *owner);
++static int airoha_npu_production_install(struct airoha_npu_owner *owner);
++static int airoha_npu_production_step(struct airoha_npu_owner *owner);
+ 
+ static int airoha_npu_owner_bank1_restore(void *ctx,
+ 					 const struct airoha_npu_txn_identity *id);
+@@ -451,6 +500,7 @@
+ 			dev_put(owner->diag_lower);
+ 		if (owner->diag_egress)
+ 			dev_put(owner->diag_egress);
++		airoha_ppe_pon_candidate_put(&owner->production);
+ 		kfree(owner);
+ 	}
+ 	return error;
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_production.h
+@@ -0,0 +1,448 @@
++#ifndef AIROHA_NPU_PRODUCTION_H
++#define AIROHA_NPU_PRODUCTION_H
++
++#include "airoha_npu_flow_row.h"
++
++static int airoha_npu_production_validate(struct airoha_npu_owner *owner)
++{
++	struct airoha_gdm_dev *ingress;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!owner || owner->ppe->ct_npu_owner != owner ||
++	    !owner->production.serial || !owner->production.ingress ||
++	    !owner->production.egress || owner->retiring ||
++	    READ_ONCE(owner->invalidated) || READ_ONCE(owner->close_pending) ||
++	    !airoha_ppe_npu_production_active(owner->ppe, owner) ||
++	    owner->production.generation != owner->txn.id.generation)
++		return -ESTALE;
++	ingress = netdev_priv(owner->production.ingress);
++	if (!owner->production_controller || !owner->production_priv ||
++	    READ_ONCE(ingress->pon_link_ops) != owner->production_controller ||
++	    READ_ONCE(ingress->pon_link_priv) != owner->production_priv)
++		return -ESTALE;
++	error = airoha_ppe_pon_candidate_validate(owner->ppe, &owner->production);
++	return error;
++}
++
++static int airoha_npu_production_install(struct airoha_npu_owner *owner)
++{
++	struct airoha_ppe *ppe = owner->ppe;
++	bool write_attempted;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!owner->production_bound || !owner->bank0_saved ||
++	    !owner->bank0_host_retired ||
++	    owner->txn.phase != NPU_TXN_PPE_RESTORE ||
++	    owner->bank0_next_row != PPE_SRAM_NUM_ENTRIES ||
++	    !airoha_ppe_bank0_hash(owner->production_hash) ||
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, owner->production_entry.ib1) !=
++	    AIROHA_FOE_STATE_BIND)
++		return -EINVAL;
++	error = airoha_npu_production_validate(owner);
++	if (error)
++		return error;
++	spin_lock_bh(&ppe_lock);
++	if (ppe->ct_npu_owner != owner || owner->invalidated || owner->close_pending) {
++		error = -ESTALE;
++	} else {
++		owner->bank0_next_row = 0;
++		error = airoha_npu_bank0_install_checked(ppe, owner->production_hash,
++						 &owner->production_entry, &write_attempted);
++	}
++	spin_unlock_bh(&ppe_lock);
++	return error;
++}
++
++static int airoha_npu_production_close(struct airoha_npu_owner *owner)
++{
++	int error, route_error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	spin_lock_bh(&ppe_lock);
++	airoha_npu_owner_invalidate(owner->ppe);
++	spin_unlock_bh(&ppe_lock);
++	error = airoha_ppe_npu_owner_close_locked(owner->ppe->eth);
++	route_error = airoha_bank1_routes_revoke(owner->ppe->eth, owner);
++	return error ?: route_error;
++}
++
++static int airoha_npu_production_fail(struct airoha_npu_owner *owner, int error)
++{
++	int close_error;
++
++	owner->epoch_dirty = true;
++	close_error = airoha_npu_production_close(owner);
++	owner->txn.last_error = close_error ?: error;
++	return owner->txn.last_error;
++}
++
++static int airoha_npu_production_authorize(struct airoha_npu_owner *owner)
++{
++	struct airoha_npu_auth_rule rule = {
++		.raw = { AUTH_MBOX_ABI, owner->txn.id.epoch, 1, 0,
++			 owner->production_bound ? owner->production_hash : 0, 4, 2,
++			 owner->production.service, owner->txn.id.generation },
++	};
++	struct airoha_npu_return *path = owner->return_path;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (owner->txn.phase != NPU_TXN_CLOSED || owner->auth_attempted || !path)
++		return -EBUSY;
++	error = airoha_npu_production_validate(owner);
++	if (error)
++		return error;
++	memcpy(rule.raw + 9, owner->production.key, sizeof(owner->production.key));
++	error = airoha_npu_auth_rules_validate(owner->txn.id.epoch,
++					      owner->txn.id.generation, &rule, 1);
++	if (error)
++		return error;
++	error = airoha_npu_owner_return_ready(owner, &owner->txn.id);
++	if (error)
++		return error;
++	rcu_read_lock();
++	error = airoha_npu_return_binding(path, owner->production.ingress, &path->config,
++					  ER_SERVICE_VALID | owner->production.service) ? 0 : -ESTALE;
++	rcu_read_unlock();
++	if (error)
++		return error;
++	owner->auth_attempted = true;
++	owner->epoch_dirty = true;
++	error = airoha_npu_auth_publish(owner->txn.id.epoch, owner->txn.id.generation,
++					&rule, 1, airoha_npu_owner_auth, owner);
++	if (!error)
++		error = airoha_npu_owner_return_ready(owner, &owner->txn.id);
++	if (!error)
++		error = airoha_npu_production_validate(owner);
++	if (!error)
++		owner->auth_count = 1;
++	return error;
++}
++
++static int airoha_npu_production_prepare(struct airoha_npu_owner *owner)
++{
++	int error;
++
++	error = airoha_npu_production_validate(owner);
++	if (!error)
++		error = airoha_ppe_npu_return_prepare_locked(owner->ppe->eth,
++						   netdev_priv(owner->production.ingress), 8);
++	if (!error)
++		error = airoha_npu_production_authorize(owner);
++	if (!error)
++		error = airoha_ppe_npu_owner_open_locked(owner->ppe->eth);
++	if (!error)
++		error = airoha_npu_production_validate(owner);
++	return error;
++}
++
++static int airoha_npu_production_step(struct airoha_npu_owner *owner)
++{
++	struct airoha_pon_unbound_event event = {};
++	struct airoha_foe_entry bound;
++	struct airoha_ppe *ppe = owner->ppe;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!owner->production.serial || owner->txn.phase != NPU_TXN_OPEN ||
++	    READ_ONCE(owner->invalidated) || READ_ONCE(owner->close_pending) || owner->retiring)
++		return 0;
++	error = airoha_npu_production_validate(owner);
++	if (error)
++		goto fail;
++	if (owner->production_bound)
++		return 0;
++	error = airoha_ppe_pon_take_unbound(ppe, owner->production.cookie,
++					    owner->production.serial, &event);
++	if (error == -EAGAIN)
++		return 0;
++	if (error)
++		goto fail;
++	if (event.serial != owner->production.serial ||
++	    event.generation != owner->production.generation ||
++	    event.service != owner->production.service ||
++	    memcmp(event.key, owner->production.key, sizeof(event.key))) {
++		error = -ESTALE;
++		goto fail;
++	}
++	bound = owner->production.data;
++	bound.ib1 &= ~(AIROHA_FOE_IB1_BIND_STATE | AIROHA_FOE_IB1_BIND_TIMESTAMP);
++	bound.ib1 |= AIROHA_FOE_IB1_BIND_STATIC |
++		FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
++		FIELD_PREP(AIROHA_FOE_IB1_BIND_TIMESTAMP, airoha_ppe_get_timestamp(ppe));
++	spin_lock_bh(&ppe_lock);
++	error = owner->invalidated ? -ESTALE :
++		airoha_npu_bank0_check_unbound(ppe, event.hardware_hash, &bound);
++	spin_unlock_bh(&ppe_lock);
++	if (error)
++		goto fail;
++	error = airoha_ppe_npu_owner_close_locked(ppe->eth);
++	if (error)
++		goto fail;
++	error = airoha_npu_production_validate(owner);
++	if (error)
++		goto fail;
++	owner->production_hash = event.hardware_hash;
++	owner->production_entry = bound;
++	owner->production_bound = true;
++	error = airoha_npu_production_prepare(owner);
++	if (error)
++		goto fail;
++	owner->txn.last_error = 0;
++	return 0;
++
++fail:
++	return airoha_npu_production_fail(owner, error);
++}
++
++static int airoha_npu_production_release(struct airoha_ppe *ppe)
++{
++	struct airoha_npu_owner *owner = ppe->ct_npu_owner;
++	struct airoha_eth *eth = ppe->eth;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!owner)
++		return 0;
++	if (!owner->production.serial)
++		return -EBUSY;
++	error = airoha_npu_production_close(owner);
++	if (error)
++		goto fail;
++	if (owner->txn.phase != NPU_TXN_CLOSED || owner->return_path ||
++	    !owner->closed_ack || !owner->bank1_saved || !owner->bank1_host_retired ||
++	    owner->bank1_next_row != PPE_SRAM_NUM_ENTRIES ||
++	    (owner->bank0_saved && (!owner->bank0_host_retired ||
++				   owner->bank0_next_row != PPE_SRAM_NUM_ENTRIES)) ||
++	    owner->ingress.saved_valid || owner->ingress.dirty ||
++	    owner->ingress.active || owner->ingress.pending) {
++		error = -EBUSY;
++		goto fail;
++	}
++	if (eth->ct_bank1_routes.owner) {
++		error = airoha_bank1_routes_release(eth, owner);
++		if (error)
++			goto fail;
++	}
++	spin_lock_bh(&ppe_lock);
++	owner->epoch_dirty = true;
++	owner->bank1_next_row = 0;
++	if (owner->bank0_saved)
++		owner->bank0_next_row = 0;
++	airoha_fe_wr(eth, REG_PPE_TB_CFG(1), owner->bank1_tb);
++	error = airoha_fe_rr(eth, REG_PPE_TB_CFG(1)) == owner->bank1_tb ? 0 : -EIO;
++	if (!error) {
++		airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(1), owner->bank1_flow);
++		error = airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(1)) == owner->bank1_flow ? 0 : -EIO;
++	}
++	if (!error && owner->bank0_saved) {
++		airoha_fe_wr(eth, REG_PPE_TB_CFG(0), owner->bank0_tb);
++		error = airoha_fe_rr(eth, REG_PPE_TB_CFG(0)) == owner->bank0_tb ? 0 : -EIO;
++		if (!error) {
++			airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(0), owner->bank0_flow);
++			error = airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(0)) == owner->bank0_flow ? 0 : -EIO;
++		}
++	}
++	if (!error) {
++		owner->epoch_dirty = false;
++		owner->bank1_next_row = PPE_SRAM_NUM_ENTRIES;
++		if (owner->bank0_saved)
++			owner->bank0_next_row = PPE_SRAM_NUM_ENTRIES;
++	}
++	spin_unlock_bh(&ppe_lock);
++	if (error)
++		goto fail;
++	error = airoha_npu_owner_retire_locked(ppe);
++	if (!error)
++		return 0;
++	owner->bank1_next_row = 0;
++	if (owner->bank0_saved)
++		owner->bank0_next_row = 0;
++fail:
++	return airoha_npu_production_fail(owner, error);
++}
++
++static int airoha_npu_production_withdraw(struct airoha_ppe *ppe,
++					  struct airoha_flow_table_entry *entry)
++{
++	struct airoha_npu_owner *owner = ppe->ct_npu_owner;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!owner || !owner->production.serial ||
++	    owner->production.cookie != entry->cookie ||
++	    owner->production.serial != entry->pon_candidate_serial)
++		return 0;
++	error = airoha_npu_production_close(owner);
++	owner->txn.last_error = error;
++	return error;
++}
++
++static int airoha_npu_production_start(struct airoha_ppe *ppe,
++				       unsigned long cookie, u64 serial)
++{
++	struct airoha_pon_candidate_snapshot snapshot = {};
++	const struct airoha_pon_link_ops *controller;
++	struct airoha_npu_owner *owner;
++	struct airoha_gdm_dev *ingress;
++	struct airoha_eth *eth = ppe->eth;
++	unsigned int index;
++	void *priv;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!serial)
++		return -EINVAL;
++	if (!eth->ct_pon_full || eth->ct_ordinary_full_test ||
++	    !ppe->ct_host_ppe || !ppe->ct_native_pairs)
++		return -EOPNOTSUPP;
++	spin_lock_bh(&ppe_lock);
++	error = ppe->ct_npu_owner || ppe->ct_pair_policy_allowed ||
++		ppe->ct_pair_failed || ppe->ct_stopping || eth->ct_cpu_fallback ||
++		eth->ct_ifc_cpu_port_failed || eth->pon_update_owner ||
++		airoha_ct_pon_ifc_busy(ppe) ? -EBUSY : 0;
++	for (index = 0; ppe->ct_pairs && index < AIROHA_CT_PAIR_SLOTS; ++index)
++		if (ppe->ct_pairs[index].used)
++			error = -EBUSY;
++	spin_unlock_bh(&ppe_lock);
++	if (error)
++		return error;
++	error = airoha_ppe_pon_candidate_snapshot(ppe, cookie, &snapshot);
++	if (error)
++		return error;
++	if (snapshot.serial != serial) {
++		error = -ESTALE;
++		goto put;
++	}
++	ingress = netdev_priv(snapshot.ingress);
++	controller = READ_ONCE(ingress->pon_link_ops);
++	priv = READ_ONCE(ingress->pon_link_priv);
++	error = airoha_ppe_npu_owner_claim_locked(eth, snapshot.generation);
++	owner = ppe->ct_npu_owner;
++	if (!owner)
++		goto put;
++	spin_lock_bh(&ppe_lock);
++	owner->production_controller = controller;
++	owner->production_priv = priv;
++	owner->production_hash = U32_MAX;
++	owner->production = snapshot;
++	spin_unlock_bh(&ppe_lock);
++	if (!error)
++		error = airoha_npu_production_validate(owner);
++	if (!error)
++		error = airoha_npu_diag_bank0_drain(owner);
++	if (!error)
++		error = airoha_npu_production_prepare(owner);
++	if (error)
++		return airoha_npu_production_fail(owner, error);
++	owner->txn.last_error = 0;
++	return 0;
++put:
++	airoha_ppe_pon_candidate_put(&snapshot);
++	return error;
++}
++
++static int airoha_npu_production_show(struct seq_file *stream, void *unused)
++{
++	struct airoha_ppe *ppe = stream->private;
++	struct airoha_pon_candidate_snapshot snapshot;
++	struct airoha_flow_table_entry *entry;
++	struct airoha_npu_owner *owner;
++	struct rhashtable_iter iter;
++	int error = 0, candidate_error;
++
++	mutex_lock(&flow_offload_mutex);
++	owner = ppe->ct_npu_owner;
++	if (owner && owner->production.serial)
++		seq_printf(stream, "cookie=%lu serial=%llu phase=%u bound=%u hash=%u error=%d\n",
++			owner->production.cookie, owner->production.serial, owner->txn.phase,
++			owner->production_bound && owner->txn.phase == NPU_TXN_OPEN &&
++			!READ_ONCE(owner->invalidated) && !READ_ONCE(owner->close_pending),
++			owner->production_hash, owner->txn.last_error);
++	else
++		seq_puts(stream, "cookie=0 serial=0 phase=0 bound=0 hash=4294967295 error=0\n");
++	rhashtable_walk_enter(&ppe->eth->flow_table, &iter);
++	rhashtable_walk_start(&iter);
++	while ((entry = rhashtable_walk_next(&iter))) {
++		if (IS_ERR(entry)) {
++			if (PTR_ERR(entry) == -EAGAIN)
++				continue;
++			error = PTR_ERR(entry);
++			break;
++		}
++		spin_lock_bh(&ppe_lock);
++		candidate_error = airoha_ppe_pon_candidate_read_locked(ppe, entry, &snapshot);
++		spin_unlock_bh(&ppe_lock);
++		if (!candidate_error)
++			seq_printf(stream, "candidate cookie=%lu serial=%llu service=%u\n",
++				snapshot.cookie, snapshot.serial, snapshot.service);
++	}
++	rhashtable_walk_stop(&iter);
++	rhashtable_walk_exit(&iter);
++	mutex_unlock(&flow_offload_mutex);
++	return error;
++}
++
++static int airoha_npu_production_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, airoha_npu_production_show, inode->i_private);
++}
++
++static ssize_t airoha_npu_production_write(struct file *file, const char __user *buffer,
++					 size_t count, loff_t *offset)
++{
++	struct airoha_ppe *ppe = ((struct seq_file *)file->private_data)->private;
++	char command[96], *cursor, *cookie_text, *serial_text;
++	unsigned long cookie;
++	u64 serial;
++	int error;
++
++	if (!count || count >= sizeof(command))
++		return -EINVAL;
++	if (copy_from_user(command, buffer, count))
++		return -EFAULT;
++	if (memchr(command, 0, count))
++		return -EINVAL;
++	command[count] = 0;
++	cursor = strim(command);
++	mutex_lock(&flow_offload_mutex);
++	if (!strcmp(cursor, "release")) {
++		error = airoha_npu_production_release(ppe);
++	} else if (!strncmp(cursor, "start ", 6)) {
++		cursor += 6;
++		cookie_text = strsep(&cursor, " ");
++		serial_text = strsep(&cursor, " ");
++		error = -EINVAL;
++		if (cookie_text && serial_text && !cursor &&
++		    !kstrtoul(cookie_text, 0, &cookie) && !kstrtou64(serial_text, 0, &serial))
++			error = airoha_npu_production_start(ppe, cookie, serial);
++	} else {
++		error = -EINVAL;
++	}
++	mutex_unlock(&flow_offload_mutex);
++	return error ? error : count;
++}
++
++static const struct file_operations airoha_npu_production_fops = {
++	.owner = THIS_MODULE,
++	.open = airoha_npu_production_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++	.write = airoha_npu_production_write,
++};
++
++static int airoha_npu_production_init(struct airoha_ppe *ppe)
++{
++	struct dentry *entry;
++
++	if (!ppe->eth->ct_pon_full)
++		return 0;
++	entry = debugfs_create_file("pon_npu_flow", 0600, ppe->debugfs_dir, ppe,
++				    &airoha_npu_production_fops);
++	return IS_ERR(entry) ? PTR_ERR(entry) : entry ? 0 : -ENOMEM;
++}
++
++#endif
+--- a/drivers/net/ethernet/airoha/airoha_npu_reopen.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_reopen.h
+@@ -5,14 +5,22 @@
+ 				      const struct airoha_npu_txn_identity *id,
+ 				      enum airoha_npu_txn_phase phase)
+ {
++	int error;
++
+ 	if ((!owner->ppe->ct_pon_qualified &&
+-	     !airoha_ppe_npu_diag_active(owner->ppe, owner)) ||
++	     !airoha_ppe_npu_diag_active(owner->ppe, owner) &&
++	     !airoha_ppe_npu_production_active(owner->ppe, owner)) ||
+ 	    !owner->ppe->ct_pair_wired_registered)
+ 		return -EOPNOTSUPP;
+ 	if (!owner->bank1_saved || !owner->bank1_host_retired ||
+ 	    !owner->auth_attempted || (!owner->auth_count &&
+ 	    !airoha_ppe_npu_diag_active(owner->ppe, owner)))
+ 		return -EACCES;
++	if (owner->production.serial) {
++		error = airoha_npu_production_validate(owner);
++		if (error)
++			return error;
++	}
+ 	return airoha_npu_owner_return_state(owner, id, phase);
+ }
+ 
+@@ -27,8 +35,10 @@
+ 	error = airoha_npu_owner_open_check(owner, id, NPU_TXN_PPE_RESTORE);
+ 	if (error)
+ 		return error;
+-	if (airoha_ppe_npu_diag_active(owner->ppe, owner)) {
+-		u32 flow = airoha_ppe_npu_diag_flow(owner->ppe, owner);
++	if (airoha_ppe_npu_diag_active(owner->ppe, owner) ||
++	    airoha_ppe_npu_production_active(owner->ppe, owner)) {
++		u32 flow = owner->production.serial ? PPE_FLOW_CFG_IP4_NAPT_MASK :
++			airoha_ppe_npu_diag_flow(owner->ppe, owner);
+ 		u32 table;
+ 
+ 		status = airoha_fe_rr(eth, REG_PPE_GLO_CFG(1));
+@@ -50,6 +60,11 @@
+ 			return -EIO;
+ 		if (owner->diag_bound) {
+ 			error = airoha_npu_diag_install(owner);
++			if (error)
++				return error;
++		}
++		if (owner->production_bound) {
++			error = airoha_npu_production_install(owner);
+ 			if (error)
+ 				return error;
+ 		}
+--- a/drivers/net/ethernet/airoha/airoha_npu_return.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_return.h
+@@ -21,7 +21,8 @@
+ 	int error;
+ 
+ 	lockdep_assert_held(&ppe_lock);
+-	if (!owner || (dev && (!owner->return_path ||
++	if (!owner || (dev && dev != owner->production.ingress &&
++	    dev != owner->production.egress && (!owner->return_path ||
+ 	    dev != netdev_from_priv(owner->return_path->dev))))
+ 		return 0;
+ 	error = airoha_npu_owner_invalidate(ppe);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -31,6 +31,8 @@
+ static DEFINE_SPINLOCK(ppe_lock);
+ 
+ static bool airoha_ppe_npu_bank0_owned(struct airoha_ppe *ppe);
++static int airoha_npu_production_withdraw(struct airoha_ppe *ppe,
++					  struct airoha_flow_table_entry *entry);
+ 
+ /* qdma_dev_hqos_init() controls WAN channel remapping with this bit. */
+ #define AIROHA_PON_QDMA_HQOS_CFG	0x0090
+@@ -1068,11 +1070,17 @@
+ 	if (e->type == FLOW_TYPE_L2 || e->type == FLOW_TYPE_L2_SUBFLOW ||
+ 	    (type != PPE_PKT_TYPE_IPV4_HNAPT && type != PPE_PKT_TYPE_IPV6_ROUTE_5T))
+ 		return -EOPNOTSUPP;
++	lockdep_assert_held(&flow_offload_mutex);
+ 	spin_lock_bh(&ppe_lock);
+ 	/* A failed withdrawal keeps its cookie/hash but cannot learn again. */
+ 	e->pon_ingress_seen = false;
+ 	memset(&e->pon_unbound_event, 0, sizeof(e->pon_unbound_event));
+ 	hlist_del_init(&e->list);
++	spin_unlock_bh(&ppe_lock);
++	err = airoha_npu_production_withdraw(ppe, e);
++	if (err)
++		return err;
++	spin_lock_bh(&ppe_lock);
+ 	if (e->hash == 0xffff)
+ 		goto unlock;
+ 	hwe = airoha_ppe_foe_get_entry_locked(ppe, e->hash);
+@@ -3102,6 +3110,7 @@
+ #include "airoha_ct_pair_banks.h"
+ #include "airoha_npu_owner.h"
+ #include "airoha_npu_diag.h"
++#include "airoha_npu_production.h"
+ 
+ bool airoha_ppe_ct_requested(struct airoha_eth *eth)
+ {
+@@ -4024,6 +4033,8 @@
+ 	if (!err)
+ 		airoha_npu_diag_init(ppe);
+ 	if (!err)
++		err = airoha_npu_production_init(ppe);
++	if (!err)
+ 		err = airoha_ct_pair_policy_init(ppe);
+ 	if (!err) {
+ 		err = airoha_ct_pon_ifc_cpu_init(ppe);

@@ -6,7 +6,7 @@ recorded in `pon-full.json`. The package installs separate
 `/lib/firmware/airoha/hg5585f-ct/`. Selecting the package selects the
 `connac2-wed-pon-full` persistent DTS and the pinned PON loader. Both Ethernet
 and NPU nodes must carry the same exclusive `airoha,connac2-pon-full` profile.
-Optical ingress uses WAN CPU while production admission remains unqualified.
+Optical ingress defaults to WAN CPU until an explicit owner session opens.
 
 The PON profile accepts exact IPv4 TCP/UDP downstream software candidates
 from a live GDM2/WAN receiver to a live local wired output. Candidate cookies
@@ -24,14 +24,15 @@ snapshots are deferred until the return mapping supports their identity.
 Shared Bank0 helpers check a real UNB row's tuple and install only into a fully
 empty row, with SRAM ACK and complete readback verification. A submitted write
 retains its cleanup obligation even when completion times out. The diagnostic
-bind/install path exercises these helpers. The production worker, per-row
-ownership and native WLAN coexistence lifecycle remain to be integrated.
+bind/install path exercises these helpers. The explicit production session
+uses them with exclusive Bank0 ownership. Shared Bank0 ownership with native
+WLAN flows remains pending.
 The WAN QDMA UNB-rate path now records a consumable hardware learning event
 with the candidate serial, generation, original key and GEM service. The
 hardware row is kept separate from the software entry's unbound hash.
 Withdrawal, identity conflict and Bank0 retirement clear pending events.
-The worker must reserve and verify the actual row before checked invalidation
-and installation; event collection alone performs no hardware binding.
+The selected worker verifies that row, closes and drains the owned bank, then
+performs checked installation before reopening the session.
 
 The source revision is `f121da5f83a870e4fc7f39157db707a7334f7c0d`.
 The recorded RAM test exercised Bank0 UNB-to-BND forwarding to LAN1,
@@ -39,6 +40,22 @@ cross-GEM isolation and owner restoration. Evidence paths are relative to
 the enclosing workspace and are recorded with hashes for retrieval; the
 offline verifier uses the committed payload identity and requires no board
 or evidence directory access.
+
+The host driver now provides an explicit single-candidate session through
+`pon_npu_flow` in the PPE debugfs directory. `start COOKIE SERIAL` selects an
+observed GPON IPv4 TCP/UDP downstream candidate. The owner authorizes its
+original ingress identity, waits for a trusted WAN hardware learning event,
+checks the actual UNB row, then installs the candidate's NAT/output action
+through the closed Bank0 transaction. Flow deletion and device/mapping
+invalidation close the session; `release` restores the saved bank settings
+and releases its references. Failed cleanup retains the owner for retry.
+This session requires native pair policy to be disabled and no active native
+pairs; the start command returns `EBUSY` while that policy is active. It does
+not change the policy itself. Shared PON/WLAN operation and automatic session
+selection remain pending. The current milestone covers GPON IPv4 downstream;
+EPON, XG-PON, upstream and IPv6 are outside this session's scope. Global
+`ct_pon_qualified` stays false. See
+`target/linux/airoha/tests/npu_pon_production` for the executable host regression.
 
 Use the NPU repository's pinned toolchain and these build options:
 
