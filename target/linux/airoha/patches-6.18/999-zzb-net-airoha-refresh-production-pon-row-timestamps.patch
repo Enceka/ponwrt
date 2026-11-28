@@ -1,0 +1,22 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: allow production PON row activity updates
+
+Production sessions use hardware row timestamps to refresh netfilter flow
+lifetimes. Static rows forward packets but retain their installation timestamp,
+so an active session expires after the flowtable timeout. Clear STATIC when
+building the owned bound row so packet hits update its activity timestamp.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu_production.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_production.h
+@@ -228,8 +228,9 @@
+ 		goto fail;
+ 	}
+ 	bound = owner->production.data;
+-	bound.ib1 &= ~(AIROHA_FOE_IB1_BIND_STATE | AIROHA_FOE_IB1_BIND_TIMESTAMP);
+-	bound.ib1 |= AIROHA_FOE_IB1_BIND_STATIC |
++	bound.ib1 &= ~(AIROHA_FOE_IB1_BIND_STATE | AIROHA_FOE_IB1_BIND_TIMESTAMP |
++		       AIROHA_FOE_IB1_BIND_STATIC);
++	bound.ib1 |=
+ 		FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
+ 		FIELD_PREP(AIROHA_FOE_IB1_BIND_TIMESTAMP, airoha_ppe_get_timestamp(ppe));
+ 	spin_lock_bh(&ppe_lock);
