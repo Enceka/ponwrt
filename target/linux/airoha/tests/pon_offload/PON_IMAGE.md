@@ -1,0 +1,86 @@
+# PON full-image pair preflight
+
+`verify_pon_image.py` checks the recovery FIT and sysupgrade FIT together before
+board validation. Run it against files from the same SDK build. It reads images
+and configuration, extracts selected squashfs content into a temporary directory,
+then writes a JSON success report. PON production admission remains owned by the
+production lifecycle; the build provenance currently records
+`pon_production_admission: false` and this checker records `board_tested: false`.
+
+## Inputs and invocation
+
+Supply the final kernel config, original uncompressed `initramfs_data.cpio`,
+and the source manifest used to generate `/etc/hg5585f-ct-build.json`. The FIT
+helper must provide `Fit`, `verify_fit_hashes`, `text` and `integer`; use the
+project's existing image helper used for the SDK image inspection. Its SHA256
+is included in the result. `--unsquashfs` accepts an executable plus optional
+arguments parsed with `shlex`, without a shell.
+
+```sh
+python3 -B /Volumes/Workspace/5585f/build/ponwrt/target/linux/airoha/tests/pon_offload/verify_pon_image.py \
+  --recovery /absolute/image-build/initramfs-recovery.itb \
+  --sysupgrade /absolute/image-build/squashfs-sysupgrade.itb \
+  --initramfs-archive /absolute/image-build/initramfs_data.cpio \
+  --config /absolute/image-build/kernel.config \
+  --source-manifest /absolute/image-build/source.json \
+  --image-helper /absolute/tools/image_helper.py \
+  --unsquashfs '/absolute/bin/unsquashfs' \
+  --output /absolute/evidence/verified-pair.json
+```
+
+The output file must be new and outside ponwrt, and its parent directory must
+already exist. Input files remain unchanged. A failed check exits nonzero and
+does not write a success report. Run with `-B` to avoid Python bytecode in the
+repository. Keep generated images, extraction files and reports under `build/`
+outside ponwrt.
+
+## Checks
+
+- FIT hashes, default configuration, LZMA/gzip ARM64 kernel, and load/entry
+  `0x8a000000`. Recovery has no filesystem or auxiliary load targets.
+  Sysupgrade has exactly one filesystem with no `load` or `entry`; an optional
+  `loadables` must be exactly that node's single NUL-terminated name. Firmware,
+  ramdisk, other targets and target lists are rejected.
+- The two DTBs are byte-identical. The real resident verifier runs with
+  `pon-full`: final kernel config, matching exclusive NPU/ETH selectors,
+  fixed board/devices, supplier links and reserved-memory references.
+  The network variant is `pon-full`; persistent NAND/PON/BOSA/GDM2/PCS devices
+  are enabled, factory calibration references and PON data-path are present,
+  and diagnostic PON mode and inline radio calibration are absent.
+- Flash has exactly one `bl2` and one `ubi` partition with the expected offsets
+  and sizes, plus `fit` and `factory` volume declarations. Kernel extent,
+  FIT staging at `0x90000000`, and reserved-memory ranges fit in
+  `0x80000000..0xa0000000` without overlap.
+- Recovery contains the supplied raw cpio exactly once. The real newc parser
+  checks its framing and safe paths; normalized path aliases cannot duplicate
+  entries. Required selected entries must be regular files.
+- Stock and PON firmware match package SHA256 pins. Both kernels contain the
+  pinned PON loader digests. RAM/ordinary firmware packages are rejected.
+  Required XPON, WLAN, WED and flow-table modules must be present.
+- Rootfs module and CT NPU firmware inventories match across recovery and
+  sysupgrade, including extra-file detection. All modules, pinned firmware,
+  network generator/empty network seed, wireless config, authorized keys,
+  module startup files and provenance are compared byte-for-byte. Selected
+  squashfs entries must be regular files.
+- Recovery provenance must equal the supplied source manifest as parsed JSON;
+  whitespace and key order may differ. The sysupgrade provenance bytes must
+  match recovery. The report records image, DTB, config, helper and source
+  manifest hashes together with compared file/module counts.
+
+## Offline regression tests
+
+```sh
+cd /Volumes/Workspace/5585f/build/ponwrt/target/linux/airoha/tests/pon_offload
+python3 -B -m unittest -v test_verify_pon_image
+```
+
+The tests require only Python's standard library. FIT parsing/hash delivery and
+unsquashfs are stubbed; fixture kernels use real LZMA/gzip, fixture DTBs pass
+through the real FDT parser and resident verifier, and raw archives pass through
+the real newc parser. Firmware pins and installed contents use isolated temporary
+fixtures. Every negative checks the intended failure reason, with positive
+baselines for the accepted FIT forms and provenance formatting. Coverage includes
+auxiliary targets, DT/profile/device and flash/RAM failures, firmware and loader
+digests, raw cpio identity, selected-file types, module/firmware inventories,
+cross-rootfs contents, provenance and CLI output protection. Temporary fixtures
+are outside the repository and removed after each test.
