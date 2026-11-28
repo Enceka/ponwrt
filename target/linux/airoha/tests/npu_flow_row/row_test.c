@@ -27,6 +27,18 @@ static int check_row(u32 hash, const struct airoha_foe_entry *entry)
 	return error;
 }
 
+static int invalidate_row(u32 hash, const struct airoha_foe_entry *entry, bool *attempted)
+{
+	int error;
+
+	tracked_attempt = attempted;
+	spin_lock_bh(&ppe_lock);
+	error = airoha_npu_bank0_invalidate_unbound_checked(&ppe, hash, entry, attempted);
+	spin_unlock_bh(&ppe_lock);
+	tracked_attempt = NULL;
+	return error;
+}
+
 static void row_fixture(bool udp)
 {
 	prepare_bound_install();
@@ -50,6 +62,8 @@ static void test_row_arguments(void)
 		attempted = true;
 		CHECK(check_row(invalid_hashes[index], &session.diag_entry) == -EINVAL);
 		CHECK(install_row(invalid_hashes[index], &session.diag_entry, &attempted) == -EINVAL);
+		attempted = true;
+		CHECK(invalidate_row(invalid_hashes[index], &session.diag_entry, &attempted) == -EINVAL);
 		CHECK(!attempted && !sram_reads && !sram_commits);
 		cases++;
 	}
@@ -58,6 +72,9 @@ static void test_row_arguments(void)
 		attempted = true;
 		spin_lock_bh(&ppe_lock);
 		CHECK(airoha_npu_bank0_install_checked(kind == 0 ? NULL : &ppe, expected_hash,
+			kind == 1 ? NULL : &session.diag_entry, kind == 2 ? NULL : &attempted) == -EINVAL);
+		attempted = true;
+		CHECK(airoha_npu_bank0_invalidate_unbound_checked(kind == 0 ? NULL : &ppe, expected_hash,
 			kind == 1 ? NULL : &session.diag_entry, kind == 2 ? NULL : &attempted) == -EINVAL);
 		if (kind < 2)
 			CHECK(airoha_npu_bank0_check_unbound(kind == 0 ? NULL : &ppe,
@@ -79,6 +96,8 @@ static void test_row_arguments(void)
 			attempted = true;
 			CHECK(check_row(expected_hash, &session.diag_entry) == -EINVAL);
 			CHECK(install_row(expected_hash, &session.diag_entry, &attempted) == -EINVAL);
+			attempted = true;
+			CHECK(invalidate_row(expected_hash, &session.diag_entry, &attempted) == -EINVAL);
 			CHECK(!attempted && !sram_reads && !sram_commits);
 			cases++;
 		}
@@ -170,6 +189,146 @@ static void test_checked_install(void)
 	}
 }
 
+static void unbound_fixture(bool udp)
+{
+	row_fixture(udp);
+	hardware_entry = session.diag_entry;
+	hardware_entry.ib1 = (hardware_entry.ib1 & ~AIROHA_FOE_IB1_BIND_STATE) |
+		FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_UNBIND);
+}
+
+static void test_checked_invalidate(void)
+{
+	const struct airoha_foe_entry zero = {};
+	const u32 ack_masks[] = {PPE_SRAM_CTRL_ACK_MASK, PPE_SRAM_CTRL_WR_MASK,
+		PPE_SRAM_CTRL_REQ_MASK, FIELD_PREP(PPE_SRAM_CTRL_ENTRY_MASK, 1)};
+
+	for (unsigned int udp = 0; udp < 2; ++udp) {
+		for (unsigned int field = 0; field < 3; ++field) {
+			u32 mask = field == 0 ? AIROHA_FOE_IB1_BIND_STATE :
+				field == 1 ? AIROHA_FOE_IB1_BIND_PACKET_TYPE : AIROHA_FOE_IB1_BIND_UDP;
+			u32 valid = field == 0 ? AIROHA_FOE_STATE_UNBIND :
+				field == 1 ? PPE_PKT_TYPE_IPV4_HNAPT : udp;
+
+			for (u32 value = 0; value <= FIELD_GET(mask, mask); ++value) {
+				bool attempted = true;
+				if (value == valid)
+					continue;
+				unbound_fixture(udp);
+				hardware_entry.ib1 = (hardware_entry.ib1 & ~mask) | FIELD_PREP(mask, value);
+				struct airoha_foe_entry before = hardware_entry;
+				CHECK(invalidate_row(expected_hash, &session.diag_entry, &attempted) == -ESTALE);
+				CHECK(!attempted && !sram_commits && sram_reads == 1);
+				CHECK(!memcmp(&before, &hardware_entry, sizeof(before)));
+				cases++;
+			}
+		}
+		{
+			bool attempted = true;
+			unbound_fixture(udp);
+			shadow_entry = session.diag_entry;
+			hardware_entry.ipv4.orig_tuple.dest_port ^= 1;
+			struct airoha_foe_entry before = hardware_entry;
+			CHECK(invalidate_row(expected_hash, &shadow_entry, &attempted) == -ESTALE);
+			CHECK(!attempted && !sram_commits && sram_reads == 1);
+			CHECK(!memcmp(&before, &hardware_entry, sizeof(before)));
+			cases++;
+		}
+		for (unsigned int bit = 0; bit < sizeof(hardware_entry.ipv4.orig_tuple) * 8; ++bit) {
+			bool attempted = true;
+			unbound_fixture(udp);
+			((u8 *)&hardware_entry.ipv4.orig_tuple)[bit / 8] ^= BIT(bit % 8);
+			struct airoha_foe_entry before = hardware_entry;
+			CHECK(invalidate_row(expected_hash, &session.diag_entry, &attempted) == -ESTALE);
+			CHECK(!attempted && !sram_commits && !memcmp(&before, &hardware_entry, sizeof(before)));
+			cases++;
+		}
+		for (unsigned int bit = 0; bit < sizeof(hardware_entry) * 8; ++bit) {
+			bool attempted = false;
+			unbound_fixture(udp);
+			corrupt_sram_read = 2;
+			corrupt_sram_byte = bit / 8;
+			corrupt_sram_mask = BIT(bit % 8);
+			CHECK(invalidate_row(expected_hash, &session.diag_entry, &attempted) == -EIO);
+			CHECK(attempted && sram_commits == 1 && sram_reads == 2);
+			CHECK(!memcmp(&zero, &hardware_entry, sizeof(zero)));
+			cases++;
+		}
+		for (unsigned int operation = 1; operation <= 3; ++operation) {
+			for (unsigned int mask = 0; mask < ARRAY_SIZE(ack_masks); ++mask) {
+				bool attempted = true;
+				unbound_fixture(udp);
+				struct airoha_foe_entry before = hardware_entry;
+				bad_sram_ack = operation;
+				bad_sram_mask = ack_masks[mask];
+				CHECK(invalidate_row(expected_hash, &session.diag_entry, &attempted) == -EIO);
+				CHECK(attempted == (operation > 1) && sram_commits == (operation > 1));
+				CHECK(!memcmp(&hardware_entry, operation > 1 ? &zero : &before, sizeof(zero)));
+				cases++;
+			}
+		}
+		for (unsigned int fault = 0; fault < 4; ++fault) {
+			bool attempted = true;
+			unbound_fixture(udp);
+			struct airoha_foe_entry before = hardware_entry;
+			if (fault < 2)
+				fail_sram_read = fault ? 2 : 1;
+			else {
+				fail_commit = -ETIMEDOUT;
+				commit_takes_effect = fault == 3;
+			}
+			CHECK(invalidate_row(expected_hash, &session.diag_entry, &attempted) == -ETIMEDOUT);
+			CHECK(attempted == (fault != 0) && sram_commits == (fault != 0));
+			CHECK(!memcmp(&hardware_entry, fault == 1 || fault == 3 ? &zero : &before, sizeof(zero)));
+			cases++;
+		}
+		for (unsigned int boundary = 0; boundary < 2; ++boundary) {
+			bool attempted = false;
+			unbound_fixture(udp);
+			expected_hash = boundary ? 8191 : 0;
+			memset(&hardware_entry.ipv4.new_tuple, 0xa5, sizeof(hardware_entry.ipv4.new_tuple));
+			shadow_entry = session.diag_entry;
+			struct airoha_foe_entry template = session.diag_entry;
+			CHECK(!invalidate_row(expected_hash, &shadow_entry, &attempted));
+			CHECK(attempted && sram_reads == 2 && sram_commits == 1);
+			CHECK(!memcmp(&hardware_entry, &zero, sizeof(zero)));
+			CHECK(!memcmp(&template, &session.diag_entry, sizeof(template)));
+			CHECK(!install_row(expected_hash, &template, &attempted));
+			CHECK(attempted && sram_reads == 4 && sram_commits == 2);
+			CHECK(!memcmp(&hardware_entry, &template, sizeof(template)));
+			CHECK(invalidate_row(expected_hash, &template, &attempted) == -ESTALE);
+			CHECK(!attempted && sram_commits == 2);
+			CHECK(!memcmp(&hardware_entry, &template, sizeof(template)));
+			cases++;
+		}
+	}
+}
+
+static void test_invalidate_retry(void)
+{
+	for (unsigned int effective = 0; effective < 2; ++effective) {
+		bool attempted = false, dirty = true;
+		unbound_fixture(false);
+		fail_commit = -ETIMEDOUT;
+		commit_takes_effect = effective;
+		CHECK(invalidate_row(expected_hash, &session.diag_entry, &attempted) == -ETIMEDOUT);
+		dirty |= attempted;
+		CHECK(dirty && attempted && sram_commits == 1);
+		fail_commit = 0;
+		fail_sram_read = sram_reads + 1;
+		CHECK(invalidate_row(expected_hash, &session.diag_entry, &attempted) == -ETIMEDOUT);
+		dirty |= attempted;
+		CHECK(dirty && !attempted && sram_commits == 1);
+		fail_sram_read = -1;
+		CHECK(invalidate_row(expected_hash, &session.diag_entry, &attempted) == (effective ? -ESTALE : 0));
+		dirty |= attempted;
+		CHECK(dirty && attempted == !effective && sram_commits == (effective ? 1 : 2));
+		CHECK(!memcmp(&hardware_entry, &(struct airoha_foe_entry){}, sizeof(hardware_entry)));
+		CHECK(ppe.ct_npu_owner == &session && lower.references && lan.references);
+		cases++;
+	}
+}
+
 static void test_dirty_cleanup_retry(void)
 {
 	const u32 pending_cursors[] = {0, 1, 17, PPE_SRAM_NUM_ENTRIES - 1,
@@ -215,6 +374,8 @@ int main(int argc, char **argv)
 	test_row_arguments();
 	test_unbound_rows();
 	test_checked_install();
+	test_checked_invalidate();
+	test_invalidate_retry();
 	test_dirty_cleanup_retry();
 	printf("{\"passed\":true,\"row_cases\":%u,\"row_checks\":%u}\n", cases, checks);
 	return 0;

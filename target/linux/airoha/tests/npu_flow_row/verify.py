@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply ZZ5 exactly and exercise shared row operations through real diag callers."""
+"""Apply ZZ5/ZZ6 exactly and exercise shared row operations and real diag callers."""
 
 import argparse
 import hashlib
@@ -22,7 +22,8 @@ from source_binding import SourceBinding, exact_hunks
 SPEC = importlib.util.spec_from_file_location('diag_runner', HERE.parent / 'npu_diag/verify.py')
 DIAG = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DIAG)
-PATCH = '999-zz5-net-airoha-share-checked-pon-bank0-row-operations.patch'
+ZZ5 = '999-zz5-net-airoha-share-checked-pon-bank0-row-operations.patch'
+PATCH = '999-zz6-net-airoha-invalidate-pon-bank0-unbound-row.patch'
 DRIVER = Path('drivers/net/ethernet/airoha')
 
 
@@ -49,12 +50,6 @@ def main():
     tree = output / 'candidate'
     shutil.copytree(source, tree)
     binding = SourceBinding(REPOSITORY / 'target/linux/airoha/patches-6.18', output, PATCH)
-    sections = list(binding.sections(binding.snapshot[PATCH], ('airoha_npu_diag.h', 'airoha_npu_flow_row.h')))
-    assert {name for name, added, section in sections} == {'airoha_npu_diag.h', 'airoha_npu_flow_row.h'}
-    for name, added, section in sections:
-        target = tree / DRIVER / name
-        assert not added or not target.exists(), name
-        exact_hunks(b'' if added else target.read_bytes(), section)
     commands = []
     environment = dict(os.environ, ASAN_OPTIONS='halt_on_error=1:abort_on_error=1',
                        UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
@@ -69,9 +64,20 @@ def main():
             assert not result.returncode, label + '\n' + result.stdout + result.stderr
         return result
 
-    applied = run(['patch', '--batch', '--forward', '--fuzz=0', '-p1'], 'apply', cwd=tree,
-                  text=binding.snapshot[PATCH].decode())
-    assert not re.search(r'fuzz|offset|FAILED', applied.stdout + applied.stderr, re.I)
+    pending = [PATCH] if (tree / DRIVER / 'airoha_npu_flow_row.h').exists() else [ZZ5, PATCH]
+    for patch in pending:
+        expected_names = {'airoha_npu_flow_row.h'}
+        if patch == ZZ5:
+            expected_names.add('airoha_npu_diag.h')
+        sections = list(binding.sections(binding.snapshot[patch], expected_names))
+        assert {name for name, added, section in sections} == expected_names
+        for name, added, section in sections:
+            target = tree / DRIVER / name
+            assert not added or not target.exists(), name
+            exact_hunks(b'' if added else target.read_bytes(), section)
+        applied = run(['patch', '--batch', '--forward', '--fuzz=0', '-p1'], 'apply-' + patch,
+                      cwd=tree, text=binding.snapshot[patch].decode())
+        assert not re.search(r'fuzz|offset|FAILED', applied.stdout + applied.stderr, re.I)
     driver = tree / DRIVER
     binding.bind(driver, ('airoha_npu_diag.h', 'airoha_npu_flow_row.h', 'airoha_npu_owner.h',
                          'airoha_npu_reopen.h', 'airoha_bank1_routes.h', 'airoha_npu_bank1.h',
@@ -123,6 +129,9 @@ def main():
         results[label] = [json.loads(line) for line in result.stdout.splitlines()]
         print(label + ': ' + result.stdout.strip(), flush=True)
     helper = (extracted / 'airoha_npu_flow_row.h').read_text()
+    for symbol in ('airoha_npu_bank0_check_unbound', 'airoha_npu_bank0_install_checked',
+                   'airoha_npu_bank0_invalidate_unbound_checked'):
+        function_hashes[symbol] = digest(DIAG.function(helper, symbol).encode())
     mutations = [
         ('unb-state', 'AIROHA_FOE_STATE_UNBIND', 'AIROHA_FOE_STATE_BIND'),
         ('unb-protocol', 'AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP', 'AIROHA_FOE_IB1_BIND_PACKET_TYPE'),
@@ -136,7 +145,15 @@ def main():
         ('late-dirty', '*write_attempted = true;\n\t*row = bound;\n\terror = airoha_ppe_foe_commit_sram_entry(ppe, hash);',
          '*row = bound;\n\terror = airoha_ppe_foe_commit_sram_entry(ppe, hash);\n\t*write_attempted = true;'),
     ]
-    for symbol in ('airoha_npu_bank0_check_unbound', 'airoha_npu_bank0_install_checked'):
+    scoped = []
+    for label, before, after in mutations:
+        symbol = 'airoha_npu_bank0_check_unbound' if label.startswith('unb-') else 'airoha_npu_bank0_install_checked'
+        original = DIAG.function(helper, symbol)
+        assert original.count(before) == 1, label
+        scoped.append((label, original, original.replace(before, after)))
+    mutations = scoped
+    for symbol in ('airoha_npu_bank0_check_unbound', 'airoha_npu_bank0_install_checked',
+                   'airoha_npu_bank0_invalidate_unbound_checked'):
         original = DIAG.function(helper, symbol)
         for label, before, after in (
             ('hash', '!airoha_ppe_bank0_hash(hash)', 'false'),
@@ -153,6 +170,29 @@ def main():
         offset = offsets[index]
         mutations.append(('install-read-ack-' + str(index), install,
                           install[:offset] + 'false' + install[offset + len(before):]))
+    invalidate = DIAG.function(helper, 'airoha_npu_bank0_invalidate_unbound_checked')
+    for label, before, after in (
+        ('unb-state', 'AIROHA_FOE_STATE_UNBIND', 'AIROHA_FOE_STATE_BIND'),
+        ('protocol', 'AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP', 'AIROHA_FOE_IB1_BIND_PACKET_TYPE'),
+        ('tuple', 'memcmp(&row->ipv4.orig_tuple, &bound.ipv4.orig_tuple,', '0 * memcmp(&row->ipv4.orig_tuple, &bound.ipv4.orig_tuple,'),
+        ('whole-zero', 'memcmp(row, &invalid, sizeof(invalid))', 'memcmp(row, &invalid, sizeof(row->ib1))'),
+        ('lost-dirty', '*write_attempted = true;', '*write_attempted = false;'),
+        ('commit-error', 'if (error)\n\t\treturn error;', 'if (error)\n\t\treturn 0;'),
+        ('write-ack', '!airoha_ppe_ct_sram_ack(ppe->eth, hash, true)', 'false'),
+        ('wrong-write', '*row = invalid;', '*row = bound;'),
+        ('late-dirty', '*write_attempted = true;\n\t*row = invalid;\n\terror = airoha_ppe_foe_commit_sram_entry(ppe, hash);',
+         '*row = invalid;\n\terror = airoha_ppe_foe_commit_sram_entry(ppe, hash);\n\t*write_attempted = true;'),
+        ('alias', 'if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, row->ib1)',
+         'bound = *expected;\n\tif (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, row->ib1)'),
+    ):
+        assert invalidate.count(before) == 1, label
+        mutations.append(('invalidate-' + label, invalidate, invalidate.replace(before, after)))
+    before = '!airoha_ppe_ct_sram_ack(ppe->eth, hash, false)'
+    offsets = [match.start() for match in re.finditer(re.escape(before), invalidate)]
+    assert len(offsets) == 2
+    for index, offset in enumerate(offsets):
+        mutations.append(('invalidate-read-ack-' + str(index), invalidate,
+                          invalidate[:offset] + 'false' + invalidate[offset + len(before):]))
     caught = []
     for label, before, after in mutations:
         assert helper.count(before) == 1, label
@@ -183,7 +223,7 @@ def main():
     for path, expected in originals.items():
         assert digest(path.read_bytes()) == expected, 'input changed: ' + str(path)
     report = dict(passed=True, results=results, mutations=caught, source_binding=binding.report(),
-                  exact_apply=dict(passed=True, fuzz=0, offset=0), source=str(source),
+                  exact_apply=dict(passed=True, fuzz=0, offset=0, patches=pending), source=str(source),
                   patch_sha256=digest(binding.snapshot[PATCH]), functions_sha256=function_hashes,
                   inputs_sha256={str(path): value for path, value in originals.items()}, commands=commands)
     (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')

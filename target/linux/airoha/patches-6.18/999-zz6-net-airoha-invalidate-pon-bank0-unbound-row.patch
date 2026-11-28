@@ -1,0 +1,66 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: add checked PON Bank0 UNB invalidation
+
+Allow a production owner to retire a reserved UNB row after quiescing its
+producers. Require the original IPv4 tuple, packet type and protocol to
+match before clearing the row. Report the write attempt before changing
+the shadow, then check the write acknowledgement and complete zero readback.
+
+The caller holds ppe_lock and maintains reservation and producer quiescence
+through verification and recovery. write_attempted reports this invocation;
+an error never releases a prior dirty obligation. Keep diagnostic whole-bank
+draining unchanged: its bind check precedes producer quiescence, while its
+install runs after the learned row has already been cleared.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu_flow_row.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_flow_row.h
+@@ -67,4 +67,49 @@
+ 	return 0;
+ }
+ 
++static inline int airoha_npu_bank0_invalidate_unbound_checked(struct airoha_ppe *ppe, u32 hash,
++					  const struct airoha_foe_entry *expected,
++					  bool *write_attempted)
++{
++	const struct airoha_foe_entry invalid = {};
++	struct airoha_foe_entry bound, *row;
++	int error;
++
++	if (!write_attempted)
++		return -EINVAL;
++	*write_attempted = false;
++	if (!ppe || !expected || !airoha_ppe_bank0_hash(hash))
++		return -EINVAL;
++	lockdep_assert_held(&ppe_lock);
++	bound = *expected;
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, bound.ib1) != AIROHA_FOE_STATE_BIND ||
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, bound.ib1) != PPE_PKT_TYPE_IPV4_HNAPT)
++		return -EINVAL;
++	row = airoha_ppe_foe_get_entry_locked(ppe, hash);
++	if (!row)
++		return -ETIMEDOUT;
++	if (!airoha_ppe_ct_sram_ack(ppe->eth, hash, false))
++		return -EIO;
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, row->ib1) != AIROHA_FOE_STATE_UNBIND ||
++	    ((row->ib1 ^ bound.ib1) &
++	     (AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP)) ||
++	    memcmp(&row->ipv4.orig_tuple, &bound.ipv4.orig_tuple,
++		   sizeof(bound.ipv4.orig_tuple)))
++		return -ESTALE;
++	*write_attempted = true;
++	*row = invalid;
++	error = airoha_ppe_foe_commit_sram_entry(ppe, hash);
++	if (error)
++		return error;
++	if (!airoha_ppe_ct_sram_ack(ppe->eth, hash, true))
++		return -EIO;
++	row = airoha_ppe_foe_get_entry_locked(ppe, hash);
++	if (!row)
++		return -ETIMEDOUT;
++	if (!airoha_ppe_ct_sram_ack(ppe->eth, hash, false) ||
++	    memcmp(row, &invalid, sizeof(invalid)))
++		return -EIO;
++	return 0;
++}
++
+ #endif
