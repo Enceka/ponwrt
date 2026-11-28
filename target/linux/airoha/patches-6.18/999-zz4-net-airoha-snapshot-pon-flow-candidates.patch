@@ -1,0 +1,212 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: snapshot PON candidates with non-reusable serials
+
+Allocate serials under ppe_lock when publishing software candidates. Reject
+exhaustion through the cookie publication rollback path. Provide referenced
+snapshots and cookie/serial revalidation under flow_offload_mutex for a future
+production owner worker, without programming hardware or opening PON gates.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -588,6 +588,7 @@
+ 	struct airoha_gdm_dev *egress_dev;
+ 	struct airoha_gdm_dev *pon_ingress_dev;
+ 	bool pon_candidate;
++	u64 pon_candidate_serial;
+ 	u32 pon_ingress_key[19], pon_ingress_service;
+ 	bool pon_ingress_seen, pon_ingress_conflict;
+ 	struct airoha_gdm_dev *ct_ingress_gdm;
+@@ -670,6 +671,15 @@
+ 	struct rcu_head rcu;
+ 	unsigned int count;
+ 	struct airoha_pon_flow_entry entries[];
++};
++
++struct airoha_pon_candidate_snapshot {
++	unsigned long cookie;
++	u64 serial, generation;
++	u32 key[19], service;
++	struct airoha_pon_flow_entry mapping;
++	struct net_device *ingress, *egress;
++	struct airoha_foe_entry data;
+ };
+ 
+ /* NAPI completes descriptors; atomic counters span the TX and RX queues. */
+@@ -778,6 +788,7 @@
+ 		bool cfg_owned;
+ 	} ct_ifc;
+ 	bool ct_host_ppe;
++	u64 pon_candidate_serial;
+ 	struct airoha_npu_owner *ct_npu_owner;
+ 	/* Set only after hardware isolates ingress source and encapsulation for
+ 	 * shared IP FOE keys. No runtime enable path exists yet.
+@@ -990,6 +1001,11 @@
+ bool airoha_ppe_is_enabled(struct airoha_eth *eth, int index);
+ void airoha_ppe_pon_observe_frame(struct airoha_gdm_dev *dev,
+ 				const unsigned char *frame, u32 bytes, u32 service);
++int airoha_ppe_pon_candidate_snapshot(struct airoha_ppe *ppe, unsigned long cookie,
++				    struct airoha_pon_candidate_snapshot *snapshot);
++int airoha_ppe_pon_candidate_validate(struct airoha_ppe *ppe,
++				    const struct airoha_pon_candidate_snapshot *snapshot);
++void airoha_ppe_pon_candidate_put(struct airoha_pon_candidate_snapshot *snapshot);
+ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 			  u16 hash, bool rx_wlan);
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1597,6 +1597,135 @@
+ 
+ 	return !READ_ONCE(dev->pon_update_blocked) &&
+ 	       netif_running(netdev) && netif_carrier_ok(netdev);
++}
++
++static int airoha_ppe_pon_candidate_read_locked(struct airoha_ppe *ppe,
++					       struct airoha_flow_table_entry *entry,
++					       struct airoha_pon_candidate_snapshot *snapshot)
++{
++	struct airoha_gdm_dev *ingress = entry->pon_ingress_dev;
++	struct airoha_gdm_dev *egress = entry->egress_dev;
++	struct airoha_eth *eth = ppe->eth;
++	struct airoha_pon_flow_table *table;
++	const struct airoha_pon_flow_entry *mapping = NULL;
++	unsigned int index;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	lockdep_assert_held(&ppe_lock);
++	if (!READ_ONCE(eth->ct_pon_full) || READ_ONCE(eth->ct_ordinary_full_test) ||
++	    READ_ONCE(eth->ct_cpu_fallback) || !ppe->ct_host_ppe ||
++	    !ppe->ct_native_pairs || ppe->ct_stopping ||
++	    of_property_read_bool(eth->dev->of_node, "airoha,connac2-pon-er-diagnostic") ||
++	    !entry->pon_candidate || !entry->pon_candidate_serial ||
++	    entry->type != FLOW_TYPE_L4 || entry->ct_bridge || entry->hash != 0xffff ||
++	    !entry->pon_ingress_seen || entry->pon_ingress_conflict ||
++	    entry->pon_ingress_service > 0xffff ||
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, entry->data.ib1) != PPE_PKT_TYPE_IPV4_HNAPT ||
++	    !ingress || !egress ||
++	    !airoha_is_valid_gdm_dev(eth, ingress) || !airoha_is_valid_gdm_dev(eth, egress) ||
++	    !test_bit(AIROHA_DEV_F_PON, &ingress->flags) ||
++	    test_bit(AIROHA_DEV_F_PON, &egress->flags) ||
++	    ingress->port->id != AIROHA_GDM2_IDX || ingress->nbq ||
++	    !ingress->pon_link_ops || !ingress->pon_link_priv ||
++	    rcu_access_pointer(ingress->qdma) != &eth->qdma[1] ||
++	    !airoha_ppe_ct_pon_dev_ready(ingress) || !airoha_ppe_ct_pon_dev_ready(egress) ||
++	    !net_eq(dev_net(netdev_from_priv(ingress)), dev_net(netdev_from_priv(egress))))
++		return -ESTALE;
++
++	table = rcu_dereference_protected(ingress->pon_flow_table,
++					 lockdep_is_held(&flow_offload_mutex));
++	if (!table)
++		return -ESTALE;
++	for (index = 0; index < table->count; index++) {
++		const struct airoha_pon_flow_entry *current = &table->entries[index];
++
++		if (!(current->tag & AIROHA_PON_QDMA_VALID) ||
++		    (current->tag & AIROHA_PON_QDMA_EPON) ||
++		    FIELD_GET(AIROHA_PON_QDMA_GEM_MASK, current->tag) != entry->pon_ingress_service)
++			continue;
++		if (mapping)
++			return -ESTALE;
++		mapping = current;
++	}
++	if (!mapping)
++		return -ESTALE;
++
++	snapshot->cookie = entry->cookie;
++	snapshot->serial = entry->pon_candidate_serial;
++	snapshot->generation = br_flow_offload_generation();
++	memcpy(snapshot->key, entry->pon_ingress_key, sizeof(snapshot->key));
++	snapshot->service = entry->pon_ingress_service;
++	snapshot->mapping = *mapping;
++	snapshot->ingress = netdev_from_priv(ingress);
++	snapshot->egress = netdev_from_priv(egress);
++	snapshot->data = entry->data;
++	return 0;
++}
++
++int airoha_ppe_pon_candidate_snapshot(struct airoha_ppe *ppe, unsigned long cookie,
++				    struct airoha_pon_candidate_snapshot *snapshot)
++{
++	struct airoha_pon_candidate_snapshot next = {};
++	struct airoha_flow_table_entry *entry;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!snapshot || snapshot->serial || snapshot->ingress || snapshot->egress)
++		return -EINVAL;
++	entry = rhashtable_lookup_fast(&ppe->eth->flow_table, &cookie,
++				      airoha_flow_table_params);
++	if (!entry)
++		return -ENOENT;
++	spin_lock_bh(&ppe_lock);
++	error = airoha_ppe_pon_candidate_read_locked(ppe, entry, &next);
++	if (!error) {
++		dev_hold(next.ingress);
++		dev_hold(next.egress);
++		*snapshot = next;
++	}
++	spin_unlock_bh(&ppe_lock);
++	return error;
++}
++
++int airoha_ppe_pon_candidate_validate(struct airoha_ppe *ppe,
++				    const struct airoha_pon_candidate_snapshot *snapshot)
++{
++	struct airoha_pon_candidate_snapshot current = {};
++	struct airoha_flow_table_entry *entry;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!snapshot || !snapshot->serial || !snapshot->ingress || !snapshot->egress)
++		return -EINVAL;
++	entry = rhashtable_lookup_fast(&ppe->eth->flow_table, &snapshot->cookie,
++				      airoha_flow_table_params);
++	if (!entry)
++		return -ENOENT;
++	spin_lock_bh(&ppe_lock);
++	error = airoha_ppe_pon_candidate_read_locked(ppe, entry, &current);
++	if (!error && (current.serial != snapshot->serial ||
++		       current.generation != snapshot->generation ||
++		       current.ingress != snapshot->ingress || current.egress != snapshot->egress ||
++		       current.service != snapshot->service ||
++		       current.mapping.tag != snapshot->mapping.tag ||
++		       current.mapping.vlan_id != snapshot->mapping.vlan_id ||
++		       current.mapping.pbit_mask != snapshot->mapping.pbit_mask ||
++		       memcmp(current.key, snapshot->key, sizeof(current.key)) ||
++		       !airoha_ppe_ct_pon_row_matches(entry, &snapshot->data)))
++		error = -ESTALE;
++	spin_unlock_bh(&ppe_lock);
++	return error;
++}
++
++void airoha_ppe_pon_candidate_put(struct airoha_pon_candidate_snapshot *snapshot)
++{
++	if (!snapshot)
++		return;
++	if (snapshot->ingress)
++		dev_put(snapshot->ingress);
++	if (snapshot->egress)
++		dev_put(snapshot->egress);
++	memset(snapshot, 0, sizeof(*snapshot));
+ }
+ 
+ static bool airoha_ppe_ct_pon_queue_ready(struct airoha_gdm_dev *dev)
+@@ -1882,6 +2011,10 @@
+ 			}
+ 		}
+ 	}
++	if (e->pon_candidate && ppe->pon_candidate_serial == U64_MAX) {
++		spin_unlock_bh(&ppe_lock);
++		return -EOVERFLOW;
++	}
+ 	if (e->ct_bridge) {
+ 		if (ppe->ct_stopping || ppe->ct_bridge_failed ||
+ 		    e->ct_bridge_generation != br_flow_offload_generation()) {
+@@ -1890,6 +2023,8 @@
+ 		}
+ 		list_add_tail(&e->ct_bridge_node, &ppe->ct_bridge_flows);
+ 	}
++	if (e->pon_candidate)
++		e->pon_candidate_serial = ++ppe->pon_candidate_serial;
+ 	hlist_add_head(&e->list, &ppe->foe_flow[hash]);
+ 	spin_unlock_bh(&ppe_lock);
+ 
