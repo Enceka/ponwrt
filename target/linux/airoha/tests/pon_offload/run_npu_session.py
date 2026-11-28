@@ -37,6 +37,7 @@ def main():
     parser.add_argument('--seconds', type=int, default=40)
     parser.add_argument('--conntrack', default='/usr/sbin/conntrack')
     parser.add_argument('--withdraw', choices=('conntrack', 'table'), default='conntrack')
+    parser.add_argument('--idle-resume', action='store_true')
     args = parser.parse_args()
     uuid.UUID(args.boot)
     require(35 <= args.seconds <= 90, 'duration must cross the 30-second flow timeout')
@@ -156,6 +157,40 @@ def main():
             time.sleep(1)
         report['bound_seconds'] = time.monotonic() - bound_started
         require(len(set(timestamps)) > 1, 'hardware activity timestamp did not advance')
+        if args.idle_resume:
+            idle = dict(before=snapshot(), seconds=20, observations=[])
+            report['idle_resume'] = idle
+            time.sleep(idle['seconds'])
+            for attempt in range(60):
+                send()
+                current = session_fields(state())
+                require(current['cookie'] == selected_cookie and current['serial'] == serial and
+                        current['phase'] == '15' and current['error'] == '0',
+                        'idle session retired')
+                rows = remote('idle-row', 'cat /sys/kernel/debug/ppe/entries')
+                row = next((line for line in rows.splitlines()
+                            if re.match(r'^0*' + format(hardware_hash, 'x') + r' BND ', line)), None)
+                idle['observations'].append(dict(session=current, row=row, probe=snapshot()))
+                if row is not None:
+                    values = fields(row)
+                    require(values['orig'] == '192.0.2.1:49152->192.0.2.2:49153' and
+                            values['new'] == '192.168.1.1:49152->192.168.1.120:49153' and
+                            current['bound'] == '1' and int(current['hash']) == hardware_hash and
+                            not int(values['ib1'], 16) & (1 << 31), 'relearned row mismatch')
+                    break
+                time.sleep(.1)
+            require(row is not None, 'idle row did not relearn')
+            resumed = snapshot()
+            require(int(resumed['rx_data']) > int(idle['before']['rx_data']),
+                    'idle probe did not exercise hardware aging')
+            for sample in range(8):
+                send()
+                after = snapshot()
+                require(after['rx_data'] == resumed['rx_data'] and
+                        after['rx_delivered'] == resumed['rx_delivered'],
+                        'relearned traffic reached CPU')
+                time.sleep(.1)
+            idle.update(passed=True, resumed=resumed, after=after)
         if args.withdraw == 'conntrack':
             remote('withdraw', 'nft flush chain ip pon_session forward; ' +
                    shlex.quote(args.conntrack) +

@@ -32,6 +32,8 @@ class SessionPeer:
         self.retain_owner = False
         self.static = False
         self.frozen_timestamp = False
+        self.aged = False
+        self.relearn = True
         self.sequence = 0
         self.cpu_packets = 0
         self.clock = 0.0
@@ -48,6 +50,9 @@ class SessionPeer:
 
     def sleep(self, seconds):
         self.clock += seconds
+        if seconds == 20:
+            self.aged = True
+            self.bound = False
 
     def receive(self, size):
         assert size == 2048
@@ -56,7 +61,7 @@ class SessionPeer:
 
     def state(self):
         header = (f'cookie={123 if self.owner else 0} serial={456 if self.owner else 0} '
-                  f'phase={15 if self.bound else 0} bound={int(self.bound)} hash=23 error=0\n')
+                  f'phase={15 if self.bound or self.aged else 0} bound={int(self.bound)} hash=23 error=0\n')
         return header + ('' if self.withdrawn else 'candidate cookie=123 serial=456 service=8500\n')
 
     def remote(self, argv, **kwargs):
@@ -84,7 +89,11 @@ class SessionPeer:
             output = 'table ip pon_session {}\n'
         elif command == "echo 'send-fixed ipv4 0 tx' > " + runner.PROBE + 'command':
             self.sequence += 1
-            if self.owner and not self.withdrawn:
+            if self.aged:
+                self.cpu_packets += 1
+                self.bound = self.relearn
+                self.aged = not self.relearn
+            elif self.owner and not self.withdrawn:
                 self.bound = True
             else:
                 self.cpu_packets += 1
@@ -137,6 +146,25 @@ class SessionPeer:
 
 
 class SessionTests(unittest.TestCase):
+    def test_idle_row_relearns_before_withdrawal(self):
+        peer = SessionPeer().run('--idle-resume')
+        self.assertIsNone(peer.error)
+        self.assertTrue(peer.report['passed'])
+        idle = peer.report['idle_resume']
+        self.assertTrue(idle['passed'])
+        self.assertGreater(int(idle['resumed']['rx_data']), int(idle['before']['rx_data']))
+        self.assertEqual(idle['resumed']['rx_data'], idle['after']['rx_data'])
+
+    def test_idle_row_stays_on_cpu(self):
+        peer = SessionPeer()
+        peer.relearn = False
+        peer.run('--idle-resume')
+        self.assertIsInstance(peer.error, ValueError)
+        self.assertIn('idle row did not relearn', str(peer.error))
+        self.assertFalse(peer.report['passed'])
+        self.assertTrue(peer.report['released'])
+        self.assertNotIn(CONNTRACK, peer.commands)
+
     def test_success_both_withdrawal_modes(self):
         for arguments, command, mode in (((), CONNTRACK, 'conntrack'),
                                          (('--withdraw', 'table'), TABLE, 'table')):

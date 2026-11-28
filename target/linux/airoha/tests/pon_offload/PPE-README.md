@@ -142,6 +142,9 @@ python3 -B run_npu_session.py --pin KNOWN_HOSTS --key SSH_KEY --boot BOOT_ID \
 
 The runner selects the observed candidate, checks LAN payloads, NAT actions,
 hardware timestamp advancement and unchanged PON CPU counters for 40 samples.
+`--idle-resume` additionally waits 20 seconds, requires the aged row to relearn
+under the same candidate identity, and checks eight subsequent hardware-forwarded
+packets before withdrawal.
 The default withdrawal flushes the test forward chain and deletes only the
 test conntrack tuple. `--withdraw table` instead deletes the complete test
 table. Both require candidate retirement, row removal and CPU forwarding of

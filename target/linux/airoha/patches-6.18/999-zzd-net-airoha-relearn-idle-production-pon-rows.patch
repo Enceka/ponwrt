@@ -1,0 +1,70 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: relearn idle production PON rows
+
+Keep consuming trusted UNB events after the first bind so an aged row can
+reuse the existing close, drain, install and reopen transaction with a new
+epoch. Validate the candidate identity and owned bank0 hash before reuse.
+Ignore queued UNB events only when the actual row still matches the complete
+owned bound entry, allowing its hardware timestamp to advance. Preserve the
+existing fail-close path for conflicting rows and SRAM failures.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu_production.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_production.h
+@@ -198,6 +198,34 @@
+ 	return error;
+ }
+ 
++static int airoha_npu_production_check_event(struct airoha_npu_owner *owner,
++					     u32 hash, const struct airoha_foe_entry *bound)
++{
++	struct airoha_ppe *ppe = owner->ppe;
++	struct airoha_foe_entry observed, *row;
++
++	lockdep_assert_held(&ppe_lock);
++	if (ppe->ct_npu_owner != owner || owner->invalidated || owner->close_pending)
++		return -ESTALE;
++	if (!airoha_ppe_bank0_hash(hash))
++		return -EINVAL;
++	if (!owner->production_bound)
++		return airoha_npu_bank0_check_unbound(ppe, hash, bound);
++	if (hash != owner->production_hash)
++		return -ESTALE;
++	row = airoha_ppe_foe_get_entry_locked(ppe, hash);
++	if (!row)
++		return -ETIMEDOUT;
++	if (!airoha_ppe_ct_sram_ack(ppe->eth, hash, false))
++		return -EIO;
++	observed = *row;
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, observed.ib1) != AIROHA_FOE_STATE_BIND)
++		return airoha_npu_bank0_check_unbound(ppe, hash, bound);
++	observed.ib1 &= ~AIROHA_FOE_IB1_BIND_TIMESTAMP;
++	observed.ib1 |= owner->production_entry.ib1 & AIROHA_FOE_IB1_BIND_TIMESTAMP;
++	return memcmp(&observed, &owner->production_entry, sizeof(observed)) ? -ESTALE : 1;
++}
++
+ static int airoha_npu_production_step(struct airoha_npu_owner *owner)
+ {
+ 	struct airoha_pon_unbound_event event = {};
+@@ -212,8 +240,6 @@
+ 	error = airoha_npu_production_validate(owner);
+ 	if (error)
+ 		goto fail;
+-	if (owner->production_bound)
+-		return 0;
+ 	error = airoha_ppe_pon_take_unbound(ppe, owner->production.cookie,
+ 					    owner->production.serial, &event);
+ 	if (error == -EAGAIN)
+@@ -234,9 +260,10 @@
+ 		FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
+ 		FIELD_PREP(AIROHA_FOE_IB1_BIND_TIMESTAMP, airoha_ppe_get_timestamp(ppe));
+ 	spin_lock_bh(&ppe_lock);
+-	error = owner->invalidated ? -ESTALE :
+-		airoha_npu_bank0_check_unbound(ppe, event.hardware_hash, &bound);
+-	spin_unlock_bh(&ppe_lock);
++	error = airoha_npu_production_check_event(owner, event.hardware_hash, &bound);
++	spin_unlock_bh(&ppe_lock);
++	if (error > 0)
++		return 0;
+ 	if (error)
+ 		goto fail;
+ 	error = airoha_ppe_npu_owner_close_locked(ppe->eth);
