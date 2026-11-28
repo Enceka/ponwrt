@@ -1,0 +1,92 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: admit observed PON software candidates
+
+Admit exact IPv4 TCP/UDP downstream flow cookies on the independent PON
+full-image profile so original ingress observation has a software candidate
+to associate. Require a live GDM2/WAN input and a live local wired output.
+Keep candidates unbound in both host learning paths even if hardware
+qualification changes later. Output actions remain encoded by the existing
+flow action validator and duplicate tuple publication remains serialized.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -587,6 +587,7 @@
+ 	/* Retire both directions when a PON bearer mapping changes. */
+ 	struct airoha_gdm_dev *egress_dev;
+ 	struct airoha_gdm_dev *pon_ingress_dev;
++	bool pon_candidate;
+ 	u32 pon_ingress_key[19], pon_ingress_service;
+ 	bool pon_ingress_seen, pon_ingress_conflict;
+ 	struct airoha_gdm_dev *ct_ingress_gdm;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1626,7 +1626,7 @@
+ 		return false;
+ 	if (!airoha_ppe_ct_pon_flow(e))
+ 		return true;
+-	if (!READ_ONCE(ppe->ct_pon_qualified))
++	if (e->pon_candidate || !READ_ONCE(ppe->ct_pon_qualified))
+ 		return false;
+ 	protocol = htons(type == PPE_PKT_TYPE_IPV6_ROUTE_5T ? ETH_P_IPV6 : ETH_P_IP);
+ 	/* nf_flow_table does not emit a PPPoE ingress dissector key. Check the
+@@ -1720,6 +1720,8 @@
+ 	u32 bank = hash / PPE_SRAM_NUM_ENTRIES;
+ 	bool wired;
+ 
++	if (entry->pon_candidate)
++		return false;
+ 	if (!ppe->ct_native_pairs)
+ 		return true;
+ 	if (bank != (rx_wlan ? 0 : 1))
+@@ -2228,6 +2230,33 @@
+ 	return err;
+ }
+ 
++static bool airoha_ppe_ct_pon_candidate_supported(struct airoha_ppe *ppe,
++						struct flow_rule *rule,
++						struct airoha_gdm_dev *ingress,
++						struct airoha_gdm_dev *egress,
++						bool bridge)
++{
++	struct flow_match_control control;
++
++	if (!ppe->eth->ct_pon_full || !ppe->ct_host_ppe || !ppe->ct_native_pairs ||
++	    READ_ONCE(ppe->ct_stopping) || bridge || !ingress || !egress ||
++	    !airoha_is_valid_gdm_dev(ppe->eth, ingress) ||
++	    !airoha_is_valid_gdm_dev(ppe->eth, egress) ||
++	    !test_bit(AIROHA_DEV_F_PON, &ingress->flags) ||
++	    test_bit(AIROHA_DEV_F_PON, &egress->flags) ||
++	    ingress->port->id != AIROHA_GDM2_IDX || ingress->nbq ||
++	    !ingress->pon_link_ops || !ingress->pon_link_priv ||
++	    !airoha_ppe_ct_pon_dev_ready(ingress) ||
++	    !airoha_ppe_ct_pon_queue_ready(ingress) ||
++	    !netif_running(netdev_from_priv(egress)) ||
++	    !netif_carrier_ok(netdev_from_priv(egress)) ||
++	    !net_eq(dev_net(netdev_from_priv(ingress)), dev_net(netdev_from_priv(egress))) ||
++	    !airoha_ppe_ct_ip_rule_supported(rule, false))
++		return false;
++	flow_rule_match_control(rule, &control);
++	return control.key->addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS;
++}
++
+ static bool airoha_ppe_ct_pon_rule_supported(struct airoha_ppe *ppe,
+ 					   struct flow_rule *rule,
+ 					   struct airoha_gdm_dev *ingress,
+@@ -2243,7 +2272,8 @@
+ 	 * directions in software until the hardware qualifier owns that scope.
+ 	 */
+ 	if (!READ_ONCE(ppe->ct_pon_qualified))
+-		return false;
++		return airoha_ppe_ct_pon_candidate_supported(ppe, rule, ingress,
++							    egress, bridge);
+ 	if (bridge || (input_pon && output_pon) ||
+ 	    !airoha_ppe_ct_ip_rule_supported(rule, false))
+ 		return false;
+@@ -2587,6 +2617,7 @@
+ 	e->egress_dev = egress_dev;
+ 	if (ingress_dev && test_bit(AIROHA_DEV_F_PON, &ingress_dev->flags))
+ 		e->pon_ingress_dev = ingress_dev;
++	e->pon_candidate = eth->ct_pon_full && e->pon_ingress_dev;
+ 	e->ct_ingress_ifindex = ingress_ifindex;
+ 	e->ct_ingress_gdm = ingress_dev;
+ 	e->ct_ingress_dsa_port = ingress_dsa_port;

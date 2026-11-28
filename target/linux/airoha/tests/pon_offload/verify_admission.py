@@ -7,6 +7,31 @@ from pathlib import Path
 import resource
 import signal
 import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+REPOSITORY = HERE.parents[4]
+sys.path.insert(0, str(HERE.parent / 'npu_ingress'))
+from source_binding import SourceBinding, exact_hunks, HUNK
+
+PATCH = '999-zz3-net-airoha-admit-observed-pon-software-candidates.patch'
+
+
+def reverse_section(section):
+    lines = section.splitlines(True)
+    result = [lines[0].replace('--- a/', '--- b/', 1),
+              lines[1].replace('+++ b/', '+++ a/', 1)]
+    for line in lines[2:]:
+        match = HUNK.match(line)
+        if match:
+            line = '@@ -' + match[3] + ',' + (match[4] or '1') + ' +' + match[1] + ',' + (match[2] or '1') + ' @@\n'
+        elif line.startswith('+'):
+            line = '-' + line[1:]
+        elif line.startswith('-'):
+            line = '+' + line[1:]
+        result.append(line)
+    return ''.join(result)
 
 def function(text, signature):
     start = text.index(signature)
@@ -21,6 +46,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--path-source', type=Path,
+                        help='nf_flow_table_path.c when the driver snapshot omits netfilter')
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -29,7 +56,36 @@ def main():
     ppe = (driver/'airoha_ppe.c').read_text()
     eth = (driver/'airoha_eth.c').read_text()
     header = (driver/'airoha_eth.h').read_text()
-    path = (source/'net/netfilter/nf_flow_table_path.c').read_text()
+    path_source = (args.path_source or source/'net/netfilter/nf_flow_table_path.c').resolve()
+    path = path_source.read_text()
+    binding = SourceBinding(REPOSITORY/'target/linux/airoha/patches-6.18', out, PATCH)
+    headers = ('airoha_npu_auth_publish.h', 'airoha_npu_flow_key.h',
+               'airoha_npu_flow_observe.h', 'npu_auth_mailbox_abi.h')
+    binding.bind(driver, headers)
+    for name in headers:
+        (out/name).write_bytes((driver/name).read_bytes())
+    replay = out/'replay'
+    replay_driver = replay/'drivers/net/ethernet/airoha'
+    replay_driver.mkdir(parents=True)
+    sections = list(binding.sections(binding.snapshot[PATCH], ('airoha_ppe.c', 'airoha_eth.h')))
+    assert {name for name, added, section in sections} == {'airoha_ppe.c', 'airoha_eth.h'}
+    for name, added, section in sections:
+        assert not added
+        data = (driver/name).read_bytes()
+        exact_hunks(data, reverse_section(section))
+        (replay_driver/name).write_bytes(data)
+    for label, reverse in (('reverse', True), ('forward', False)):
+        selected = ''.join(reverse_section(section) if reverse else section
+                           for name, added, section in sections)
+        for name, added, section in sections:
+            exact_hunks((replay_driver/name).read_bytes(), reverse_section(section) if reverse else section)
+        result = subprocess.run(['patch', '--batch', '--forward', '--fuzz=0', '-p1'],
+                                input=selected, cwd=replay, capture_output=True, text=True)
+        log = result.stdout + result.stderr
+        (out/('zz3-' + label + '.log')).write_text(log)
+        assert not result.returncode and not any(word in log.lower() for word in ('fuzz', 'offset', 'failed')), log
+    for name, added, section in sections:
+        assert (replay_driver/name).read_bytes() == (driver/name).read_bytes()
     begin = header.index('enum {\n\tAIROHA_FOE_STATE_INVALID,')
     end = header.index('static_assert(sizeof(struct airoha_foe_entry) == PPE_ENTRY_SIZE);', begin)
     end += len('static_assert(sizeof(struct airoha_foe_entry) == PPE_ENTRY_SIZE);')
@@ -52,7 +108,24 @@ def main():
         'static int airoha_ppe_ct_ingress_dev(',
         'static bool airoha_ppe_ct_pon_rule_supported(',
     )
+    signatures = signatures[:-1] + ('static bool airoha_ppe_ct_pon_candidate_supported(',) + signatures[-1:]
     functions += ''.join(function(ppe, name) for name in signatures)
+    functions += function(ppe, 'void airoha_ppe_pon_observe_frame(')
+    replace = function(ppe, 'static int airoha_ppe_flow_offload_replace(')
+    fields = replace[replace.index('\te->egress_dev = egress_dev;'):replace.index('\te->ct_bridge_generation =')]
+    publication = replace[replace.index('\tif (bridge || (eth->ppe->ct_host_ppe && airoha_ppe_ct_pon_flow(e)))'):replace.index('\n\terr = airoha_ppe_foe_flow_commit_entry(eth->ppe, e);')]
+    functions += '''static int candidate_publish(struct airoha_eth *eth,
+        struct airoha_flow_table_entry *e, struct airoha_gdm_dev *ingress_dev,
+        struct airoha_gdm_dev *egress_dev, bool bridge)
+{
+    int ingress_ifindex = ingress_dev ? ingress_dev->netdev->ifindex : 0;
+    int ingress_dsa_port = -1, err;
+''' + fields + publication + '''
+    return -EOPNOTSUPP;
+free_entry:
+    return err;
+}
+'''
     functions += function(path, 'struct nft_forward_info {') + ';\n'
     functions += function(path, 'static bool nft_is_valid_ether_device(')
     functions += function(path, 'static int nft_dev_path_info(')
@@ -64,7 +137,7 @@ def main():
         c = out/(label+'.c'); c.write_text(template)
         exe = out/label
         build = subprocess.run(['cc', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
-                                '-Wno-unused-but-set-variable', '-Wno-sign-compare', '-fsanitize=address,undefined',
+                                '-Wno-unused-but-set-variable', '-Wno-sign-compare', '-Wno-address', '-fsanitize=address,undefined',
                                 '-I', str(Path(__file__).parent), str(c), '-o', str(exe)],
                                capture_output=True, text=True)
         (out/(label+'.build.log')).write_text(build.stdout+build.stderr)
@@ -100,7 +173,7 @@ def main():
         'omit-gdm-source-device': ('skb->dev != netdev_from_priv(e->ct_ingress_gdm)', 'false'),
         'permit-pon-tuple-collision': ('airoha_ppe_ct_pon_flow(e) || airoha_ppe_ct_pon_flow(prev)', '(airoha_ppe_ct_pon_flow(e), airoha_ppe_ct_pon_flow(prev), false)'),
         'mix-pon-lan1-source': ('*port = sport - 1;', '*port = sport == 2 ? 3 : sport - 1;'),
-        'learn-owned-bank': ('(ppe->ct_npu_owner && hash >= PPE_SRAM_NUM_ENTRIES)', 'false'),
+        'learn-owned-bank': ('(ppe->ct_npu_owner &&\n\t      (hash >= PPE_SRAM_NUM_ENTRIES ||\n\t       airoha_ppe_npu_bank0_owned(ppe)))', '(airoha_ppe_npu_bank0_owned(ppe), false)'),
         'learn-outside-sram': ('hash >= airoha_ppe_get_total_sram_num_entries(ppe)',
                               '((void)airoha_ppe_get_total_sram_num_entries(ppe), false)'),
         'ignore-physical-bank': ('bank != (rx_wlan ? 0 : 1)', '((void)bank, false)'),
@@ -117,8 +190,8 @@ def main():
             'static bool airoha_ppe_ct_pon_rule_supported(', 'omit-hardware-admission-qualifier'),
             ('static bool airoha_ppe_ct_pon_flow_current(', 'omit-hardware-bind-qualifier')):
         original = function(ppe, signature)
-        broken = original.replace('if (!READ_ONCE(ppe->ct_pon_qualified))',
-                                  'if (((void)READ_ONCE(ppe->ct_pon_qualified), false))')
+        broken = original.replace('!READ_ONCE(ppe->ct_pon_qualified)',
+                                  '((void)READ_ONCE(ppe->ct_pon_qualified), false)')
         assert original != broken
         mutations[label] = (original, broken)
     publisher = function(ppe, 'static int airoha_ppe_ct_bridge_publish(')
@@ -134,14 +207,52 @@ def main():
     }
 '''
     mutations['learn-before-cookie'] = (publisher, broken_publisher)
+    candidate = function(ppe, 'static bool airoha_ppe_ct_pon_candidate_supported(')
+    for label, old, new in (
+        ('candidate-profile', '!ppe->eth->ct_pon_full ||', ''),
+        ('candidate-host', '!ppe->ct_host_ppe ||', ''),
+        ('candidate-native', '!ppe->ct_native_pairs ||', ''),
+        ('candidate-stopping', 'READ_ONCE(ppe->ct_stopping) ||', ''),
+        ('candidate-bridge', 'bridge ||', '(bridge && false) ||'),
+        ('candidate-ingress-local', '!airoha_is_valid_gdm_dev(ppe->eth, ingress) ||', ''),
+        ('candidate-egress-local', '!airoha_is_valid_gdm_dev(ppe->eth, egress) ||', ''),
+        ('candidate-input-pon', '!test_bit(AIROHA_DEV_F_PON, &ingress->flags) ||', ''),
+        ('candidate-output-pon', 'test_bit(AIROHA_DEV_F_PON, &egress->flags) ||', ''),
+        ('candidate-gdm2', 'ingress->port->id != AIROHA_GDM2_IDX ||', ''),
+        ('candidate-nbq', 'ingress->nbq ||', ''),
+        ('candidate-link-ops', '!ingress->pon_link_ops ||', ''),
+        ('candidate-link-private', '!ingress->pon_link_priv ||', ''),
+        ('candidate-wan', '!airoha_ppe_ct_pon_queue_ready(ingress) ||', ''),
+        ('candidate-output-running', '!netif_running(netdev_from_priv(egress)) ||', ''),
+        ('candidate-output-carrier', '!netif_carrier_ok(netdev_from_priv(egress)) ||', ''),
+        ('candidate-namespace', '!net_eq(dev_net(netdev_from_priv(ingress)), dev_net(netdev_from_priv(egress))) ||', ''),
+        ('candidate-ipv6', 'control.key->addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS', 'true'),
+        ('candidate-masks', '!airoha_ppe_ct_ip_rule_supported(rule, false)', 'false'),
+    ):
+        assert candidate.count(old) == 1, label
+        mutations[label] = (candidate, candidate.replace(old, new))
+    mutations['candidate-flag'] = ('e->pon_candidate = eth->ct_pon_full && e->pon_ingress_dev;',
+                                   'e->pon_candidate = false;')
+    mutations['candidate-current-gate'] = ('e->pon_candidate || !READ_ONCE(ppe->ct_pon_qualified)',
+                                         '!READ_ONCE(ppe->ct_pon_qualified)')
+    mutations['candidate-bank-gate'] = ('if (entry->pon_candidate)\n\t\treturn false;', '')
+    mutations['candidate-nat-observation'] = ('tuple.ipv4.orig_tuple.src_ip = identity.source_ip;',
+                                            'tuple.ipv4.new_tuple.src_ip = identity.source_ip;')
+    mutations['candidate-conflict'] = ('entry->pon_ingress_conflict = true;',
+                                      'entry->pon_ingress_conflict = false;')
     for label, (old, new) in mutations.items():
         assert functions.count(old) == 1, (label, functions.count(old))
         run(label, functions.replace(old, new), False)
     (out/'admission_production.inc').write_text(functions)
+    binding.verify_unchanged()
+    assert binding.read_patches()[PATCH] == binding.snapshot[PATCH]
     report = dict(passed=True, result=result, negative_controls=list(mutations),
+                  source_binding=binding.report(), zz3_reverse_replay=dict(passed=True, fuzz=0, offset=0),
+                  zz3_sha256=hashlib.sha256(binding.snapshot[PATCH]).hexdigest(), path_source=str(path_source),
+                  extracted_functions_sha256=hashlib.sha256(functions.encode()).hexdigest(),
                   sanitizers=['address','undefined'], source=str(source),
                   source_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                                 for p in (driver/'airoha_ppe.c',driver/'airoha_eth.c',driver/'airoha_eth.h',source/'net/netfilter/nf_flow_table_path.c')},
+                                 for p in (driver/'airoha_ppe.c',driver/'airoha_eth.c',driver/'airoha_eth.h',path_source)},
                   test_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                                for p in (Path(__file__), Path(__file__).with_name('admission_test.c'),
                                          Path(__file__).with_name('learning_isolation_test.inc'))})

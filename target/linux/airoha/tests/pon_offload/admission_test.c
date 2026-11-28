@@ -33,6 +33,7 @@ typedef uint16_t __u16;
 #define ARPHRD_ETHER 1
 #define IFF_LOOPBACK 8
 #define AIROHA_DEV_F_PON 1
+#define AIROHA_GDM2_IDX 2
 #define AIROHA_MAX_DSA_PORTS 7
 #define AIROHA_PON_QDMA_HQOS_CFG 0x90
 #define AIROHA_PON_QDMA_HQOS_EN BIT(31)
@@ -40,6 +41,7 @@ typedef uint16_t __u16;
 #undef static_assert
 #define static_assert(e) _Static_assert(e,#e)
 #include "foe_types.inc"
+#include "airoha_npu_flow_observe.h"
 
 enum {
  FLOW_DISSECTOR_KEY_META, FLOW_DISSECTOR_KEY_CONTROL, FLOW_DISSECTOR_KEY_BASIC,
@@ -83,10 +85,10 @@ struct net_device {
  bool running,carrier,uses_dsa; int dsa_port; unsigned refs,flags,type,addr_len; u8 dev_addr[6];
 };
 struct airoha_qdma {u32 hqos;};
-struct airoha_gdm_dev {struct airoha_eth *eth;struct net_device *netdev;unsigned long flags;bool pon_update_blocked;struct airoha_qdma *qdma;};
-struct airoha_gdm_port {struct airoha_gdm_dev *devs[4];};
+struct airoha_gdm_dev {struct airoha_eth *eth;struct net_device *netdev;unsigned long flags;bool pon_update_blocked;struct airoha_qdma *qdma;struct airoha_gdm_port *port;unsigned nbq;void *pon_link_ops,*pon_link_priv;};
+struct airoha_gdm_port {struct airoha_gdm_dev *devs[4];unsigned id;};
 struct airoha_ppe;
-struct airoha_eth {struct airoha_gdm_port *ports[4];struct airoha_qdma qdma[2];struct airoha_ppe *ppe;int flow_table;};
+struct airoha_eth {struct airoha_gdm_port *ports[4];struct airoha_qdma qdma[2];struct airoha_ppe *ppe;int flow_table;bool ct_pon_full;};
 static struct net_device *devices[8];
 static struct net *dev_net(struct net_device *n) {return n->net;}
 static bool net_eq(struct net *a,struct net *b) {return a==b;}
@@ -115,6 +117,8 @@ struct airoha_flow_table_entry {
  struct hlist_node list; struct airoha_gdm_dev *egress_dev,*pon_ingress_dev,*ct_ingress_gdm; int ct_ingress_dsa_port;
  int type,ct_ingress_ifindex,node,ct_bridge_node; bool ct_bridge; u32 hash; u64 ct_bridge_generation; struct airoha_foe_entry data;
  struct airoha_ct_bridge_peer ct_dest;
+ bool pon_candidate,pon_ingress_seen,pon_ingress_conflict;
+ u32 pon_ingress_key[19],pon_ingress_service;
 };
 struct airoha_ppe {
  struct airoha_eth *eth;bool ct_host_ppe,ct_pon_qualified,ct_stopping,ct_native_pairs,ct_bridge_failed;int ct_bridge_flows;
@@ -141,6 +145,7 @@ static int rhashtable_insert_fast(int *t,int *n,int p) {(void)t;(void)n;(void)p;
 static void rhashtable_remove_fast(int *t,int *n,int p) {(void)t;(void)n;(void)p;assert(cookies);cookies--;removed_cookies++;}
 #define hlist_for_each_entry_safe(e,n,h,m) for((e)=*(h),(n)=NULL;(e);(e)=NULL)
 static u32 airoha_ppe_get_total_sram_num_entries(struct airoha_ppe *ppe) {(void)ppe;return 2*PPE_SRAM_NUM_ENTRIES;}
+static bool airoha_ppe_npu_bank0_owned(struct airoha_ppe *ppe) {(void)ppe;assert(ppe_lock);return false;}
 static struct airoha_foe_entry *airoha_ppe_foe_get_entry_locked(struct airoha_ppe *p,u32 hash) {(void)p;assert(ppe_lock && hash==selected_row);row_reads++;return &learned;}
 static bool airoha_is_7581(struct airoha_eth *eth) {(void)eth;return true;}
 static void airoha_ct_native_pair_bind(struct airoha_ppe *p,struct sk_buff *s,u32 h,const struct airoha_ct_bridge_peer *peer) {(void)p;(void)s;(void)h;(void)peer;native_binds++;}
@@ -248,6 +253,165 @@ static unsigned test_wlan_epoch(struct airoha_ppe *ppe, struct net_device *input
 }
 
 #include "learning_isolation_test.inc"
+
+static unsigned test_candidates(void)
+{
+ unsigned cases = 0;
+ struct net local = {1}, remote = {2};
+ struct airoha_eth eth = {.ct_pon_full = true};
+ struct net_device input = {.ifindex = 2, .net = &local, .running = true, .carrier = true};
+ struct net_device output = {.ifindex = 24, .net = &local, .running = true, .carrier = true};
+ struct airoha_gdm_port pon_port = {.id = AIROHA_GDM2_IDX}, lan_port = {.id = 4};
+ struct airoha_gdm_dev pon = {.eth = &eth, .netdev = &input, .flags = BIT(AIROHA_DEV_F_PON),
+  .qdma = &eth.qdma[1], .port = &pon_port, .pon_link_ops = &eth, .pon_link_priv = &eth};
+ struct airoha_gdm_dev wired = {.eth = &eth, .netdev = &output, .port = &lan_port};
+ struct airoha_ppe ppe = {.eth = &eth, .ct_host_ppe = true, .ct_native_pairs = true};
+ eth.ppe = &ppe; eth.ports[0] = &pon_port; eth.ports[1] = &lan_port;
+ pon_port.devs[0] = &pon; lan_port.devs[0] = &wired;
+ input.priv = &pon; output.priv = &wired;
+ for (unsigned udp = 0; udp < 2; ++udp) {
+  struct flow_rule rule = valid_rule(false, udp);
+  assert(airoha_ppe_ct_pon_candidate_supported(&ppe, &rule, &pon, &wired, false)); cases++;
+  assert(airoha_ppe_ct_pon_rule_supported(&ppe, &rule, &pon, &wired, false)); cases++;
+  assert(!airoha_ppe_ct_pon_candidate_supported(&ppe, &rule, &wired, &pon, false)); cases++;
+  for (unsigned fault = 0; fault < 27; ++fault) {
+   struct airoha_gdm_dev foreign = wired;
+   struct airoha_gdm_dev *ingress = &pon, *egress = &wired;
+   bool bridge = false;
+   switch (fault) {
+   case 0: eth.ct_pon_full = false; break;
+   case 1: ppe.ct_host_ppe = false; break;
+   case 2: ppe.ct_native_pairs = false; break;
+   case 3: ppe.ct_stopping = true; break;
+   case 4: bridge = true; break;
+   case 5: ingress = NULL; break;
+   case 6: egress = NULL; break;
+   case 7: foreign = pon; ingress = &foreign; break;
+   case 8: egress = &foreign; break;
+   case 9: pon.flags = 0; break;
+   case 10: wired.flags = BIT(AIROHA_DEV_F_PON); break;
+   case 11: pon_port.id = 1; break;
+   case 12: pon.nbq = 1; break;
+   case 13: pon.pon_link_ops = NULL; break;
+   case 14: pon.pon_link_priv = NULL; break;
+   case 15: pon.pon_update_blocked = true; break;
+   case 16: input.running = false; break;
+   case 17: input.carrier = false; break;
+   case 18: pon.qdma = &eth.qdma[0]; break;
+   case 19: pon.qdma = NULL; break;
+   case 20: eth.qdma[1].hqos = AIROHA_PON_QDMA_HQOS_EN; break;
+   case 21: output.running = false; break;
+   case 22: output.carrier = false; break;
+   case 23: output.net = &remote; break;
+   case 24: rule = valid_rule(true, udp); break;
+   case 25: rule.key.basic.ip_proto = IPPROTO_ICMP; break;
+   case 26: rule.key.control.flags = 1; break;
+   }
+   assert(!airoha_ppe_ct_pon_candidate_supported(&ppe, &rule, ingress, egress, bridge)); cases++;
+   eth.ct_pon_full = ppe.ct_host_ppe = ppe.ct_native_pairs = true;
+   ppe.ct_stopping = false; pon.flags = BIT(AIROHA_DEV_F_PON); wired.flags = 0;
+   pon_port.id = AIROHA_GDM2_IDX; pon.nbq = 0;
+   pon.pon_link_ops = pon.pon_link_priv = &eth; pon.pon_update_blocked = false;
+   input.running = input.carrier = output.running = output.carrier = true;
+   pon.qdma = &eth.qdma[1]; eth.qdma[1].hqos = 0; output.net = &local;
+   rule = valid_rule(false, udp);
+  }
+  for (unsigned field = 0; field < 9; ++field)
+   for (unsigned bit = 0; bit < (field < 3 ? 32 : field == 8 ? 8 : 16); ++bit) {
+    rule = valid_rule(false, udp);
+    switch (field) {
+    case 0: rule.mask.meta.ingress_ifindex ^= BIT(bit); break;
+    case 1: rule.mask.ipv4_addrs.src ^= htonl(BIT(bit)); break;
+    case 2: rule.mask.ipv4_addrs.dst ^= htonl(BIT(bit)); break;
+    case 3: rule.mask.ports.src ^= htons(BIT(bit)); break;
+    case 4: rule.mask.ports.dst ^= htons(BIT(bit)); break;
+    case 5: rule.mask.control.addr_type ^= BIT(bit); break;
+    case 6: rule.mask.basic.n_proto ^= htons(BIT(bit)); break;
+    case 7: rule.mask.meta.ingress_iftype = BIT(bit); break;
+    case 8: rule.mask.basic.ip_proto ^= BIT(bit); break;
+    }
+    assert(!airoha_ppe_ct_pon_candidate_supported(&ppe, &rule, &pon, &wired, false)); cases++;
+   }
+  for (unsigned key = 0; key <= FLOW_DISSECTOR_KEY_ENC_CONTROL; ++key) {
+   rule = valid_rule(false, udp);
+   if (key == FLOW_DISSECTOR_KEY_IP || key == FLOW_DISSECTOR_KEY_TCP)
+    continue;
+   dissector.used_keys ^= BIT_ULL(key);
+   assert(!airoha_ppe_ct_pon_candidate_supported(&ppe, &rule, &pon, &wired, false)); cases++;
+  }
+  rule = valid_rule(false, udp);
+  struct airoha_flow_table_entry entry = {};
+  entry.data.ib1 = FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE, PPE_PKT_TYPE_IPV4_HNAPT) |
+   FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
+   FIELD_PREP(AIROHA_FOE_IB1_BIND_UDP, udp);
+  entry.data.ipv4.orig_tuple.src_ip = 0xc0000201;
+  entry.data.ipv4.orig_tuple.dest_ip = 0xc6336402;
+  entry.data.ipv4.orig_tuple.src_port = 12345;
+  entry.data.ipv4.orig_tuple.dest_port = 443;
+  entry.data.ipv4.new_tuple.src_ip = 0x0a000001;
+  entry.data.ipv4.new_tuple.dest_ip = 0x0a000002;
+  entry.data.ipv4.new_tuple.src_port = 23456;
+  entry.data.ipv4.new_tuple.dest_port = 8443;
+  ppe.foe_flow[0] = NULL; commits = links = cookies = removed_cookies = 0;
+  index_error = -ENOMEM;
+  assert(candidate_publish(&eth, &entry, &pon, &wired, false) == -ENOMEM);
+  assert(!ppe.foe_flow[0] && !cookies && !links && !commits); cases++;
+  index_error = 0;
+  assert(!candidate_publish(&eth, &entry, &pon, &wired, false));
+  assert(entry.pon_candidate && entry.hash == 0xffff && entry.type == FLOW_TYPE_L4);
+  assert(entry.pon_ingress_dev == &pon && ppe.foe_flow[0] == &entry);
+  assert(cookies == 1 && links == 1 && !commits && !entry.pon_ingress_seen); cases++;
+  struct airoha_flow_table_entry duplicate = entry;
+  assert(candidate_publish(&eth, &duplicate, &pon, &wired, false) == -EEXIST);
+  assert(cookies == 1 && links == 1 && removed_cookies == 1 && !commits); cases++;
+  unsigned char frame[54] = {2,0,0,0,0,1,4,0,0,0,0,2,8,0,0x45,0,0,40};
+  frame[23] = udp ? IPPROTO_UDP : IPPROTO_TCP;
+  frame[26] = 192; frame[27] = 0; frame[28] = 2; frame[29] = 1;
+  frame[30] = 198; frame[31] = 51; frame[32] = 100; frame[33] = 2;
+  frame[34] = 0x30; frame[35] = 0x39; frame[36] = 1; frame[37] = 0xbb;
+  frame[39] = 20; frame[46] = 0x50;
+  unsigned char nat_frame[sizeof(frame)]; memcpy(nat_frame, frame, sizeof(frame));
+  nat_frame[26] = 10; nat_frame[28] = 0;
+  airoha_ppe_pon_observe_frame(&pon, nat_frame, sizeof(nat_frame), 7);
+  assert(!entry.pon_ingress_seen && !entry.pon_ingress_conflict); cases++;
+  airoha_ppe_pon_observe_frame(&pon, frame, sizeof(frame), 7);
+  assert(entry.pon_ingress_seen && !entry.pon_ingress_conflict && entry.pon_ingress_service == 7);
+  assert(entry.pon_ingress_key[2] == 0xc0000201 && entry.pon_ingress_key[6] == 0xc6336402);
+  assert(entry.pon_ingress_key[10] == (12345u << 16 | 443));
+  assert(entry.hash == 0xffff && !commits); cases++;
+  duplicate = entry;
+  airoha_ppe_pon_observe_frame(&pon, frame, sizeof(frame), 7);
+  assert(!memcmp(&entry, &duplicate, sizeof(entry))); cases++;
+  for (unsigned qualified = 0; qualified < 2; ++qualified)
+   for (unsigned native = 0; native < 2; ++native) {
+    ppe.ct_pon_qualified = qualified; ppe.ct_native_pairs = native;
+    struct sk_buff skb = {.dev = &input, .hdr.h_proto = htons(ETH_P_IP)};
+    assert(!airoha_ppe_ct_pon_flow_current(&ppe, &entry, &skb)); cases++;
+    const u32 rows[] = {0,8191,8192,16383,16384,U32_MAX};
+    for (unsigned row = 0; row < ARRAY_SIZE(rows); ++row)
+     for (unsigned wlan = 0; wlan < 2; ++wlan) {
+      assert(!airoha_ppe_ct_flow_bank_matches(&ppe, &entry, rows[row], wlan)); cases++;
+      selected_row = rows[row]; learned = entry.data;
+      learned.ib1 = (learned.ib1 & ~AIROHA_FOE_IB1_BIND_STATE) |
+       FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_UNBIND);
+      airoha_ppe_foe_insert_entry(&ppe, &skb, selected_row, wlan, NULL);
+      assert(entry.hash == 0xffff && !commits); cases++;
+     }
+   }
+  airoha_ppe_pon_observe_frame(&pon, frame, sizeof(frame), 8);
+  assert(!entry.pon_ingress_seen && entry.pon_ingress_conflict); cases++;
+  airoha_ppe_pon_observe_frame(&pon, frame, sizeof(frame), 7);
+  assert(!entry.pon_ingress_seen && entry.pon_ingress_conflict && entry.hash == 0xffff); cases++;
+  ppe.ct_native_pairs = true; ppe.ct_pon_qualified = false;
+  eth.ct_pon_full = false; ppe.foe_flow[0] = NULL;
+  struct airoha_flow_table_entry ordinary = {.data = entry.data};
+  assert(!candidate_publish(&eth, &ordinary, &pon, &wired, false));
+  assert(!ordinary.pon_candidate && ordinary.hash == 0xffff); cases++;
+  eth.ct_pon_full = true;
+ }
+ printf("PASS %u candidate admission, publication, observation and host isolation cases\n", cases);
+ return cases;
+}
 
 int main(void) {
  unsigned cases=0;
@@ -410,6 +574,7 @@ int main(void) {
   cases++;
  }
  cases += test_learning_isolation(&eth, &pon, &wired, &wifi);
+ cases += test_candidates();
  printf("PASS %u production PON admission, actual learn/bind, lower-path and source-port cases\n",cases);
  return 0;
 }
