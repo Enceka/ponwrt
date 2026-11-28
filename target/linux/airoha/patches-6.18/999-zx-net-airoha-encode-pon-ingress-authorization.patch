@@ -1,0 +1,76 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: encode IPv4 PON ingress authorization
+
+Encode a host-order ingress identity as a bank0 PON AUTH rule, including
+the original IPv4 tuple, Ethernet addresses, VLAN stack and PPPoE session.
+Reject field overflow before packing and validate the complete rule before
+publishing the result to the caller. Leave the output unchanged on error.
+
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_npu_flow_key.h
+@@ -0,0 +1,65 @@
++#ifndef AIROHA_NPU_FLOW_KEY_H
++#define AIROHA_NPU_FLOW_KEY_H
++
++#include "airoha_npu_auth_publish.h"
++
++struct airoha_npu_ipv4_identity {
++	auth_u32 service, source_ip, destination_ip;
++	auth_u32 source_port, destination_port, protocol;
++	auth_u32 vlan_count, vlan[2], pppoe_session;
++	unsigned char destination_mac[6], source_mac[6];
++};
++
++static inline int
++airoha_npu_auth_encode_ipv4(struct airoha_npu_auth_rule *rule,
++			    auth_u32 epoch, auth_u32 generation,
++			    auth_u32 token, auth_u32 row,
++			    const struct airoha_npu_ipv4_identity *identity)
++{
++	struct airoha_npu_auth_rule encoded = {
++		.raw = { AUTH_MBOX_ABI, epoch, token, 0, row, 4, 2 },
++	};
++	int error;
++
++	if (!rule || !identity)
++		return -EINVAL;
++	if (identity->service > 0xffffu ||
++	    identity->source_port > 0xffffu ||
++	    identity->destination_port > 0xffffu ||
++	    (identity->protocol != 6u && identity->protocol != 17u) ||
++	    identity->vlan_count > 2u || identity->pppoe_session > 0xffffu)
++		return -EINVAL;
++
++	encoded.raw[7] = identity->service;
++	encoded.raw[8] = generation;
++	encoded.raw[9] = 4;
++	encoded.raw[10] = identity->protocol;
++	encoded.raw[11] = identity->source_ip;
++	encoded.raw[15] = identity->destination_ip;
++	encoded.raw[19] = identity->source_port << 16 | identity->destination_port;
++	encoded.raw[20] = identity->vlan_count;
++	encoded.raw[21] = identity->vlan[0];
++	encoded.raw[22] = identity->vlan[1];
++	encoded.raw[23] = identity->pppoe_session;
++	encoded.raw[24] = identity->pppoe_session ? 0x21u : 0;
++	encoded.raw[25] = (auth_u32)identity->destination_mac[0] << 24 |
++			  (auth_u32)identity->destination_mac[1] << 16 |
++			  (auth_u32)identity->destination_mac[2] << 8 |
++			  identity->destination_mac[3];
++	encoded.raw[26] = (auth_u32)identity->destination_mac[4] << 24 |
++			  (auth_u32)identity->destination_mac[5] << 16 |
++			  (auth_u32)identity->source_mac[0] << 8 |
++			  identity->source_mac[1];
++	encoded.raw[27] = (auth_u32)identity->source_mac[2] << 24 |
++			  (auth_u32)identity->source_mac[3] << 16 |
++			  (auth_u32)identity->source_mac[4] << 8 |
++			  identity->source_mac[5];
++
++	error = airoha_npu_auth_rules_validate(epoch, generation, &encoded, 1);
++	if (error)
++		return error;
++	*rule = encoded;
++	return 0;
++}
++
++#endif
