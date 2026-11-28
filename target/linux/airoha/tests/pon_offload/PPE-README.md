@@ -103,8 +103,9 @@ families, including a synthetic PON-ingress candidate at the actual bind step.
   physical Ethernet output. Patch 966 rejects outer tunnel metadata and
   addresses, GRE keys, L2TPv3 sessions and IPsec selectors in both PPE modes
   before FOE preparation. PON still rejects VLAN/CVLAN keys at
-  admission and rechecks packet framing at bind. The production PON gate
-  remains closed for all candidates.
+  admission and rechecks packet framing at bind. The default PON gate remains
+  closed; ZZ8 adds explicit exclusive sessions for observed plain IPv4 GPON
+  downstream candidates.
 - NAT66, non-TCP/UDP traffic, native bridge PON flows,
   PON-to-PON flows and per-P-bit split GEM mappings.
 - WAN HQoS enabled mode (T-CONT/channel remapping).
@@ -123,3 +124,28 @@ five-tuple is rejected because the hardware lookup has no ingress key.
 The generated report records hashes of every extracted source. Hardware
 throughput and live optical-line behavior require device validation after the
 integrated driver is built.
+
+## Production session board test
+
+`run_npu_session.py` exercises an already prepared production RAM boot with
+`ct_pon_loopback production_session=1 special_tag=1`, service 8500 and disabled
+native-pair policy. It uses the pinned SSH host key and boot ID and requires
+NAND to remain disabled. The host receiver binds `192.168.1.120:49153` on LAN1.
+The isolated `ip pon_session` table must offload between `pon0` and `lan1`,
+DNAT `192.0.2.1:49152 -> 192.0.2.2:49153` to that receiver and SNAT the source
+to `192.168.1.1:49152`; the reply must route back through `pon0`.
+
+```sh
+python3 -B run_npu_session.py --pin KNOWN_HOSTS --key SSH_KEY --boot BOOT_ID \
+  --output EVIDENCE_DIRECTORY --conntrack /tmp/pon-session-conntrack
+```
+
+The runner selects the observed candidate, checks LAN payloads, NAT actions,
+hardware timestamp advancement and unchanged PON CPU counters for 40 samples.
+The default withdrawal flushes the test forward chain and deletes only the
+test conntrack tuple. `--withdraw table` instead deletes the complete test
+table. Both require candidate retirement, row removal and CPU forwarding of
+the next packet. The runner releases the session it starts and preserves
+command output and cleanup errors in the evidence directory. The caller
+removes the remaining test network/rules and restores the loopback afterward.
+`test_npu_session.py` runs host regressions with mocked SSH and UDP transport.
