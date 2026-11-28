@@ -84,3 +84,36 @@ auxiliary targets, DT/profile/device and flash/RAM failures, firmware and loader
 digests, raw cpio identity, selected-file types, module/firmware inventories,
 cross-rootfs contents, provenance and CLI output protection. Temporary fixtures
 are outside the repository and removed after each test.
+
+## Recovery boot
+
+`boot_pon_recovery.py` consumes a passing pair report and the exact recovery FIT.
+Without `--run` it checks the image digest, resident checks, endpoint configuration
+and new output location. With `--run` it verifies the current board boot UUID over
+pinned SSH and checks serial access before restarting into U-Boot. It transfers
+the FIT into RAM, checks its SHA256 on the board, and starts it with `bootm`.
+The U-Boot IP settings are volatile; this command does not flash or save settings.
+
+```sh
+python3 -B /Volumes/Workspace/5585f/build/ponwrt/target/linux/airoha/tests/pon_offload/boot_pon_recovery.py \
+  --fit /absolute/image-build/initramfs-recovery.itb \
+  --evidence /absolute/evidence/verified-pair.json \
+  --key /absolute/private-lab-ssh --pin /absolute/current/known-hosts \
+  --toolkit /absolute/factory-toolkit --serial /dev/cu.usbserial-11330 \
+  --previous-boot CURRENT-BOOT-UUID --output /absolute/evidence/recovery-boot \
+  --run
+```
+
+Defaults use LAN control on `en6`, `192.168.1.120` to `192.168.1.1`, and transfer
+on `en4`, `192.168.6.231` to `192.168.6.221`, UDP port 1069. Both host addresses
+and the board's transfer address must exist before restart. The toolkit directory
+must contain the project's `live.py` serial, pinned SSH and read-only TFTP helpers.
+
+The output records the serial log, old/new board state and new SSH host pin. A
+successful result requires the `pon-full` DT variant, tmpfs root, a changed boot
+UUID and successful pinned SSH access. SSH startup retries are bounded. Failures
+retain the serial evidence and write `recovery_ready: false`; inspect the current
+console state before retrying. After success, use the new pin and boot UUID to
+restore the lab WAN and check wireless connectivity. Production offload and
+flash acceptance are subsequent checks. Preflight/readiness regressions run with
+`python3 -B -m unittest -v test_boot_pon_recovery` in this directory.
