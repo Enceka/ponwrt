@@ -94,18 +94,18 @@ def generated_abi(text):
 
 def mutations():
     return (
-        ('aba', 'current.serial != snapshot->serial ||', 'false ||'),
-        ('generation', 'current.generation != snapshot->generation ||', 'false ||'),
-        ('mapping-tag', 'current.mapping.tag != snapshot->mapping.tag ||', 'false ||'),
-        ('mapping-vlan', 'current.mapping.vlan_id != snapshot->mapping.vlan_id ||', 'false ||'),
-        ('mapping-pbit', 'current.mapping.pbit_mask != snapshot->mapping.pbit_mask ||', 'false ||'),
+        ('aba', 'observed.serial != snapshot->serial ||', 'false ||'),
+        ('generation', 'observed.generation != snapshot->generation ||', 'false ||'),
+        ('mapping-tag', 'observed.mapping.tag != snapshot->mapping.tag ||', 'false ||'),
+        ('mapping-vlan', 'observed.mapping.vlan_id != snapshot->mapping.vlan_id ||', 'false ||'),
+        ('mapping-pbit', 'observed.mapping.pbit_mask != snapshot->mapping.pbit_mask ||', 'false ||'),
         ('actions', '!airoha_ppe_ct_pon_row_matches(entry, &snapshot->data)', 'false'),
         ('raw-state-comparison', '!airoha_ppe_ct_pon_row_matches(entry, &snapshot->data)',
          'memcmp(&entry->data, &snapshot->data, sizeof(entry->data))'),
         ('seen', '!entry->pon_ingress_seen ||', 'false ||'),
         ('conflict', 'entry->pon_ingress_conflict ||', 'false ||'),
         ('bound-row', 'entry->hash != 0xffff ||', 'false ||'),
-        ('epon', '(current->tag & AIROHA_PON_QDMA_EPON) ||', 'false ||'),
+        ('epon', '(mapping_entry->tag & AIROHA_PON_QDMA_EPON) ||', 'false ||'),
         ('overflow', 'e->pon_candidate && ppe->pon_candidate_serial == U64_MAX', 'false'),
         ('cookie-rollback', 'if (err)\n\t\trhashtable_remove_fast', 'if (false)\n\t\trhashtable_remove_fast'),
         ('ingress-ref', 'dev_hold(next.ingress);', '(void)next.ingress;'),
@@ -214,12 +214,25 @@ def main():
             caught[name] = result.stderr.strip()
         finally:
             (output / 'production.inc').write_text(production)
+    compile_mutants = {}
+    for identifier in ('mapping_entry', 'observed'):
+        label = 'kernel-current-' + identifier
+        try:
+            changed = re.sub(r'\b' + identifier + r'\b', 'current', production)
+            assert changed != production
+            (output / 'production.inc').write_text(changed)
+            result = run(compiler + flags + ['-fsyntax-only'], label, required=False)
+            assert result.returncode and 'get_current' in result.stderr and 'error:' in result.stderr, result.stderr
+            compile_mutants[label] = {'rejected': True, 'log': str(output / (label + '.log'))}
+        finally:
+            (output / 'production.inc').write_text(production)
     for path, data in inputs.items():
         assert path.read_bytes() == data, 'input changed: ' + str(path)
     report = {
         'passed': True, 'source': str(source), 'baseline': baseline,
         'binding': {'zz3_reverse_replay': True, 'zz4_exact_application': True, 'fuzz': 0, 'offset': 0},
-        'lock_tests': lock_tests, 'mutants': caught, 'sanitizers': ['address', 'undefined'],
+        'lock_tests': lock_tests, 'mutants': caught, 'compile_mutants': compile_mutants,
+        'sanitizers': ['address', 'undefined'],
         'patch_sha256': digest(binding.snapshot[PATCH]),
         'inputs_sha256': {str(path): digest(data) for path, data in inputs.items()},
         'patched_sha256': {name: digest((driver / name).read_bytes()) for name in TARGETS},
@@ -228,6 +241,7 @@ def main():
     }
     (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     print('PASS lock contracts and ' + str(len(caught)) + ' runtime mutants', flush=True)
+    print('PASS ' + str(len(compile_mutants)) + ' kernel current macro compile mutants', flush=True)
     print('PASS report: ' + str(output / 'report.json'), flush=True)
 
 

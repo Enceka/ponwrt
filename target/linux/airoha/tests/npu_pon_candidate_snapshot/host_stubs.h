@@ -26,6 +26,10 @@ typedef uint64_t u64;
 #define READ_ONCE(value) (value)
 #define test_bit(bit, pointer) (!!(*(pointer) & (1ul << (bit))))
 
+struct task_struct;
+struct task_struct *get_current(void);
+#define current get_current()
+
 static const char *test_case;
 static unsigned checks, cases;
 #define CHECK(condition) do { \

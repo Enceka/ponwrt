@@ -98,15 +98,15 @@ production owner worker, without programming hardware or opening PON gates.
 +	if (!table)
 +		return -ESTALE;
 +	for (index = 0; index < table->count; index++) {
-+		const struct airoha_pon_flow_entry *current = &table->entries[index];
++		const struct airoha_pon_flow_entry *mapping_entry = &table->entries[index];
 +
-+		if (!(current->tag & AIROHA_PON_QDMA_VALID) ||
-+		    (current->tag & AIROHA_PON_QDMA_EPON) ||
-+		    FIELD_GET(AIROHA_PON_QDMA_GEM_MASK, current->tag) != entry->pon_ingress_service)
++		if (!(mapping_entry->tag & AIROHA_PON_QDMA_VALID) ||
++		    (mapping_entry->tag & AIROHA_PON_QDMA_EPON) ||
++		    FIELD_GET(AIROHA_PON_QDMA_GEM_MASK, mapping_entry->tag) != entry->pon_ingress_service)
 +			continue;
 +		if (mapping)
 +			return -ESTALE;
-+		mapping = current;
++		mapping = mapping_entry;
 +	}
 +	if (!mapping)
 +		return -ESTALE;
@@ -151,7 +151,7 @@ production owner worker, without programming hardware or opening PON gates.
 +int airoha_ppe_pon_candidate_validate(struct airoha_ppe *ppe,
 +				    const struct airoha_pon_candidate_snapshot *snapshot)
 +{
-+	struct airoha_pon_candidate_snapshot current = {};
++	struct airoha_pon_candidate_snapshot observed = {};
 +	struct airoha_flow_table_entry *entry;
 +	int error;
 +
@@ -163,15 +163,15 @@ production owner worker, without programming hardware or opening PON gates.
 +	if (!entry)
 +		return -ENOENT;
 +	spin_lock_bh(&ppe_lock);
-+	error = airoha_ppe_pon_candidate_read_locked(ppe, entry, &current);
-+	if (!error && (current.serial != snapshot->serial ||
-+		       current.generation != snapshot->generation ||
-+		       current.ingress != snapshot->ingress || current.egress != snapshot->egress ||
-+		       current.service != snapshot->service ||
-+		       current.mapping.tag != snapshot->mapping.tag ||
-+		       current.mapping.vlan_id != snapshot->mapping.vlan_id ||
-+		       current.mapping.pbit_mask != snapshot->mapping.pbit_mask ||
-+		       memcmp(current.key, snapshot->key, sizeof(current.key)) ||
++	error = airoha_ppe_pon_candidate_read_locked(ppe, entry, &observed);
++	if (!error && (observed.serial != snapshot->serial ||
++		       observed.generation != snapshot->generation ||
++		       observed.ingress != snapshot->ingress || observed.egress != snapshot->egress ||
++		       observed.service != snapshot->service ||
++		       observed.mapping.tag != snapshot->mapping.tag ||
++		       observed.mapping.vlan_id != snapshot->mapping.vlan_id ||
++		       observed.mapping.pbit_mask != snapshot->mapping.pbit_mask ||
++		       memcmp(observed.key, snapshot->key, sizeof(observed.key)) ||
 +		       !airoha_ppe_ct_pon_row_matches(entry, &snapshot->data)))
 +		error = -ESTALE;
 +	spin_unlock_bh(&ppe_lock);

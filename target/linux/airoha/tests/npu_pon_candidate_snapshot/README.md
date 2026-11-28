@@ -83,5 +83,8 @@ deleted/conflicted/bound entries, profile/carrier/device/mapping/generation
 changes, all 19 key words, NAT/L2 actions, table replacement, retire STATE and
 timestamp changes, failed-output atomicity, and idempotent put. Expected-failure
 lock tests and runtime mutations check that the important guards are exercised.
+The host fixture also defines the kernel `current` macro as `get_current()`;
+two compile-failure mutations reintroduce that name in the mapping scan and
+snapshot validation to guard against kernel-only identifier collisions.
 `report.json` records results, source/patch/function hashes and all commands.
 No SDK build, VM or board operation is performed by this suite.
