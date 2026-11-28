@@ -1,0 +1,107 @@
+From: Enceka <enceka@yeah.net>
+Date: Sat, 28 Nov 2026 10:00:00 +0800
+Subject: [PATCH] net: airoha: report owned PON session activity
+
+Read the selected production session's bound SRAM row for FLOW_CLS_STATS.
+Validate its owner, candidate identity, generation and open state before
+accepting the hardware timestamp, including timestamp wrap. Keep the
+candidate hash and snapshot unchanged, and leave lastused unchanged on
+read errors or stale bindings.
+
+--- a/drivers/net/ethernet/airoha/airoha_npu_production.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_production.h
+@@ -22,6 +22,66 @@
+ 	    READ_ONCE(ingress->pon_link_priv) != owner->production_priv)
+ 		return -ESTALE;
+ 	error = airoha_ppe_pon_candidate_validate(owner->ppe, &owner->production);
++	return error;
++}
++
++/* Keep the candidate snapshot immutable; activity belongs to its owned row. */
++static int airoha_npu_production_idle(struct airoha_ppe *ppe,
++				    struct airoha_flow_table_entry *entry, u32 *idle)
++{
++	struct airoha_npu_owner *owner = ppe->ct_npu_owner;
++	struct airoha_foe_entry observed, *row;
++	u32 ib1;
++	int error;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!owner || owner->ppe != ppe ||
++	    owner->production.cookie != entry->cookie ||
++	    owner->production.serial != entry->pon_candidate_serial)
++		return -ESTALE;
++	error = airoha_npu_production_validate(owner);
++	if (error)
++		return error;
++
++	spin_lock_bh(&ppe_lock);
++	if (ppe->ct_npu_owner != owner || !owner->production_bound ||
++	    owner->txn.phase != NPU_TXN_OPEN || owner->closed_ack ||
++	    !airoha_ppe_npu_production_active(ppe, owner) ||
++	    owner->production.generation != owner->txn.id.generation ||
++	    !entry->pon_candidate || entry->hash != 0xffff ||
++	    !entry->pon_ingress_seen || entry->pon_ingress_conflict ||
++	    entry->cookie != owner->production.cookie ||
++	    entry->pon_candidate_serial != owner->production.serial ||
++	    !airoha_ppe_bank0_hash(owner->production_hash)) {
++		error = -ESTALE;
++		goto unlock;
++	}
++	row = airoha_ppe_foe_get_entry_locked(ppe, owner->production_hash);
++	if (!row) {
++		error = -ETIMEDOUT;
++		goto unlock;
++	}
++	if (!airoha_ppe_ct_sram_ack(ppe->eth, owner->production_hash, false)) {
++		error = -EIO;
++		goto unlock;
++	}
++	observed = *row;
++	ib1 = observed.ib1;
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1) != AIROHA_FOE_STATE_BIND ||
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, ib1) != PPE_PKT_TYPE_IPV4_HNAPT) {
++		error = -ESTALE;
++		goto unlock;
++	}
++	observed.ib1 &= ~AIROHA_FOE_IB1_BIND_TIMESTAMP;
++	observed.ib1 |= owner->production_entry.ib1 & AIROHA_FOE_IB1_BIND_TIMESTAMP;
++	if (memcmp(&observed, &owner->production_entry, sizeof(observed)) ||
++	    !airoha_ppe_npu_production_active(ppe, owner)) {
++		error = -ESTALE;
++		goto unlock;
++	}
++	*idle = airoha_ppe_get_entry_idle_time(ppe, ib1);
++unlock:
++	spin_unlock_bh(&ppe_lock);
+ 	return error;
+ }
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -33,6 +33,9 @@
+ static bool airoha_ppe_npu_bank0_owned(struct airoha_ppe *ppe);
+ static int airoha_npu_production_withdraw(struct airoha_ppe *ppe,
+ 					  struct airoha_flow_table_entry *entry);
++
++static int airoha_npu_production_idle(struct airoha_ppe *ppe,
++				    struct airoha_flow_table_entry *entry, u32 *idle);
+ 
+ /* qdma_dev_hqos_init() controls WAN channel remapping with this bit. */
+ #define AIROHA_PON_QDMA_HQOS_CFG	0x0090
+@@ -3016,6 +3019,15 @@
+ 	if (!e)
+ 		return -ENOENT;
+ 
++	if (e->pon_candidate) {
++		int error = airoha_npu_production_idle(eth->ppe, e, &idle);
++
++		if (error)
++			return error;
++		f->stats.lastused = jiffies - idle * HZ;
++		return 0;
++	}
++
+ 	idle = airoha_ppe_entry_idle_time(eth->ppe, e);
+ 	f->stats.lastused = jiffies - idle * HZ;
+ 
