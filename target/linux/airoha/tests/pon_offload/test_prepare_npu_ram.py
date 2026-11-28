@@ -4,9 +4,10 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import prepare_npu_ram as subject
-from pack_npu_ram import verified_kernel
+from pack_npu_ram import select_profile, verified_kernel
 
 
 class PreparationTests(unittest.TestCase):
@@ -126,6 +127,100 @@ class PreparationTests(unittest.TestCase):
         self.archive = subject.encode_archive(original[1:], self.trailer)
         with self.assertRaises(ValueError):
             self.prepare()
+
+    def production_source(self):
+        digest = ', '.join('0x' + subject.sha256(b'new RV32')[index:index + 2]
+                           for index in range(0, 64, 2))
+        return (self.loader.replace('0x18000, lab_sha256[0]', '0x18000, pon ? pon_sha256 : lab_sha256[0]') +
+                'static const u8 pon_sha256[SHA256_DIGEST_SIZE] = {\n' + digest + '\n\t};\n' +
+                '\n'.join('airoha/hg5585f-ct/' + name for name in subject.INSTALLED_NAMES.values()))
+
+    def test_production_archive_and_unchanged_loader(self):
+        (self.payload / 'ram-payload.json').write_text(json.dumps(self.manifest))
+        source = self.production_source()
+        with patch.object(subject, 'verify_pon_payload') as verify:
+            loader, archive, report = subject.prepare(self.payload, self.acceptance,
+                                                      self.archive, source, 'production-session')
+            verify.assert_called_once_with(self.payload)
+        entries, _ = subject.archive_entries(archive)
+        self.assertEqual(loader, source)
+        self.assertEqual([entry[0] for entry in entries[:2]],
+                         [subject.FIRMWARE + name for name in subject.INSTALLED_NAMES.values()])
+        self.assertEqual(entries[0][2], b'new RV32')
+        self.assertEqual(entries[2], subject.archive_entries(self.archive)[0][2])
+        self.assertEqual(report['profile'], 'production-session')
+        with patch.object(subject, 'verify_pon_payload', side_effect=ValueError('package pin')):
+            with self.assertRaisesRegex(ValueError, 'package pin'):
+                subject.prepare(self.payload, self.acceptance, self.archive, source, 'production-session')
+
+    def test_production_loader_rejects_wrong_digest_or_missing_profile(self):
+        source = self.production_source()
+        for invalid in (source + source, source.replace('pon_sha256', 'wrong_sha256'),
+                        source.replace('npu_pon_full_data.bin', 'wrong.bin'),
+                        source.replace('0x18000', '0x20000')):
+            with self.subTest(source=invalid[-80:]), self.assertRaises(ValueError):
+                subject.production_loader(invalid, [b'new RV32', bytes(4)])
+        with self.assertRaisesRegex(ValueError, 'digest mismatch'):
+            subject.production_loader(source, [b'other RV32', bytes(4)])
+
+    def test_production_archive_rejects_destination_collision(self):
+        (self.payload / 'ram-payload.json').write_text(json.dumps(self.manifest))
+        entries = self.entries + [(subject.FIRMWARE + subject.INSTALLED_NAMES['code'],
+                                   self.entries[0][1], b'existing')]
+        with patch.object(subject, 'verify_pon_payload'), self.assertRaisesRegex(ValueError, 'already contains'):
+            subject.prepare(self.payload, self.acceptance, subject.encode_archive(entries, self.trailer),
+                            self.production_source(), 'production-session')
+
+    def test_module_replacement_checks_architecture_and_release(self):
+        directory = self.payload / 'modules'
+        directory.mkdir()
+        name = 'lib/modules/6.18.60/nf_flow_table.ko'
+        original = b'\x7fELF\x02\x01' + bytes(12) + b'\xb7\0' + b'vermagic=6.18.60 SMP\0'
+        path = directory / 'nf_flow_table.ko'
+        entries = [(name, self.entries[0][1], b'old module')]
+        path.write_bytes(original)
+        self.assertEqual(subject.module_replacements(directory, entries), {name: original})
+        for invalid in (original.replace(b'6.18.60', b'6.18.59'), original.replace(b'\xb7\0', b'\x3e\0'),
+                        b'not ELF'):
+            path.write_bytes(invalid)
+            with self.assertRaises(ValueError):
+                subject.module_replacements(directory, entries)
+        path.write_bytes(original)
+        with self.assertRaises(ValueError):
+            subject.module_replacements(directory, [])
+        with self.assertRaises(ValueError):
+            subject.module_replacements(directory, entries + entries)
+
+
+class ProfileTests(unittest.TestCase):
+    def test_production_profile_removes_lab_and_diagnostic(self):
+        for diagnostic in (False, True):
+            npu = {'airoha,connac2-rebuilt-ram-lab': b'', 'untouched': b'NPU'}
+            eth = {'airoha,connac2-ram-native-pairs': b'', 'untouched': b'ETH'}
+            if diagnostic:
+                eth['airoha,connac2-pon-er-diagnostic'] = b''
+            select_profile(npu, eth, 'production-session')
+            self.assertEqual(npu, {'airoha,connac2-pon-full': b'', 'untouched': b'NPU'})
+            self.assertEqual(eth, {'airoha,connac2-pon-full': b'', 'untouched': b'ETH'})
+
+    def test_reject_mixed_profile(self):
+        for target in ('npu', 'eth'):
+            for marker in ('airoha,connac2-ordinary-full-test', 'airoha,connac2-pon-full'):
+                npu = {'airoha,connac2-rebuilt-ram-lab': b''}
+                eth = {'airoha,connac2-ram-native-pairs': b''}
+                (npu if target == 'npu' else eth)[marker] = b''
+                with self.subTest(target=target, marker=marker), self.assertRaises(ValueError):
+                    select_profile(npu, eth, 'production-session')
+
+    def test_diagnostic_default_and_repeat_rejection(self):
+        npu = {'airoha,connac2-rebuilt-ram-lab': b''}
+        eth = {'airoha,connac2-ram-native-pairs': b''}
+        select_profile(npu, eth, 'diagnostic')
+        self.assertIn('airoha,connac2-rebuilt-ram-lab', npu)
+        self.assertIn('airoha,connac2-ram-native-pairs', eth)
+        self.assertIn('airoha,connac2-pon-er-diagnostic', eth)
+        with self.assertRaises(ValueError):
+            select_profile(npu, eth, 'diagnostic')
 
 
 if __name__ == '__main__':

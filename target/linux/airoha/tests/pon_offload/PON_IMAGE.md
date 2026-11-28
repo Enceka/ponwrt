@@ -85,6 +85,41 @@ digests, raw cpio identity, selected-file types, module/firmware inventories,
 cross-rootfs contents, provenance and CLI output protection. Temporary fixtures
 are outside the repository and removed after each test.
 
+## Production session in RAM
+
+Before full-image flashing, use `prepare_npu_ram.py` and `pack_npu_ram.py`
+with `--profile production-session` to exercise the real `pon_npu_flow`
+candidate lifecycle in an isolated RAM system. The default remains
+`diagnostic` for existing callers.
+
+Preparation verifies the payload against the package's PON identity and the
+RV32 acceptance report. It installs the production firmware names and checks
+the canonical production loader digests without rewriting the loader. Optional
+`--modules DIRECTORY` replaces existing rootfs modules with rebuilt ARM64
+modules of the same kernel release. Use a flat directory containing the
+selected `.ko` files; record the build/config and retain required external
+WLAN/PON modules from the matching base. The preparation report records every
+replacement digest.
+
+Packing requires that exact prepared CPIO embedded in the transferred kernel,
+the production session interface and pinned loader digests. It replaces the
+paired RAM firmware profile with `connac2-pon-full` on both Ethernet and NPU,
+removes the diagnostic marker, and runs the resident verifier for `pon-full`.
+The base FIT must retain disabled NAND, ECC, xPON, PCS and BOSA nodes. Other DT
+properties, memory reservations and the TX-disable GPIO hog are preserved.
+The output is `pon-npu-session-ram.itb`, with `sealed.json` and resident checks.
+
+Use the RAM loopback module's explicit production-session mode for netfilter
+candidate admission, observation, hardware UNB learning, binding and withdrawal.
+Keep the NAND-enabled recovery pair and its flashing workflow separate from
+this RAM-only artifact.
+
+Run preparation/profile regressions with:
+
+```sh
+python3 -B -m unittest test_prepare_npu_ram
+```
+
 ## Recovery boot
 
 `boot_pon_recovery.py` consumes a passing pair report and the exact recovery FIT.

@@ -10,7 +10,28 @@ import subprocess
 import sys
 import zlib
 
-from prepare_npu_ram import require, sha256
+from prepare_npu_ram import FIRMWARE, require, sha256
+from verify_pon_payload import INSTALLED_NAMES, load_identity
+
+
+def select_profile(npu, eth, profile):
+    require('airoha,connac2-rebuilt-ram-lab' in npu and
+            'airoha,connac2-ram-native-pairs' in eth, 'wrong baseline firmware profile')
+    for properties in (npu, eth):
+        require(not {'airoha,connac2-ordinary-full-test', 'airoha,connac2-pon-full'} & properties.keys(),
+                'mixed baseline firmware profile')
+    require('airoha,connac2-ram-native-pairs' not in npu and
+            'airoha,connac2-rebuilt-ram-lab' not in eth, 'misplaced baseline firmware profile')
+    if profile == 'production-session':
+        del npu['airoha,connac2-rebuilt-ram-lab']
+        del eth['airoha,connac2-ram-native-pairs']
+        eth.pop('airoha,connac2-pon-er-diagnostic', None)
+        npu['airoha,connac2-pon-full'] = b''
+        eth['airoha,connac2-pon-full'] = b''
+    else:
+        require(profile == 'diagnostic', 'unknown RAM profile')
+        require('airoha,connac2-pon-er-diagnostic' not in eth, 'baseline already has diagnostic marker')
+        eth['airoha,connac2-pon-er-diagnostic'] = b''
 
 
 def verified_kernel(path, expected):
@@ -20,10 +41,11 @@ def verified_kernel(path, expected):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Pack a prepared PON diagnostic kernel into a pinned RAM FIT')
+    parser = argparse.ArgumentParser(description='Pack a prepared PON kernel into a pinned RAM FIT')
     for name in ('baseline', 'base-archive', 'prepared', 'kernel', 'config', 'image-helper', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--baseline-sha256', required=True)
+    parser.add_argument('--profile', choices=('diagnostic', 'production-session'), default='diagnostic')
     parser.add_argument('--kernel-sha256', required=True,
                         help='SHA256 computed in the kernel build environment before transfer')
     args = parser.parse_args()
@@ -48,6 +70,13 @@ def main():
     old_payload = fit.image_data(kernel)[0]
     old_kernel = lzma.decompress(old_payload)
     prepared = json.loads((args.prepared / 'prepared.json').read_text())
+    require(prepared.get('profile', 'diagnostic') == args.profile, 'prepared RAM profile mismatch')
+    if args.profile == 'production-session':
+        identity = load_identity()
+        require(prepared['elf_sha256'] == identity['manifest']['elf']['sha256'] and
+                prepared['firmware_sha256'] == {
+                    FIRMWARE + name: identity['manifest'][section]['sha256']
+                    for section, name in INSTALLED_NAMES.items()}, 'production payload identity mismatch')
     old_archive = args.base_archive.read_bytes()
     archive = (args.prepared / 'pon-npu.cpio').read_bytes()
     require(sha256(old_archive) == prepared['baseline_initramfs_sha256'] and
@@ -57,6 +86,10 @@ def main():
     require(raw[56:60] == b'ARMd' and raw.count(archive) == 1, 'kernel does not embed prepared initramfs')
     require(b'starting bound rebuilt Connac2 firmware' in raw and
             b'pon_npu_diag' in raw, 'missing startup or PON diagnostic code')
+    if args.profile == 'production-session':
+        require(b'pon_npu_flow' in raw and
+                all(('airoha/hg5585f-ct/' + name).encode() in raw
+                    for name in INSTALLED_NAMES.values()), 'missing production session or loader code')
     require(all(bytes.fromhex(digest) in raw for digest in prepared['firmware_sha256'].values()),
             'kernel is missing a prepared loader digest')
     fdt = images.child('fdt-1')
@@ -73,13 +106,12 @@ def main():
 
     for label in ('pnand', 'pnand_ecc', 'xpon_mac', 'pon_pcs', 'hg5585f_bosa'):
         require(node(label).properties.get('status') == b'disabled\0', 'enabled flash or optical node: ' + label)
-    require('airoha,connac2-rebuilt-ram-lab' in node('npu').properties and
-            'airoha,connac2-ram-native-pairs' in node('eth').properties and
-            'airoha,connac2-ordinary-full-test' not in node('eth').properties, 'wrong firmware profile')
-    require('airoha,connac2-pon-er-diagnostic' not in node('eth').properties, 'baseline already has diagnostic marker')
-    node('eth').properties['airoha,connac2-pon-er-diagnostic'] = b''
+    originals = {label: node(label).properties.copy() for label in ('npu', 'eth')}
+    select_profile(node('npu').properties, node('eth').properties, args.profile)
     dtb = tree.encode()
-    del node('eth').properties['airoha,connac2-pon-er-diagnostic']
+    for label, properties in originals.items():
+        node(label).properties.clear()
+        node(label).properties.update(properties)
     require(tree.encode() == image.Fit(old_dtb).encode(), 'unrelated DT mutation')
     properties = old_payload[0]
     payload = lzma.compress(raw, format=lzma.FORMAT_ALONE, filters=[dict(
@@ -115,13 +147,16 @@ def main():
     (output / 'final.config').write_bytes(args.config.read_bytes())
     verifier = Path(__file__).resolve().parent.parent / 'npu_resident_config/verify.py'
     subprocess.run([sys.executable, '-B', str(verifier), '--config', str(output / 'final.config'),
-                    '--dt', str(output / 'final.dtb'), '--report', str(output / 'resident.json')], check=True)
+                    '--dt', str(output / 'final.dtb'), '--report', str(output / 'resident.json'),
+                    '--profile', 'pon-full' if args.profile == 'production-session' else 'rebuilt-ram-lab'],
+                   check=True)
     report = dict(prepared, fit_sha256=sha256(packed), bytes=len(packed),
                   kernel_sha256=sha256(raw), config_sha256=sha256(args.config.read_bytes()),
                   dtb_sha256=sha256(dtb), baseline_fit_sha256=sha256(baseline),
                   image_helper_sha256=sha256(args.image_helper.read_bytes()),
                   board_tested=False, pon_ppe_qualified=False)
-    (output / 'pon-npu-diag-ram.itb').write_bytes(packed)
+    filename = 'pon-npu-session-ram.itb' if args.profile == 'production-session' else 'pon-npu-diag-ram.itb'
+    (output / filename).write_bytes(packed)
     (output / 'sealed.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
 

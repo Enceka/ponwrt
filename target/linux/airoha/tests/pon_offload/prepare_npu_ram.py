@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import stat
 
+from verify_pon_payload import INSTALLED_NAMES, verify as verify_pon_payload
+
 
 FIRMWARE = 'lib/firmware/airoha/hg5585f-ct/'
 NAMES = ('npu_rebuilt_rv32.bin', 'npu_rebuilt_data.bin')
@@ -81,7 +83,46 @@ def replace_loader(source, old_payloads, payloads):
     return source[:match.start(2)] + ''.join(rows) + source[match.end(2):]
 
 
-def prepare(payload_dir, acceptance, archive, loader):
+def production_loader(source, payloads):
+    tables = {}
+    for name, dimensions in (('pon_sha256', r'\[SHA256_DIGEST_SIZE\]'),
+                             ('lab_sha256', r'\[\]\[SHA256_DIGEST_SIZE\]')):
+        matches = re.findall(r'static const u8 ' + name + dimensions +
+                             r' = \{(.*?)\n\t\};', source, re.S)
+        require(len(matches) == 1, 'expected one production loader table: ' + name)
+        tables[name] = bytes(int(word, 16) for word in re.findall(r'0x([0-9a-fA-F]{2})\b', matches[0]))
+    require(tables['pon_sha256'] == hashlib.sha256(payloads[0]).digest() and
+            len(tables['lab_sha256']) == 64 and
+            tables['lab_sha256'][32:] == hashlib.sha256(payloads[1]).digest(),
+            'production loader digest mismatch')
+    require(all('airoha/hg5585f-ct/' + name in source for name in INSTALLED_NAMES.values()) and
+            '0x18000, pon ? pon_sha256 :' in source and
+            '4, lab_sha256[1], false)' in source, 'unsupported production loader')
+    return source
+
+
+def module_replacements(directory, entries):
+    result = {}
+    for path in sorted(directory.glob('*.ko')):
+        require(path.is_file() and not path.is_symlink(), 'module must be a regular file')
+        matches = [(name, fields) for name, fields, _ in entries
+                   if name.startswith('lib/modules/') and Path(name).name == path.name]
+        require(len(matches) == 1, 'missing or ambiguous baseline module: ' + path.name)
+        name, fields = matches[0]
+        require(stat.S_ISREG(fields[1]) and fields[4] == 1, 'baseline module must be regular and unlinked')
+        blob = path.read_bytes()
+        release = name.split('/')[2].encode()
+        require(blob[:6] == b'\x7fELF\x02\x01' and blob[18:20] == b'\xb7\0' and
+                b'vermagic=' + release + b' ' in blob, 'module architecture or release mismatch: ' + path.name)
+        result[name] = blob
+    require(result, 'no replacement modules')
+    return result
+
+
+def prepare(payload_dir, acceptance, archive, loader, profile='diagnostic', modules=None):
+    require(profile in ('diagnostic', 'production-session'), 'unknown RAM profile')
+    if profile == 'production-session':
+        verify_pon_payload(payload_dir)
     manifest = json.loads((payload_dir / 'ram-payload.json').read_text())
     require(acceptance.get('passed') is True, 'RV32 acceptance failed')
     require(acceptance['elf_sha256'] == manifest['elf']['sha256'], 'untested RV32 ELF')
@@ -116,22 +157,36 @@ def prepare(payload_dir, acceptance, archive, loader):
     for name, fields, _ in entries:
         if name in replacements:
             require(stat.S_ISREG(fields[1]) and fields[4] == 1, 'firmware must be a regular unlinked file')
-    rewritten = [(name, fields, replacements.get(name, content)) for name, fields, content in entries]
+    installed = dict(zip(replacements, (FIRMWARE + name for name in INSTALLED_NAMES.values())))
+    if profile == 'production-session':
+        require(not set(installed.values()) & old.keys(), 'baseline already contains production firmware')
+        source = production_loader(loader, [blobs['code'], blobs['data']])
+    else:
+        installed = {name: name for name in replacements}
+        source = replace_loader(loader, [old[FIRMWARE + name] for name in NAMES],
+                                [blobs['code'], blobs['data']])
+    firmware_sha256 = {installed[name]: sha256(content) for name, content in replacements.items()}
+    updated_modules = module_replacements(modules, entries) if modules is not None else {}
+    replacements.update(updated_modules)
+    installed.update({name: name for name in updated_modules})
+    rewritten = [(installed.get(name, name), fields, replacements.get(name, content))
+                 for name, fields, content in entries]
     result = encode_archive(rewritten, trailer)
     verified, _ = archive_entries(result)
     require([(name, fields[:6] + fields[7:11] + fields[12:], content)
              for name, fields, content in verified] ==
             [(name, fields[:6] + fields[7:11] + fields[12:], content)
              for name, fields, content in rewritten], 'archive roundtrip mismatch')
-    source = replace_loader(loader, [old[FIRMWARE + name] for name in NAMES],
-                            [blobs['code'], blobs['data']])
-    report = dict(purpose='isolated RAM PON validation', elf_sha256=manifest['elf']['sha256'],
+    report = dict(purpose='isolated RAM PON validation', profile=profile,
+                  elf_sha256=manifest['elf']['sha256'],
                   features=manifest['features'], local_sram=manifest['local_sram'],
                   baseline_initramfs_sha256=sha256(archive), initramfs_sha256=sha256(result),
                   baseline_loader_sha256=sha256(loader.encode()), loader_sha256=sha256(source.encode()),
                   initramfs_entries=len(entries),
-                  changed_entries=[name for name, content in replacements.items() if old[name] != content],
-                  firmware_sha256={name: sha256(content) for name, content in replacements.items()})
+                  changed_entries=[installed[name] for name, content in replacements.items()
+                                   if old[name] != content or installed[name] != name],
+                  firmware_sha256=firmware_sha256,
+                  modules_sha256={name: sha256(content) for name, content in updated_modules.items()})
     return source, result, report
 
 
@@ -142,12 +197,14 @@ def main():
     parser.add_argument('--archive', type=Path, required=True)
     parser.add_argument('--loader', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--profile', choices=('diagnostic', 'production-session'), default='diagnostic')
+    parser.add_argument('--modules', type=Path, help='Flat directory of rebuilt replacements for existing rootfs modules')
     args = parser.parse_args()
     output = args.output.resolve()
     repo = Path(__file__).resolve().parents[5]
     require(not output.is_relative_to(repo), 'generated output must be outside ponwrt')
     source, archive, report = prepare(args.payload, json.loads(args.acceptance.read_text()),
-                                      args.archive.read_bytes(), args.loader.read_text())
+                                      args.archive.read_bytes(), args.loader.read_text(), args.profile, args.modules)
     output.mkdir(parents=True, exist_ok=False)
     (output / 'airoha_npu.c').write_text(source)
     (output / 'pon-npu.cpio').write_bytes(archive)
