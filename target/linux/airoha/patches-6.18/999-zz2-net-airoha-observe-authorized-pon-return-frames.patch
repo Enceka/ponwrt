@@ -1,0 +1,74 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: observe authorized PON return frames
+
+Offer an optional ER observation callback after descriptor validation,
+live binding and skb allocation, under RCU and before protocol conversion.
+Only feed complete production PON frames and their validated service into
+the existing ingress identity observer. Recheck binding and open lifecycle
+state, and exclude diagnostic owners and diagnostic configuration.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth_return.c
++++ b/drivers/net/ethernet/airoha/airoha_eth_return.c
+@@ -117,6 +117,9 @@
+ 			skb_put_data(skb, payload, size);
+ 			skb->dev = ring->lower;
+ 			skb->ip_summed = CHECKSUM_NONE;
++			if (ring->ops->observe)
++				ring->ops->observe(ring->ctx, ring->lower, &ring->config,
++						   snapshot[ER_D_SERVICE], payload, size);
+ 			skb->protocol = eth_type_trans(skb, ring->lower);
+ 			napi_gro_receive(napi, skb);
+ 			++ring->packets;
+--- a/drivers/net/ethernet/airoha/airoha_eth_return.h
++++ b/drivers/net/ethernet/airoha/airoha_eth_return.h
+@@ -14,6 +14,9 @@
+ 				const struct er_config *config, u32 service);
+ 	void (*fault)(void *ctx, const struct er_config *config, u32 reason);
+ 	bool (*access_revoked)(void *ctx, const struct er_config *config);
++	void (*observe)(void *ctx, struct net_device *lower,
++			const struct er_config *config, u32 service,
++			const unsigned char *frame, u32 bytes);
+ };
+ 
+ struct airoha_er_stats {
+--- a/drivers/net/ethernet/airoha/airoha_npu_return.h
++++ b/drivers/net/ethernet/airoha/airoha_npu_return.h
+@@ -94,6 +94,30 @@
+ 	return false;
+ }
+ 
++static void airoha_npu_return_observe(void *ctx, struct net_device *lower,
++				     const struct er_config *config, u32 service,
++				     const unsigned char *frame, u32 bytes)
++{
++	struct airoha_npu_return *path = ctx;
++	struct airoha_npu_owner *owner = path->owner;
++	struct airoha_ppe *ppe = owner->ppe;
++	struct airoha_eth *eth = ppe->eth;
++	struct airoha_bank1_routes *routes = &eth->ct_bank1_routes;
++
++	if (!READ_ONCE(eth->ct_pon_full) ||
++	    READ_ONCE(eth->ct_ordinary_full_test) || READ_ONCE(owner->diag_lower) ||
++	    of_property_read_bool(eth->dev->of_node, "airoha,connac2-pon-er-diagnostic") ||
++	    READ_ONCE(ppe->ct_stopping) || READ_ONCE(path->stopping) ||
++	    READ_ONCE(owner->retiring) || READ_ONCE(owner->close_pending) ||
++	    READ_ONCE(owner->txn.phase) != NPU_TXN_OPEN ||
++	    READ_ONCE(routes->owner) != owner || !READ_ONCE(routes->ready) ||
++	    !READ_ONCE(routes->pon_open) || READ_ONCE(routes->revoked) ||
++	    !READ_ONCE(routes->ingress_ready) || config->sport != ER_PON ||
++	    !airoha_npu_return_binding(ctx, lower, config, service))
++		return;
++	airoha_ppe_pon_observe_frame(path->dev, frame, bytes, service & 0xffffU);
++}
++
+ static void airoha_npu_return_fault_work(struct work_struct *work)
+ {
+ 	struct airoha_npu_return *path =
+@@ -125,6 +149,7 @@
+ 	.command = airoha_npu_return_command,
+ 	.quiesce = airoha_npu_return_quiesce,
+ 	.binding_matches = airoha_npu_return_binding,
++	.observe = airoha_npu_return_observe,
+ 	.fault = airoha_npu_return_fault,
+ };
+ 
