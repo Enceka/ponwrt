@@ -1,0 +1,23 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: preserve PON session during WLAN station cleanup
+
+Keep a valid exclusive production PON session across unrelated WLAN WCID
+revocation. The WLAN flush caller still advances the station epoch and
+removes stale flow rows. Preserve fail-close on epoch exhaustion and the
+existing owner notification for global, LAN1 and inactive-session revokes.
+
+--- a/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_native_pair.h
+@@ -348,6 +348,12 @@
+ 	int err;
+ 
+ 	lockdep_assert_held(&ppe_lock);
++	/* WLAN teardown keeps the exclusive PON session; the caller retires
++	 * the station epoch and stale WLAN flow rows. */
++	if (band >= 0 && band <= 1 && wcid && wcid <= 150 &&
++	    airoha_ppe_npu_production_active(ppe, ppe->ct_npu_owner))
++		return ppe->ct_wlan_epoch[band][wcid] == U32_MAX ?
++			airoha_ct_pair_fail(ppe, -EOVERFLOW) : 0;
+ 	if (ppe->ct_host_ppe) {
+ 		err = airoha_npu_owner_notify(ppe, NULL);
+ 		if (err)
