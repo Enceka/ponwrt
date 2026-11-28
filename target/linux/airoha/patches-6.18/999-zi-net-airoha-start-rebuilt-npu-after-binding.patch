@@ -122,7 +122,7 @@ consumers before exposing NPU resources. Preserve legacy startup selection.
  	mutex_init(&instance->er.lock);
  	npu->ops.ppe_init = airoha_npu_ppe_init;
  	npu->ops.ppe_deinit = airoha_npu_ppe_deinit;
-@@ -1025,58 +1071,9 @@
+@@ -1025,60 +1071,9 @@
  			return -ENOMEM;
  	}
  
@@ -160,7 +160,9 @@ consumers before exposing NPU resources. Preserve legacy startup selection.
 -	msleep(100);
 -
 -	if (airoha_npu_is_connac2_ct(dev)) {
--		if (of_property_read_bool(dev->of_node, "airoha,connac2-rebuilt-ram-lab"))
+-		if (of_property_read_bool(dev->of_node, "airoha,connac2-ordinary-full-test"))
+-			dev_info(dev, "verified ordinary Connac2 full-test firmware\n");
+-		else if (of_property_read_bool(dev->of_node, "airoha,connac2-rebuilt-ram-lab"))
 -			dev_info(dev, "verified rebuilt Connac2 RAM firmware\n");
 -		else
 -			dev_info(dev, "verified Connac2 firmware 1456-50\n");
