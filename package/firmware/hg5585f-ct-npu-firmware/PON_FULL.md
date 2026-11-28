@@ -26,6 +26,12 @@ empty row, with SRAM ACK and complete readback verification. A submitted write
 retains its cleanup obligation even when completion times out. The diagnostic
 bind/install path exercises these helpers. The production worker, per-row
 ownership and native WLAN coexistence lifecycle remain to be integrated.
+The WAN QDMA UNB-rate path now records a consumable hardware learning event
+with the candidate serial, generation, original key and GEM service. The
+hardware row is kept separate from the software entry's unbound hash.
+Withdrawal, identity conflict and Bank0 retirement clear pending events.
+The worker must reserve and verify the actual row before checked invalidation
+and installation; event collection alone performs no hardware binding.
 
 The source revision is `f121da5f83a870e4fc7f39157db707a7334f7c0d`.
 The recorded RAM test exercised Bank0 UNB-to-BND forwarding to LAN1,
