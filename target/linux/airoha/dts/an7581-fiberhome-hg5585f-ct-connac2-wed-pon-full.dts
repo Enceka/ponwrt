@@ -1,0 +1,13 @@
+#include "an7581-fiberhome-hg5585f-ct-connac2-wed.dts"
+
+/ {
+	variant = "pon-full";
+};
+
+&npu {
+	airoha,connac2-pon-full;
+};
+
+&eth {
+	airoha,connac2-pon-full;
+};

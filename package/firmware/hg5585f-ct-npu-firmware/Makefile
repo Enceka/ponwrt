@@ -42,8 +42,8 @@ endef
 
 define Package/hg5585f-ct-npu-pon-full-firmware/description
   Pinned dualbank-owner PON payload for full-image integration.
-  Installs separate firmware files; device selection and PON activation
-  are supplied by subsequent platform integration.
+  Selects the persistent PON image profile and installs separate firmware
+  files. Optical ingress remains on WAN CPU until production admission.
 endef
 
 define Package/hg5585f-ct-npu-firmware/install

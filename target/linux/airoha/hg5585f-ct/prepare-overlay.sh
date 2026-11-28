@@ -1,26 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
+shopt -s nullglob
 
-if [[ $# != 2 && $# != 3 && !( $# == 4 && $3 == --full-test ) ]]; then
-  echo "usage: bash $0 STOCK_USERFS NEW_OVERLAY_DIRECTORY [REBUILT_PAYLOAD_DIRECTORY | --full-test PAYLOAD_DIRECTORY]" >&2
+if [[ $# != 2 && $# != 3 && !( $# == 4 && ( $3 == --full-test || $3 == --pon-full ) ) ]]; then
+  echo "usage: bash $0 STOCK_USERFS NEW_OVERLAY_DIRECTORY [REBUILT_PAYLOAD_DIRECTORY | --full-test PAYLOAD_DIRECTORY | --pon-full PAYLOAD_DIRECTORY]" >&2
   exit 2
 fi
 source_dir=$(cd "$1" && pwd)
 repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 rebuilt_dir=
 full_dir=
+pon_dir=
 if [[ $# == 3 ]]; then
   rebuilt_dir=$(cd "$3" && pwd)
 elif [[ $# == 4 ]]; then
-  full_dir=$(cd "$4" && pwd)
+  if [[ $3 == --pon-full ]]; then
+    pon_dir=$(cd "$4" && pwd)
+  else
+    full_dir=$(cd "$4" && pwd)
+  fi
 fi
 package=package/firmware/hg5585f-ct-npu-firmware
 firmware=(npu_rv32.bin npu_data.bin)
 (cd "$source_dir" && sha256sum -c "$repo/$package/SHA256SUMS")
+if [[ -n "$pon_dir" ]]; then
+  python3 -B "$repo/target/linux/airoha/tests/pon_offload/verify_pon_payload.py" --payload-dir "$pon_dir"
+fi
 mkdir -- "$2"
 overlay=$(cd "$2" && pwd)
 cd "$repo"
 for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebuilt" "$package/SHA256SUMS.full-test" \
+  "$package/SHA256SUMS.pon-full" "$package/pon-full.json" "$package/PON_FULL.md" \
   package/kernel/mt76/{Makefile,patches/111-mt7915-connac2-mailbox.patch,patches/112-mt7915-connac2-counters.patch,patches/113-mt7915-connac2-rx-rings.patch} \
   package/kernel/mt76/patches/{114-mt7915-connac2-host-rx.patch,115-mt7915-connac2-host-dequeue.patch,116-mt7915-connac2-packet-count.patch} \
   package/kernel/mt76/patches/{117-mt7915-connac2-pcie-windows.patch,118-mt7915-connac2-completion-counts.patch} \
@@ -133,6 +143,10 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/patches-6.18/999-zu-net-airoha-retain-pon-bank0-ownership.patch \
   target/linux/airoha/patches-6.18/999-zv-net-airoha-retire-host-bank0-before-npu-reuse.patch \
   target/linux/airoha/patches-6.18/999-zw-net-airoha-align-pon-auth-bank-metadata.patch \
+  target/linux/airoha/patches-6.18/999-zx-net-airoha-encode-pon-ingress-authorization.patch \
+  target/linux/airoha/patches-6.18/999-zy-net-airoha-load-pinned-pon-full-firmware.patch \
+  target/linux/airoha/patches-6.18/999-zz-net-airoha-observe-pon-ingress-flow-identity.patch \
+  target/linux/airoha/patches-6.18/999-zz1-net-airoha-match-pon-full-platform-profile.patch \
   target/linux/airoha/hg5585f-ct/{ram-dts.py,ram.config,NATIVE_PAIRS.md} \
   target/linux/airoha/tests/native_pair/*.{py,c} \
   target/linux/airoha/tests/native_pair/fixtures/*.inc \
@@ -160,9 +174,13 @@ for path in "$package/Makefile" "$package/SHA256SUMS" "$package/SHA256SUMS.rebui
   target/linux/airoha/tests/npu_ingress_owner/*.{py,c,md} \
   target/linux/airoha/tests/npu_owner_events/*.{py,c,md} \
   target/linux/airoha/tests/npu_auth_publish/*.{py,c,md} \
+  target/linux/airoha/tests/npu_flow_key/*.{py,c,h,inc,md} \
+  target/linux/airoha/tests/npu_flow_observe/*.{py,c,h,inc,md} \
+  target/linux/airoha/tests/npu_pon_full_profile/*.{py,c,h,inc,md} \
+  target/linux/airoha/tests/npu_pon_platform/*.{py,c,h,inc,md} \
   target/linux/airoha/tests/eth_return/*.{py,c,h,md} \
   target/linux/airoha/tests/tunnel/*.{py,c,sh,md} \
-  target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed-full-test.dts}; do
+  target/linux/airoha/{image/an7581.mk,dts/an7581-fiberhome-hg5585f-ct-connac2.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed-full-test.dts,dts/an7581-fiberhome-hg5585f-ct-connac2-wed-pon-full.dts}; do
   mkdir -p "$overlay/tree/$(dirname "$path")"
   install -m 644 "$path" "$overlay/tree/$path"
 done
@@ -183,17 +201,28 @@ if [[ -n "$rebuilt_dir" ]]; then
   printf '%s\n' CONFIG_PACKAGE_hg5585f-ct-npu-rebuilt-firmware=y \
     CONFIG_PACKAGE_kmod-nft-core=y CONFIG_PACKAGE_kmod-nft-bridge=y >> "$overlay/local.config"
 fi
-if [[ -n "$full_dir" ]]; then
+if [[ -n "$full_dir" || -n "$pon_dir" ]]; then
   board_network=target/linux/airoha/an7581/base-files/etc/board.d/02_network
   mkdir -p "$overlay/tree/$(dirname "$board_network")" "$overlay/tree/files/etc/config"
   install -m 755 "$board_network" "$overlay/tree/$board_network"
   # config_generate skips nonempty network files, including the old LAN1-WAN seed.
   : > "$overlay/tree/files/etc/config/network"
+fi
+if [[ -n "$full_dir" ]]; then
   for kind in rv32 data; do
     install -m 644 "$full_dir/ram-npu_$kind.bin" "$overlay/tree/$package/files/npu_full_test_$kind.bin"
   done
   (cd "$overlay/tree/$package/files" && sha256sum -c ../SHA256SUMS.full-test)
   printf '%s\n' CONFIG_PACKAGE_hg5585f-ct-npu-full-test-firmware=y \
+    CONFIG_PACKAGE_kmod-nft-core=y CONFIG_PACKAGE_kmod-nft-bridge=y >> "$overlay/local.config"
+fi
+if [[ -n "$pon_dir" ]]; then
+  for kind in rv32 data; do
+    install -m 644 "$pon_dir/ram-npu_$kind.bin" "$overlay/tree/$package/files/npu_pon_full_$kind.bin"
+  done
+  python3 -B "$repo/target/linux/airoha/tests/pon_offload/verify_pon_payload.py" --installed-dir "$overlay/tree/$package/files"
+  (cd "$overlay/tree/$package/files" && sha256sum -c ../SHA256SUMS.pon-full)
+  printf '%s\n' CONFIG_PACKAGE_hg5585f-ct-npu-pon-full-firmware=y \
     CONFIG_PACKAGE_kmod-nft-core=y CONFIG_PACKAGE_kmod-nft-bridge=y >> "$overlay/local.config"
 fi
 python3 - "$overlay" <<'PY_MANIFEST'

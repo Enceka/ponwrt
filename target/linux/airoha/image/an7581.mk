@@ -206,6 +206,8 @@ define Device/fiberhome_hg5585f-ct
   DEVICE_DTS := an7581-fiberhome-hg5585f-ct$(if $(filter y,$(CONFIG_PACKAGE_hg5585f-ct-npu-firmware)),-connac2)$(if $(filter y,$(CONFIG_PACKAGE_kmod-mt7916-ct-wed-prepare)),$(if $(filter 1,$(HG5585F_CT_RAM_TRIAL)),,-wed))$(if $(filter 1,$(HG5585F_CT_RAM_TRIAL)),-ram)
   $(if $(filter y,$(CONFIG_PACKAGE_hg5585f-ct-npu-full-test-firmware)),$(if $(filter 1,$(HG5585F_CT_RAM_TRIAL)),$(error HG5585F CT full-test and RAM trial are mutually exclusive),DEVICE_DTS := an7581-fiberhome-hg5585f-ct-connac2-wed-full-test))
   DEVICE_PACKAGES += $(if $(filter y,$(CONFIG_PACKAGE_hg5585f-ct-npu-full-test-firmware)),hg5585f-ct-npu-full-test-firmware)
+  $(if $(filter y,$(CONFIG_PACKAGE_hg5585f-ct-npu-pon-full-firmware)),$(if $(filter 1,$(HG5585F_CT_RAM_TRIAL)),$(error HG5585F CT PON full and RAM trial are mutually exclusive))$(if $(filter y m,$(CONFIG_PACKAGE_hg5585f-ct-npu-rebuilt-firmware) $(CONFIG_PACKAGE_hg5585f-ct-npu-full-test-firmware)),$(error HG5585F CT PON full conflicts with rebuilt/full-test firmware),DEVICE_DTS := an7581-fiberhome-hg5585f-ct-connac2-wed-pon-full))
+  DEVICE_PACKAGES += $(if $(filter y,$(CONFIG_PACKAGE_hg5585f-ct-npu-pon-full-firmware)),hg5585f-ct-npu-pon-full-firmware)
   DEVICE_PACKAGES += kmod-phy-maxlinear $(if $(filter y,$(CONFIG_PACKAGE_hg5585f-ct-npu-firmware)),hg5585f-ct-npu-firmware)
   SUPPORTED_DEVICES += fiberhome,hg5585f-ct-usb-sfp
   $(call Device/fiberhome_hg5585f-images)

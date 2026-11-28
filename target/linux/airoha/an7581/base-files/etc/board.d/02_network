@@ -33,7 +33,7 @@ an7581_setup_interfaces()
 	fiberhome,hg5382a|\
 	fiberhome,hg5585f-ct)
 		case "$VARIANT" in
-			ordinary-full-test)
+			ordinary-full-test|pon-full)
 				ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "lan4"
 				;;
 			usb-sfp)
