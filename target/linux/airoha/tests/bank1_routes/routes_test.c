@@ -133,7 +133,7 @@ struct airoha_eth {
 	struct airoha_bank1_routes ct_bank1_routes;
 	u16 ct_cpu_route_mask[4];
 	bool ct_cpu_fallback, ct_cpu_ifc_disabled, ct_cpu_routes_ready;
-	bool ct_ifc_cpu_port_failed, ct_ifc_pon_ready, ct_ordinary_full_test;
+	bool ct_ifc_cpu_port_failed, ct_ifc_pon_ready, ct_ordinary_full_test, ct_pon_full;
 	bool ct_ifc_command_pending;
 	u32 ct_ifc_port_mask;
 	struct airoha_ppe *ppe;
@@ -335,6 +335,8 @@ static void airoha_ct_pon_ifc_fault(struct airoha_ppe *target) { ++legacy_faults
 static bool covered_diagnostic;
 static bool airoha_ppe_npu_diag_active(struct airoha_ppe *target, const void *owner)
 { return covered_diagnostic && target == &ppe && owner == &owner_token; }
+static u32 airoha_ppe_npu_diag_flow(struct airoha_ppe *target, const void *owner)
+{ return 0; }
 #endif
 #include "airoha_ct_ifc_command.h"
 #include "airoha_ct_cpu_fallback.h"

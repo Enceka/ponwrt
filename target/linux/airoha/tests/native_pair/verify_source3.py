@@ -19,7 +19,8 @@ pre = pre.replace('u32 ct_pair_token,ct_wlan_epoch', '''struct { u32 tcam[2][9][
  struct {bool cfg_owned;struct {u8 lut_index;} rule[2];} ct_ifc;
  u32 ct_pair_token,ct_wlan_epoch''')
 pre = pre.replace('struct airoha_eth {', 'struct airoha_ppe; struct airoha_qdma {int id;}; struct airoha_soc {int num_ppe;}; struct airoha_eth {struct airoha_ppe*ppe; struct airoha_soc*soc;struct airoha_qdma qdma[2];int ct_route_lock,ifc_port_lock;u32 ct_ifc_port_mask,ifc_port_desired;u16 ct_cpu_route_mask[4];bool ct_ifc_cpu_port_failed,ct_ifc_pon_ready,ct_ordinary_full_test;bool ct_cpu_fallback,ct_cpu_ifc_disabled,ct_cpu_routes_ready,ct_cpu_wlan_gated;')
-pre = pre.replace('struct airoha_eth {', 'struct airoha_eth {bool ct_ifc_command_pending;')
+pre = pre.replace('struct airoha_eth {', 'struct airoha_eth {bool ct_ifc_command_pending,ct_pon_full;')
+pre = pre.replace('bool ct_native_pairs,', 'bool ct_pon_qualified;bool ct_native_pairs,')
 pre = pre.replace('struct airoha_gdm_dev {', 'struct airoha_gdm_dev {struct airoha_qdma*qdma;')
 pre = pre.replace('bool ct_native_pairs,', 'bool ct_bridge_failed;bool ct_native_pairs,')
 pre = pre.replace('bool ct_native_pairs,', 'bool ct_pair_close_pending;bool ct_native_pairs,')
@@ -155,7 +156,7 @@ static void tables_restored(void){
 '''
 fixture = fixture.replace('ppe_lock=rcu=0;', 'eth.ppe=&ppe;eth.soc=&test_soc;eth.ct_cpu_fallback=eth.ct_cpu_ifc_disabled=eth.ct_cpu_routes_ready=eth.ct_cpu_wlan_gated=false;eth.ct_route_lock=eth.ifc_port_lock=0;eth.ct_ifc_port_mask=eth.ifc_port_desired=BIT(24);eth.ct_ifc_cpu_port_failed=eth.ct_ifc_pon_ready=eth.ct_ordinary_full_test=false;memset(eth.ct_cpu_route_mask,0,sizeof eth.ct_cpu_route_mask);schedules=0;ppe.ct_ifc.cfg_owned=true;ppe.ct_ifc.rule[0].lut_index=31;ppe.ct_ifc.rule[1].lut_index=30;mmio_reset();ppe_lock=rcu=0;')
 fixture = fixture.replace('wired=(struct airoha_gdm_dev){', 'wired=(struct airoha_gdm_dev){.qdma=&eth.qdma[1],')
-fixture = fixture.replace('mmio_reset();', 'eth.ct_ifc_command_pending=false;mmio_reset();')
+fixture = fixture.replace('mmio_reset();', 'eth.ct_ifc_command_pending=eth.ct_pon_full=false;mmio_reset();')
 body = '''#include "airoha_ct_cpu_fallback.h"\nstatic int airoha_ct_pair_fault_close(struct airoha_ppe *ppe);\n#include "fail_closed.inc"\n#define airoha_ppe_ct_bridge_fail_closed(ppe) airoha_ppe_ct_bridge_fail_closed_from(ppe,__func__,__LINE__)\n#include "airoha_ct_native_pair.h"\n#include "pair_policy_event.inc"\n'''
 main = r'''
 static void source_reset(void){reset();src.ieee80211_ptr=NULL;src.running=src.carrier=true;wired.netdev=&src;}

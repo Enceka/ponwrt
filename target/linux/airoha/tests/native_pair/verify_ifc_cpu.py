@@ -70,7 +70,7 @@ struct airoha_soc {struct {u32(*get_vip_port)(struct airoha_gdm_port*,unsigned);
 struct airoha_ppe;
 struct airoha_eth {struct airoha_gdm_port *ports[4];struct airoha_soc*soc;struct airoha_qdma qdma[2];struct airoha_ppe*ppe;void*dev;
  int ct_route_lock,ifc_port_lock;bool ct_cpu_fallback,ct_ifc_cpu_port_failed,ct_ifc_pon_ready,ct_ifc_command_pending;
- bool ct_ordinary_full_test,ct_cpu_routes_ready,ct_cpu_ifc_disabled;
+ bool ct_ordinary_full_test,ct_pon_full,ct_cpu_routes_ready,ct_cpu_ifc_disabled;
  u16 ct_cpu_route_mask[4];u32 ct_ifc_port_mask,ifc_port_desired;};
 static int flow_offload_mutex=1,ppe_lock,rcu;
 static int *route_lock,*port_lock;
@@ -92,7 +92,7 @@ static bool flow_rule_match_key(struct flow_rule*r,int k){return r->encap==k;}
 static void flow_rule_match_basic(struct flow_rule*r,struct flow_match_basic*m){static struct basic a,b;a.n_proto=r->proto_mask;b.n_proto=r->proto;m->mask=&a;m->key=&b;}
 static void flow_rule_match_meta(struct flow_rule*r,struct flow_match_meta*m){static struct meta a,b;a.ingress_ifindex=r->ingress_mask;b.ingress_ifindex=r->ingress;m->mask=&a;m->key=&b;}
 '''
-pre+=rule+'\nstruct airoha_ppe {struct airoha_eth *eth;bool ct_host_ppe,ct_stopping,ct_native_pairs,ct_pon_ifc_route_owned;struct {bool health_stopping;int health_work;} ct_fe;'+ifc+'};\n'
+pre+=rule+'\nstruct airoha_ppe {struct airoha_eth *eth;bool ct_host_ppe,ct_stopping,ct_native_pairs,ct_pon_ifc_route_owned,ct_pon_qualified;struct {bool health_stopping;int health_work;} ct_fe;'+ifc+'};\n'
 pre+=r'''
 static u32 regs[0x10000/4],table[3][64][9][3],saved[3][64][9][3];
 static unsigned writes,reads,fail_write,fail_read,fail_mode,fail_from,reg_failure,reg_errors;

@@ -136,7 +136,7 @@ struct airoha_eth {
 	u32 ct_ifc_port_mask, ifc_port_desired;
 	u16 ct_cpu_route_mask[4];
 	bool ct_ifc_command_pending, ct_ifc_pon_ready, ct_ifc_cpu_port_failed;
-	bool ct_cpu_fallback, ct_cpu_routes_ready, ct_cpu_ifc_disabled, ct_ordinary_full_test;
+	bool ct_cpu_fallback, ct_cpu_routes_ready, ct_cpu_ifc_disabled, ct_ordinary_full_test, ct_pon_full;
 };
 struct airoha_ppe {
 	struct airoha_eth *eth;

@@ -1,0 +1,84 @@
+From: Enceka <enceka@yeah.net>
+Subject: [PATCH] net: airoha: match PON full platform profiles and CPU routing
+
+Require the Ethernet and NPU nodes to select the same single firmware
+profile before allocating native pairs. Keep the PON full-image identity
+separate from ordinary full-test and send optical ingress to WAN CPU until
+production admission is qualified. Propagate route failures on PON open.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -888,6 +888,7 @@
+ 	bool ct_ifc_cpu_port_failed;
+ 	bool ct_ifc_command_pending;
+ 	bool ct_ordinary_full_test;
++	bool ct_pon_full;
+ 	bool ct_cpu_fallback;
+ 	bool ct_cpu_ifc_disabled;
+ 	bool ct_cpu_routes_ready;
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2652,1 +2652,3 @@
+-	if (err && qdma->eth->ct_ordinary_full_test && test_bit(AIROHA_DEV_F_PON, &dev->flags)) {
++	if (err && (qdma->eth->ct_ordinary_full_test ||
++		    qdma->eth->ct_pon_full) &&
++	    test_bit(AIROHA_DEV_F_PON, &dev->flags)) {
+@@ -5219,6 +5221,8 @@
+ 	eth->dev = &pdev->dev;
+ 	eth->ct_ordinary_full_test = of_property_read_bool(pdev->dev.of_node,
+ 							  "airoha,connac2-ordinary-full-test");
++	eth->ct_pon_full = of_property_read_bool(pdev->dev.of_node,
++					       "airoha,connac2-pon-full");
+ 	spin_lock_init(&eth->ct_route_lock);
+ 	spin_lock_init(&eth->ifc_port_lock);
+ 	mutex_init(&eth->pon_config_lock);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -3667,21 +3667,25 @@
+-	if (of_property_read_bool(eth->dev->of_node, "airoha,connac2-ram-native-pairs") ||
+-	    of_property_read_bool(eth->dev->of_node, "airoha,connac2-ordinary-full-test")) {
++	{
+ 		struct device_node *np = of_parse_phandle(eth->dev->of_node, "airoha,npu", 0);
+ 		bool ram_lab = np && of_property_read_bool(np, "airoha,connac2-rebuilt-ram-lab");
+ 		bool full = np && of_property_read_bool(np, "airoha,connac2-ordinary-full-test");
++		bool pon = np && of_property_read_bool(np, "airoha,connac2-pon-full");
++		bool eth_ram = of_property_read_bool(eth->dev->of_node, "airoha,connac2-ram-native-pairs");
++		bool eth_full = of_property_read_bool(eth->dev->of_node, "airoha,connac2-ordinary-full-test");
++		bool eth_pon = of_property_read_bool(eth->dev->of_node, "airoha,connac2-pon-full");
+ 
+ 		of_node_put(np);
+-		if (ram_lab == full || !airoha_ppe_ct_requested(eth) ||
+-		    ram_lab != of_property_read_bool(eth->dev->of_node, "airoha,connac2-ram-native-pairs") ||
+-		    full != of_property_read_bool(eth->dev->of_node, "airoha,connac2-ordinary-full-test"))
+-			return -EOPNOTSUPP;
+-		ppe->ct_pairs = devm_kcalloc(eth->dev, AIROHA_CT_PAIR_SLOTS,
+-					    sizeof(*ppe->ct_pairs), GFP_KERNEL);
+-		if (!ppe->ct_pairs)
+-			return -ENOMEM;
+-		ppe->ct_native_pairs = true;
++		if (ram_lab || full || pon || eth_ram || eth_full || eth_pon) {
++			if (ram_lab + full + pon != 1 || !airoha_ppe_ct_requested(eth) ||
++			    ram_lab != eth_ram || full != eth_full || pon != eth_pon)
++				return -EOPNOTSUPP;
++			ppe->ct_pairs = devm_kcalloc(eth->dev, AIROHA_CT_PAIR_SLOTS,
++						    sizeof(*ppe->ct_pairs), GFP_KERNEL);
++			if (!ppe->ct_pairs)
++				return -ENOMEM;
++			ppe->ct_native_pairs = true;
++		}
+ 	}
+ 
+ 	ppe_num_entries = airoha_ppe_get_total_num_entries(ppe);
+ 	foe_size = ppe_num_entries * sizeof(struct airoha_foe_entry);
+ 	ppe->foe = dmam_alloc_coherent(eth->dev, foe_size, &ppe->foe_dma,
+--- a/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
++++ b/drivers/net/ethernet/airoha/airoha_ct_cpu_fallback.h
+@@ -152,5 +152,7 @@
+ 	 */
+-	if (eth->ct_ordinary_full_test && id == AIROHA_GDM2_IDX)
++	if (id == AIROHA_GDM2_IDX &&
++	    (eth->ct_ordinary_full_test ||
++	     (eth->ct_pon_full && (!eth->ppe || !eth->ppe->ct_pon_qualified))))
+ 		cfg = airoha_ct_cpu_selectors(cfg, airoha_ct_ppe_selectors(cfg), FE_PSE_PORT_CDM2);
+ 	airoha_fe_wr(eth, REG_GDM_FWD_CFG(id), cfg);
+ 	if (airoha_fe_rr(eth, REG_GDM_FWD_CFG(id)) != cfg)

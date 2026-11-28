@@ -60,10 +60,11 @@ struct airoha_gdm_dev {
 struct airoha_gdm_port { struct airoha_gdm_dev *devs[2]; };
 struct airoha_soc { int num_ppe; };
 struct airoha_eth {
+    struct { void *owner; bool pon_open, revoked, ready; u32 desired[4]; } ct_bank1_routes;
     spinlock_t ct_route_lock;
     u16 ct_cpu_route_mask[4];
     bool ct_cpu_fallback, ct_cpu_ifc_disabled, ct_cpu_routes_ready, ct_cpu_wlan_gated;
-    bool ct_ifc_cpu_port_failed, ct_ifc_pon_ready, ct_ordinary_full_test;
+    bool ct_ifc_cpu_port_failed, ct_ifc_pon_ready, ct_ordinary_full_test, ct_pon_full;
     struct airoha_ppe *ppe;
     struct airoha_npu *npu;
     struct airoha_soc *soc;
@@ -75,14 +76,14 @@ struct airoha_ppe {
     struct airoha_eth *eth;
     struct { bool cfg_owned; } ct_ifc;
     struct {
-        bool active, armed, pending, arm_pending, touched, saved, health_stopping;
+        bool active, armed, pending, arm_pending, touched, saved, health_stopping, owner;
         u32 epoch, pending_epoch;
         u64 generation, pending_generation;
         int health_work;
     } ct_fe;
     bool ct_native_pairs, ct_pair_policy_allowed, ct_pair_failed;
     bool ct_bridge_failed, ct_stopping, ct_pair_hw_stopped;
-    bool ct_pair_close_pending;
+    bool ct_pair_close_pending, ct_pon_qualified, ct_pon_ifc_route_owned;
     u32 ct_pair_wired_epoch;
 };
 
@@ -146,6 +147,11 @@ static int airoha_ct_fe_control(struct airoha_ppe *p, unsigned int op, u64 gener
     ({ (void)(a); (void)(b); (void)(c); (val)=fn(__VA_ARGS__); (cond) ? 0 : -ETIMEDOUT; })
 
 static bool ct_ifc_cpu_port_matches(struct airoha_eth *e) { return !e->ct_ifc_cpu_port_failed; }
+static int airoha_bank1_routes_revoke_locked(struct airoha_eth *device)
+{
+    assert(!device->ct_bank1_routes.owner);
+    return -EOPNOTSUPP;
+}
 #include "airoha_ct_cpu_fallback.h"
 #include "cpu_fallback_extracted.inc"
 
@@ -175,6 +181,7 @@ static void reset(void)
 int main(void)
 {
     int cases=0;
+    unsigned selector_combinations=0;
     /* Exhaustive selectors: only destinations 4/8 move, including mixed types. */
     for (u32 low=0;low<0x10000;low++) for (int cpu=0;cpu<=5;cpu+=5) {
         u32 out=airoha_ct_cpu_selectors(0xabc00000|low,airoha_ct_ppe_selectors(low),cpu);
@@ -183,8 +190,30 @@ int main(void)
             int before=(low>>(n*4))&15,after=(out>>(n*4))&15;
             assert(after==((before==4||before==8)?cpu:before));
         }
+        selector_combinations++;
     }
     cases++;
+    for (unsigned profile=0;profile<4;profile++) for (unsigned state=0;state<3;state++) {
+        reset(); eth.ct_ordinary_full_test=profile&1; eth.ct_pon_full=profile&2;
+        ppe.ct_pon_qualified=state==2;
+        if (!state) eth.ppe=NULL;
+        for (unsigned id=1;id<=4;id++) for (u32 low=0;low<0x10000;low++) {
+            bool cpu=id==AIROHA_GDM2_IDX &&
+                (eth.ct_ordinary_full_test || (eth.ct_pon_full && state!=2));
+            u32 expected=0xabcd0000;
+            for (unsigned shift=0;shift<16;shift+=4) {
+                u32 selector=(low>>shift)&15;
+                expected|=((cpu && (selector==4 || selector==8))?FE_PSE_PORT_CDM2:selector)<<shift;
+            }
+            assert(!airoha_gdm_fwd_cfg_update(&eth,id,U32_MAX,0xabcd0000|low));
+            assert(eth.regs[id-1]==expected);
+            selector_combinations++;
+        }
+        reject_reg=AIROHA_GDM2_IDX-1;
+        eth.regs[reject_reg]=0;
+        assert(airoha_gdm_fwd_cfg_update(&eth,AIROHA_GDM2_IDX,U32_MAX,0xabcd8888)==-EIO);
+        cases++;
+    }
     reset(); eth.ct_ordinary_full_test=true;
     for (u32 low=0;low<0x10000;low++) {
         assert(!airoha_gdm_fwd_cfg_update(&eth,2,U32_MAX,0xabcd0000|low));
@@ -194,6 +223,7 @@ int main(void)
             expected|=((p==4||p==8)?5:p)<<(4*n);
         }
         assert(eth.regs[1]==expected);
+        selector_combinations++;
     }
     assert(!airoha_set_gdm_port_fwd_cfg(&eth,4,4) && (eth.regs[3]&0xffff)==0x8888);
     reject_reg=1; assert(airoha_set_gdm_port_fwd_cfg(&eth,2,8)==-EIO);
@@ -324,6 +354,6 @@ int main(void)
     assert(eth.ct_cpu_fallback && ppe.ct_bridge_failed && !close_calls);
     assert(!ppe.ct_pair_policy_allowed && ppe.ct_pair_hw_stopped); cases++;
     assert(!rcu_depth && !eth.ct_route_lock.held);
-    printf("PASS: %d scenario groups; 131072 selector combinations; extracted production functions\n",cases);
+    printf("PASS: %d scenario groups; %u selector combinations; extracted production functions\n",cases,selector_combinations);
     return 0;
 }
